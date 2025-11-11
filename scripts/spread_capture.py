@@ -1,7 +1,13 @@
+"""
+Spread Capture Strategy
 
+This strategy collects bid/ask spread data from Binance (or other connectors) and stores
+snapshot samples at configurable intervals. It also computes rolling averages of spreads
+over a defined time window and persists results to SQLite.
+
+"""
 from __future__ import annotations
 
-import glob
 import json
 import os
 import time
@@ -10,12 +16,8 @@ import urllib.request
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, ClassVar, Dict, List, Optional, Tuple
 
-try:
-    import yaml
-except Exception:
-    yaml = None
-
 from pydantic import Field
+from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from hummingbot.client.hummingbot_application import HummingbotApplication
@@ -30,7 +32,7 @@ class SpreadSamplerConfig(StrategyV2ConfigBase):
     Generic config for the spread sampler. Accepts connector/exchange aliases.
     quote is a list of quotes to include (e.g. ["USDT", "BUSD"]). Backwards-compatible with a single string.
     """
-    script_file_name: str = __file__
+    script_file_name: str = os.path.basename(__file__)
 
     connector_name: Optional[str] = Field(None, description="Primary connector/exchange name (e.g., binance).")
     exchange: Optional[str] = Field(None, description="Alias for connector_name.")
@@ -43,89 +45,10 @@ class SpreadSamplerConfig(StrategyV2ConfigBase):
     candles_config: List[CandlesConfig] = Field(default_factory=list)
 
 
-def _find_saved_script_yaml(base_name: str) -> Optional[str]:
-    candidates = []
-    cwd = os.getcwd()
-    candidates += glob.glob(os.path.join(cwd, "conf", "scripts", f"conf_{base_name}*.yml"))
-    candidates += glob.glob(os.path.join(cwd, "conf", "strategies", f"{base_name}.yml"))
-    project_root = os.path.dirname(os.path.dirname(cwd))
-    candidates += glob.glob(os.path.join(project_root, "conf", "scripts", f"conf_{base_name}*.yml"))
-    candidates += glob.glob(os.path.join(project_root, "conf", "strategies", f"{base_name}.yml"))
-    home = os.path.expanduser("~")
-    candidates += glob.glob(os.path.join(home, ".hummingbot", "conf", "scripts", f"conf_{base_name}*.yml"))
-    candidates += glob.glob(os.path.join(home, ".hummingbot", "conf", "strategies", f"{base_name}.yml"))
-    for p in candidates:
-        if os.path.isfile(p):
-            return p
-    return None
-
-
-def _load_yaml_as_dict(path: str) -> Optional[dict]:
-    if not path or not os.path.isfile(path):
-        return None
-    if yaml is None:
-        data: Dict[str, Any] = {}
-        with open(path, "r") as f:
-            key = None
-            for raw in f:
-                line = raw.rstrip("\n")
-                if not line.strip() or line.strip().startswith("#"):
-                    continue
-                if line.lstrip().startswith("-"):
-                    if key is None:
-                        continue
-                    item = line.lstrip().lstrip("-").strip()
-                    if isinstance(data.get(key), list):
-                        data[key].append(item.strip('"').strip("'"))
-                    else:
-                        data[key] = [item.strip('"').strip("'")]
-                    continue
-                if ":" not in line:
-                    continue
-                k, v = line.split(":", 1)
-                key = k.strip()
-                val = v.strip()
-                if val == "":
-                    data[key] = []
-                else:
-                    if val.lower() in ("null", "none"):
-                        data[key] = None
-                    elif val.lower() in ("true", "false"):
-                        data[key] = val.lower() == "true"
-                    else:
-                        if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
-                            data[key] = val[1:-1]
-                        else:
-                            try:
-                                data[key] = int(val)
-                            except Exception:
-                                data[key] = val
-        return data
-    try:
-        with open(path, "r") as f:
-            return yaml.safe_load(f) or {}
-    except Exception:
-        return None
-
-
 class SpreadSampler(StrategyV2Base):
     markets: ClassVar[Dict[str, set]] = {}
 
-    def __init__(self, *args, **kwargs):
-        connectors = kwargs.get("connectors", None)
-        config_in = kwargs.get("config", None)
-
-        if config_in is None and len(args) >= 1:
-            if len(args) >= 2:
-                connectors = connectors or args[0]
-                config_in = config_in or args[1]
-            else:
-                single = args[0]
-                if isinstance(single, (dict, SpreadSamplerConfig)):
-                    config_in = single
-                else:
-                    connectors = single
-
+    def __init__(self, connectors: Optional[dict] = None, config: Optional[Any] = None):
         if connectors is None:
             connectors = {}
         if not isinstance(connectors, dict):
@@ -135,140 +58,84 @@ class SpreadSampler(StrategyV2Base):
                 connectors = {}
 
         # produce normalized configuration object
-        config_obj = None
-
-        def _normalize_data(d: dict) -> dict:
-            out = dict(d)
+        def _normalize_data(config_dict: dict) -> dict:
+            normalized_config = dict(config_dict)
             # connector_name from aliases
-            if "connector_name" not in out or not out.get("connector_name"):
+            if "connector_name" not in normalized_config or not normalized_config.get("connector_name"):
                 for alias in ("exchange", "connector"):
-                    if alias in out and out.get(alias):
-                        out["connector_name"] = out.get(alias)
+                    if alias in normalized_config and normalized_config.get(alias):
+                        normalized_config["connector_name"] = normalized_config.get(alias)
                         break
             # normalize quote to list uppercase
-            q = out.get("quote", None)
-            if isinstance(q, str):
-                out["quote"] = [q.strip().upper()]
-            elif isinstance(q, (list, tuple, set)):
-                out["quote"] = [str(x).strip().upper() for x in q if x is not None]
+            quote = normalized_config.get("quote", None)
+            if isinstance(quote, str):
+                normalized_config["quote"] = [quote.strip().upper()]
+            elif isinstance(quote, (list, tuple, set)):
+                normalized_config["quote"] = [str(item).strip().upper() for item in quote if item is not None]
             else:
-                out["quote"] = ["USDT"]
+                normalized_config["quote"] = ["USDT"]
             # normalize markets values to lists of normalized pairs (BASE-QUOTE)
-            mk = out.get("markets", {}) or {}
-            norm_markets: Dict[str, List[str]] = {}
-            for k, v in mk.items():
-                items: List[str] = []
-                if isinstance(v, (list, tuple, set)):
-                    seq = v
-                elif v is None:
-                    seq = []
+            markets = normalized_config.get("markets", {}) or {}
+            normalize_markets: Dict[str, List[str]] = {}
+            for exchange_name, market_list in markets.items():
+                normalized_pairs: List[str] = []
+                if isinstance(market_list, (list, tuple, set)):
+                    market_entries = market_list
+                elif market_list is None:
+                    market_entries = []
                 else:
-                    seq = [v]
-                for it in seq:
-                    if not isinstance(it, str):
+                    market_entries = [market_list]
+                for market_pair in market_entries:
+                    if not isinstance(market_pair, str):
                         continue
-                    p = it.replace("/", "-").replace("_", "-").upper()
-                    items.append(p)
-                norm_markets[k] = items
-            out["markets"] = norm_markets
-            return out
+                    normalized_pair = market_pair.replace("/", "-").replace("_", "-").upper()
+                    normalized_pairs.append(normalized_pair)
+                normalize_markets[exchange_name] = normalized_pairs
+            normalized_config["markets"] = normalize_markets
+            return normalized_config
 
+        config_obj = None
         try:
-            if isinstance(config_in, SpreadSamplerConfig):
-                config_obj = config_in
-            elif isinstance(config_in, dict):
-                data = _normalize_data(config_in)
+            if isinstance(config, SpreadSamplerConfig):
+                config_obj = config
+            elif isinstance(config, dict):
+                normalized_data = _normalize_data(config)
                 try:
-                    config_obj = SpreadSamplerConfig(**data)
+                    config_obj = SpreadSamplerConfig(**normalized_data)
                 except Exception:
-                    cfg = type("Cfg", (), {})()
-                    for k, v in data.items():
-                        setattr(cfg, k, v)
-                    config_obj = cfg
-            elif config_in is None:
-                base_name = os.path.splitext(os.path.basename(__file__))[0]
-                yaml_path = _find_saved_script_yaml(base_name)
-                if not yaml_path:
-                    try_path = os.path.join(os.getcwd(), "conf", "scripts", f"conf_{base_name}.yml")
-                    if os.path.isfile(try_path):
-                        yaml_path = try_path
-                if yaml_path:
-                    data = _load_yaml_as_dict(yaml_path)
-                    if data:
-                        data = _normalize_data(data)
-                        try:
-                            config_obj = SpreadSamplerConfig(**data)
-                        except Exception:
-                            cfg = type("Cfg", (), {})()
-                            for k, v in data.items():
-                                setattr(cfg, k, v)
-                            config_obj = cfg
+                    fallback_config = type("Cfg", (), {})()
+                    for key, value in normalized_data.items():
+                        setattr(fallback_config, key, value)
+                    config_obj = fallback_config
+
         except Exception:
             config_obj = None
 
         if config_obj is None:
-            raise ValueError("SpreadSampler requires a valid config object or conf YAML.")
+            try:
+                config_obj = SpreadSamplerConfig()
+            except Exception:
+                raise ValueError("SpreadSampler requires a valid config object.")
 
         # call parent
         super().__init__(connectors, config_obj)
 
-        self.config = config_obj  # type: ignore
         self._started_at: Optional[float] = None
         self._last_snapshot_at: float = 0.0
         self._last_window_report: float = 0.0
         self._samples: Dict[str, List[dict]] = {}
         self._pairs: List[str] = []
-        self._discovered = False
-        self._symbol_cache_ts: float = 0.0
+        self._pairs_discovered: bool = False
+        self._symbol_cache_timestamp: float = 0.0
         self._symbol_cache: List[str] = []
-
-        # If connector_name or markets missing, try explicit conf/scripts/conf_spread_capture.yml fallback
-        try:
-            has_conn = bool(getattr(self.config, "connector_name", None))
-            has_markets = bool(getattr(self.config, "markets", None))
-            if not has_conn or not has_markets:
-                explicit_path = os.path.join(os.getcwd(), "conf", "scripts", "conf_spread_capture.yml")
-                if os.path.isfile(explicit_path):
-                    data = _load_yaml_as_dict(explicit_path) or {}
-                    # apply connector_name if missing
-                    if not has_conn and data.get("connector_name"):
-                        try:
-                            setattr(self.config, "connector_name", data.get("connector_name"))
-                        except Exception:
-                            pass
-                    # apply quote if present
-                    if data.get("quote") is not None:
-                        q = data.get("quote")
-                        if isinstance(q, str):
-                            q = [q]
-                        q_list = [str(x).strip().upper() for x in (q or []) if x is not None]
-                        try:
-                            setattr(self.config, "quote", q_list)
-                        except Exception:
-                            pass
-                    # apply and normalize markets
-                    if data.get("markets") is not None:
-                        mk = data.get("markets") or {}
-                        norm: Dict[str, List[str]] = {}
-                        for k, v in mk.items():
-                            seq = v if isinstance(v, (list, tuple, set)) else ([v] if v is not None else [])
-                            items = [it.replace("/", "-").replace("_", "-").upper() for it in seq if isinstance(it, str)]
-                            norm[str(k)] = items
-                        try:
-                            setattr(self.config, "markets", norm)
-                        except Exception:
-                            pass
-                    self._log_msg(f"[spread_sampler] loaded explicit config from {explicit_path}")
-        except Exception:
-            pass
 
         # debug: show what config/connectors look like at init
         try:
-            ck = list(getattr(self, "connectors", {}).keys())
-            cname = getattr(self.config, "connector_name", None)
-            q = getattr(self.config, "quote", None)
-            mk_keys = list(getattr(self.config, "markets", {}).keys()) if getattr(self.config, "markets", None) else []
-            self._log_msg(f"[spread_sampler] debug init connector_keys={ck} connector_name={cname} quote={q} markets_keys={mk_keys}")
+            connector_keys = list(getattr(self, "connectors", {}).keys())
+            connector_name = getattr(self.config, "connector_name", None)
+            quote = getattr(self.config, "quote", None)
+            market_keys = list(getattr(self.config, "markets", {}).keys()) if getattr(self.config, "markets", None) else []
+            self._log_msg(f"[spread_sampler] debug init connector_keys={connector_keys} connector_name={connector_name} quote={quote} markets_keys={market_keys}")
         except Exception:
             pass
 
@@ -276,49 +143,60 @@ class SpreadSampler(StrategyV2Base):
         return time.time()
 
     def _fetch_exchange_symbols(self) -> List[str]:
-        now = self._now()
-        if self._symbol_cache and (now - self._symbol_cache_ts) < 300:
+        """Fetch tradable symbols from the exchange (e.g., Binance) via REST API."""
+        current_time = self._now()
+
+    # Use cached symbols if fetched within last 5 minutes
+        if self._symbol_cache and (current_time - self._symbol_cache_timestamp) < 300:
             return self._symbol_cache
+
         try:
-            connector = (getattr(self.config, "connector_name", "") or "").lower()
-            if "binance" not in connector:
+            connector_name = (getattr(self.config, "connector_name", "") or "").lower()
+            if "binance" not in connector_name:
                 return []
-            url = "https://api.binance.com/api/v3/exchangeInfo"
-            with urllib.request.urlopen(url, timeout=8) as resp:
-                data = json.loads(resp.read().decode())
-            syms = data.get("symbols") or []
-            q_list = [q.upper() for q in (getattr(self.config, "quote", []) or [])]
-            out = []
-            for s in syms:
+
+            api_url = "https://api.binance.com/api/v3/exchangeInfo"
+            with urllib.request.urlopen(api_url, timeout=8) as response:
+                data = json.loads(response.read().decode())
+
+            exchange_symbols = data.get("symbols") or []
+            quote_assets = [quote.upper() for quote in (getattr(self.config, "quote", []) or [])]
+            filtered_symbols: List[str] = []
+
+            for symbol_entry in exchange_symbols:
                 try:
-                    if s.get("status", "").upper() != "TRADING":
+                    if symbol_entry.get("status", "").upper() != "TRADING":
                         continue
-                    quote = (s.get("quoteAsset") or "").upper()
-                    base = (s.get("baseAsset") or "").upper()
-                    if quote in q_list:
-                        out.append(f"{base}-{quote}")
-                except Exception:
+                    quote_asset = (symbol_entry.get("quoteAsset") or "").upper()
+                    base_asset = (symbol_entry.get("baseAsset") or "").upper()
+                    if quote_asset in quote_assets:
+                        filtered_symbols.append(f"{base_asset}-{quote_asset}")
+                except Exception as e:
+                    self._log_msg(f"[spread_sampler] symbol parsing error: {e}")
                     continue
-            self._symbol_cache = sorted(set(out))
-            self._symbol_cache_ts = now
+
+            self._symbol_cache = sorted(set(filtered_symbols))
+            self._symbol_cache_timestamp = current_time
             return self._symbol_cache
-        except Exception:
+
+        except Exception as e:
+            self._log_msg(f"[spread_sampler] failed to fetch exchange symbols: {e}")
             return []
 
     def _fetch_exchange_top(self, pair: str) -> Tuple[Optional[Decimal], Optional[Decimal]]:
         try:
-            connector = (getattr(self.config, "connector_name", "") or "").lower()
-            if "binance" not in connector:
+            connector_name = (getattr(self.config, "connector_name", "") or "").lower()
+            if "binance" not in connector_name:
                 return None, None
-            sym = pair.replace("-", "").replace("/", "").upper()
-            url = f"https://api.binance.com/api/v3/depth?symbol={urllib.parse.quote(sym)}&limit=5"
-            with urllib.request.urlopen(url, timeout=6) as resp:
+            symbol_name = pair.replace("-", "").replace("/", "").upper()
+            api_url = f"https://api.binance.com/api/v3/depth?symbol={urllib.parse.quote(symbol_name)}&limit=5"
+            with urllib.request.urlopen(api_url, timeout=6) as resp:
                 data = json.loads(resp.read().decode())
             bids = data.get("bids") or []
             asks = data.get("asks") or []
-            bid = Decimal(str(bids[0][0])) if bids and len(bids[0]) >= 1 else None
-            ask = Decimal(str(asks[0][0])) if asks and len(asks[0]) >= 1 else None
-            return bid, ask
+            best_bid = Decimal(str(bids[0][0])) if bids and len(bids[0]) >= 1 else None
+            best_ask = Decimal(str(asks[0][0])) if asks and len(asks[0]) >= 1 else None
+            return best_bid, best_ask
         except Exception:
             return None, None
 
@@ -336,12 +214,13 @@ class SpreadSampler(StrategyV2Base):
         except Exception:
             pass
         try:
-            engine = HummingbotBase.metadata.bind
-            if engine is not None:
-                return sessionmaker(bind=engine)()
-        except Exception:
-            pass
-        return None
+            db_path = os.path.join(os.getcwd(), "data", "spread_capture.sqlite")
+            engine = create_engine(f"sqlite:///{db_path}", echo=False)
+            HummingbotBase.metadata.bind = engine
+            return sessionmaker(bind=engine)()
+        except Exception as e:
+            self._log_msg(f"[spread_sampler] DB engine creation failed: {e}")
+            return None
 
     def _store_sample_to_db(self,
                             pair: str,
@@ -398,96 +277,96 @@ class SpreadSampler(StrategyV2Base):
                     pass
 
     def _discover_pairs(self) -> List[str]:
-        pairs = set()
-        conn = getattr(self, "connectors", None)
-        conn = conn.get(getattr(self.config, "connector_name", None)) if conn else None
-        if conn is not None:
-            ob = getattr(conn, "order_books", None)
-            if isinstance(ob, dict):
-                pairs.update(ob.keys())
-            tp = getattr(conn, "trading_pairs", None)
-            if isinstance(tp, (list, set, tuple)):
-                pairs.update(tp)
+        candidate_pairs = set()
+        connectors_dict = getattr(self, "connectors", None)
+        connector_instance = connectors_dict.get(getattr(self.config, "connector_name", None)) if connectors_dict else None
+        if connector_instance is not None:
+            order_books = getattr(connector_instance, "order_books", None)
+            if isinstance(order_books, dict):
+                candidate_pairs.update(order_books.keys())
+            trading_pairs = getattr(connector_instance, "trading_pairs", None)
+            if isinstance(trading_pairs, (list, set, tuple)):
+                candidate_pairs.update(trading_pairs)
 
         # include configured seed markets (all keys)
         try:
-            cfg_markets = getattr(self.config, "markets", {}) or {}
-            for v in cfg_markets.values():
-                if isinstance(v, (list, set, tuple)):
-                    pairs.update(v)
-                elif isinstance(v, str):
-                    pairs.add(v)
+            configured_markets = getattr(self.config, "markets", {}) or {}
+            for market_entries in configured_markets.values():
+                if isinstance(market_entries, (list, set, tuple)):
+                    candidate_pairs.update(market_entries)
+                elif isinstance(market_entries, str):
+                    candidate_pairs.add(market_entries)
         except Exception:
             pass
 
         # REST fallback symbol list for known connectors
-        rest_pairs = []
+        rest_pairs: List[str] = []
         try:
             rest_pairs = self._fetch_exchange_symbols()
-            pairs.update(rest_pairs)
+            candidate_pairs.update(rest_pairs)
         except Exception:
             pass
 
         # normalize to BASE-QUOTE form 'BASE-QUOTE' and filter by configured quotes
-        normalized = set()
-        q_list = [q.upper() for q in (self.config.quote or [])]
-        for p in pairs:
-            if not isinstance(p, str):
+        normalized_pairs = set()
+        quote_assets = [quote.upper() for quote in (self.config.quote or [])]
+        for raw_pair in candidate_pairs:
+            if not isinstance(raw_pair, str):
                 continue
-            p_norm = p.replace("/", "-").replace("_", "-").upper()
-            matched = False
-            for q in q_list:
-                if p_norm.endswith(f"-{q}"):
-                    normalized.add(p_norm)
-                    matched = True
+            normalized_pair = raw_pair.replace("/", "-").replace("_", "-").upper()
+            match_found = False
+            for quote_asset in quote_assets:
+                if normalized_pair.endswith(f"-{quote_asset}"):
+                    normalized_pairs.add(normalized_pair)
+                    match_found = True
                     break
-            if matched:
+            if match_found:
                 continue
-            for q in q_list:
-                if p_norm.endswith(q) and "-" not in p_norm:
-                    base = p_norm[:-len(q)]
-                    if base:
-                        normalized.add(f"{base}-{q}")
+            for quote_asset in quote_assets:
+                if normalized_pair.endswith(quote_asset) and "-" not in normalized_pair:
+                    base_asset = normalized_pair[:-len(quote_asset)]
+                    if base_asset:
+                        normalized_pairs.add(f"{base_asset}-{quote_asset}")
                         break
 
         # debug: report discovery metrics
         try:
-            self._log_msg(f"[spread_sampler] debug discover connector_present={conn is not None} connector_name={self.config.connector_name} seed_count={sum(len(v) for v in (self.config.markets or {}).values())} rest_count={len(rest_pairs)} normalized_count={len(normalized)}")
+            self._log_msg(f"[spread_sampler] debug discover connector_present={connector_instance is not None} connector_name={self.config.connector_name} seed_count={sum(len(entries) for entries in (self.config.markets or {}).values())} rest_count={len(rest_pairs)} normalized_count={len(normalized_pairs)}")
         except Exception:
             pass
 
-        return sorted(normalized)
+        return sorted(normalized_pairs)
 
-    def _sample_top(self, pair: str) -> None:
-        conn = getattr(self, "connectors", None)
-        conn = conn.get(self.config.connector_name) if conn else None
+    def _sample_top(self, trading_pair: str) -> None:
+        connectors_dict = getattr(self, "connectors", None)
+        connector_instance = connectors_dict.get(self.config.connector_name) if connectors_dict else None
         bid = None
         ask = None
-        source = "connector"
+        data_source = "connector"
         try:
-            if conn is not None:
-                ob = getattr(conn, "order_books", {})
-                ob_pair = ob.get(pair)
-                if ob_pair is None:
-                    alt_keys = [pair.replace("-", "/"), pair.replace("-", "")]
-                    for k in alt_keys:
-                        ob_pair = ob.get(k)
-                        if ob_pair is not None:
+            if connector_instance is not None:
+                order_books = getattr(connector_instance, "order_books", {})
+                order_book_entry = order_books.get(trading_pair)
+                if order_book_entry is None:
+                    alt_keys = [trading_pair.replace("-", "/"), trading_pair.replace("-", "")]
+                    for key in alt_keys:
+                        order_book_entry = order_books.get(key)
+                        if order_book_entry is not None:
                             break
-                if ob_pair:
-                    if isinstance(ob_pair, dict):
-                        bids = ob_pair.get("bids") or []
-                        asks = ob_pair.get("asks") or []
+                if order_book_entry:
+                    if isinstance(order_book_entry, dict):
+                        bids = order_book_entry.get("bids") or []
+                        asks = order_book_entry.get("asks") or []
                         if bids:
                             bid = Decimal(str(bids[0][0])) if bids and len(bids[0]) >= 1 else None
                         if asks:
                             ask = Decimal(str(asks[0][0])) if asks and len(asks[0]) >= 1 else None
                     else:
                         try:
-                            snap = getattr(ob_pair, "get_snapshot", lambda: None)()
-                            if snap:
-                                bids = snap.get("bids") or []
-                                asks = snap.get("asks") or []
+                            snapshot = getattr(order_book_entry, "get_snapshot", lambda: None)()
+                            if snapshot:
+                                bids = snapshot.get("bids") or []
+                                asks = snapshot.get("asks") or []
                                 if bids:
                                     bid = Decimal(str(bids[0][0]))
                                 if asks:
@@ -496,12 +375,12 @@ class SpreadSampler(StrategyV2Base):
                             pass
 
             if (bid is None or ask is None):
-                fb, fa = self._fetch_exchange_top(pair)
-                if fb is not None or fa is not None:
-                    self._log_msg(f"[spread_sampler] REST fallback {pair} -> bid={fb} ask={fa}")
-                    bid = bid or fb
-                    ask = ask or fa
-                    source = "rest"
+                fallback_bid, fallback_ask = self._fetch_exchange_top(trading_pair)
+                if fallback_bid is not None or fallback_ask is not None:
+                    self._log_msg(f"[spread_sampler] REST fallback {trading_pair} -> bid={fallback_bid} ask={fallback_ask}")
+                    bid = bid or fallback_bid
+                    ask = ask or fallback_ask
+                    data_source = "rest"
 
             spread = None
             try:
@@ -518,30 +397,30 @@ class SpreadSampler(StrategyV2Base):
                 mid_d = None
                 spread = None
 
-            ts_now = self._now()
-            self._samples.setdefault(pair, []).append({"ts": ts_now, "bid": bid, "ask": ask, "spread": spread, "source": source})
+            timestamp_now = self._now()
+            self._samples.setdefault(trading_pair, []).append({"ts": timestamp_now, "bid": bid, "ask": ask, "spread": spread, "source": data_source})
             try:
-                self._store_sample_to_db(pair=pair, ts=ts_now, bid=bid, ask=ask, mid=mid_d, spread=spread, source=source)
+                self._store_sample_to_db(pair=trading_pair, ts=timestamp_now, bid=bid, ask=ask, mid=mid_d, spread=spread, source=data_source)
             except Exception:
                 pass
         except Exception:
             return
 
     def _take_snapshot(self) -> None:
-        for p in self._pairs:
-            self._sample_top(p)
+        for trading_pair in self._pairs:
+            self._sample_top(trading_pair)
         self._last_snapshot_at = self._now()
-        for p in self._pairs:
-            entries = self._samples.get(p) or []
-            if not entries:
+        for trading_pair in self._pairs:
+            pair_samples = self._samples.get(trading_pair) or []
+            if not pair_samples:
                 continue
-            last = entries[-1]
+            last = pair_samples[-1]
             bid = last.get("bid")
             ask = last.get("ask")
-            ts = last.get("ts")
+            timestamp = last.get("ts")
             spread = last.get("spread")
             spread_text = f"{spread:.2f}%" if isinstance(spread, Decimal) else "None"
-            self._log_msg(f"[spread_sampler] snapshot {p} ts={ts} bid={bid} ask={ask} spread={spread_text}")
+            self._log_msg(f"[spread_sampler] snapshot {trading_pair} ts={timestamp} bid={bid} ask={ask} spread={spread_text}")
 
     def _trim(self) -> None:
         window_min = self.config.averaging_window_min if (self.config.averaging_window_min is not None) else (self.config.averaging_window_hours * 60)

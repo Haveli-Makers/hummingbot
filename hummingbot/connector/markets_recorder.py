@@ -275,6 +275,100 @@ class MarketsRecorder:
             session.add(controller)
             session.commit()
 
+    def store_market_data(self,
+                          exchange: str,
+                          trading_pair: str,
+                          best_bid: float,
+                          best_ask: float,
+                          mid_price: float = None,
+                          spread: float = None,
+                          spread_pct: float = None,
+                          order_book: dict = None):
+        """
+        Store market data (bid/ask/spread) into the MarketData table.
+        
+        Args:
+            exchange: The exchange name (e.g., "binance")
+            trading_pair: The trading pair (e.g., "BTC-USDT")
+            best_bid: The best bid price
+            best_ask: The best ask price
+            mid_price: The mid price (optional, calculated if not provided)
+            spread: Absolute spread (optional, calculated if not provided)
+            spread_pct: Spread percentage (optional, calculated if not provided)
+            order_book: Optional order book data as dict with "bid" and "ask" keys
+        """
+        if mid_price is None:
+            mid_price = (best_bid + best_ask) / 2
+        if spread is None:
+            spread = best_ask - best_bid
+        if spread_pct is None:
+            spread_pct = (spread / mid_price) * 100 if mid_price > 0 else 0
+        
+        with self._sql_manager.get_new_session() as session:
+            market_data = MarketData(
+                timestamp=self.db_timestamp,
+                exchange=exchange,
+                trading_pair=trading_pair,
+                mid_price=mid_price,
+                best_bid=best_bid,
+                best_ask=best_ask,
+                spread=spread,
+                spread_pct=spread_pct,
+                order_book=order_book
+            )
+            session.add(market_data)
+            session.commit()
+
+    def store_market_data_batch(self, market_data_list: List[dict]):
+        """
+        Store multiple market data records in a single transaction.
+        
+        Args:
+            market_data_list: List of dicts with keys:
+                - exchange: str
+                - trading_pair: str
+                - best_bid: float
+                - best_ask: float
+                - mid_price: float (optional)
+                - spread: float (optional)
+                - spread_pct: float (optional)
+                - order_book: dict (optional)
+        """
+        if not market_data_list:
+            return
+            
+        with self._sql_manager.get_new_session() as session:
+            timestamp = self.db_timestamp
+            for data in market_data_list:
+                best_bid = data['best_bid']
+                best_ask = data['best_ask']
+                
+                mid_price = data.get('mid_price')
+                if mid_price is None:
+                    mid_price = (best_bid + best_ask) / 2
+                
+                spread = data.get('spread')
+                if spread is None:
+                    spread = best_ask - best_bid
+                
+                spread_pct = data.get('spread_pct')
+                if spread_pct is None:
+                    spread_pct = (spread / mid_price) * 100 if mid_price > 0 else 0
+                
+                market_data = MarketData(
+                    timestamp=timestamp,
+                    exchange=data['exchange'],
+                    trading_pair=data['trading_pair'],
+                    mid_price=mid_price,
+                    best_bid=best_bid,
+                    best_ask=best_ask,
+                    spread=spread,
+                    spread_pct=spread_pct,
+                    order_book=data.get('order_book')
+                )
+                session.add(market_data)
+            session.commit()
+
     def get_executors_by_ids(self, executor_ids: List[str]):
         with self._sql_manager.get_new_session() as session:
             executors = session.query(Executors).filter(Executors.id.in_(executor_ids)).all()

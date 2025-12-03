@@ -1,15 +1,10 @@
 import asyncio
-import sqlite3
-from typing import Dict, Set
-from hummingbot.core.data_type.common import PriceType
+from typing import Dict, Set, List
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
-import os
 import time
-from hummingbot.strategy_v2.models.executor_actions import StoreExecutorAction
-from hummingbot.client.settings import AllConnectorSettings
-from hummingbot.data_feed.market_data_provider import MarketDataProvider
-from hummingbot.core.utils.trading_pair_fetcher import TradingPairFetcher
 from hummingbot.core.utils.async_utils import safe_ensure_future
+from hummingbot.core.rate_oracle.sources.binance_rate_source import BinanceRateSource
+from hummingbot.connector.markets_recorder import MarketsRecorder
 
 class USDTQuoteSpreadViewer(ScriptStrategyBase):
 
@@ -18,24 +13,14 @@ class USDTQuoteSpreadViewer(ScriptStrategyBase):
 
     # Manually defined markets
     markets: Dict[str, Set[str]] = {
-        "binance": ['BTC-USDT', 'ETH-USDT', 'XRP-USDT']  # Example pairs
+        "binance": {'BTC-USDT'}  # Example pairs
     }
 
     connector_name = "binance"
-
-    def create_markets(self):
-        try:
-            connector_setting = AllConnectorSettings.get_connector_settings()[self.connector_name]
-            inst = TradingPairFetcher.get_instance()
-            trading_pairs = inst.trading_pairs.get(self.connector_name, [])
-            
-            usdt_pairs = [p for p in trading_pairs if p.endswith("-USDT")]
-            
-            self.markets[self.connector_name] = set(usdt_pairs)
-            
-        except Exception as e:
-            self.logger().error(f"Error fetching trading pairs: {str(e)}")
-        self.__init__(connectors=self.connectors)
+    
+    def __init__(self, connectors: Dict = None):
+        super().__init__(connectors or {})
+        self._rate_source = BinanceRateSource()
 
     async def grid(self):
         now = int(time.time())
@@ -44,37 +29,59 @@ class USDTQuoteSpreadViewer(ScriptStrategyBase):
 
         self.last_run = now
         
-        self.create_markets()
+        try:
+            bid_ask_prices = await self._rate_source.get_bid_ask_prices(quote_token="USDT")
+            
+            if not bid_ask_prices:
+                self.logger().warning("No bid/ask prices received from Binance")
+                return
+            
+            market_data_batch: List[dict] = []
+            
+            for trading_pair, price_data in bid_ask_prices.items():
+                bid = float(price_data['bid'])
+                ask = float(price_data['ask'])
+                mid_price = float(price_data['mid'])
+                spread = float(price_data['spread'])
+                spread_pct = float(price_data['spread_pct'])
                 
-        for connector_name, trading_pairs in self.markets.items():
-            connector = self.connectors.get(connector_name)
-            if connector is None:
-                self.logger().error(f"Connector {connector_name} not found!")
-                continue
-
-            for pair in trading_pairs:
-                try:
-                    order_book = await connector._orderbook_ds._order_book_snapshot(pair)
-                    bid = None
-                    ask = None
-                    if order_book is not None:
-                        bid = float(order_book.content['bids'][0][0])                    
-                        ask = float(order_book.content['asks'][0][0])
-
-                    if bid is None or ask is None:
-                        continue
-
-                    spread = ask - bid
-                    
-                    mid_price = (bid + ask) / 2
-                    spread_pct = (spread / mid_price) * 100 if mid_price > 0 else 0
-
-                    self.logger().info(
-                        f"{pair} → BID: {bid}, ASK: {ask}, "
-                        f"SPREAD: {spread:.6f} ({spread_pct:.4f}%)"
-                    )
-                except Exception as e:
-                    self.logger().warning(f"{pair} error: {e}")
+                self.logger().info(
+                    f"{trading_pair} → BID: {bid}, ASK: {ask}, "
+                    f"SPREAD: {spread:.6f} ({spread_pct:.4f}%)"
+                )
+                
+                market_data_batch.append({
+                    'exchange': self.connector_name,
+                    'trading_pair': trading_pair,
+                    'best_bid': bid,
+                    'best_ask': ask,
+                    'mid_price': mid_price,
+                    'spread': spread,
+                    'spread_pct': spread_pct
+                })
+            
+            self.store_spread_data(market_data_batch)
+            self.logger().info(f"Processed {len(bid_ask_prices)} trading pairs")
+            
+        except Exception as e:
+            self.logger().error(f"Error fetching bid/ask prices: {e}")
+    
+    def store_spread_data(self, market_data_list: List[dict]):
+        """
+        Store spread/market data using the MarketsRecorder.
+        """
+        if not market_data_list:
+            return
+            
+        try:
+            markets_recorder = MarketsRecorder._shared_instance
+            if markets_recorder is not None:
+                markets_recorder.store_market_data_batch(market_data_list)
+                self.logger().info(f"Stored {len(market_data_list)} market data records to database")
+            else:
+                self.logger().warning("MarketsRecorder instance not available - data not stored")
+        except Exception as e:
+            self.logger().error(f"Error storing market data: {e}")
                     
     def on_tick(self):
         safe_ensure_future(self.grid())

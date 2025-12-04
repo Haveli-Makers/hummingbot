@@ -14,7 +14,7 @@ SUPPORTED_CONNECTORS = [
     "mexc", "ascend_ex", "coinbase_advanced_trade", "cube", "hyperliquid", "dexalot"
 ]
 
-# Path to the configuration file
+# Path to the configuration file for connector_name, quote_token, and interval_sec
 CONFIG_FILE_PATH = "conf/scripts/conf_spread_calculation.yml"
 
 

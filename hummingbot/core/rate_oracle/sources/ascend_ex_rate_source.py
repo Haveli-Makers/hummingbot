@@ -33,6 +33,39 @@ class AscendExRateSource(RateSourceBase):
             )
         return results
 
+    @async_ttl_cache(ttl=30, maxsize=1)
+    async def get_bid_ask_prices(self, quote_token: Optional[str] = None) -> Dict[str, Dict[str, Decimal]]:
+        """
+        Fetches best bid and ask prices for all trading pairs.
+        
+        :param quote_token: A quote symbol, if specified only pairs with the quote symbol are included
+        :return: A dictionary of trading pairs to {"bid": Decimal, "ask": Decimal, "mid": Decimal, "spread": Decimal, "spread_pct": Decimal}
+        """
+        self._ensure_exchange()
+        results = {}
+        try:
+            records = await self._exchange.get_all_pairs_prices()
+            for record in records["data"]:
+                try:
+                    pair = await self._exchange.trading_pair_associated_to_exchange_symbol(record["symbol"])
+                except KeyError:
+                    continue
+                bid = Decimal(str(record["bid"][0]))
+                ask = Decimal(str(record["ask"][0]))
+                if bid > 0 and ask > 0 and bid <= ask:
+                    results[pair] = {
+                        "bid": bid,
+                        "ask": ask,
+                        "mid": (bid + ask) / Decimal("2"),
+                        "spread": ask - bid,
+                        "spread_pct": ((ask - bid) / ((bid + ask) / Decimal("2"))) * Decimal("100")
+                    }
+        except Exception:
+            self.logger().exception(
+                msg="Unexpected error while retrieving bid/ask prices from AscendEx. Check the log file for more info.",
+            )
+        return results
+
     def _ensure_exchange(self):
         if self._exchange is None:
             self._exchange = self._build_ascend_ex_connector_without_private_keys()

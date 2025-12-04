@@ -14,6 +14,9 @@ RUN conda env create -f /tmp/environment.yml && \
     conda clean -afy && \
     rm /tmp/environment.yml
 
+# Install dos2unix for line ending conversion
+RUN apt-get update && apt-get install -y dos2unix && rm -rf /var/lib/apt/lists/*
+
 # Copy remaining files
 COPY bin/ bin/
 COPY hummingbot/ hummingbot/
@@ -23,6 +26,9 @@ COPY scripts/ scripts-copy/
 COPY setup.py .
 COPY LICENSE .
 COPY README.md .
+
+# Convert line endings from Windows to Unix
+RUN find . -type f -name "*.py" -exec dos2unix {} \;
 
 # activate hummingbot env when entering the CT
 SHELL [ "/bin/bash", "-lc" ]

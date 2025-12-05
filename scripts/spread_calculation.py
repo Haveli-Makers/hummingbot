@@ -14,7 +14,7 @@ from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 
 SUPPORTED_CONNECTORS = [
     "binance", "binance_perpetual", "binance_us", "kucoin", "gate_io", 
-    "mexc", "ascend_ex", "coinbase_advanced_trade", "cube", "hyperliquid", "dexalot"
+    "mexc", "ascend_ex", "cube", "hyperliquid", "dexalot"
 ]
 
 
@@ -42,6 +42,13 @@ class SpreadCalculationConfig(BaseClientModel):
         gt=0,
         json_schema_extra={
             "prompt": lambda mi: "Enter the fetch interval in seconds (e.g., 900 for 15 minutes): ",
+            "prompt_on_new": True
+        }
+    )
+    excluding_pairs: str = Field(
+        default="",
+        json_schema_extra={
+            "prompt": lambda mi: "Enter trading pairs to exclude (comma-separated, e.g., BTC-USDT,ETH-USDT), leave empty to include all: ",
             "prompt_on_new": True
         }
     )
@@ -113,6 +120,7 @@ class USDTQuoteSpreadViewer(ScriptStrategyBase):
         self.connector_name = config.connector_name
         self.quote_token = config.quote_token
         self.interval_sec = config.interval_sec
+        self.excluding_pairs: Set[str] = self._parse_excluding_pairs(config.excluding_pairs)
         
         self.last_run: int = 0
         self._rate_source: Optional[RateSourceBase] = None
@@ -136,6 +144,8 @@ class USDTQuoteSpreadViewer(ScriptStrategyBase):
             self.logger().info(f"✓ Connector: {self.connector_name}")
             self.logger().info(f"✓ Quote token filter: {self.quote_token}")
             self.logger().info(f"✓ Fetch interval: {self.interval_sec} seconds")
+            if self.excluding_pairs:
+                self.logger().info(f"✓ Excluding pairs: {', '.join(self.excluding_pairs)}")
             self.logger().info("=" * 60)
             self._initialized = True
         except Exception as e:
@@ -169,8 +179,14 @@ class USDTQuoteSpreadViewer(ScriptStrategyBase):
                 return
             
             market_data_batch: List[dict] = []
+            excluded_count = 0
             
             for trading_pair, price_data in bid_ask_prices.items():
+                # Skip excluded pairs
+                if trading_pair in self.excluding_pairs:
+                    excluded_count += 1
+                    continue
+                    
                 bid = float(price_data['bid'])
                 ask = float(price_data['ask'])
                 mid_price = float(price_data['mid'])
@@ -193,7 +209,8 @@ class USDTQuoteSpreadViewer(ScriptStrategyBase):
                 })
             
             self.store_spread_data(market_data_batch)
-            self.logger().info(f"Processed {len(bid_ask_prices)} trading pairs from {self.connector_name}")
+            self.logger().info(f"Processed {len(market_data_batch)} trading pairs from {self.connector_name}" +
+                              (f" (excluded {excluded_count} pairs)" if excluded_count > 0 else ""))
             
         except Exception as e:
             self.logger().error(f"Error fetching bid/ask prices from {self.connector_name}: {e}")
@@ -211,8 +228,14 @@ class USDTQuoteSpreadViewer(ScriptStrategyBase):
                 return
             
             market_data_batch: List[dict] = []
+            excluded_count = 0
             
             for trading_pair, mid_price in prices.items():
+                # Skip excluded pairs
+                if trading_pair in self.excluding_pairs:
+                    excluded_count += 1
+                    continue
+                    
                 self.logger().info(f"{trading_pair} → MID: {float(mid_price)}")
                 
                 market_data_batch.append({
@@ -226,7 +249,8 @@ class USDTQuoteSpreadViewer(ScriptStrategyBase):
                 })
             
             self.store_spread_data(market_data_batch)
-            self.logger().info(f"Processed {len(prices)} trading pairs from {self.connector_name} (mid prices only)")
+            self.logger().info(f"Processed {len(market_data_batch)} trading pairs from {self.connector_name} (mid prices only)" +
+                              (f" (excluded {excluded_count} pairs)" if excluded_count > 0 else ""))
             
         except Exception as e:
             self.logger().error(f"Error fetching prices from {self.connector_name}: {e}")
@@ -248,6 +272,14 @@ class USDTQuoteSpreadViewer(ScriptStrategyBase):
         except Exception as e:
             self.logger().error(f"Error storing market data: {e}")
                     
+    def _parse_excluding_pairs(self, excluding_pairs_str: str) -> Set[str]:
+        """
+        Parse the comma-separated excluding pairs string into a set.
+        """
+        if not excluding_pairs_str or not excluding_pairs_str.strip():
+            return set()
+        return {pair.strip().upper() for pair in excluding_pairs_str.split(",") if pair.strip()}
+
     def on_tick(self):
         if not self._initialized:
             return

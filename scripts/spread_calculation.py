@@ -1,11 +1,15 @@
-from typing import Dict, Set, List, Optional
-from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
-import time
 import os
-import yaml
-from hummingbot.core.utils.async_utils import safe_ensure_future
-from hummingbot.core.rate_oracle.sources.rate_source_base import RateSourceBase
+import time
+from typing import Dict, List, Optional, Set
+
+from pydantic import Field
+
+from hummingbot.client.config.config_data_types import BaseClientModel
+from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.connector.markets_recorder import MarketsRecorder
+from hummingbot.core.rate_oracle.sources.rate_source_base import RateSourceBase
+from hummingbot.core.utils.async_utils import safe_ensure_future
+from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 
 
 SUPPORTED_CONNECTORS = [
@@ -13,30 +17,34 @@ SUPPORTED_CONNECTORS = [
     "mexc", "ascend_ex", "coinbase_advanced_trade", "cube", "hyperliquid", "dexalot"
 ]
 
-# Path to the configuration file for connector_name, quote_token, and interval_sec
-CONFIG_FILE_PATH = "conf/scripts/conf_spread_calculation.yml"
 
-
-def load_config() -> dict:
-    """Load configuration from YAML file."""
-    config = {
-        "connector_name": "binance",
-        "quote_token": "USDT",
-        "interval_sec": 900
-    }
-    
-    try:
-        if os.path.exists(CONFIG_FILE_PATH):
-            with open(CONFIG_FILE_PATH, 'r') as f:
-                yaml_config = yaml.safe_load(f)
-                if yaml_config:
-                    config["connector_name"] = yaml_config.get("connector_name", config["connector_name"])
-                    config["quote_token"] = yaml_config.get("quote_token", config["quote_token"])
-                    config["interval_sec"] = yaml_config.get("interval_sec", config["interval_sec"])
-    except Exception as e:
-        print(f"Error loading config file: {e}")
-    
-    return config
+class SpreadCalculationConfig(BaseClientModel):
+    """
+    Configuration for the Spread Calculation script.
+    """
+    script_file_name: str = Field(default_factory=lambda: os.path.basename(__file__))
+    connector_name: str = Field(
+        default="binance",
+        json_schema_extra={
+            "prompt": lambda mi: f"Enter the connector name ({', '.join(SUPPORTED_CONNECTORS)}): ",
+            "prompt_on_new": True
+        }
+    )
+    quote_token: str = Field(
+        default="USDT",
+        json_schema_extra={
+            "prompt": lambda mi: "Enter the quote token to filter pairs (e.g., USDT, USDC): ",
+            "prompt_on_new": True
+        }
+    )
+    interval_sec: int = Field(
+        default=900,
+        gt=0,
+        json_schema_extra={
+            "prompt": lambda mi: "Enter the fetch interval in seconds (e.g., 900 for 15 minutes): ",
+            "prompt_on_new": True
+        }
+    )
 
 
 def get_rate_source(connector_name: str) -> RateSourceBase:
@@ -49,7 +57,7 @@ def get_rate_source(connector_name: str) -> RateSourceBase:
     """
     connector_name_lower = connector_name.lower()
     
-    if connector_name_lower in ("binance", "binance_perpetual"):
+    if connector_name_lower in ("binance"):
         from hummingbot.core.rate_oracle.sources.binance_rate_source import BinanceRateSource
         return BinanceRateSource()
     elif connector_name_lower == "binance_us":
@@ -67,9 +75,6 @@ def get_rate_source(connector_name: str) -> RateSourceBase:
     elif connector_name_lower == "ascend_ex":
         from hummingbot.core.rate_oracle.sources.ascend_ex_rate_source import AscendExRateSource
         return AscendExRateSource()
-    elif connector_name_lower == "coinbase_advanced_trade":
-        from hummingbot.core.rate_oracle.sources.coinbase_advanced_trade_rate_source import CoinbaseAdvancedTradeRateSource
-        return CoinbaseAdvancedTradeRateSource()
     elif connector_name_lower == "cube":
         from hummingbot.core.rate_oracle.sources.cube_rate_source import CubeRateSource
         return CubeRateSource()
@@ -88,22 +93,26 @@ class USDTQuoteSpreadViewer(ScriptStrategyBase):
     """
     A script that fetches and stores spread data from various exchanges.
     
-    Configuration is read from conf/scripts/conf_spread_calculation.yml:
+    Configuration is created via the CLI 'create' command:
         - connector_name: The exchange connector to use (e.g., 'binance', 'kucoin', 'gate_io', 'mexc')
         - quote_token: The quote token to filter pairs (e.g., 'USDT', 'USDC')
         - interval_sec: How often to fetch data (in seconds)
     """
 
     markets: Dict[str, Set[str]] = {}
+
+    @classmethod
+    def init_markets(cls, config: SpreadCalculationConfig):
+        """Initialize markets from config. Called by the start command."""
+        cls.markets = {}  
     
-    def __init__(self, connectors: Dict):
-        super().__init__(connectors)
+    def __init__(self, connectors: Dict[str, ConnectorBase], config: SpreadCalculationConfig):
+        super().__init__(connectors, config)
         
-        # Load configuration from YAML file
-        config = load_config()
-        self.connector_name = config["connector_name"]
-        self.quote_token = config["quote_token"]
-        self.interval_sec = config["interval_sec"]
+        # Load configuration from the config object
+        self.connector_name = config.connector_name
+        self.quote_token = config.quote_token
+        self.interval_sec = config.interval_sec
         
         self.last_run: int = 0
         self._rate_source: Optional[RateSourceBase] = None

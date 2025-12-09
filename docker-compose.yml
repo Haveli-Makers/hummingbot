@@ -2,9 +2,9 @@ services:
   hummingbot:
     container_name: hummingbot
     # image: hummingbot/hummingbot:latest
-    build: # Uncomment this build section and comment image to build Hummingbot locally
-      context: .
-      dockerfile: Dockerfile
+    # build: # Uncomment this build section and comment image to build Hummingbot locally
+    #   context: .
+    #   dockerfile: Dockerfile
     volumes:
       - ./conf:/home/hummingbot/conf
       - ./conf/connectors:/home/hummingbot/conf/connectors

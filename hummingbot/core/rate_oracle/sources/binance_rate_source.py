@@ -42,7 +42,7 @@ class BinanceRateSource(RateSourceBase):
     async def get_bid_ask_prices(self, quote_token: Optional[str] = None) -> Dict[str, Dict[str, Decimal]]:
         """
         Fetches best bid and ask prices for all trading pairs.
-        
+
         :param quote_token: A quote symbol, if specified only pairs with the quote symbol are included
         :return: A dictionary of trading pairs to {"bid": Decimal, "ask": Decimal, "mid": Decimal}
         """
@@ -140,4 +140,3 @@ class BinanceRateSource(RateSourceBase):
             trading_required=False,
             domain=domain,
         )
-

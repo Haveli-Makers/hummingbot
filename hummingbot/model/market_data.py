@@ -1,6 +1,6 @@
 import inspect
 
-from sqlalchemy import JSON, Column, Index, Text, PrimaryKeyConstraint
+from sqlalchemy import JSON, Column, Index, PrimaryKeyConstraint, Text
 
 from hummingbot.model import HummingbotBase
 from hummingbot.model.decimal_type_decorator import SqliteDecimal
@@ -21,7 +21,7 @@ class MarketData(HummingbotBase):
     best_bid = Column(SqliteDecimal(6), nullable=False)
     best_ask = Column(SqliteDecimal(6), nullable=False)
     spread_pct = Column(SqliteDecimal(6), nullable=True)  # Spread percentage: (spread / mid_price) * 100
-    order_book = Column(JSON)  
+    order_book = Column(JSON)
 
     def __repr__(self) -> str:
         list_of_fields = [f"{name}: {value}" for name, value in inspect.getmembers(self) if isinstance(value, Column)]

@@ -191,11 +191,10 @@ class SpreadCapture(ScriptStrategyBase):
                 bid = float(price_data["bid"])
                 ask = float(price_data["ask"])
                 mid_price = float(price_data["mid"])
-                spread = float(price_data["spread"])
                 spread_pct = float(price_data["spread_pct"])
 
                 self.logger().info(
-                    f"{trading_pair} → BID: {bid}, ASK: {ask}, " f"SPREAD: {spread:.6f} ({spread_pct:.4f}%)"
+                    f"{trading_pair} → BID: {bid}, ASK: {ask}, SPREAD_PCT: {spread_pct:.4f}%"
                 )
 
                 market_data_batch.append(
@@ -205,7 +204,6 @@ class SpreadCapture(ScriptStrategyBase):
                         "best_bid": bid,
                         "best_ask": ask,
                         "mid_price": mid_price,
-                        "spread": spread,
                         "spread_pct": spread_pct,
                     }
                 )

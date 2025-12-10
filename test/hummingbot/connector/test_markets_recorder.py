@@ -992,7 +992,6 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
                 'best_bid': 50000.0,
                 'best_ask': 50010.0,
                 'mid_price': 50005.0,
-                'spread': 10.0,
                 'spread_pct': 0.02,
             },
             {
@@ -1001,7 +1000,6 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
                 'best_bid': 3000.0,
                 'best_ask': 3001.0,
                 'mid_price': 3000.5,
-                'spread': 1.0,
                 'spread_pct': 0.033,
             },
         ]
@@ -1058,7 +1056,6 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
         self.assertIsNotNone(record)
         self.assertEqual('kucoin', record.exchange)
         self.assertAlmostEqual(float(record.mid_price), 100.5, places=2)  # (100 + 101) / 2
-        self.assertAlmostEqual(float(record.spread), 1.0, places=2)  # 101 - 100
         # spread_pct = (1 / 100.5) * 100 ≈ 0.995
         self.assertAlmostEqual(float(record.spread_pct), 0.995, places=2)
 

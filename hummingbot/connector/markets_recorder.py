@@ -286,7 +286,6 @@ class MarketsRecorder:
                 - best_bid: float
                 - best_ask: float
                 - mid_price: float (optional)
-                - spread: float (optional)
                 - spread_pct: float (optional)
                 - order_book: dict (optional)
         """
@@ -303,12 +302,9 @@ class MarketsRecorder:
                 if mid_price is None:
                     mid_price = (best_bid + best_ask) / 2
 
-                spread = data.get('spread')
-                if spread is None:
-                    spread = best_ask - best_bid
-
                 spread_pct = data.get('spread_pct')
                 if spread_pct is None:
+                    spread = best_ask - best_bid
                     spread_pct = (spread / mid_price) * 100 if mid_price > 0 else 0
 
                 market_data = MarketData(
@@ -318,7 +314,6 @@ class MarketsRecorder:
                     mid_price=mid_price,
                     best_bid=best_bid,
                     best_ask=best_ask,
-                    spread=spread,
                     spread_pct=spread_pct,
                     order_book=data.get('order_book')
                 )

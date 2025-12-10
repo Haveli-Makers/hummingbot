@@ -90,21 +90,8 @@ class DexalotRateSourceTest(IsolatedAsyncioWrapperTestCase):
         await self.mocking_assistant.run_until_all_aiohttp_messages_delivered(ws_connect_mock.return_value)
         return prices
 
-    @aioresponses()
-    async def test_get_prices(self, mock_api):
-        expected_rate = Decimal("10")
-        rate_source = DexalotRateSource()
-        prices = await self.setup_dexalot_responses(mock_api=mock_api, rate_source=rate_source)
-
-        self.assertIn(self.trading_pair, prices)
-        self.assertEqual(expected_rate, prices[self.trading_pair])
-        self.assertNotIn(self.ignored_trading_pair, prices)
-
     @patch("aiohttp.ClientSession.ws_connect", new_callable=AsyncMock)
-    @aioresponses()
-    async def test_get_bid_ask_prices(self, mock_api, ws_connect_mock):
-        rate_source = DexalotRateSource()
-
+    async def setup_dexalot_bid_ask_responses(self, ws_connect_mock, mock_api, rate_source):
         symbols_url = web_utils.public_rest_url(path_url=CONSTANTS.EXCHANGE_INFO_PATH_URL)
         symbols_response = [
             {'env': 'production-multi-subnet', 'pair': 'ALOT/USDC', 'base': 'ALOT', 'quote': 'USDC',
@@ -129,9 +116,25 @@ class DexalotRateSourceTest(IsolatedAsyncioWrapperTestCase):
         self.mocking_assistant.add_websocket_aiohttp_message(
             websocket_mock=ws_connect_mock.return_value,
             message=json.dumps(result_subscribe))
-
         bid_ask_prices = await rate_source.get_bid_ask_prices()
+
         await self.mocking_assistant.run_until_all_aiohttp_messages_delivered(ws_connect_mock.return_value)
+        return bid_ask_prices
+
+    @aioresponses()
+    async def test_get_prices(self, mock_api):
+        expected_rate = Decimal("10")
+        rate_source = DexalotRateSource()
+        prices = await self.setup_dexalot_responses(mock_api=mock_api, rate_source=rate_source)
+
+        self.assertIn(self.trading_pair, prices)
+        self.assertEqual(expected_rate, prices[self.trading_pair])
+        self.assertNotIn(self.ignored_trading_pair, prices)
+
+    @aioresponses()
+    async def test_get_bid_ask_prices(self, mock_api):
+        rate_source = DexalotRateSource()
+        bid_ask_prices = await self.setup_dexalot_bid_ask_responses(mock_api=mock_api, rate_source=rate_source)
 
         self.assertIn(self.trading_pair, bid_ask_prices)
         price_data = bid_ask_prices[self.trading_pair]

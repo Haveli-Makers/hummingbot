@@ -1,5 +1,5 @@
 from decimal import Decimal
-from typing import TYPE_CHECKING, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Optional
 
 from hummingbot.connector.utils import split_hb_trading_pair
 from hummingbot.core.rate_oracle.sources.rate_source_base import RateSourceBase

@@ -20,9 +20,8 @@ class MarketData(HummingbotBase):
     mid_price = Column(SqliteDecimal(6), nullable=False)
     best_bid = Column(SqliteDecimal(6), nullable=False)
     best_ask = Column(SqliteDecimal(6), nullable=False)
-    spread = Column(SqliteDecimal(6), nullable=True)  # Absolute spread: ask - bid
     spread_pct = Column(SqliteDecimal(6), nullable=True)  # Spread percentage: (spread / mid_price) * 100
-    order_book = Column(JSON)  # Optional order book depth data
+    order_book = Column(JSON)  
 
     def __repr__(self) -> str:
         list_of_fields = [f"{name}: {value}" for name, value in inspect.getmembers(self) if isinstance(value, Column)]

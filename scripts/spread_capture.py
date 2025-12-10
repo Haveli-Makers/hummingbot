@@ -18,9 +18,9 @@ SUPPORTED_CONNECTORS = [
 ]
 
 
-class SpreadCalculationConfig(BaseClientModel):
+class SpreadCaptureConfig(BaseClientModel):
     """
-    Configuration for the Spread Calculation script.
+    Configuration for the Spread Capture script.
     """
     script_file_name: str = Field(default_factory=lambda: os.path.basename(__file__))
     connector_name: str = Field(
@@ -96,7 +96,7 @@ def get_rate_source(connector_name: str) -> RateSourceBase:
                         f"{', '.join(SUPPORTED_CONNECTORS)}")
 
 
-class USDTQuoteSpreadViewer(ScriptStrategyBase):
+class SpreadCapture(ScriptStrategyBase):
     """
     A script that fetches and stores spread data from various exchanges.
     
@@ -109,11 +109,11 @@ class USDTQuoteSpreadViewer(ScriptStrategyBase):
     markets: Dict[str, Set[str]] = {}
 
     @classmethod
-    def init_markets(cls, config: SpreadCalculationConfig):
+    def init_markets(cls, config: SpreadCaptureConfig):
         """Initialize markets from config. Called by the start command."""
         cls.markets = {}  
     
-    def __init__(self, connectors: Dict[str, ConnectorBase], config: SpreadCalculationConfig):
+    def __init__(self, connectors: Dict[str, ConnectorBase], config: SpreadCaptureConfig):
         super().__init__(connectors, config)
         
         # Load configuration from the config object
@@ -138,25 +138,17 @@ class USDTQuoteSpreadViewer(ScriptStrategyBase):
                 return
                 
             self._rate_source = get_rate_source(self.connector_name)
-            self.logger().info("=" * 60)
-            self.logger().info("SPREAD CALCULATION SCRIPT STARTED")
-            self.logger().info("=" * 60)
-            self.logger().info(f"✓ Connector: {self.connector_name}")
-            self.logger().info(f"✓ Quote token filter: {self.quote_token}")
-            self.logger().info(f"✓ Fetch interval: {self.interval_sec} seconds")
+    
             if self.excluding_pairs:
                 self.logger().info(f"✓ Excluding pairs: {', '.join(self.excluding_pairs)}")
-            self.logger().info("=" * 60)
+            
             self._initialized = True
         except Exception as e:
             self.logger().error(f"Failed to initialize rate source: {e}")
             self._initialized = False
 
-    async def grid(self):
-        # If not initialized, don't run
-        if not self._initialized:
-            return
-            
+    async def fetch_and_store_spread(self):
+                   
         now = int(time.time())
         if now - self.last_run < self.interval_sec:
             return
@@ -164,14 +156,6 @@ class USDTQuoteSpreadViewer(ScriptStrategyBase):
         self.last_run = now
         
         try:
-            if not hasattr(self._rate_source, 'get_bid_ask_prices'):
-                self.logger().warning(
-                    f"Rate source for {self.connector_name} does not support get_bid_ask_prices. "
-                    f"Falling back to get_prices method."
-                )
-                await self._fetch_using_get_prices()
-                return
-            
             bid_ask_prices = await self._rate_source.get_bid_ask_prices(quote_token=self.quote_token)
             
             if not bid_ask_prices:
@@ -215,46 +199,6 @@ class USDTQuoteSpreadViewer(ScriptStrategyBase):
         except Exception as e:
             self.logger().error(f"Error fetching bid/ask prices from {self.connector_name}: {e}")
     
-    async def _fetch_using_get_prices(self):
-        """
-        Fallback method for rate sources that don't support get_bid_ask_prices.
-        Uses get_prices which only returns mid prices (no spread data).
-        """
-        try:
-            prices = await self._rate_source.get_prices(quote_token=self.quote_token)
-            
-            if not prices:
-                self.logger().warning(f"No prices received from {self.connector_name}")
-                return
-            
-            market_data_batch: List[dict] = []
-            excluded_count = 0
-            
-            for trading_pair, mid_price in prices.items():
-                # Skip excluded pairs
-                if trading_pair in self.excluding_pairs:
-                    excluded_count += 1
-                    continue
-                    
-                self.logger().info(f"{trading_pair} → MID: {float(mid_price)}")
-                
-                market_data_batch.append({
-                    'exchange': self.connector_name,
-                    'trading_pair': trading_pair,
-                    'best_bid': None,
-                    'best_ask': None,
-                    'mid_price': float(mid_price),
-                    'spread': None,
-                    'spread_pct': None
-                })
-            
-            self.store_spread_data(market_data_batch)
-            self.logger().info(f"Processed {len(market_data_batch)} trading pairs from {self.connector_name} (mid prices only)" +
-                              (f" (excluded {excluded_count} pairs)" if excluded_count > 0 else ""))
-            
-        except Exception as e:
-            self.logger().error(f"Error fetching prices from {self.connector_name}: {e}")
-    
     def store_spread_data(self, market_data_list: List[dict]):
         """
         Store spread/market data using the MarketsRecorder.
@@ -263,7 +207,7 @@ class USDTQuoteSpreadViewer(ScriptStrategyBase):
             return
             
         try:
-            markets_recorder = MarketsRecorder._shared_instance
+            markets_recorder = MarketsRecorder.get_instance()
             if markets_recorder is not None:
                 markets_recorder.store_market_data_batch(market_data_list)
                 self.logger().info(f"Stored {len(market_data_list)} market data records to database")
@@ -283,5 +227,5 @@ class USDTQuoteSpreadViewer(ScriptStrategyBase):
     def on_tick(self):
         if not self._initialized:
             return
-        safe_ensure_future(self.grid())
+        safe_ensure_future(self.fetch_and_store_spread())
         

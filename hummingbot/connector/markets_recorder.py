@@ -275,7 +275,6 @@ class MarketsRecorder:
             session.add(controller)
             session.commit()
 
-
     def store_market_data(self, market_data_list: List[dict]):
         """
         Store multiple market data records in a single transaction.

@@ -971,7 +971,7 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual("BTC-USDT", orders[0].symbol)
         self.assertEqual("NEW_MARKET_OID1", orders[0].id)
 
-    def test_store_market_data_batch(self):
+    def test_store_market_data(self):
         """Test storing multiple market data records in a single batch."""
         recorder = MarketsRecorder(
             sql=self.manager,
@@ -1006,7 +1006,7 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
             },
         ]
 
-        recorder.store_market_data_batch(market_data_list)
+        recorder.store_market_data(market_data_list)
 
         with self.manager.get_new_session() as session:
             query = session.query(MarketData)
@@ -1025,8 +1025,8 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual('binance', eth_record.exchange)
         self.assertAlmostEqual(float(eth_record.best_bid), 3000.0, places=2)
 
-    def test_store_market_data_batch_calculates_missing_values(self):
-        """Test that store_market_data_batch calculates mid_price, spread, spread_pct if not provided."""
+    def test_store_market_data_calculates_missing_values(self):
+        """Test that store_market_data calculates mid_price, spread, spread_pct if not provided."""
         recorder = MarketsRecorder(
             sql=self.manager,
             markets=[self],
@@ -1049,7 +1049,7 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
             },
         ]
 
-        recorder.store_market_data_batch(market_data_list)
+        recorder.store_market_data(market_data_list)
 
         with self.manager.get_new_session() as session:
             query = session.query(MarketData).filter(MarketData.trading_pair == 'SOL-USDT')
@@ -1062,8 +1062,8 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
         # spread_pct = (1 / 100.5) * 100 ≈ 0.995
         self.assertAlmostEqual(float(record.spread_pct), 0.995, places=2)
 
-    def test_store_market_data_batch_empty_list(self):
-        """Test that store_market_data_batch handles empty list gracefully."""
+    def test_store_market_data_empty_list(self):
+        """Test that store_market_data handles empty list gracefully."""
         recorder = MarketsRecorder(
             sql=self.manager,
             markets=[self],
@@ -1077,7 +1077,7 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
         )
 
         # Should not raise any exception
-        recorder.store_market_data_batch([])
+        recorder.store_market_data([])
 
         with self.manager.get_new_session() as session:
             query = session.query(MarketData)

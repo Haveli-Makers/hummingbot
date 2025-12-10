@@ -229,7 +229,7 @@ class SpreadCapture(ScriptStrategyBase):
         try:
             markets_recorder = MarketsRecorder.get_instance()
             if markets_recorder is not None:
-                markets_recorder.store_market_data_batch(market_data_list)
+                markets_recorder.store_market_data(market_data_list)
                 self.logger().info(f"Stored {len(market_data_list)} market data records to database")
             else:
                 self.logger().warning("MarketsRecorder instance not available - data not stored")

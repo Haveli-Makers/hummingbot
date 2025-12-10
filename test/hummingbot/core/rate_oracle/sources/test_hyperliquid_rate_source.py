@@ -180,3 +180,20 @@ class HyperliquidRateSourceTest(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(expected_rate, prices[self.trading_pair])
         # self.assertIn(self.us_trading_pair, prices)
         self.assertNotIn(self.ignored_trading_pair, prices)
+
+    @aioresponses()
+    async def test_get_bid_ask_prices(self, mock_api):
+        expected_rate = Decimal("10")
+        self.setup_hyperliquid_responses(mock_api=mock_api, expected_rate=expected_rate)
+
+        rate_source = HyperliquidRateSource()
+        bid_ask_prices = await rate_source.get_bid_ask_prices()
+
+        self.assertIn(self.trading_pair, bid_ask_prices)
+        price_data = bid_ask_prices[self.trading_pair]
+        self.assertIn("bid", price_data)
+        self.assertIn("ask", price_data)
+        self.assertIn("mid", price_data)
+        self.assertIn("spread", price_data)
+        self.assertIn("spread_pct", price_data)
+        self.assertNotIn(self.ignored_trading_pair, bid_ask_prices)

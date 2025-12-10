@@ -74,3 +74,20 @@ class BinanceUSRateSourceTest(IsolatedAsyncioWrapperTestCase):
         self.assertIn(self.us_trading_pair, prices)
         self.assertEqual(expected_rate, prices[self.us_trading_pair])
         self.assertNotIn(self.ignored_trading_pair, prices)
+
+    @aioresponses()
+    async def test_get_bid_ask_prices(self, mock_api):
+        expected_rate = Decimal("10")
+        self.setup_binance_us_responses(mock_api=mock_api, expected_rate=expected_rate)
+
+        rate_source = BinanceUSRateSource()
+        bid_ask_prices = await rate_source.get_bid_ask_prices()
+
+        self.assertIn(self.us_trading_pair, bid_ask_prices)
+        price_data = bid_ask_prices[self.us_trading_pair]
+        self.assertEqual(expected_rate - Decimal("0.1"), price_data["bid"])
+        self.assertEqual(expected_rate + Decimal("0.1"), price_data["ask"])
+        self.assertEqual(expected_rate, price_data["mid"])
+        self.assertEqual(Decimal("0.2"), price_data["spread"])
+        self.assertIn("spread_pct", price_data)
+        self.assertNotIn(self.ignored_trading_pair, bid_ask_prices)

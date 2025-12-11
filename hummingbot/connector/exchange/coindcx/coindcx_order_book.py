@@ -20,13 +20,13 @@ class CoinDCXOrderBook(OrderBook):
     ) -> OrderBookMessage:
         """
         Converts a CoinDCX order book snapshot to an OrderBookMessage.
-        
+
         CoinDCX snapshot format:
         {
             "bids": {"price1": "quantity1", "price2": "quantity2", ...},
             "asks": {"price1": "quantity1", "price2": "quantity2", ...}
         }
-        
+
         :param msg: the order book snapshot message from CoinDCX
         :param timestamp: the timestamp of the message
         :param metadata: additional metadata (should include 'trading_pair')
@@ -34,30 +34,30 @@ class CoinDCXOrderBook(OrderBook):
         """
         if metadata is None:
             metadata = {}
-        
+
         # Convert bids and asks from dict to list of [price, amount]
         bids = []
         asks = []
-        
+
         if "bids" in msg:
             for price, amount in msg["bids"].items():
                 bids.append([float(price), float(amount)])
-        
+
         if "asks" in msg:
             for price, amount in msg["asks"].items():
                 asks.append([float(price), float(amount)])
-        
+
         # Sort bids (descending) and asks (ascending)
         bids.sort(key=lambda x: x[0], reverse=True)
         asks.sort(key=lambda x: x[0])
-        
+
         content = {
             "trading_pair": metadata.get("trading_pair"),
             "update_id": msg.get("vs", int(timestamp * 1000)),
             "bids": bids,
             "asks": asks
         }
-        
+
         return OrderBookMessage(
             message_type=OrderBookMessageType.SNAPSHOT,
             content=content,
@@ -73,7 +73,7 @@ class CoinDCXOrderBook(OrderBook):
     ) -> OrderBookMessage:
         """
         Converts a CoinDCX order book diff (update) to an OrderBookMessage.
-        
+
         CoinDCX depth-update format:
         {
             "ts": timestamp,
@@ -81,7 +81,7 @@ class CoinDCXOrderBook(OrderBook):
             "asks": {"price1": "quantity1", ...},
             "bids": {"price1": "quantity1", ...}
         }
-        
+
         :param msg: the order book diff message from CoinDCX
         :param timestamp: the timestamp of the message
         :param metadata: additional metadata (should include 'trading_pair')
@@ -89,26 +89,26 @@ class CoinDCXOrderBook(OrderBook):
         """
         if metadata is None:
             metadata = {}
-        
+
         # Convert bids and asks from dict to list of [price, amount]
         bids = []
         asks = []
-        
+
         if "bids" in msg:
             for price, amount in msg["bids"].items():
                 bids.append([float(price), float(amount)])
-        
+
         if "asks" in msg:
             for price, amount in msg["asks"].items():
                 asks.append([float(price), float(amount)])
-        
+
         content = {
             "trading_pair": metadata.get("trading_pair"),
             "update_id": msg.get("vs", int(timestamp * 1000)),
             "bids": bids,
             "asks": asks
         }
-        
+
         return OrderBookMessage(
             message_type=OrderBookMessageType.DIFF,
             content=content,
@@ -123,7 +123,7 @@ class CoinDCXOrderBook(OrderBook):
     ) -> OrderBookMessage:
         """
         Converts a CoinDCX trade message to an OrderBookMessage.
-        
+
         CoinDCX new-trade format:
         {
             "T": "timestamp",
@@ -133,16 +133,16 @@ class CoinDCXOrderBook(OrderBook):
             "s": "pair",
             "pr": "spot"
         }
-        
+
         :param msg: the trade message from CoinDCX
         :param metadata: additional metadata (should include 'trading_pair')
         :return: an OrderBookMessage object
         """
         if metadata is None:
             metadata = {}
-        
+
         ts = float(msg.get("T", 0)) / 1000.0  # Convert from milliseconds
-        
+
         content = {
             "trading_pair": metadata.get("trading_pair"),
             "trade_type": float(TradeType.SELL.value) if msg.get("m", 0) else float(TradeType.BUY.value),
@@ -151,7 +151,7 @@ class CoinDCXOrderBook(OrderBook):
             "price": float(msg.get("p", 0)),
             "amount": float(msg.get("q", 0))
         }
-        
+
         return OrderBookMessage(
             message_type=OrderBookMessageType.TRADE,
             content=content,

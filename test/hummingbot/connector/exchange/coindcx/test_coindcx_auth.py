@@ -1,8 +1,9 @@
+import asyncio
 import hashlib
 import hmac
 import json
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from hummingbot.connector.exchange.coindcx.coindcx_auth import CoinDCXAuth
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod, RESTRequest

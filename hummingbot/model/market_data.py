@@ -14,15 +14,14 @@ class MarketData(HummingbotBase):
         Index("idx_market_data_trading_pair", "trading_pair"),
     )
 
-    timestamp = Column(SqliteDecimal(6), nullable=False)  # Milliseconds since epoch: int(time.time() * 1e3)
+    timestamp = Column(SqliteDecimal(6), nullable=False)  
     exchange = Column(Text, nullable=False)
     trading_pair = Column(Text, nullable=False)
     mid_price = Column(SqliteDecimal(6), nullable=False)
     best_bid = Column(SqliteDecimal(6), nullable=False)
     best_ask = Column(SqliteDecimal(6), nullable=False)
-    spread = Column(SqliteDecimal(6), nullable=True)  # Absolute spread: ask - bid
-    spread_pct = Column(SqliteDecimal(6), nullable=True)  # Spread percentage: (spread / mid_price) * 100
-    order_book = Column(JSON)  # Optional order book depth data
+    spread_pct = Column(SqliteDecimal(6), nullable=True)  
+    order_book = Column(JSON)  
 
     def __repr__(self) -> str:
         list_of_fields = [f"{name}: {value}" for name, value in inspect.getmembers(self) if isinstance(value, Column)]

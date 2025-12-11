@@ -4,7 +4,6 @@ These tests verify the logic patterns used in CoinDCX connector.
 """
 import unittest
 from decimal import Decimal
-import re
 
 
 class TestCoinDCXUtilsLogic(unittest.TestCase):

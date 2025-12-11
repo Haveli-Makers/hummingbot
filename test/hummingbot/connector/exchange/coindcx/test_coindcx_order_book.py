@@ -222,9 +222,9 @@ class TestCoinDCXOrderBookTradeMessage(unittest.TestCase):
 class TestCoinDCXOrderBookUpdate(unittest.TestCase):
     """Test cases for order book update handling."""
 
-    def apply_order_book_update(self, 
-                                 book: Dict[Decimal, Decimal], 
-                                 updates: List[Tuple[Decimal, Decimal]]) -> None:
+    def apply_order_book_update(self,
+                                book: Dict[Decimal, Decimal],
+                                updates: List[Tuple[Decimal, Decimal]]) -> None:
         """
         Apply updates to an order book side.
         If quantity is 0, remove the level.

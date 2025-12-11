@@ -2,11 +2,11 @@
 Test cases for CoinDCX API Order Book Data Source.
 These tests verify WebSocket message handling and data source logic.
 """
-import unittest
-from decimal import Decimal
-from typing import Dict, List, Optional, Tuple
 import json
 import time
+import unittest
+from decimal import Decimal
+from typing import Dict, Tuple
 
 
 class TestCoinDCXWebSocketMessages(unittest.TestCase):

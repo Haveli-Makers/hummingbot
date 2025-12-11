@@ -1,5 +1,4 @@
 import asyncio
-import time
 from typing import TYPE_CHECKING, List, Optional
 
 from hummingbot.connector.exchange.coindcx import coindcx_constants as CONSTANTS

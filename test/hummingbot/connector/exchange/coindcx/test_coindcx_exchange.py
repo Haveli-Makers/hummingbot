@@ -33,12 +33,12 @@ class TestCoinDCXOrderCreation(unittest.TestCase):
     """Test cases for order creation logic."""
 
     def create_order_payload(self,
-                            symbol: str,
-                            side: OrderSide,
-                            order_type: OrderType,
-                            quantity: Decimal,
-                            price: Optional[Decimal] = None,
-                            client_order_id: str = "") -> dict:
+                             symbol: str,
+                             side: OrderSide,
+                             order_type: OrderType,
+                             quantity: Decimal,
+                             price: Optional[Decimal] = None,
+                             client_order_id: str = "") -> dict:
         """Create an order payload for CoinDCX API."""
         payload = {
             "market": symbol,
@@ -147,8 +147,8 @@ class TestCoinDCXBalanceParsing(unittest.TestCase):
             "currency": balance_entry.get("currency", ""),
             "available": Decimal(str(balance_entry.get("balance", "0"))),
             "locked": Decimal(str(balance_entry.get("locked_balance", "0"))),
-            "total": Decimal(str(balance_entry.get("balance", "0"))) + 
-                     Decimal(str(balance_entry.get("locked_balance", "0")))
+            "total": (Decimal(str(balance_entry.get("balance", "0"))) +
+                      Decimal(str(balance_entry.get("locked_balance", "0"))))
         }
 
     def parse_all_balances(self, balances: list) -> Dict[str, dict]:

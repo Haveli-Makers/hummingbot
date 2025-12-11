@@ -48,7 +48,9 @@ def load_env_file():
                         value = value[1:-1]
                     os.environ[key] = value
 
+
 load_env_file()
+
 
 REST_URL = "https://api.coindcx.com"
 USER_BALANCES_PATH_URL = "/exchange/v1/users/balances"
@@ -63,12 +65,12 @@ def get_credentials() -> tuple:
     
     if not api_key or not secret_key or api_key == "your_api_key_here":
         env_path = hummingbot_root / ".env"
-        print(f"\n❌ API credentials not configured!")
-        print(f"\nPlease edit the .env file at:")
+        print("\n❌ API credentials not configured!")
+        print("\nPlease edit the .env file at:")
         print(f"   {env_path}")
-        print(f"\nAnd set your CoinDCX API credentials:")
-        print(f"   COINDCX_API_KEY=your_actual_api_key")
-        print(f"   COINDCX_SECRET_KEY=your_actual_secret_key")
+        print("\nAnd set your CoinDCX API credentials:")
+        print("   COINDCX_API_KEY=your_actual_api_key")
+        print("   COINDCX_SECRET_KEY=your_actual_secret_key")
         return "", ""
     
     return api_key, secret_key
@@ -210,7 +212,7 @@ async def get_inr_prices() -> Dict[str, Decimal]:
                                 try:
                                     mid = (Decimal(str(bid)) + Decimal(str(ask))) / 2
                                     prices[base] = mid
-                                except:
+                                except Exception:
                                     pass
                     # INR itself
                     prices["INR"] = Decimal("1")

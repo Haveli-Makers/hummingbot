@@ -1,6 +1,6 @@
 import inspect
 
-from sqlalchemy import JSON, Column, Index, Text, PrimaryKeyConstraint
+from sqlalchemy import JSON, Column, Index, PrimaryKeyConstraint, Text
 
 from hummingbot.model import HummingbotBase
 from hummingbot.model.decimal_type_decorator import SqliteDecimal

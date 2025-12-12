@@ -4,7 +4,10 @@ These tests verify the parsing logic for order book data.
 """
 import unittest
 from decimal import Decimal
-from typing import Dict, List, Tuple
+from typing import List, Tuple
+
+from hummingbot.connector.exchange.coindcx.coindcx_order_book import CoinDCXOrderBook
+from hummingbot.core.data_type.order_book_message import OrderBookMessageType
 
 
 class TestCoinDCXOrderBookMessageParsing(unittest.TestCase):
@@ -219,75 +222,54 @@ class TestCoinDCXOrderBookTradeMessage(unittest.TestCase):
         self.assertFalse(trade["is_buyer_maker"])
 
 
-class TestCoinDCXOrderBookUpdate(unittest.TestCase):
-    """Test cases for order book update handling."""
-
-    def apply_order_book_update(self,
-                                book: Dict[Decimal, Decimal],
-                                updates: List[Tuple[Decimal, Decimal]]) -> None:
-        """
-        Apply updates to an order book side.
-        If quantity is 0, remove the level.
-        Otherwise, set/update the level.
-        """
-        for price, qty in updates:
-            if qty == Decimal("0"):
-                book.pop(price, None)
-            else:
-                book[price] = qty
-
-    def test_update_add_new_level(self):
-        """Test adding a new price level."""
-        book = {Decimal("50000"): Decimal("1.0")}
-        updates = [(Decimal("49999"), Decimal("2.0"))]
-
-        self.apply_order_book_update(book, updates)
-
-        self.assertEqual(len(book), 2)
-        self.assertEqual(book[Decimal("49999")], Decimal("2.0"))
-
-    def test_update_modify_existing_level(self):
-        """Test modifying an existing price level."""
-        book = {Decimal("50000"): Decimal("1.0")}
-        updates = [(Decimal("50000"), Decimal("3.0"))]
-
-        self.apply_order_book_update(book, updates)
-
-        self.assertEqual(len(book), 1)
-        self.assertEqual(book[Decimal("50000")], Decimal("3.0"))
-
-    def test_update_remove_level(self):
-        """Test removing a price level with zero quantity."""
-        book = {
-            Decimal("50000"): Decimal("1.0"),
-            Decimal("49999"): Decimal("2.0")
+class TestCoinDCXOrderBookMessageConversion(unittest.TestCase):
+    def test_snapshot_message_from_exchange(self):
+        msg = {
+            "bids": {"100.0": "1.5", "99.0": "2.0"},
+            "asks": {"101.0": "1.0", "102.0": "2.5"},
+            "vs": 12345
         }
-        updates = [(Decimal("50000"), Decimal("0"))]
+        metadata = {"trading_pair": "BTC-USDT"}
+        timestamp = 1234567890.0
+        ob_msg = CoinDCXOrderBook.snapshot_message_from_exchange(msg, timestamp, metadata)
+        self.assertEqual(ob_msg.message_type, OrderBookMessageType.SNAPSHOT)
+        self.assertEqual(ob_msg.content["trading_pair"], "BTC-USDT")
+        self.assertEqual(ob_msg.content["update_id"], 12345)
+        self.assertEqual(ob_msg.content["bids"], [[100.0, 1.5], [99.0, 2.0]])
+        self.assertEqual(ob_msg.content["asks"], [[101.0, 1.0], [102.0, 2.5]])
+        self.assertEqual(ob_msg.timestamp, timestamp)
 
-        self.apply_order_book_update(book, updates)
-
-        self.assertEqual(len(book), 1)
-        self.assertNotIn(Decimal("50000"), book)
-
-    def test_update_multiple_changes(self):
-        """Test multiple updates at once."""
-        book = {
-            Decimal("50000"): Decimal("1.0"),
-            Decimal("49999"): Decimal("2.0")
+    def test_diff_message_from_exchange(self):
+        msg = {
+            "bids": {"100.0": "1.5"},
+            "asks": {"101.0": "1.0"},
+            "vs": 54321
         }
-        updates = [
-            (Decimal("50000"), Decimal("0")),      # Remove
-            (Decimal("49999"), Decimal("5.0")),    # Modify
-            (Decimal("49998"), Decimal("3.0"))     # Add
-        ]
+        metadata = {"trading_pair": "BTC-USDT"}
+        timestamp = 1234567890.0
+        ob_msg = CoinDCXOrderBook.diff_message_from_exchange(msg, timestamp, metadata)
+        self.assertEqual(ob_msg.message_type, OrderBookMessageType.DIFF)
+        self.assertEqual(ob_msg.content["trading_pair"], "BTC-USDT")
+        self.assertEqual(ob_msg.content["update_id"], 54321)
+        self.assertEqual(ob_msg.content["bids"], [[100.0, 1.5]])
+        self.assertEqual(ob_msg.content["asks"], [[101.0, 1.0]])
+        self.assertEqual(ob_msg.timestamp, timestamp)
 
-        self.apply_order_book_update(book, updates)
-
-        self.assertEqual(len(book), 2)
-        self.assertNotIn(Decimal("50000"), book)
-        self.assertEqual(book[Decimal("49999")], Decimal("5.0"))
-        self.assertEqual(book[Decimal("49998")], Decimal("3.0"))
-
-
-if __name__ == "__main__":
-    unittest.main()
+    def test_trade_message_from_exchange(self):
+        msg = {
+            "T": 1234567890000,
+            "p": "100.5",
+            "q": "0.25",
+            "m": 1,
+            "s": "BTCUSDT"
+        }
+        metadata = {"trading_pair": "BTC-USDT"}
+        ob_msg = CoinDCXOrderBook.trade_message_from_exchange(msg, metadata)
+        self.assertEqual(ob_msg.message_type, OrderBookMessageType.TRADE)
+        self.assertEqual(ob_msg.content["trading_pair"], "BTC-USDT")
+        self.assertEqual(ob_msg.content["trade_id"], 1234567890000)
+        self.assertEqual(ob_msg.content["update_id"], 1234567890000)
+        self.assertEqual(ob_msg.content["price"], 100.5)
+        self.assertEqual(ob_msg.content["amount"], 0.25)
+        self.assertEqual(ob_msg.timestamp, 1234567890.0)
+        self.assertEqual(ob_msg.content["trade_type"], 1.0)

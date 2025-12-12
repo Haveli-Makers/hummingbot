@@ -4,7 +4,8 @@ These tests verify URL generation and API constants.
 """
 import unittest
 
-from hummingbot.connector.exchange.coindcx import coindcx_constants as CONSTANTS
+from hummingbot.connector.exchange.coindcx import coindcx_constants as CONSTANTS, coindcx_web_utils as web_utils
+from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
 
 
 class TestCoinDCXWebUtils(unittest.TestCase):
@@ -185,6 +186,44 @@ class TestCoinDCXUrlConstruction(unittest.TestCase):
         self.assertIsNotNone(CONSTANTS.DEFAULT_DOMAIN)
         self.assertIsNotNone(CONSTANTS.WSS_URL)
         self.assertIsNotNone(CONSTANTS.REST_URL)
+
+
+class TestCoinDCXWebUtilsFunctions(unittest.TestCase):
+    def test_public_rest_url_market_data(self):
+        url = web_utils.public_rest_url("/market_data/orderbook")
+        self.assertIn("public.coindcx.com", url)
+        self.assertTrue(url.endswith("/market_data/orderbook"))
+
+    def test_public_rest_url_default(self):
+        url = web_utils.public_rest_url("/exchange/v1/markets")
+        self.assertIn("api.coindcx.com", url)
+        self.assertTrue(url.endswith("/exchange/v1/markets"))
+
+    def test_private_rest_url(self):
+        url = web_utils.private_rest_url("/exchange/v1/users/balances")
+        self.assertIn("api.coindcx.com", url)
+        self.assertTrue(url.endswith("/exchange/v1/users/balances"))
+
+    def test_build_api_factory(self):
+        throttler = AsyncThrottler([])
+        factory = web_utils.build_api_factory(throttler=throttler)
+        self.assertIsNotNone(factory)
+        self.assertTrue(hasattr(factory, "get_rest_assistant"))
+
+    def test_build_api_factory_without_time_synchronizer_pre_processor(self):
+        throttler = AsyncThrottler([])
+        factory = web_utils.build_api_factory_without_time_synchronizer_pre_processor(throttler)
+        self.assertIsNotNone(factory)
+        self.assertTrue(hasattr(factory, "get_rest_assistant"))
+
+    def test_create_throttler(self):
+        throttler = web_utils.create_throttler()
+        self.assertIsInstance(throttler, AsyncThrottler)
+
+    def test_get_current_server_time(self):
+        import asyncio
+        result = asyncio.get_event_loop().run_until_complete(web_utils.get_current_server_time())
+        self.assertIsInstance(result, float)
 
 
 if __name__ == "__main__":

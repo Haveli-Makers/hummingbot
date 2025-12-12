@@ -44,7 +44,7 @@ class DexalotRateSource(RateSourceBase):
         """
         Fetches best bid and ask prices for all trading pairs.
         Note: Dexalot uses low/high as proxy for bid/ask.
-        
+
         :param quote_token: A quote symbol, if specified only pairs with the quote symbol are included
         :return: A dictionary of trading pairs to {"bid": Decimal, "ask": Decimal, "mid": Decimal, "spread": Decimal, "spread_pct": Decimal}
         """
@@ -61,13 +61,13 @@ class DexalotRateSource(RateSourceBase):
                 # Safely parse low/high values, handling empty strings or invalid values
                 low_val = record.get("low")
                 high_val = record.get("high")
-                
+
                 try:
                     bid = Decimal(str(low_val)) if low_val not in (None, "", 0) else Decimal("0")
                     ask = Decimal(str(high_val)) if high_val not in (None, "", 0) else Decimal("0")
                 except Exception:
                     continue
-                
+
                 if bid > 0 and ask > 0 and bid <= ask:
                     results[pair] = {
                         "bid": bid,

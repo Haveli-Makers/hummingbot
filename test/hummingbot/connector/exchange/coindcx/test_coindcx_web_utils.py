@@ -7,11 +7,11 @@ import unittest
 
 class TestCoinDCXWebUtils(unittest.TestCase):
     """Test cases for CoinDCX web utilities."""
-    
+
     # Constants replicated from coindcx_constants
     REST_URL = "https://api.coindcx.com"
     WSS_URL = "wss://stream.coindcx.com"
-    
+
     # API Paths
     EXCHANGE_INFO_PATH = "/exchange/v1/markets_details"
     ORDER_PATH = "/exchange/v1/orders/create"
@@ -39,21 +39,21 @@ class TestCoinDCXWebUtils(unittest.TestCase):
         """Test public REST URL generation."""
         path = self.EXCHANGE_INFO_PATH
         url = f"{self.REST_URL}{path}"
-        
+
         self.assertEqual(url, "https://api.coindcx.com/exchange/v1/markets_details")
 
     def test_private_rest_url(self):
         """Test private REST URL generation."""
         path = self.USER_BALANCES_PATH
         url = f"{self.REST_URL}{path}"
-        
+
         self.assertEqual(url, "https://api.coindcx.com/exchange/v1/users/balances")
 
     def test_order_book_url(self):
         """Test order book URL generation."""
         symbol = "BTCUSDT"
         url = f"{self.REST_URL}{self.ORDER_BOOK_PATH}?pair={symbol}"
-        
+
         self.assertIn("orderbook", url)
         self.assertIn("BTCUSDT", url)
 
@@ -61,14 +61,14 @@ class TestCoinDCXWebUtils(unittest.TestCase):
         """Test trades URL generation."""
         symbol = "BTCUSDT"
         url = f"{self.REST_URL}{self.RECENT_TRADES_PATH}?pair={symbol}"
-        
+
         self.assertIn("trade_history", url)
         self.assertIn("BTCUSDT", url)
 
 
 class TestCoinDCXApiPaths(unittest.TestCase):
     """Test API path constants."""
-    
+
     EXCHANGE_INFO_PATH = "/exchange/v1/markets_details"
     ORDER_PATH = "/exchange/v1/orders/create"
     CANCEL_ORDER_PATH = "/exchange/v1/orders/cancel"
@@ -103,7 +103,7 @@ class TestCoinDCXApiPaths(unittest.TestCase):
 
 class TestCoinDCXWebSocketChannels(unittest.TestCase):
     """Test WebSocket channel names."""
-    
+
     WS_ORDER_BOOK_CHANNEL = "orderbook"
     WS_TRADES_CHANNEL = "trades"
     WS_TICKER_CHANNEL = "ticker"
@@ -151,7 +151,7 @@ class TestCoinDCXRateLimits(unittest.TestCase):
 
 class TestCoinDCXUrlConstruction(unittest.TestCase):
     """Test URL construction helpers."""
-    
+
     REST_URL = "https://api.coindcx.com"
 
     def build_url(self, path: str, params: dict = None) -> str:

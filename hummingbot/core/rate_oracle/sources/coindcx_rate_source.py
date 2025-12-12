@@ -13,14 +13,14 @@ class CoindcxRateSource(RateSourceBase):
     Rate source for CoinDCX exchange.
     Fetches ticker data directly from CoinDCX public API.
     """
-    
+
     TICKER_URL = "https://api.coindcx.com/exchange/ticker"
     MARKETS_DETAILS_URL = "https://api.coindcx.com/exchange/v1/markets_details"
-    MARKETS_CACHE_TTL = 300  
-    
+    MARKETS_CACHE_TTL = 300
+
     # Common quote currencies to parse symbols
     QUOTE_CURRENCIES = ["USDT", "USDC", "INR", "BTC", "ETH", "DAI", "BUSD", "TRX"]
-    
+
     def __init__(self):
         super().__init__()
         self._markets_cache: Optional[Dict[str, Dict]] = None
@@ -39,7 +39,7 @@ class CoindcxRateSource(RateSourceBase):
         for quote in self.QUOTE_CURRENCIES:
             if symbol_upper.endswith(quote):
                 base = symbol_upper[:-len(quote)]
-                if base:  
+                if base:
                     return {
                         "trading_pair": f"{base}-{quote}",
                         "base": base,
@@ -52,7 +52,7 @@ class CoindcxRateSource(RateSourceBase):
         current_time = time.time()
         if self._markets_cache is not None and (current_time - self._markets_cache_time) < self.MARKETS_CACHE_TTL:
             return self._markets_cache
-            
+
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(self.MARKETS_DETAILS_URL) as response:
@@ -78,51 +78,51 @@ class CoindcxRateSource(RateSourceBase):
                         return self._markets_cache
         except Exception as e:
             self.logger().warning(f"Error fetching markets details: {e}")
-        
+
         return {}
 
     @async_ttl_cache(ttl=30, maxsize=1)
     async def get_prices(self, quote_token: Optional[str] = None) -> Dict[str, Decimal]:
         """
         Fetches mid prices for all trading pairs.
-        
+
         :param quote_token: A quote symbol, if specified only pairs with the quote symbol are included
         :return: A dictionary of trading pairs to mid prices
         """
         results = {}
         try:
             markets = await self._fetch_markets()
-            
+
             async with aiohttp.ClientSession() as session:
                 async with session.get(self.TICKER_URL) as response:
                     if response.status == 200:
                         data = await response.json()
-                        
+
                         tickers = data if isinstance(data, list) else data.get("data", data)
                         if isinstance(tickers, dict):
                             tickers = list(tickers.values()) if not isinstance(list(tickers.values())[0], str) else []
-                        
+
                         for ticker in tickers:
                             if isinstance(ticker, str):
-                                continue 
-                                
+                                continue
+
                             symbol = ticker.get("market", "")
-                            
+
                             market_info = markets.get(symbol)
                             if not market_info:
                                 market_info = self._parse_trading_pair(symbol)
-                            
+
                             if not market_info:
                                 continue
-                            
+
                             trading_pair = market_info["trading_pair"]
-                            
+
                             if quote_token and market_info["quote"] != quote_token:
                                 continue
-                            
+
                             bid = ticker.get("bid")
                             ask = ticker.get("ask")
-                            
+
                             if bid is not None and ask is not None:
                                 try:
                                     bid_dec = Decimal(str(bid))
@@ -133,51 +133,51 @@ class CoindcxRateSource(RateSourceBase):
                                     continue
         except Exception as e:
             self.logger().error(f"Error fetching CoinDCX prices: {e}")
-        
+
         return results
 
     @async_ttl_cache(ttl=30, maxsize=1)
     async def get_bid_ask_prices(self, quote_token: Optional[str] = None) -> Dict[str, Dict[str, Decimal]]:
         """
         Fetches best bid and ask prices for all trading pairs.
-        
+
         :param quote_token: A quote symbol, if specified only pairs with the quote symbol are included
         :return: A dictionary of trading pairs to {"bid": Decimal, "ask": Decimal, "mid": Decimal, "spread": Decimal, "spread_pct": Decimal}
         """
         results = {}
         try:
             markets = await self._fetch_markets()
-            
+
             async with aiohttp.ClientSession() as session:
                 async with session.get(self.TICKER_URL) as response:
                     if response.status == 200:
                         data = await response.json()
-                        
+
                         tickers = data if isinstance(data, list) else data.get("data", data)
                         if isinstance(tickers, dict):
                             tickers = list(tickers.values()) if not isinstance(list(tickers.values())[0], str) else []
-                        
+
                         for ticker in tickers:
                             if isinstance(ticker, str):
                                 continue
-                                
+
                             symbol = ticker.get("market", "")
-                            
+
                             market_info = markets.get(symbol)
                             if not market_info:
                                 market_info = self._parse_trading_pair(symbol)
-                            
+
                             if not market_info:
                                 continue
-                            
+
                             trading_pair = market_info["trading_pair"]
-                            
+
                             if quote_token and market_info["quote"] != quote_token:
                                 continue
-                            
+
                             bid = ticker.get("bid")
                             ask = ticker.get("ask")
-                            
+
                             if bid is not None and ask is not None:
                                 try:
                                     bid_dec = Decimal(str(bid))
@@ -197,5 +197,5 @@ class CoindcxRateSource(RateSourceBase):
                                     continue
         except Exception as e:
             self.logger().error(f"Error fetching CoinDCX bid/ask prices: {e}")
-        
+
         return results

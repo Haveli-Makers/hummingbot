@@ -47,13 +47,13 @@ class TestCoinDCXOrderCreation(unittest.TestCase):
             "total_quantity": str(quantity),
             "timestamp": 1620000000000
         }
-        
+
         if price is not None and order_type == OrderType.LIMIT:
             payload["price_per_unit"] = str(price)
-        
+
         if client_order_id:
             payload["client_order_id"] = client_order_id
-        
+
         return payload
 
     def test_create_limit_buy_order(self):
@@ -65,7 +65,7 @@ class TestCoinDCXOrderCreation(unittest.TestCase):
             quantity=Decimal("1.0"),
             price=Decimal("50000.00")
         )
-        
+
         self.assertEqual(payload["market"], "BTCUSDT")
         self.assertEqual(payload["side"], "buy")
         self.assertEqual(payload["order_type"], "limit_order")
@@ -81,7 +81,7 @@ class TestCoinDCXOrderCreation(unittest.TestCase):
             quantity=Decimal("0.5"),
             price=Decimal("51000.00")
         )
-        
+
         self.assertEqual(payload["side"], "sell")
         self.assertEqual(payload["total_quantity"], "0.5")
         self.assertEqual(payload["price_per_unit"], "51000.00")
@@ -95,7 +95,7 @@ class TestCoinDCXOrderCreation(unittest.TestCase):
             quantity=Decimal("1.0"),
             price=Decimal("50000.00")  # Should be ignored
         )
-        
+
         self.assertEqual(payload["order_type"], "market_order")
         self.assertNotIn("price_per_unit", payload)
 
@@ -109,7 +109,7 @@ class TestCoinDCXOrderCreation(unittest.TestCase):
             price=Decimal("50000.00"),
             client_order_id="my-order-123"
         )
-        
+
         self.assertEqual(payload["client_order_id"], "my-order-123")
 
 
@@ -126,14 +126,14 @@ class TestCoinDCXOrderCancellation(unittest.TestCase):
     def test_create_cancel_payload(self):
         """Test creating cancel order payload."""
         payload = self.create_cancel_payload("order123")
-        
+
         self.assertEqual(payload["id"], "order123")
         self.assertIn("timestamp", payload)
 
     def test_cancel_payload_has_required_fields(self):
         """Test cancel payload has all required fields."""
         payload = self.create_cancel_payload("abc123")
-        
+
         self.assertIn("id", payload)
         self.assertIn("timestamp", payload)
 
@@ -167,9 +167,9 @@ class TestCoinDCXBalanceParsing(unittest.TestCase):
             "balance": "1.5",
             "locked_balance": "0.5"
         }
-        
+
         result = self.parse_balance(entry)
-        
+
         self.assertEqual(result["currency"], "BTC")
         self.assertEqual(result["available"], Decimal("1.5"))
         self.assertEqual(result["locked"], Decimal("0.5"))
@@ -182,9 +182,9 @@ class TestCoinDCXBalanceParsing(unittest.TestCase):
             "balance": "10000.00",
             "locked_balance": "0"
         }
-        
+
         result = self.parse_balance(entry)
-        
+
         self.assertEqual(result["available"], Decimal("10000.00"))
         self.assertEqual(result["locked"], Decimal("0"))
         self.assertEqual(result["total"], Decimal("10000.00"))
@@ -196,9 +196,9 @@ class TestCoinDCXBalanceParsing(unittest.TestCase):
             {"currency": "USDT", "balance": "5000", "locked_balance": "1000"},
             {"currency": "ETH", "balance": "10", "locked_balance": "0"}
         ]
-        
+
         result = self.parse_all_balances(balances)
-        
+
         self.assertEqual(len(result), 3)
         self.assertIn("BTC", result)
         self.assertIn("USDT", result)
@@ -257,7 +257,7 @@ class TestCoinDCXOrderStatusParsing(unittest.TestCase):
         result1 = self.parse_order_status("FILLED")
         result2 = self.parse_order_status("Filled")
         result3 = self.parse_order_status("filled")
-        
+
         self.assertEqual(result1, OrderStatus.FILLED)
         self.assertEqual(result2, OrderStatus.FILLED)
         self.assertEqual(result3, OrderStatus.FILLED)
@@ -291,9 +291,9 @@ class TestCoinDCXTradingRules(unittest.TestCase):
             "target_currency_precision": "0.00000001",
             "min_notional": "10"
         }
-        
+
         rule = self.parse_trading_rule(market_info)
-        
+
         self.assertEqual(rule["symbol"], "BTCUSDT")
         self.assertEqual(rule["base_asset"], "BTC")
         self.assertEqual(rule["quote_asset"], "USDT")
@@ -306,9 +306,9 @@ class TestCoinDCXTradingRules(unittest.TestCase):
         market_info = {
             "coindcx_name": "BTCUSDT"
         }
-        
+
         rule = self.parse_trading_rule(market_info)
-        
+
         self.assertEqual(rule["symbol"], "BTCUSDT")
         self.assertEqual(rule["min_order_size"], Decimal("0"))
         self.assertEqual(rule["max_order_size"], Decimal("999999999"))
@@ -317,7 +317,7 @@ class TestCoinDCXTradingRules(unittest.TestCase):
 class TestCoinDCXOrderQuantityValidation(unittest.TestCase):
     """Test cases for order quantity validation."""
 
-    def validate_order_quantity(self, 
+    def validate_order_quantity(self,
                                 quantity: Decimal,
                                 min_size: Decimal,
                                 max_size: Decimal,
@@ -328,16 +328,16 @@ class TestCoinDCXOrderQuantityValidation(unittest.TestCase):
         """
         if quantity < min_size:
             return False, f"Quantity {quantity} is below minimum {min_size}"
-        
+
         if quantity > max_size:
             return False, f"Quantity {quantity} is above maximum {max_size}"
-        
+
         # Check step size
         if step_size > 0:
             remainder = quantity % step_size
             if remainder != Decimal("0"):
                 return False, f"Quantity {quantity} is not a multiple of step size {step_size}"
-        
+
         return True, ""
 
     def test_valid_quantity(self):
@@ -348,7 +348,7 @@ class TestCoinDCXOrderQuantityValidation(unittest.TestCase):
             max_size=Decimal("100"),
             step_size=Decimal("0.001")
         )
-        
+
         self.assertTrue(is_valid)
         self.assertEqual(error, "")
 
@@ -360,7 +360,7 @@ class TestCoinDCXOrderQuantityValidation(unittest.TestCase):
             max_size=Decimal("100"),
             step_size=Decimal("0.001")
         )
-        
+
         self.assertFalse(is_valid)
         self.assertIn("below minimum", error)
 
@@ -372,7 +372,7 @@ class TestCoinDCXOrderQuantityValidation(unittest.TestCase):
             max_size=Decimal("100"),
             step_size=Decimal("0.001")
         )
-        
+
         self.assertFalse(is_valid)
         self.assertIn("above maximum", error)
 
@@ -384,7 +384,7 @@ class TestCoinDCXOrderQuantityValidation(unittest.TestCase):
             max_size=Decimal("100"),
             step_size=Decimal("0.001")
         )
-        
+
         self.assertFalse(is_valid)
         self.assertIn("step size", error)
 
@@ -401,11 +401,11 @@ class TestCoinDCXPriceValidation(unittest.TestCase):
         """
         if tick_size <= 0:
             return True, price
-        
+
         # Round to tick size
         rounded = (price / tick_size).quantize(Decimal("1")) * tick_size
         is_valid = price == rounded
-        
+
         return is_valid, rounded
 
     def test_valid_price(self):
@@ -414,7 +414,7 @@ class TestCoinDCXPriceValidation(unittest.TestCase):
             price=Decimal("50000.00"),
             tick_size=Decimal("0.01")
         )
-        
+
         self.assertTrue(is_valid)
         self.assertEqual(rounded, Decimal("50000.00"))
 
@@ -424,7 +424,7 @@ class TestCoinDCXPriceValidation(unittest.TestCase):
             price=Decimal("50000.005"),
             tick_size=Decimal("0.01")
         )
-        
+
         self.assertFalse(is_valid)
         # The rounding uses banker's rounding by default, so 50000.005 rounds to 50000.00
         self.assertEqual(rounded, Decimal("50000.00"))

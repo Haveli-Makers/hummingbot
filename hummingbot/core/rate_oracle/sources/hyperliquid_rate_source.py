@@ -48,7 +48,7 @@ class HyperliquidRateSource(RateSourceBase):
         """
         Fetches best bid and ask prices for all trading pairs.
         Note: Hyperliquid API may not provide separate bid/ask, using price as mid.
-        
+
         :param quote_token: A quote symbol, if specified only pairs with the quote symbol are included
         :return: A dictionary of trading pairs to {"bid": Decimal, "ask": Decimal, "mid": Decimal, "spread": Decimal, "spread_pct": Decimal}
         """

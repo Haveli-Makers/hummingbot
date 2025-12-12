@@ -58,16 +58,16 @@ class CoinDCXAPIUserStreamDataSource(UserStreamTrackerDataSource):
             ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL,
             message_timeout=None
         )
-        
+
         auth_payload = self._auth.generate_ws_auth_payload()
         join_message = {
             "type": "join",
             **auth_payload
         }
-        
+
         await ws.send(WSJSONRequest(payload=join_message))
         self.logger().info("Authenticated and joined CoinDCX private channel")
-        
+
         self._ws_assistant = ws
         return ws
 
@@ -78,7 +78,7 @@ class CoinDCXAPIUserStreamDataSource(UserStreamTrackerDataSource):
         - balance-update events
         - order-update events
         - trade-update events
-        
+
         No additional subscription is needed after joining the authenticated channel.
         """
         try:
@@ -99,13 +99,13 @@ class CoinDCXAPIUserStreamDataSource(UserStreamTrackerDataSource):
         """
         async for ws_response in websocket_assistant.iter_messages():
             data = ws_response.data
-            
+
             if isinstance(data, dict):
                 event_type = data.get("event", data.get("e", ""))
-                
+
                 if event_type in ["ping", "pong"]:
                     continue
-                
+
                 if event_type in [
                     CONSTANTS.BALANCE_UPDATE_EVENT_TYPE,
                     CONSTANTS.ORDER_UPDATE_EVENT_TYPE,

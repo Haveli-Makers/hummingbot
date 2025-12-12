@@ -33,7 +33,7 @@ class TestCoinDCXWebSocketMessages(unittest.TestCase):
         """Test parsing a valid JSON message."""
         raw = '{"event": "subscribed", "channel": "orderbook"}'
         result = self.parse_ws_message(raw)
-        
+
         self.assertEqual(result["event"], "subscribed")
         self.assertEqual(result["channel"], "orderbook")
 
@@ -41,7 +41,7 @@ class TestCoinDCXWebSocketMessages(unittest.TestCase):
         """Test parsing invalid JSON returns empty dict."""
         raw = 'not valid json'
         result = self.parse_ws_message(raw)
-        
+
         self.assertEqual(result, {})
 
     def test_get_message_type_event(self):
@@ -82,7 +82,7 @@ class TestCoinDCXOrderBookSubscription(unittest.TestCase):
     def test_create_orderbook_subscription(self):
         """Test creating order book subscription message."""
         msg = self.create_subscribe_message("orderbook", "BTCUSDT")
-        
+
         self.assertEqual(msg["event"], "subscribe")
         self.assertEqual(msg["channel"], "orderbook")
         self.assertEqual(msg["symbol"], "BTCUSDT")
@@ -90,14 +90,14 @@ class TestCoinDCXOrderBookSubscription(unittest.TestCase):
     def test_create_trades_subscription(self):
         """Test creating trades subscription message."""
         msg = self.create_subscribe_message("trades", "ETHUSDT")
-        
+
         self.assertEqual(msg["channel"], "trades")
         self.assertEqual(msg["symbol"], "ETHUSDT")
 
     def test_create_unsubscribe_message(self):
         """Test creating unsubscription message."""
         msg = self.create_unsubscribe_message("orderbook", "BTCUSDT")
-        
+
         self.assertEqual(msg["event"], "unsubscribe")
         self.assertEqual(msg["channel"], "orderbook")
 
@@ -111,16 +111,16 @@ class TestCoinDCXOrderBookSnapshot(unittest.TestCase):
         Returns (timestamp, bids, asks).
         """
         timestamp = data.get("timestamp", int(time.time() * 1000))
-        
+
         bids = {}
         asks = {}
-        
+
         for price, qty in data.get("bids", {}).items():
             bids[price] = Decimal(str(qty))
-        
+
         for price, qty in data.get("asks", {}).items():
             asks[price] = Decimal(str(qty))
-        
+
         return timestamp, bids, asks
 
     def test_process_snapshot_basic(self):
@@ -130,9 +130,9 @@ class TestCoinDCXOrderBookSnapshot(unittest.TestCase):
             "bids": {"50000": "1.0", "49999": "2.0"},
             "asks": {"50001": "0.5", "50002": "1.5"}
         }
-        
+
         timestamp, bids, asks = self.process_snapshot(data)
-        
+
         self.assertEqual(timestamp, 1620000000000)
         self.assertEqual(len(bids), 2)
         self.assertEqual(len(asks), 2)
@@ -142,18 +142,18 @@ class TestCoinDCXOrderBookSnapshot(unittest.TestCase):
     def test_process_snapshot_empty(self):
         """Test processing empty snapshot."""
         data = {"timestamp": 1620000000000}
-        
+
         timestamp, bids, asks = self.process_snapshot(data)
-        
+
         self.assertEqual(len(bids), 0)
         self.assertEqual(len(asks), 0)
 
     def test_process_snapshot_default_timestamp(self):
         """Test that missing timestamp gets a default."""
         data = {"bids": {"50000": "1.0"}}
-        
+
         timestamp, bids, asks = self.process_snapshot(data)
-        
+
         self.assertIsInstance(timestamp, int)
         self.assertGreater(timestamp, 0)
 
@@ -161,7 +161,7 @@ class TestCoinDCXOrderBookSnapshot(unittest.TestCase):
 class TestCoinDCXOrderBookDiff(unittest.TestCase):
     """Test cases for order book diff handling."""
 
-    def apply_diff(self, 
+    def apply_diff(self,
                    current_book: Dict[str, Decimal],
                    diff: Dict[str, str]) -> Dict[str, Decimal]:
         """
@@ -169,23 +169,23 @@ class TestCoinDCXOrderBookDiff(unittest.TestCase):
         If quantity is "0", remove the level.
         """
         result = current_book.copy()
-        
+
         for price, qty in diff.items():
             qty_decimal = Decimal(str(qty))
             if qty_decimal == Decimal("0"):
                 result.pop(price, None)
             else:
                 result[price] = qty_decimal
-        
+
         return result
 
     def test_apply_diff_add(self):
         """Test adding a new price level."""
         current = {"50000": Decimal("1.0")}
         diff = {"49999": "2.0"}
-        
+
         result = self.apply_diff(current, diff)
-        
+
         self.assertEqual(len(result), 2)
         self.assertEqual(result["49999"], Decimal("2.0"))
 
@@ -193,9 +193,9 @@ class TestCoinDCXOrderBookDiff(unittest.TestCase):
         """Test updating an existing price level."""
         current = {"50000": Decimal("1.0")}
         diff = {"50000": "3.0"}
-        
+
         result = self.apply_diff(current, diff)
-        
+
         self.assertEqual(len(result), 1)
         self.assertEqual(result["50000"], Decimal("3.0"))
 
@@ -203,9 +203,9 @@ class TestCoinDCXOrderBookDiff(unittest.TestCase):
         """Test removing a price level with zero quantity."""
         current = {"50000": Decimal("1.0"), "49999": Decimal("2.0")}
         diff = {"50000": "0"}
-        
+
         result = self.apply_diff(current, diff)
-        
+
         self.assertEqual(len(result), 1)
         self.assertNotIn("50000", result)
 
@@ -217,9 +217,9 @@ class TestCoinDCXOrderBookDiff(unittest.TestCase):
             "49999": "5.0",     # Update
             "49998": "3.0"      # Add
         }
-        
+
         result = self.apply_diff(current, diff)
-        
+
         self.assertEqual(len(result), 2)
         self.assertNotIn("50000", result)
         self.assertEqual(result["49999"], Decimal("5.0"))
@@ -250,9 +250,9 @@ class TestCoinDCXTradeDataParsing(unittest.TestCase):
             "timestamp": 1620000000000,
             "side": "buy"
         }
-        
+
         trade = self.parse_trade(data)
-        
+
         self.assertEqual(trade["trade_id"], "12345")
         self.assertEqual(trade["symbol"], "BTCUSDT")
         self.assertEqual(trade["price"], Decimal("50000.00"))
@@ -269,9 +269,9 @@ class TestCoinDCXTradeDataParsing(unittest.TestCase):
             "t": 1620000001000,
             "m": True
         }
-        
+
         trade = self.parse_trade(data)
-        
+
         self.assertEqual(trade["trade_id"], "67890")
         self.assertEqual(trade["symbol"], "ETHUSDT")
         self.assertEqual(trade["price"], Decimal("3000.00"))
@@ -301,9 +301,9 @@ class TestCoinDCXTickerParsing(unittest.TestCase):
             "volume": "1000.5",
             "change_24_hour": "2.5"
         }
-        
+
         ticker = self.parse_ticker(data)
-        
+
         self.assertEqual(ticker["symbol"], "BTCUSDT")
         self.assertEqual(ticker["last_price"], Decimal("50000.00"))
         self.assertEqual(ticker["high_24h"], Decimal("51000.00"))
@@ -321,9 +321,9 @@ class TestCoinDCXTickerParsing(unittest.TestCase):
             "v": "5000",
             "P": "1.5"
         }
-        
+
         ticker = self.parse_ticker(data)
-        
+
         self.assertEqual(ticker["symbol"], "ETHUSDT")
         self.assertEqual(ticker["last_price"], Decimal("3000.00"))
 
@@ -365,7 +365,7 @@ class TestCoinDCXDataSourceHelpers(unittest.TestCase):
         original = "BTC-USDT"
         ws_format = self.format_symbol_for_ws(original)
         result = self.format_symbol_from_ws(ws_format)
-        
+
         self.assertEqual(result, original)
 
 

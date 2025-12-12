@@ -17,18 +17,18 @@ class TestCoinDCXOrderBookMessageParsing(unittest.TestCase):
         """
         bids = []
         asks = []
-        
+
         # CoinDCX format: {"bids": {"price": "qty", ...}, "asks": {"price": "qty", ...}}
         if "bids" in data:
             for price, qty in data["bids"].items():
                 bids.append([Decimal(price), Decimal(qty)])
             bids.sort(key=lambda x: x[0], reverse=True)  # Highest bid first
-        
+
         if "asks" in data:
             for price, qty in data["asks"].items():
                 asks.append([Decimal(price), Decimal(qty)])
             asks.sort(key=lambda x: x[0])  # Lowest ask first
-        
+
         return bids, asks
 
     def parse_order_book_diff(self, data: dict) -> Tuple[List, List]:
@@ -38,7 +38,7 @@ class TestCoinDCXOrderBookMessageParsing(unittest.TestCase):
         """
         bids = []
         asks = []
-        
+
         # WebSocket format may vary
         if "bids" in data:
             for entry in data["bids"]:
@@ -46,14 +46,14 @@ class TestCoinDCXOrderBookMessageParsing(unittest.TestCase):
                     bids.append([Decimal(entry[0]), Decimal(entry[1])])
                 elif isinstance(entry, dict):
                     bids.append([Decimal(entry["price"]), Decimal(entry["quantity"])])
-        
+
         if "asks" in data:
             for entry in data["asks"]:
                 if isinstance(entry, list):
                     asks.append([Decimal(entry[0]), Decimal(entry[1])])
                 elif isinstance(entry, dict):
                     asks.append([Decimal(entry["price"]), Decimal(entry["quantity"])])
-        
+
         return bids, asks
 
     def test_parse_snapshot_basic(self):
@@ -68,16 +68,16 @@ class TestCoinDCXOrderBookMessageParsing(unittest.TestCase):
                 "50002.00": "0.5"
             }
         }
-        
+
         bids, asks = self.parse_order_book_snapshot(data)
-        
+
         self.assertEqual(len(bids), 2)
         self.assertEqual(len(asks), 2)
-        
+
         # Bids should be sorted highest first
         self.assertEqual(bids[0][0], Decimal("50000.00"))
         self.assertEqual(bids[1][0], Decimal("49999.00"))
-        
+
         # Asks should be sorted lowest first
         self.assertEqual(asks[0][0], Decimal("50001.00"))
         self.assertEqual(asks[1][0], Decimal("50002.00"))
@@ -88,9 +88,9 @@ class TestCoinDCXOrderBookMessageParsing(unittest.TestCase):
             "bids": {"50000.00": "1.5"},
             "asks": {"50001.00": "2.5"}
         }
-        
+
         bids, asks = self.parse_order_book_snapshot(data)
-        
+
         self.assertEqual(bids[0][1], Decimal("1.5"))
         self.assertEqual(asks[0][1], Decimal("2.5"))
 
@@ -100,9 +100,9 @@ class TestCoinDCXOrderBookMessageParsing(unittest.TestCase):
             "bids": {},
             "asks": {"50001.00": "1.0"}
         }
-        
+
         bids, asks = self.parse_order_book_snapshot(data)
-        
+
         self.assertEqual(len(bids), 0)
         self.assertEqual(len(asks), 1)
 
@@ -112,9 +112,9 @@ class TestCoinDCXOrderBookMessageParsing(unittest.TestCase):
             "bids": {"50000.00": "1.0"},
             "asks": {}
         }
-        
+
         bids, asks = self.parse_order_book_snapshot(data)
-        
+
         self.assertEqual(len(bids), 1)
         self.assertEqual(len(asks), 0)
 
@@ -134,9 +134,9 @@ class TestCoinDCXOrderBookMessageParsing(unittest.TestCase):
                 "50003.00": "3.0"
             }
         }
-        
+
         bids, asks = self.parse_order_book_snapshot(data)
-        
+
         self.assertEqual(len(bids), 5)
         self.assertEqual(len(asks), 3)
 
@@ -146,9 +146,9 @@ class TestCoinDCXOrderBookMessageParsing(unittest.TestCase):
             "bids": [["50000.00", "1.5"], ["49999.00", "2.0"]],
             "asks": [["50001.00", "1.0"], ["50002.00", "0.5"]]
         }
-        
+
         bids, asks = self.parse_order_book_diff(data)
-        
+
         self.assertEqual(len(bids), 2)
         self.assertEqual(len(asks), 2)
         self.assertEqual(bids[0][0], Decimal("50000.00"))
@@ -164,9 +164,9 @@ class TestCoinDCXOrderBookMessageParsing(unittest.TestCase):
                 {"price": "50001.00", "quantity": "1.0"}
             ]
         }
-        
+
         bids, asks = self.parse_order_book_diff(data)
-        
+
         self.assertEqual(len(bids), 2)
         self.assertEqual(len(asks), 1)
 
@@ -193,9 +193,9 @@ class TestCoinDCXOrderBookTradeMessage(unittest.TestCase):
             "t": 1620000000000,
             "m": True
         }
-        
+
         trade = self.parse_trade_message(data)
-        
+
         self.assertEqual(trade["trade_id"], "12345")
         self.assertEqual(trade["price"], Decimal("50000.00"))
         self.assertEqual(trade["quantity"], Decimal("1.5"))
@@ -211,9 +211,9 @@ class TestCoinDCXOrderBookTradeMessage(unittest.TestCase):
             "timestamp": 1620000001000,
             "is_buyer_maker": False
         }
-        
+
         trade = self.parse_trade_message(data)
-        
+
         self.assertEqual(trade["trade_id"], "67890")
         self.assertEqual(trade["price"], Decimal("49999.99"))
         self.assertFalse(trade["is_buyer_maker"])
@@ -240,9 +240,9 @@ class TestCoinDCXOrderBookUpdate(unittest.TestCase):
         """Test adding a new price level."""
         book = {Decimal("50000"): Decimal("1.0")}
         updates = [(Decimal("49999"), Decimal("2.0"))]
-        
+
         self.apply_order_book_update(book, updates)
-        
+
         self.assertEqual(len(book), 2)
         self.assertEqual(book[Decimal("49999")], Decimal("2.0"))
 
@@ -250,9 +250,9 @@ class TestCoinDCXOrderBookUpdate(unittest.TestCase):
         """Test modifying an existing price level."""
         book = {Decimal("50000"): Decimal("1.0")}
         updates = [(Decimal("50000"), Decimal("3.0"))]
-        
+
         self.apply_order_book_update(book, updates)
-        
+
         self.assertEqual(len(book), 1)
         self.assertEqual(book[Decimal("50000")], Decimal("3.0"))
 
@@ -263,9 +263,9 @@ class TestCoinDCXOrderBookUpdate(unittest.TestCase):
             Decimal("49999"): Decimal("2.0")
         }
         updates = [(Decimal("50000"), Decimal("0"))]
-        
+
         self.apply_order_book_update(book, updates)
-        
+
         self.assertEqual(len(book), 1)
         self.assertNotIn(Decimal("50000"), book)
 
@@ -280,9 +280,9 @@ class TestCoinDCXOrderBookUpdate(unittest.TestCase):
             (Decimal("49999"), Decimal("5.0")),    # Modify
             (Decimal("49998"), Decimal("3.0"))     # Add
         ]
-        
+
         self.apply_order_book_update(book, updates)
-        
+
         self.assertEqual(len(book), 2)
         self.assertNotIn(Decimal("50000"), book)
         self.assertEqual(book[Decimal("49999")], Decimal("5.0"))

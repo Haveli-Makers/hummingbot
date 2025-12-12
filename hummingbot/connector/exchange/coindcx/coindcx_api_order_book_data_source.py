@@ -21,7 +21,7 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
     Data source for CoinDCX order book and trade data.
     Uses CoinDCX WebSocket for real-time updates and REST API for snapshots.
     """
-    
+
     HEARTBEAT_TIME_INTERVAL = 30.0
     TRADE_STREAM_ID = 1
     DIFF_STREAM_ID = 2
@@ -52,15 +52,15 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
     async def _request_order_book_snapshot(self, trading_pair: str) -> Dict[str, Any]:
         """
         Retrieves a copy of the full order book from the exchange.
-        
+
         CoinDCX uses the format: GET /market_data/orderbook?pair=B-BTC_USDT
-        
+
         :param trading_pair: the trading pair for which the order book will be retrieved
         :return: the response from the exchange (JSON dictionary)
         """
         # Convert HB pair to CoinDCX pair format
         coindcx_pair = hb_pair_to_coindcx_pair(trading_pair)
-        
+
         params = {
             "pair": coindcx_pair
         }
@@ -78,31 +78,31 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
     async def _subscribe_channels(self, ws: WSAssistant):
         """
         Subscribes to the trade events and diff orders events through the provided websocket connection.
-        
+
         CoinDCX WebSocket channels:
         - {pair}@orderbook@{depth} for order book updates (e.g., B-BTC_USDT@orderbook@20)
         - {pair}@trades for trade updates (e.g., B-BTC_USDT@trades)
-        
+
         :param ws: the websocket assistant used to connect to the exchange
         """
         try:
             for trading_pair in self._trading_pairs:
                 coindcx_pair = hb_pair_to_coindcx_pair(trading_pair)
-                
+
                 # Subscribe to order book depth
                 orderbook_channel = f"{coindcx_pair}@orderbook@20"
                 subscribe_orderbook = {
                     "channelName": orderbook_channel
                 }
                 await ws.send(WSJSONRequest(payload={"type": "join", **subscribe_orderbook}))
-                
+
                 # Subscribe to trades
                 trades_channel = f"{coindcx_pair}@trades"
                 subscribe_trades = {
                     "channelName": trades_channel
                 }
                 await ws.send(WSJSONRequest(payload={"type": "join", **subscribe_trades}))
-                
+
             self.logger().info("Subscribed to public order book and trade channels...")
         except asyncio.CancelledError:
             raise
@@ -157,11 +157,11 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         if "bids" in raw_message or "asks" in raw_message:
             channel = raw_message.get("channel", "")
             trading_pair = None
-            
+
             if "@orderbook" in channel:
                 pair_part = channel.split("@")[0]
                 trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=pair_part)
-            
+
             if trading_pair:
                 order_book_message: OrderBookMessage = CoinDCXOrderBook.diff_message_from_exchange(
                     raw_message, time.time(), {"trading_pair": trading_pair})
@@ -172,10 +172,10 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         Determines which channel a message originated from based on its content.
         """
         channel = ""
-        
+
         if "p" in event_message and "q" in event_message and "T" in event_message:
             channel = self._trade_messages_queue_key
         elif "bids" in event_message or "asks" in event_message:
             channel = self._diff_messages_queue_key
-        
+
         return channel

@@ -12,7 +12,7 @@ def public_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> st
     """
     Creates a full URL for provided public REST endpoint.
     Uses the main API URL for most endpoints.
-    
+
     :param path_url: a public REST endpoint
     :param domain: not used for CoinDCX but kept for compatibility
     :return: the full URL to the endpoint
@@ -26,7 +26,7 @@ def public_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> st
 def private_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
     """
     Creates a full URL for provided private REST endpoint.
-    
+
     :param path_url: a private REST endpoint
     :param domain: not used for CoinDCX but kept for compatibility
     :return: the full URL to the endpoint
@@ -46,10 +46,10 @@ def build_api_factory(
     """
     throttler = throttler or create_throttler()
     time_synchronizer = time_synchronizer or TimeSynchronizer()
-    
+
     # CoinDCX doesn't require server time synchronization as we use local time
     time_provider = time_provider or (lambda: get_current_server_time())
-    
+
     api_factory = WebAssistantsFactory(
         throttler=throttler,
         auth=auth,

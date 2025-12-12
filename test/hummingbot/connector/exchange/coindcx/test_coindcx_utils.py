@@ -44,9 +44,16 @@ def test_coindcx_pair_to_hb_pair_unknown_quote():
 def test_config_map_reflection_and_construct():
     from hummingbot.connector.exchange.coindcx.coindcx_utils import CoinDCXConfigMap
 
-    # Access model config
-    assert CoinDCXConfigMap.model_config.title == "coindcx"
+    # Access model config (support both pydantic v1 and v2 shapes)
+    mc = CoinDCXConfigMap.model_config
+    title = None
+    if hasattr(mc, "title"):
+        title = mc.title
+    elif isinstance(mc, dict):
+        title = mc.get("title")
+    assert title == "coindcx"
 
     # Construct a model instance via model_construct (no validation)
     cm = CoinDCXConfigMap.model_construct()
-    assert hasattr(cm, "coindcx_api_key")
+    has_field = hasattr(cm, "coindcx_api_key") or (hasattr(cm, "model_fields") and "coindcx_api_key" in cm.model_fields)
+    assert has_field

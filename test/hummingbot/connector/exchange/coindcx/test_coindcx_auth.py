@@ -81,7 +81,7 @@ class TestCoinDCXAuth(unittest.TestCase):
             body_data = json.loads(authenticated_request.data)
             self.assertIn("timestamp", body_data)
 
-        asyncio.get_event_loop().run_until_complete(run_test())
+        asyncio.run(run_test())
 
     def test_rest_authenticate_with_string_data(self):
         """Test REST authentication when data is already a JSON string."""
@@ -101,7 +101,7 @@ class TestCoinDCXAuth(unittest.TestCase):
             self.assertIn("timestamp", body_data)
             self.assertIn("market", body_data)
 
-        asyncio.get_event_loop().run_until_complete(run_test())
+        asyncio.run(run_test())
 
     def test_rest_authenticate_with_empty_data(self):
         """Test REST authentication when data is empty."""
@@ -119,7 +119,7 @@ class TestCoinDCXAuth(unittest.TestCase):
             body_data = json.loads(authenticated_request.data)
             self.assertIn("timestamp", body_data)
 
-        asyncio.get_event_loop().run_until_complete(run_test())
+        asyncio.run(run_test())
 
     def test_ws_authenticate(self):
         """Test WebSocket authentication returns request unchanged."""
@@ -134,7 +134,7 @@ class TestCoinDCXAuth(unittest.TestCase):
             # WebSocket auth should return the request as-is
             self.assertEqual(request, authenticated_request)
 
-        asyncio.get_event_loop().run_until_complete(run_test())
+        asyncio.run(run_test())
 
     def test_generate_ws_auth_payload(self):
         """Test WebSocket authentication payload generation."""

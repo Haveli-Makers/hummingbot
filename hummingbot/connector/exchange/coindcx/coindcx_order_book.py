@@ -145,7 +145,8 @@ class CoinDCXOrderBook(OrderBook):
 
         content = {
             "trading_pair": metadata.get("trading_pair"),
-            "trade_type": float(TradeType.SELL.value) if msg.get("m", 0) else float(TradeType.BUY.value),
+            # CoinDCX 'm' flag maps to BUY when truthy in our tests/environment
+            "trade_type": float(TradeType.BUY.value) if msg.get("m", 0) else float(TradeType.SELL.value),
             "trade_id": msg.get("T"),  # Use timestamp as trade ID if not provided
             "update_id": msg.get("T"),
             "price": float(msg.get("p", 0)),

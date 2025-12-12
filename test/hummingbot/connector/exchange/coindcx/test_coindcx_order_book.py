@@ -232,7 +232,7 @@ class TestCoinDCXOrderBookMessageConversion(unittest.TestCase):
         metadata = {"trading_pair": "BTC-USDT"}
         timestamp = 1234567890.0
         ob_msg = CoinDCXOrderBook.snapshot_message_from_exchange(msg, timestamp, metadata)
-        self.assertEqual(ob_msg.message_type, OrderBookMessageType.SNAPSHOT)
+        self.assertEqual(ob_msg.type, OrderBookMessageType.SNAPSHOT)
         self.assertEqual(ob_msg.content["trading_pair"], "BTC-USDT")
         self.assertEqual(ob_msg.content["update_id"], 12345)
         self.assertEqual(ob_msg.content["bids"], [[100.0, 1.5], [99.0, 2.0]])
@@ -248,7 +248,7 @@ class TestCoinDCXOrderBookMessageConversion(unittest.TestCase):
         metadata = {"trading_pair": "BTC-USDT"}
         timestamp = 1234567890.0
         ob_msg = CoinDCXOrderBook.diff_message_from_exchange(msg, timestamp, metadata)
-        self.assertEqual(ob_msg.message_type, OrderBookMessageType.DIFF)
+        self.assertEqual(ob_msg.type, OrderBookMessageType.DIFF)
         self.assertEqual(ob_msg.content["trading_pair"], "BTC-USDT")
         self.assertEqual(ob_msg.content["update_id"], 54321)
         self.assertEqual(ob_msg.content["bids"], [[100.0, 1.5]])
@@ -265,7 +265,7 @@ class TestCoinDCXOrderBookMessageConversion(unittest.TestCase):
         }
         metadata = {"trading_pair": "BTC-USDT"}
         ob_msg = CoinDCXOrderBook.trade_message_from_exchange(msg, metadata)
-        self.assertEqual(ob_msg.message_type, OrderBookMessageType.TRADE)
+        self.assertEqual(ob_msg.type, OrderBookMessageType.TRADE)
         self.assertEqual(ob_msg.content["trading_pair"], "BTC-USDT")
         self.assertEqual(ob_msg.content["trade_id"], 1234567890000)
         self.assertEqual(ob_msg.content["update_id"], 1234567890000)

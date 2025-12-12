@@ -222,7 +222,7 @@ class TestCoinDCXWebUtilsFunctions(unittest.TestCase):
 
     def test_get_current_server_time(self):
         import asyncio
-        result = asyncio.get_event_loop().run_until_complete(web_utils.get_current_server_time())
+        result = asyncio.run(web_utils.get_current_server_time())
         self.assertIsInstance(result, float)
 
 

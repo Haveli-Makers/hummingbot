@@ -46,16 +46,16 @@ class CoinDCXAPIUserStreamDataSourceTest(unittest.IsolatedAsyncioTestCase):
         queue = asyncio.Queue()
         ws_response = MagicMock()
         ws_response.data = {"event": "balance-update", "foo": "bar"}
-        self.ws_assistant.iter_messages = AsyncMock(return_value=iter([ws_response]))
-        put_nowait = AsyncMock()
-        queue.put_nowait = put_nowait
-        # Patch async for
 
         async def fake_iter():
             yield ws_response
+
         self.ws_assistant.iter_messages = fake_iter
         await self.data_source._process_websocket_messages(self.ws_assistant, queue)
-        put_nowait.assert_called_with({"event": "balance-update", "foo": "bar"})
+
+        # Ensure the queue received the event (use real Queue to avoid coroutine warnings)
+        item = queue.get_nowait()
+        self.assertEqual(item, {"event": "balance-update", "foo": "bar"})
 
     async def test_on_user_stream_interruption_resets_ws(self):
         self.data_source._ws_assistant = self.ws_assistant

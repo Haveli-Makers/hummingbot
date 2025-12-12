@@ -1,10 +1,9 @@
 import asyncio
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 from hummingbot.connector.exchange.coindcx.coindcx_api_user_stream_data_source import CoinDCXAPIUserStreamDataSource
 from hummingbot.connector.exchange.coindcx.coindcx_auth import CoinDCXAuth
-from hummingbot.core.web_assistant.connections.data_types import WSJSONRequest
 
 
 class CoinDCXAPIUserStreamDataSourceTest(unittest.IsolatedAsyncioTestCase):

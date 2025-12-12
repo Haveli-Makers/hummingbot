@@ -1,1 +1,1 @@
-# CoinDCX Exchange Connector Tests
+# Coindcx tests package

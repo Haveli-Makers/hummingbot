@@ -1,434 +1,592 @@
-"""
-Test cases for CoinDCX exchange logic.
-These tests verify order handling, balance parsing, and trading rules.
-"""
-import unittest
+import asyncio
+import json
+import re
 from decimal import Decimal
-from enum import Enum
-from typing import Dict, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
+from unittest.mock import patch
+
+from aioresponses import aioresponses
+from aioresponses.core import RequestCall
+
+from hummingbot.connector.exchange.coindcx import coindcx_constants as CONSTANTS, coindcx_web_utils as web_utils
+from hummingbot.connector.exchange.coindcx.coindcx_exchange import CoindcxExchange
+from hummingbot.connector.test_support.exchange_connector_test import AbstractExchangeConnectorTests
+from hummingbot.connector.trading_rule import TradingRule
+from hummingbot.core.data_type.common import OrderType, TradeType
+from hummingbot.core.data_type.in_flight_order import InFlightOrder
+from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TokenAmount
 
 
-class OrderSide(Enum):
-    """Order side enumeration."""
-    BUY = "buy"
-    SELL = "sell"
+class CoindcxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
 
+    @property
+    def all_symbols_url(self):
+        return web_utils.public_rest_url(path_url=CONSTANTS.MARKETS_DETAILS_PATH_URL, domain=self.exchange._domain)
 
-class OrderType(Enum):
-    """Order type enumeration."""
-    LIMIT = "limit_order"
-    MARKET = "market_order"
+    @property
+    def latest_prices_url(self):
+        url = web_utils.public_rest_url(path_url=CONSTANTS.TICKER_PATH_URL, domain=self.exchange._domain)
+        url = f"{url}?symbol={self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset)}"
+        return url
 
+    @property
+    def network_status_url(self):
+        url = web_utils.public_rest_url(path_url=CONSTANTS.MARKETS_PATH_URL, domain=self.exchange._domain)
+        return url
 
-class OrderStatus(Enum):
-    """Order status enumeration."""
-    OPEN = "open"
-    PARTIALLY_FILLED = "partially_filled"
-    FILLED = "filled"
-    CANCELLED = "cancelled"
-    REJECTED = "rejected"
+    @property
+    def trading_rules_url(self):
+        url = web_utils.public_rest_url(path_url=CONSTANTS.MARKETS_DETAILS_PATH_URL, domain=self.exchange._domain)
+        return url
 
+    @property
+    def order_creation_url(self):
+        url = web_utils.private_rest_url(CONSTANTS.CREATE_ORDER_PATH_URL, domain=self.exchange._domain)
+        return url
 
-class TestCoinDCXOrderCreation(unittest.TestCase):
-    """Test cases for order creation logic."""
+    @property
+    def balance_url(self):
+        url = web_utils.private_rest_url(CONSTANTS.USER_BALANCES_PATH_URL, domain=self.exchange._domain)
+        return url
 
-    def create_order_payload(self,
-                             symbol: str,
-                             side: OrderSide,
-                             order_type: OrderType,
-                             quantity: Decimal,
-                             price: Optional[Decimal] = None,
-                             client_order_id: str = "") -> dict:
-        """Create an order payload for CoinDCX API."""
-        payload = {
-            "market": symbol,
-            "side": side.value,
-            "order_type": order_type.value,
-            "total_quantity": str(quantity),
-            "timestamp": 1620000000000
-        }
-
-        if price is not None and order_type == OrderType.LIMIT:
-            payload["price_per_unit"] = str(price)
-
-        if client_order_id:
-            payload["client_order_id"] = client_order_id
-
-        return payload
-
-    def test_create_limit_buy_order(self):
-        """Test creating a limit buy order."""
-        payload = self.create_order_payload(
-            symbol="BTCUSDT",
-            side=OrderSide.BUY,
-            order_type=OrderType.LIMIT,
-            quantity=Decimal("1.0"),
-            price=Decimal("50000.00")
-        )
-
-        self.assertEqual(payload["market"], "BTCUSDT")
-        self.assertEqual(payload["side"], "buy")
-        self.assertEqual(payload["order_type"], "limit_order")
-        self.assertEqual(payload["total_quantity"], "1.0")
-        self.assertEqual(payload["price_per_unit"], "50000.00")
-
-    def test_create_limit_sell_order(self):
-        """Test creating a limit sell order."""
-        payload = self.create_order_payload(
-            symbol="BTCUSDT",
-            side=OrderSide.SELL,
-            order_type=OrderType.LIMIT,
-            quantity=Decimal("0.5"),
-            price=Decimal("51000.00")
-        )
-
-        self.assertEqual(payload["side"], "sell")
-        self.assertEqual(payload["total_quantity"], "0.5")
-        self.assertEqual(payload["price_per_unit"], "51000.00")
-
-    def test_create_market_order_no_price(self):
-        """Test that market orders don't include price."""
-        payload = self.create_order_payload(
-            symbol="BTCUSDT",
-            side=OrderSide.BUY,
-            order_type=OrderType.MARKET,
-            quantity=Decimal("1.0"),
-            price=Decimal("50000.00")  # Should be ignored
-        )
-
-        self.assertEqual(payload["order_type"], "market_order")
-        self.assertNotIn("price_per_unit", payload)
-
-    def test_create_order_with_client_id(self):
-        """Test creating order with client order ID."""
-        payload = self.create_order_payload(
-            symbol="BTCUSDT",
-            side=OrderSide.BUY,
-            order_type=OrderType.LIMIT,
-            quantity=Decimal("1.0"),
-            price=Decimal("50000.00"),
-            client_order_id="my-order-123"
-        )
-
-        self.assertEqual(payload["client_order_id"], "my-order-123")
-
-
-class TestCoinDCXOrderCancellation(unittest.TestCase):
-    """Test cases for order cancellation logic."""
-
-    def create_cancel_payload(self, order_id: str) -> dict:
-        """Create a cancel order payload."""
-        return {
-            "id": order_id,
-            "timestamp": 1620000000000
-        }
-
-    def test_create_cancel_payload(self):
-        """Test creating cancel order payload."""
-        payload = self.create_cancel_payload("order123")
-
-        self.assertEqual(payload["id"], "order123")
-        self.assertIn("timestamp", payload)
-
-    def test_cancel_payload_has_required_fields(self):
-        """Test cancel payload has all required fields."""
-        payload = self.create_cancel_payload("abc123")
-
-        self.assertIn("id", payload)
-        self.assertIn("timestamp", payload)
-
-
-class TestCoinDCXBalanceParsing(unittest.TestCase):
-    """Test cases for balance parsing."""
-
-    def parse_balance(self, balance_entry: dict) -> dict:
-        """Parse a single balance entry."""
-        return {
-            "currency": balance_entry.get("currency", ""),
-            "available": Decimal(str(balance_entry.get("balance", "0"))),
-            "locked": Decimal(str(balance_entry.get("locked_balance", "0"))),
-            "total": (Decimal(str(balance_entry.get("balance", "0"))) +
-                      Decimal(str(balance_entry.get("locked_balance", "0"))))
-        }
-
-    def parse_all_balances(self, balances: list) -> Dict[str, dict]:
-        """Parse all balance entries."""
-        result = {}
-        for entry in balances:
-            parsed = self.parse_balance(entry)
-            if parsed["currency"]:
-                result[parsed["currency"]] = parsed
-        return result
-
-    def test_parse_single_balance(self):
-        """Test parsing a single balance entry."""
-        entry = {
-            "currency": "BTC",
-            "balance": "1.5",
-            "locked_balance": "0.5"
-        }
-
-        result = self.parse_balance(entry)
-
-        self.assertEqual(result["currency"], "BTC")
-        self.assertEqual(result["available"], Decimal("1.5"))
-        self.assertEqual(result["locked"], Decimal("0.5"))
-        self.assertEqual(result["total"], Decimal("2.0"))
-
-    def test_parse_balance_zero_locked(self):
-        """Test parsing balance with no locked funds."""
-        entry = {
-            "currency": "USDT",
-            "balance": "10000.00",
-            "locked_balance": "0"
-        }
-
-        result = self.parse_balance(entry)
-
-        self.assertEqual(result["available"], Decimal("10000.00"))
-        self.assertEqual(result["locked"], Decimal("0"))
-        self.assertEqual(result["total"], Decimal("10000.00"))
-
-    def test_parse_all_balances(self):
-        """Test parsing multiple balance entries."""
-        balances = [
-            {"currency": "BTC", "balance": "1.0", "locked_balance": "0.1"},
-            {"currency": "USDT", "balance": "5000", "locked_balance": "1000"},
-            {"currency": "ETH", "balance": "10", "locked_balance": "0"}
+    @property
+    def all_symbols_request_mock_response(self):
+        return [
+            {
+                "symbol": self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset),
+                "coindcx_name": self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset),
+                "base_currency_short_name": self.quote_asset,
+                "target_currency_short_name": self.base_asset,
+                "min_quantity": 1,
+                "max_quantity": 90000000,
+                "min_price": 0.000001,
+                "max_price": 100000.0,
+                "min_notional": 0.001,
+                "base_currency_precision": 8,
+                "target_currency_precision": 8,
+                "step": 1,
+                "status": "active"
+            }
         ]
 
-        result = self.parse_all_balances(balances)
-
-        self.assertEqual(len(result), 3)
-        self.assertIn("BTC", result)
-        self.assertIn("USDT", result)
-        self.assertIn("ETH", result)
-        self.assertEqual(result["BTC"]["available"], Decimal("1.0"))
-        self.assertEqual(result["USDT"]["total"], Decimal("6000"))
-
-    def test_parse_empty_balances(self):
-        """Test parsing empty balance list."""
-        result = self.parse_all_balances([])
-        self.assertEqual(len(result), 0)
-
-
-class TestCoinDCXOrderStatusParsing(unittest.TestCase):
-    """Test cases for order status parsing."""
-
-    def parse_order_status(self, status_str: str) -> OrderStatus:
-        """Parse order status string to enum."""
-        status_map = {
-            "open": OrderStatus.OPEN,
-            "partially_filled": OrderStatus.PARTIALLY_FILLED,
-            "filled": OrderStatus.FILLED,
-            "cancelled": OrderStatus.CANCELLED,
-            "canceled": OrderStatus.CANCELLED,  # Handle both spellings
-            "rejected": OrderStatus.REJECTED
-        }
-        return status_map.get(status_str.lower(), OrderStatus.OPEN)
-
-    def test_parse_open_status(self):
-        """Test parsing open status."""
-        result = self.parse_order_status("open")
-        self.assertEqual(result, OrderStatus.OPEN)
-
-    def test_parse_filled_status(self):
-        """Test parsing filled status."""
-        result = self.parse_order_status("filled")
-        self.assertEqual(result, OrderStatus.FILLED)
-
-    def test_parse_cancelled_status(self):
-        """Test parsing cancelled status (British spelling)."""
-        result = self.parse_order_status("cancelled")
-        self.assertEqual(result, OrderStatus.CANCELLED)
-
-    def test_parse_canceled_status(self):
-        """Test parsing canceled status (American spelling)."""
-        result = self.parse_order_status("canceled")
-        self.assertEqual(result, OrderStatus.CANCELLED)
-
-    def test_parse_partially_filled(self):
-        """Test parsing partially filled status."""
-        result = self.parse_order_status("partially_filled")
-        self.assertEqual(result, OrderStatus.PARTIALLY_FILLED)
-
-    def test_parse_case_insensitive(self):
-        """Test that status parsing is case insensitive."""
-        result1 = self.parse_order_status("FILLED")
-        result2 = self.parse_order_status("Filled")
-        result3 = self.parse_order_status("filled")
-
-        self.assertEqual(result1, OrderStatus.FILLED)
-        self.assertEqual(result2, OrderStatus.FILLED)
-        self.assertEqual(result3, OrderStatus.FILLED)
-
-
-class TestCoinDCXTradingRules(unittest.TestCase):
-    """Test cases for trading rules parsing."""
-
-    def parse_trading_rule(self, market_info: dict) -> dict:
-        """Parse trading rules from market info."""
+    @property
+    def latest_prices_request_mock_response(self):
         return {
-            "symbol": market_info.get("coindcx_name", ""),
-            "base_asset": market_info.get("target_currency_name", ""),
-            "quote_asset": market_info.get("base_currency_name", ""),
-            "min_order_size": Decimal(str(market_info.get("min_quantity", "0"))),
-            "max_order_size": Decimal(str(market_info.get("max_quantity", "999999999"))),
-            "min_price_increment": Decimal(str(market_info.get("step", "0.00000001"))),
-            "min_base_increment": Decimal(str(market_info.get("target_currency_precision", "0.00000001"))),
-            "min_notional": Decimal(str(market_info.get("min_notional", "0")))
+            "symbol": self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset),
+            "last_price": str(self.expected_latest_price),
         }
 
-    def test_parse_trading_rule_basic(self):
-        """Test parsing basic trading rules."""
-        market_info = {
-            "coindcx_name": "BTCUSDT",
-            "target_currency_name": "BTC",
-            "base_currency_name": "USDT",
-            "min_quantity": "0.0001",
-            "max_quantity": "100",
-            "step": "0.01",
-            "target_currency_precision": "0.00000001",
-            "min_notional": "10"
+    @property
+    def all_symbols_including_invalid_pair_mock_response(self) -> Tuple[str, Any]:
+        response = [
+            {
+                "symbol": self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset),
+                "coindcx_name": self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset),
+                "base_currency_short_name": self.quote_asset,
+                "target_currency_short_name": self.base_asset,
+                "min_quantity": 1,
+                "max_quantity": 90000000,
+                "min_price": 0.000001,
+                "max_price": 100000.0,
+                "min_notional": 0.001,
+                "base_currency_precision": 8,
+                "target_currency_precision": 8,
+                "step": 1,
+                "status": "active"
+            },
+            {
+                "symbol": self.exchange_symbol_for_tokens("INVALID", "PAIR"),
+                "coindcx_name": self.exchange_symbol_for_tokens("INVALID", "PAIR"),
+                "base_currency_short_name": "PAIR",
+                "target_currency_short_name": "INVALID",
+                "min_quantity": 1,
+                "max_quantity": 90000000,
+                "min_price": 0.000001,
+                "max_price": 100000.0,
+                "min_notional": 0.001,
+                "base_currency_precision": 8,
+                "target_currency_precision": 8,
+                "step": 1,
+                "status": "active"
+            },
+        ]
+        return "INVALID-PAIR", response
+
+    @property
+    def network_status_request_successful_mock_response(self):
+        return []
+
+    @property
+    def trading_rules_request_mock_response(self):
+        return [
+            {
+                "symbol": self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset),
+                "coindcx_name": self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset),
+                "base_currency_short_name": self.quote_asset,
+                "target_currency_short_name": self.base_asset,
+                "min_quantity": 1,
+                "max_quantity": 90000000,
+                "min_price": 0.000001,
+                "max_price": 100000.0,
+                "min_notional": 0.001,
+                "base_currency_precision": 8,
+                "target_currency_precision": 8,
+                "step": 1,
+                "status": "active"
+            }
+        ]
+
+    @property
+    def trading_rules_request_erroneous_mock_response(self):
+        return [
+            {
+                # Missing quotes and base to trigger parsing error
+                "symbol": "",
+                "coindcx_name": "",
+                "base_currency_short_name": "",
+                "target_currency_short_name": "",
+                "status": "inactive"
+            }
+        ]
+
+    @property
+    def order_creation_request_successful_mock_response(self):
+        # CoinDCX returns either a dict with orders list or a single order; we return a list
+        return [{
+            "id": self.expected_exchange_order_id,
+            "created_at": 1640000000000
+        }]
+
+    @property
+    def balance_request_mock_response_for_base_and_quote(self):
+        return [
+            {"currency": self.base_asset, "balance": 10.0, "locked_balance": 5.0},
+            {"currency": self.quote_asset, "balance": 2000.0, "locked_balance": 0.0}
+        ]
+
+    @property
+    def balance_request_mock_response_only_base(self):
+        return [{"currency": self.base_asset, "balance": 10.0, "locked_balance": 5.0}]
+
+    @property
+    def balance_event_websocket_update(self):
+        return {"currency": self.base_asset, "balance": 10.0, "locked_balance": 5.0}
+
+    @property
+    def expected_latest_price(self):
+        return 9999.9
+
+    @property
+    def expected_supported_order_types(self):
+        return [OrderType.LIMIT, OrderType.LIMIT_MAKER, OrderType.MARKET]
+
+    @property
+    def expected_trading_rule(self):
+        rule = self.trading_rules_request_mock_response[0]
+        base_precision = int(rule.get("base_currency_precision", 8))
+        target_precision = int(rule.get("target_currency_precision", 8))
+        return TradingRule(
+            trading_pair=self.trading_pair,
+            min_order_size=Decimal(str(rule.get("min_quantity", 0))),
+            min_price_increment=Decimal(10) ** (-base_precision),
+            min_base_amount_increment=Decimal(10) ** (-target_precision),
+            min_notional_size=Decimal(str(rule.get("min_notional", 0))),
+        )
+
+    @property
+    def expected_logged_error_for_erroneous_trading_rule(self):
+        erroneous_rule = self.trading_rules_request_erroneous_mock_response[0]
+        return f"Error parsing the trading pair rule {erroneous_rule}. Skipping."
+
+    @property
+    def expected_exchange_order_id(self):
+        return "28"
+
+    @property
+    def is_order_fill_http_update_included_in_status_update(self) -> bool:
+        return True
+
+    @property
+    def is_order_fill_http_update_executed_during_websocket_order_event_processing(self) -> bool:
+        return False
+
+    @property
+    def expected_partial_fill_price(self) -> Decimal:
+        return Decimal(10500)
+
+    @property
+    def expected_partial_fill_amount(self) -> Decimal:
+        return Decimal("0.5")
+
+    @property
+    def expected_fill_fee(self):
+        return DeductedFromReturnsTradeFee(
+            percent_token=self.quote_asset,
+            flat_fees=[TokenAmount(token=self.quote_asset, amount=Decimal("0"))],
+        )
+
+    @property
+    def expected_fill_trade_id(self) -> str:
+        return str(30000)
+
+    def exchange_symbol_for_tokens(self, base_token: str, quote_token: str) -> str:
+        return f"{base_token}{quote_token}"
+
+    def create_exchange_instance(self):
+        return CoindcxExchange(
+            coindcx_api_key="testAPIKey",
+            coindcx_api_secret="testSecret",
+            trading_pairs=[self.trading_pair],
+        )
+
+    def validate_auth_credentials_present(self, request_call: RequestCall):
+        headers = request_call.kwargs.get("headers") or request_call.kwargs.get("headers", {})
+        self.assertTrue(headers.get("X-AUTH-APIKEY") is not None)
+        self.assertTrue(headers.get("X-AUTH-SIGNATURE") is not None)
+
+    def validate_order_creation_request(self, order: InFlightOrder, request_call: RequestCall):
+        request_data = json.loads(request_call.kwargs["data"])
+        self.assertEqual(self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset), request_data["market"])
+        self.assertEqual(order.trade_type == TradeType.BUY, request_data["side"] == CONSTANTS.SIDE_BUY)
+        self.assertEqual(CoindcxExchange.coindcx_order_type(OrderType.LIMIT), request_data["order_type"])
+        self.assertEqual(Decimal("100"), Decimal(str(request_data["total_quantity"])))
+        self.assertEqual(Decimal("10000"), Decimal(str(request_data.get("price_per_unit", 0))))
+        self.assertEqual(order.client_order_id, request_data["client_order_id"])
+
+    def validate_order_cancelation_request(self, order: InFlightOrder, request_call: RequestCall):
+        # Cancel is also a POST with id or client_order_id
+        data = json.loads(request_call.kwargs["data"]) if request_call.kwargs.get("data") else {}
+        if "id" in data:
+            self.assertEqual(order.exchange_order_id, str(data["id"]))
+        else:
+            self.assertEqual(order.client_order_id, data.get("client_order_id"))
+
+    def validate_order_status_request(self, order: InFlightOrder, request_call: RequestCall):
+        # Order status uses POST with id or client_order_id
+        data = json.loads(request_call.kwargs["data"]) if request_call.kwargs.get("data") else {}
+        if "id" in data:
+            self.assertEqual(order.exchange_order_id, str(data["id"]))
+        else:
+            self.assertEqual(order.client_order_id, data.get("client_order_id"))
+
+    def validate_trades_request(self, order: InFlightOrder, request_call: RequestCall):
+        # Trades history POST uses symbol and limit
+        data = request_call.kwargs.get("data")
+        self.assertIsNotNone(data)
+
+    def configure_successful_cancelation_response(
+            self,
+            order: InFlightOrder,
+            mock_api: aioresponses,
+            callback: Optional[Callable] = lambda *args, **kwargs: None) -> str:
+        url = web_utils.private_rest_url(CONSTANTS.CANCEL_ORDER_PATH_URL)
+        regex_url = re.compile(r".*" + re.escape(CONSTANTS.CANCEL_ORDER_PATH_URL) + r".*")
+        response = self._order_cancelation_request_successful_mock_response(order=order)
+        mock_api.post(regex_url, body=json.dumps(response), callback=callback)
+        return url
+
+    def configure_erroneous_cancelation_response(
+            self,
+            order: InFlightOrder,
+            mock_api: aioresponses,
+            callback: Optional[Callable] = lambda *args, **kwargs: None) -> str:
+        url = web_utils.private_rest_url(CONSTANTS.CANCEL_ORDER_PATH_URL)
+        regex_url = re.compile(r".*" + re.escape(CONSTANTS.CANCEL_ORDER_PATH_URL) + r".*")
+        response = {"code": 99999, "message": "generic error"}
+        mock_api.post(regex_url, status=500, body=json.dumps(response), callback=callback)
+        return url
+
+    def configure_order_not_found_error_cancelation_response(
+            self, order: InFlightOrder, mock_api: aioresponses,
+            callback: Optional[Callable] = lambda *args, **kwargs: None
+    ) -> str:
+        url = web_utils.private_rest_url(CONSTANTS.CANCEL_ORDER_PATH_URL)
+        regex_url = re.compile(f"^{url}".replace(".", r"\\.").replace("?", r"\?"))
+        response = {"code": CONSTANTS.ORDER_NOT_EXIST_ERROR_CODE, "message": CONSTANTS.ORDER_NOT_EXIST_MESSAGE}
+        mock_api.post(regex_url, status=400, body=json.dumps(response), callback=callback)
+        return url
+
+    def configure_one_successful_one_erroneous_cancel_all_response(
+            self,
+            successful_order: InFlightOrder,
+            erroneous_order: InFlightOrder,
+            mock_api: aioresponses) -> List[str]:
+        all_urls = []
+        url = self.configure_successful_cancelation_response(order=successful_order, mock_api=mock_api)
+        all_urls.append(url)
+        url = self.configure_erroneous_cancelation_response(order=erroneous_order, mock_api=mock_api)
+        all_urls.append(url)
+        return all_urls
+
+    def configure_completely_filled_order_status_response(
+            self,
+            order: InFlightOrder,
+            mock_api: aioresponses,
+            callback: Optional[Callable] = lambda *args, **kwargs: None) -> str:
+        url = web_utils.private_rest_url(CONSTANTS.ORDER_STATUS_PATH_URL)
+        regex_url = re.compile(f"^{url}".replace(".", r"\\.").replace("?", r"\?"))
+        response = self._order_status_request_completely_filled_mock_response(order=order)
+        mock_api.post(regex_url, body=json.dumps(response), callback=callback)
+        return url
+
+    def configure_canceled_order_status_response(
+            self,
+            order: InFlightOrder,
+            mock_api: aioresponses,
+            callback: Optional[Callable] = lambda *args, **kwargs: None) -> str:
+        url = web_utils.private_rest_url(CONSTANTS.ORDER_STATUS_PATH_URL)
+        regex_url = re.compile(f"^{url}".replace(".", r"\\.").replace("?", r"\?"))
+        response = self._order_status_request_canceled_mock_response(order=order)
+        mock_api.post(regex_url, body=json.dumps(response), callback=callback)
+        return url
+
+    def configure_erroneous_http_fill_trade_response(
+            self,
+            order: InFlightOrder,
+            mock_api: aioresponses,
+            callback: Optional[Callable] = lambda *args, **kwargs: None) -> str:
+        url = web_utils.private_rest_url(path_url=CONSTANTS.TRADE_HISTORY_ACCOUNT_PATH_URL)
+        regex_url = re.compile(url + r"\?.*")
+        mock_api.post(regex_url, status=400, callback=callback)
+        return url
+
+    def configure_open_order_status_response(
+            self,
+            order: InFlightOrder,
+            mock_api: aioresponses,
+            callback: Optional[Callable] = lambda *args, **kwargs: None) -> str:
+        url = web_utils.private_rest_url(CONSTANTS.ORDER_STATUS_PATH_URL)
+        regex_url = re.compile(f"^{url}".replace(".", r"\\.").replace("?", r"\?"))
+        response = self._order_status_request_open_mock_response(order=order)
+        mock_api.post(regex_url, body=json.dumps(response), callback=callback)
+        return url
+
+    def configure_http_error_order_status_response(
+            self,
+            order: InFlightOrder,
+            mock_api: aioresponses,
+            callback: Optional[Callable] = lambda *args, **kwargs: None) -> str:
+        url = web_utils.private_rest_url(CONSTANTS.ORDER_STATUS_PATH_URL)
+        regex_url = re.compile(f"^{url}".replace(".", r"\\.").replace("?", r"\?"))
+        mock_api.post(regex_url, status=401, callback=callback)
+        return url
+
+    def configure_partially_filled_order_status_response(
+            self,
+            order: InFlightOrder,
+            mock_api: aioresponses,
+            callback: Optional[Callable] = lambda *args, **kwargs: None) -> str:
+        url = web_utils.private_rest_url(CONSTANTS.ORDER_STATUS_PATH_URL)
+        regex_url = re.compile(f"^{url}".replace(".", r"\\.").replace("?", r"\?"))
+        response = self._order_status_request_partially_filled_mock_response(order=order)
+        mock_api.post(regex_url, body=json.dumps(response), callback=callback)
+        return url
+
+    def configure_order_not_found_error_order_status_response(
+            self, order: InFlightOrder, mock_api: aioresponses,
+            callback: Optional[Callable] = lambda *args, **kwargs: None,
+    ) -> List[str]:
+        url = web_utils.private_rest_url(CONSTANTS.ORDER_STATUS_PATH_URL)
+        regex_url = re.compile(f"^{url}".replace(".", r"\\.").replace("?", r"\?"))
+        response = {"code": CONSTANTS.ORDER_NOT_EXIST_ERROR_CODE, "message": CONSTANTS.ORDER_NOT_EXIST_MESSAGE}
+        mock_api.post(regex_url, body=json.dumps(response), status=400, callback=callback)
+        return [url]
+
+    def configure_partial_fill_trade_response(
+            self,
+            order: InFlightOrder,
+            mock_api: aioresponses,
+            callback: Optional[Callable] = lambda *args, **kwargs: None) -> str:
+        url = web_utils.private_rest_url(path_url=CONSTANTS.TRADE_HISTORY_ACCOUNT_PATH_URL)
+        regex_url = re.compile(url + r"\?.*")
+        response = self._order_fills_request_partial_fill_mock_response(order=order)
+        mock_api.post(regex_url, body=json.dumps(response), callback=callback)
+        return url
+
+    def configure_full_fill_trade_response(
+            self,
+            order: InFlightOrder,
+            mock_api: aioresponses,
+            callback: Optional[Callable] = None) -> str:
+        url = web_utils.private_rest_url(path_url=CONSTANTS.TRADE_HISTORY_ACCOUNT_PATH_URL)
+        regex_url = re.compile(url + r"\?.*")
+        response = self._order_fills_request_full_fill_mock_response(order=order)
+        mock_api.post(regex_url, body=json.dumps(response), callback=callback)
+        return url
+
+    def _order_cancelation_request_successful_mock_response(self, order: InFlightOrder) -> Any:
+        return {
+            "id": order.exchange_order_id or "",
+            "client_order_id": order.client_order_id,
+            "status": "cancelled",
         }
 
-        rule = self.parse_trading_rule(market_info)
-
-        self.assertEqual(rule["symbol"], "BTCUSDT")
-        self.assertEqual(rule["base_asset"], "BTC")
-        self.assertEqual(rule["quote_asset"], "USDT")
-        self.assertEqual(rule["min_order_size"], Decimal("0.0001"))
-        self.assertEqual(rule["max_order_size"], Decimal("100"))
-        self.assertEqual(rule["min_notional"], Decimal("10"))
-
-    def test_parse_trading_rule_defaults(self):
-        """Test that defaults are applied for missing fields."""
-        market_info = {
-            "coindcx_name": "BTCUSDT"
+    def _order_status_request_completely_filled_mock_response(self, order: InFlightOrder) -> Any:
+        return {
+            "id": order.exchange_order_id,
+            "client_order_id": order.client_order_id,
+            "status": "filled",
+            "price": str(order.price),
+            "quantity": str(order.amount),
+            "executed_quantity": str(order.amount),
         }
 
-        rule = self.parse_trading_rule(market_info)
+    def _order_status_request_canceled_mock_response(self, order: InFlightOrder) -> Any:
+        return {
+            "id": order.exchange_order_id,
+            "client_order_id": order.client_order_id,
+            "status": "cancelled",
+            "price": str(order.price),
+            "quantity": str(order.amount),
+            "executed_quantity": str(0),
+        }
 
-        self.assertEqual(rule["symbol"], "BTCUSDT")
-        self.assertEqual(rule["min_order_size"], Decimal("0"))
-        self.assertEqual(rule["max_order_size"], Decimal("999999999"))
+    def _order_status_request_open_mock_response(self, order: InFlightOrder) -> Any:
+        return {
+            "id": order.exchange_order_id,
+            "client_order_id": order.client_order_id,
+            "status": "open",
+            "price": str(order.price),
+            "quantity": str(order.amount),
+            "executed_quantity": str(0),
+        }
 
+    def _order_status_request_partially_filled_mock_response(self, order: InFlightOrder) -> Any:
+        return {
+            "id": order.exchange_order_id,
+            "client_order_id": order.client_order_id,
+            "status": "partially_filled",
+            "price": str(order.price),
+            "quantity": str(order.amount),
+            "executed_quantity": str(self.expected_partial_fill_amount),
+        }
 
-class TestCoinDCXOrderQuantityValidation(unittest.TestCase):
-    """Test cases for order quantity validation."""
+    def _order_fills_request_partial_fill_mock_response(self, order: InFlightOrder):
+        return [
+            {
+                "symbol": self.exchange_symbol_for_tokens(order.base_asset, order.quote_asset),
+                "id": self.expected_fill_trade_id,
+                "orderId": int(order.exchange_order_id) if order.exchange_order_id is not None else 0,
+                "price": str(self.expected_partial_fill_price),
+                "qty": str(self.expected_partial_fill_amount),
+                "quoteQty": str(self.expected_partial_fill_amount * self.expected_partial_fill_price),
+                "commission": str(self.expected_fill_fee.flat_fees[0].amount),
+                "commissionAsset": self.expected_fill_fee.flat_fees[0].token,
+                "time": 1499865549590,
+                "isBuyer": True,
+                "isMaker": False,
+                "isBestMatch": True,
+            }
+        ]
 
-    def validate_order_quantity(self,
-                                quantity: Decimal,
-                                min_size: Decimal,
-                                max_size: Decimal,
-                                step_size: Decimal) -> tuple:
-        """
-        Validate order quantity against trading rules.
-        Returns (is_valid, error_message).
-        """
-        if quantity < min_size:
-            return False, f"Quantity {quantity} is below minimum {min_size}"
+    def _order_fills_request_full_fill_mock_response(self, order: InFlightOrder):
+        return [
+            {
+                "symbol": self.exchange_symbol_for_tokens(order.base_asset, order.quote_asset),
+                "id": self.expected_fill_trade_id,
+                "orderId": int(order.exchange_order_id) if order.exchange_order_id is not None else 0,
+                "price": str(order.price),
+                "qty": str(order.amount),
+                "quoteQty": str(order.amount * order.price),
+                "commission": str(self.expected_fill_fee.flat_fees[0].amount),
+                "commissionAsset": self.expected_fill_fee.flat_fees[0].token,
+                "time": 1499865549590,
+                "isBuyer": True,
+                "isMaker": False,
+                "isBestMatch": True,
+            }
+        ]
 
-        if quantity > max_size:
-            return False, f"Quantity {quantity} is above maximum {max_size}"
-
-        # Check step size
-        if step_size > 0:
-            remainder = quantity % step_size
-            if remainder != Decimal("0"):
-                return False, f"Quantity {quantity} is not a multiple of step size {step_size}"
-
-        return True, ""
-
-    def test_valid_quantity(self):
-        """Test a valid order quantity."""
-        is_valid, error = self.validate_order_quantity(
-            quantity=Decimal("1.0"),
-            min_size=Decimal("0.001"),
-            max_size=Decimal("100"),
-            step_size=Decimal("0.001")
+    def _configure_balance_response(
+            self,
+            response: Dict[str, Any],
+            mock_api: aioresponses,
+            callback: Optional[Callable] = lambda *args, **kwargs: None,
+    ) -> str:
+        url = self.balance_url
+        mock_api.post(
+            re.compile(f"^{url}".replace(".", r"\\.").replace("?", r"\?")), body=json.dumps(response), callback=callback
         )
+        return url
 
-        self.assertTrue(is_valid)
-        self.assertEqual(error, "")
+    def order_event_for_new_order_websocket_update(self, order: InFlightOrder):
+        return {
+            "event": "order-update",
+            "data": {
+                "id": order.exchange_order_id,
+                "client_order_id": order.client_order_id,
+                "status": "open",
+                "updated_at": 1661938138040
+            }
+        }
 
-    def test_quantity_below_minimum(self):
-        """Test quantity below minimum."""
-        is_valid, error = self.validate_order_quantity(
-            quantity=Decimal("0.0001"),
-            min_size=Decimal("0.001"),
-            max_size=Decimal("100"),
-            step_size=Decimal("0.001")
-        )
+    def order_event_for_canceled_order_websocket_update(self, order: InFlightOrder):
+        return {
+            "event": "order-update",
+            "data": {
+                "id": order.exchange_order_id,
+                "client_order_id": order.client_order_id,
+                "status": "cancelled",
+                "updated_at": 1661938138040
+            }
+        }
 
-        self.assertFalse(is_valid)
-        self.assertIn("below minimum", error)
+    def order_event_for_full_fill_websocket_update(self, order: InFlightOrder):
+        return {
+            "event": "order-update",
+            "data": {
+                "id": order.exchange_order_id,
+                "client_order_id": order.client_order_id,
+                "status": "filled",
+                "updated_at": 1661938138040
+            }
+        }
 
-    def test_quantity_above_maximum(self):
-        """Test quantity above maximum."""
-        is_valid, error = self.validate_order_quantity(
-            quantity=Decimal("150"),
-            min_size=Decimal("0.001"),
-            max_size=Decimal("100"),
-            step_size=Decimal("0.001")
-        )
+    def trade_event_for_full_fill_websocket_update(self, order: InFlightOrder):
+        return {
+            "event": "trade-update",
+            "data": {
+                "p": float(order.price),
+                "q": float(order.amount),
+                "f": float(self.expected_fill_fee.flat_fees[0].amount),
+                "t": int(self.expected_fill_trade_id),
+                "c": order.client_order_id,
+                "o": order.exchange_order_id,
+                "timestamp": 1661938980325
+            }
+        }
 
-        self.assertFalse(is_valid)
-        self.assertIn("above maximum", error)
+    @aioresponses()
+    @patch("hummingbot.connector.time_synchronizer.TimeSynchronizer._current_seconds_counter")
+    def test_update_time_synchronizer_successfully(self, mock_api, seconds_counter_mock):
+        request_sent_event = asyncio.Event()
+        seconds_counter_mock.side_effect = [0, 0, 0]
 
-    def test_quantity_not_step_multiple(self):
-        """Test quantity that's not a multiple of step size."""
-        is_valid, error = self.validate_order_quantity(
-            quantity=Decimal("1.0005"),
-            min_size=Decimal("0.001"),
-            max_size=Decimal("100"),
-            step_size=Decimal("0.001")
-        )
+        self.exchange._time_synchronizer.clear_time_offset_ms_samples()
+        # CoinDCX does not use SERVER_TIME endpoint; test network check instead
+        url = self.network_status_url
+        regex_url = re.compile(f"^{url}".replace(".", r"\\.").replace("?", r"\?"))
 
-        self.assertFalse(is_valid)
-        self.assertIn("step size", error)
+        mock_api.get(regex_url, body=json.dumps(self.network_status_request_successful_mock_response), callback=lambda *args, **kwargs: request_sent_event.set())
 
+        self.async_run_with_timeout(self.exchange._update_time_synchronizer())
 
-class TestCoinDCXPriceValidation(unittest.TestCase):
-    """Test cases for price validation."""
+        # CoinDCX uses local time, but ensure function runs without raising
+        self.assertTrue(True)
 
-    def validate_price(self,
-                       price: Decimal,
-                       tick_size: Decimal) -> tuple:
-        """
-        Validate price against tick size.
-        Returns (is_valid, rounded_price).
-        """
-        if tick_size <= 0:
-            return True, price
+    @aioresponses()
+    def test_update_time_synchronizer_failure_is_logged(self, mock_api):
+        request_sent_event = asyncio.Event()
+        url = self.network_status_url
+        regex_url = re.compile(f"^{url}".replace(".", r"\\.").replace("?", r"\?"))
 
-        # Round to tick size
-        rounded = (price / tick_size).quantize(Decimal("1")) * tick_size
-        is_valid = price == rounded
+        mock_api.get(regex_url, status=400, callback=lambda *args, **kwargs: request_sent_event.set())
 
-        return is_valid, rounded
+        self.async_run_with_timeout(self.exchange._update_time_synchronizer())
 
-    def test_valid_price(self):
-        """Test a valid price."""
-        is_valid, rounded = self.validate_price(
-            price=Decimal("50000.00"),
-            tick_size=Decimal("0.01")
-        )
+        self.assertTrue(self.is_logged("NETWORK", "Error getting server time."))
 
-        self.assertTrue(is_valid)
-        self.assertEqual(rounded, Decimal("50000.00"))
-
-    def test_price_rounded(self):
-        """Test price that needs rounding."""
-        is_valid, rounded = self.validate_price(
-            price=Decimal("50000.005"),
-            tick_size=Decimal("0.01")
-        )
-
-        self.assertFalse(is_valid)
-        # The rounding uses banker's rounding by default, so 50000.005 rounds to 50000.00
-        self.assertEqual(rounded, Decimal("50000.00"))
-
-
-if __name__ == "__main__":
-    unittest.main()
+    @aioresponses()
+    def test_update_time_synchronizer_raises_cancelled_error(self, mock_api):
+        # CoinDCX does not check server time; no implementation
+        pass

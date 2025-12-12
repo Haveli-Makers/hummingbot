@@ -4,6 +4,8 @@ These tests verify URL generation and API constants.
 """
 import unittest
 
+from hummingbot.connector.exchange.coindcx import coindcx_constants as CONSTANTS
+
 
 class TestCoinDCXWebUtils(unittest.TestCase):
     """Test cases for CoinDCX web utilities."""
@@ -177,6 +179,12 @@ class TestCoinDCXUrlConstruction(unittest.TestCase):
         url = self.build_url("/market_data/orderbook", {"pair": "BTCUSDT", "limit": "100"})
         self.assertIn("pair=BTCUSDT", url)
         self.assertIn("limit=100", url)
+
+    def test_constants_import(self):
+        """Test that constants can be imported and accessed."""
+        self.assertIsNotNone(CONSTANTS.DEFAULT_DOMAIN)
+        self.assertIsNotNone(CONSTANTS.WSS_URL)
+        self.assertIsNotNone(CONSTANTS.REST_URL)
 
 
 if __name__ == "__main__":

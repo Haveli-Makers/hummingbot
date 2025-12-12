@@ -49,10 +49,6 @@ portfolio_value.csv
 debug.log
 /installation/docker-commands/hummingbot_files
 
-# Environment variables (API keys)
-.env
-.env.local
-.env.*.local
 
 # Distribution files
 /build

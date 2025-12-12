@@ -29,7 +29,7 @@ class CoindcxExchange(ExchangePyBase):
     CoinDCX exchange connector implementation.
     Supports spot trading on CoinDCX exchange.
     """
-    
+
     UPDATE_ORDER_STATUS_MIN_INTERVAL = 10.0
 
     web_utils = web_utils
@@ -193,7 +193,7 @@ class CoindcxExchange(ExchangePyBase):
                            **kwargs) -> Tuple[str, float]:
         """
         Places an order on CoinDCX.
-        
+
         CoinDCX order creation format:
         {
             "side": "buy",
@@ -209,7 +209,7 @@ class CoindcxExchange(ExchangePyBase):
         type_str = CoindcxExchange.coindcx_order_type(order_type)
         side_str = CONSTANTS.SIDE_BUY if trade_type is TradeType.BUY else CONSTANTS.SIDE_SELL
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-        
+
         api_params = {
             "market": symbol,
             "side": side_str,
@@ -217,7 +217,7 @@ class CoindcxExchange(ExchangePyBase):
             "order_type": type_str,
             "client_order_id": order_id
         }
-        
+
         if order_type is OrderType.LIMIT or order_type is OrderType.LIMIT_MAKER:
             api_params["price_per_unit"] = float(price)
 
@@ -226,7 +226,7 @@ class CoindcxExchange(ExchangePyBase):
                 path_url=CONSTANTS.CREATE_ORDER_PATH_URL,
                 data=api_params,
                 is_auth_required=True)
-            
+
             # CoinDCX returns orders in a list
             if isinstance(order_result, dict) and "orders" in order_result:
                 order_data = order_result["orders"][0]
@@ -234,7 +234,7 @@ class CoindcxExchange(ExchangePyBase):
                 order_data = order_result[0]
             else:
                 order_data = order_result
-            
+
             o_id = str(order_data.get("id", order_id))
             # Parse timestamp from created_at field
             created_at = order_data.get("created_at", "")
@@ -242,7 +242,7 @@ class CoindcxExchange(ExchangePyBase):
                 transact_time = created_at / 1e3
             else:
                 transact_time = self._time_synchronizer.time()
-                
+
         except IOError as e:
             error_description = str(e)
             is_server_overloaded = "status is 503" in error_description
@@ -251,13 +251,13 @@ class CoindcxExchange(ExchangePyBase):
                 transact_time = self._time_synchronizer.time()
             else:
                 raise
-        
+
         return o_id, transact_time
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
         """
         Cancels an order on CoinDCX.
-        
+
         CoinDCX cancel order format:
         {
             "id": "ead19992-43fd-11e8-b027-bb815bcb14ed",
@@ -265,18 +265,18 @@ class CoindcxExchange(ExchangePyBase):
         }
         """
         api_params = {}
-        
+
         # Use exchange order ID if available, otherwise use client order ID
         if tracked_order.exchange_order_id:
             api_params["id"] = tracked_order.exchange_order_id
         else:
             api_params["client_order_id"] = order_id
-        
+
         cancel_result = await self._api_post(
             path_url=CONSTANTS.CANCEL_ORDER_PATH_URL,
             data=api_params,
             is_auth_required=True)
-        
+
         # Check if cancellation was successful
         if cancel_result is not None:
             return True
@@ -285,7 +285,7 @@ class CoindcxExchange(ExchangePyBase):
     async def _format_trading_rules(self, exchange_info_dict: Dict[str, Any]) -> List[TradingRule]:
         """
         Formats trading rules from CoinDCX markets_details response.
-        
+
         CoinDCX market details format:
         {
             "coindcx_name": "SNMBTC",
@@ -304,22 +304,22 @@ class CoindcxExchange(ExchangePyBase):
         """
         trading_pair_rules = exchange_info_dict if isinstance(exchange_info_dict, list) else [exchange_info_dict]
         retval = []
-        
+
         for rule in filter(coindcx_utils.is_exchange_information_valid, trading_pair_rules):
             try:
                 trading_pair = await self.trading_pair_associated_to_exchange_symbol(
                     symbol=rule.get("symbol", rule.get("coindcx_name", ""))
                 )
-                
+
                 min_order_size = Decimal(str(rule.get("min_quantity", 0)))
                 max_order_size = Decimal(str(rule.get("max_quantity", 1e9)))
                 step_size = Decimal(str(rule.get("step", 1)))
                 min_notional = Decimal(str(rule.get("min_notional", 0)))
-                
+
                 # Calculate price increment from precision
                 base_precision = int(rule.get("base_currency_precision", 8))
                 price_increment = Decimal(10) ** (-base_precision)
-                
+
                 # Calculate quantity increment from target precision
                 target_precision = int(rule.get("target_currency_precision", 8))
                 quantity_increment = Decimal(10) ** (-target_precision)
@@ -338,7 +338,7 @@ class CoindcxExchange(ExchangePyBase):
                 )
             except Exception:
                 self.logger().exception(f"Error parsing the trading pair rule {rule}. Skipping.")
-        
+
         return retval
 
     async def _status_polling_loop_fetch_updates(self):
@@ -360,31 +360,31 @@ class CoindcxExchange(ExchangePyBase):
         async for event_message in self._iter_user_event_queue():
             try:
                 event_type = event_message.get("event", event_message.get("e", ""))
-                
+
                 # Handle order updates
                 if event_type in ["order-update", CONSTANTS.ORDER_UPDATE_EVENT_TYPE]:
                     order_data = event_message.get("data", event_message)
-                    
+
                     if isinstance(order_data, list):
                         for order in order_data:
                             await self._process_order_update(order)
                     else:
                         await self._process_order_update(order_data)
-                
+
                 # Handle trade updates
                 elif event_type in ["trade-update", CONSTANTS.TRADE_UPDATE_EVENT_TYPE]:
                     trade_data = event_message.get("data", event_message)
-                    
+
                     if isinstance(trade_data, list):
                         for trade in trade_data:
                             await self._process_trade_update(trade)
                     else:
                         await self._process_trade_update(trade_data)
-                
+
                 # Handle balance updates
                 elif event_type in ["balance-update", CONSTANTS.BALANCE_UPDATE_EVENT_TYPE]:
                     balance_data = event_message.get("data", event_message)
-                    
+
                     if isinstance(balance_data, list):
                         for balance in balance_data:
                             self._process_balance_update(balance)
@@ -403,12 +403,12 @@ class CoindcxExchange(ExchangePyBase):
         """
         client_order_id = order_data.get("client_order_id", order_data.get("c", ""))
         exchange_order_id = str(order_data.get("id", order_data.get("o", "")))
-        
+
         tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
         if tracked_order is not None:
             status = order_data.get("status", "")
             new_state = CONSTANTS.ORDER_STATE.get(status, tracked_order.current_state)
-            
+
             order_update = OrderUpdate(
                 trading_pair=tracked_order.trading_pair,
                 update_timestamp=order_data.get("updated_at", self._time_synchronizer.time() * 1000) / 1000,
@@ -424,26 +424,26 @@ class CoindcxExchange(ExchangePyBase):
         """
         client_order_id = trade_data.get("c", trade_data.get("client_order_id", ""))
         exchange_order_id = str(trade_data.get("o", trade_data.get("order_id", "")))
-        
+
         tracked_order = self._order_tracker.all_fillable_orders.get(client_order_id)
         if tracked_order is not None:
             fee_amount = Decimal(str(trade_data.get("f", trade_data.get("fee_amount", 0))))
-            
+
             # Determine fee token (usually the quote currency for spot trades)
             trading_pair = tracked_order.trading_pair
             base, quote = trading_pair.split("-")
             fee_token = quote
-            
+
             fee = TradeFeeBase.new_spot_fee(
                 fee_schema=self.trade_fee_schema(),
                 trade_type=tracked_order.trade_type,
                 percent_token=fee_token,
                 flat_fees=[TokenAmount(amount=fee_amount, token=fee_token)]
             )
-            
+
             fill_price = Decimal(str(trade_data.get("p", trade_data.get("price", 0))))
             fill_amount = Decimal(str(trade_data.get("q", trade_data.get("quantity", 0))))
-            
+
             trade_update = TradeUpdate(
                 trade_id=str(trade_data.get("t", trade_data.get("id", ""))),
                 client_order_id=client_order_id,
@@ -465,7 +465,7 @@ class CoindcxExchange(ExchangePyBase):
         free_balance = Decimal(str(balance_data.get("balance", balance_data.get("f", 0))))
         locked_balance = Decimal(str(balance_data.get("locked_balance", balance_data.get("l", 0))))
         total_balance = free_balance + locked_balance
-        
+
         self._account_available_balances[asset_name] = free_balance
         self._account_balances[asset_name] = total_balance
 
@@ -481,39 +481,39 @@ class CoindcxExchange(ExchangePyBase):
 
         if (long_interval_current_tick > long_interval_last_tick
                 or (self.in_flight_orders and small_interval_current_tick > small_interval_last_tick)):
-            
+
             self._last_trades_poll_coindcx_timestamp = self._time_synchronizer.time()
-            
+
             # Fetch trade history
             try:
                 trade_history_params = {
                     "limit": 100
                 }
-                
+
                 trades = await self._api_post(
                     path_url=CONSTANTS.TRADE_HISTORY_ACCOUNT_PATH_URL,
                     data=trade_history_params,
                     is_auth_required=True
                 )
-                
+
                 if trades:
                     for trade in trades:
                         order_id = str(trade.get("order_id", ""))
-                        
+
                         # Check if this trade belongs to any tracked order
                         for tracked_order in self._order_tracker.all_fillable_orders.values():
                             if tracked_order.exchange_order_id == order_id:
                                 fee_amount = Decimal(str(trade.get("fee_amount", 0)))
                                 trading_pair = tracked_order.trading_pair
                                 base, quote = trading_pair.split("-")
-                                
+
                                 fee = TradeFeeBase.new_spot_fee(
                                     fee_schema=self.trade_fee_schema(),
                                     trade_type=tracked_order.trade_type,
                                     percent_token=quote,
                                     flat_fees=[TokenAmount(amount=fee_amount, token=quote)]
                                 )
-                                
+
                                 trade_update = TradeUpdate(
                                     trade_id=str(trade.get("id", "")),
                                     client_order_id=tracked_order.client_order_id,
@@ -527,7 +527,7 @@ class CoindcxExchange(ExchangePyBase):
                                 )
                                 self._order_tracker.process_trade_update(trade_update)
                                 break
-                                
+
             except Exception as e:
                 self.logger().error(f"Error fetching trade history: {e}")
 
@@ -543,7 +543,7 @@ class CoindcxExchange(ExchangePyBase):
                     "symbol": await self.exchange_symbol_associated_to_pair(trading_pair=order.trading_pair),
                     "limit": 100
                 }
-                
+
                 all_fills_response = await self._api_post(
                     path_url=CONSTANTS.TRADE_HISTORY_ACCOUNT_PATH_URL,
                     data=trade_history_params,
@@ -555,14 +555,14 @@ class CoindcxExchange(ExchangePyBase):
                         fee_amount = Decimal(str(trade.get("fee_amount", 0)))
                         trading_pair = order.trading_pair
                         base, quote = trading_pair.split("-")
-                        
+
                         fee = TradeFeeBase.new_spot_fee(
                             fee_schema=self.trade_fee_schema(),
                             trade_type=order.trade_type,
                             percent_token=quote,
                             flat_fees=[TokenAmount(amount=fee_amount, token=quote)]
                         )
-                        
+
                         trade_update = TradeUpdate(
                             trade_id=str(trade.get("id", "")),
                             client_order_id=order.client_order_id,
@@ -575,7 +575,7 @@ class CoindcxExchange(ExchangePyBase):
                             fill_timestamp=trade.get("timestamp", self._time_synchronizer.time() * 1000) / 1000,
                         )
                         trade_updates.append(trade_update)
-                        
+
             except Exception as e:
                 self.logger().error(f"Error fetching trades for order: {e}")
 
@@ -584,7 +584,7 @@ class CoindcxExchange(ExchangePyBase):
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
         """
         Requests the status of an order from CoinDCX.
-        
+
         CoinDCX order status request format:
         {
             "id": "ead19992-43fd-11e8-b027-bb815bcb14ed",
@@ -592,12 +592,12 @@ class CoindcxExchange(ExchangePyBase):
         }
         """
         api_params = {}
-        
+
         if tracked_order.exchange_order_id:
             api_params["id"] = tracked_order.exchange_order_id
         else:
             api_params["client_order_id"] = tracked_order.client_order_id
-        
+
         updated_order_data = await self._api_post(
             path_url=CONSTANTS.ORDER_STATUS_PATH_URL,
             data=api_params,
@@ -619,7 +619,7 @@ class CoindcxExchange(ExchangePyBase):
     async def _update_balances(self):
         """
         Fetches and updates account balances from CoinDCX.
-        
+
         CoinDCX balances response format:
         [
             {
@@ -641,13 +641,13 @@ class CoindcxExchange(ExchangePyBase):
             balances = account_info
         else:
             balances = account_info.get("balances", [])
-        
+
         for balance_entry in balances:
             asset_name = balance_entry.get("currency", "")
             free_balance = Decimal(str(balance_entry.get("balance", 0)))
             locked_balance = Decimal(str(balance_entry.get("locked_balance", 0)))
             total_balance = free_balance + locked_balance
-            
+
             self._account_available_balances[asset_name] = free_balance
             self._account_balances[asset_name] = total_balance
             remote_asset_names.add(asset_name)
@@ -660,7 +660,7 @@ class CoindcxExchange(ExchangePyBase):
     def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Dict[str, Any]):
         """
         Initializes the trading pair symbol map from exchange info.
-        
+
         CoinDCX market details format:
         {
             "coindcx_name": "SNMBTC",
@@ -672,16 +672,16 @@ class CoindcxExchange(ExchangePyBase):
         """
         mapping = bidict()
         markets_list = exchange_info if isinstance(exchange_info, list) else [exchange_info]
-        
+
         for symbol_data in filter(coindcx_utils.is_exchange_information_valid, markets_list):
             symbol = symbol_data.get("symbol", symbol_data.get("coindcx_name", ""))
             base = symbol_data.get("target_currency_short_name", "")  # In CoinDCX, target is the base
             quote = symbol_data.get("base_currency_short_name", "")   # In CoinDCX, base is the quote
-            
+
             if symbol and base and quote:
                 trading_pair = combine_to_hb_trading_pair(base=base, quote=quote)
                 mapping[symbol] = trading_pair
-        
+
         self._set_trading_pair_symbol_map(mapping)
 
     async def _get_last_traded_price(self, trading_pair: str) -> float:
@@ -693,16 +693,16 @@ class CoindcxExchange(ExchangePyBase):
             exchange_info = await self._api_get(
                 path_url=CONSTANTS.MARKETS_DETAILS_PATH_URL
             )
-            
+
             symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-            
+
             if isinstance(exchange_info, list):
                 for market in exchange_info:
                     if market.get("symbol", market.get("coindcx_name", "")) == symbol:
                         # Try to get last price from different possible fields
                         last_price = market.get("last_price", market.get("last", 0))
                         return float(last_price)
-            
+
             return 0.0
         except Exception as e:
             self.logger().error(f"Error getting last traded price: {e}")

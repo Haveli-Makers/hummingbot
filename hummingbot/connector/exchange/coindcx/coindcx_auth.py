@@ -26,7 +26,7 @@ class CoinDCXAuth(AuthBase):
         CoinDCX requires:
         - X-AUTH-APIKEY: API key
         - X-AUTH-SIGNATURE: HMAC SHA256 signature of the JSON body
-        
+
         :param request: the request to be configured for authenticated interaction
         """
         if request.method == RESTMethod.POST:
@@ -37,23 +37,23 @@ class CoinDCXAuth(AuthBase):
                     body = request.data
             else:
                 body = {}
-            
+
             timestamp = int(time.time() * 1000)
             body["timestamp"] = timestamp
-            
+
             json_body = json.dumps(body, separators=(',', ':'))
-            
+
             signature = self._generate_signature(json_body)
-            
+
             request.data = json_body
-            
+
             headers = {}
             if request.headers is not None:
                 headers.update(request.headers)
             headers.update(self.header_for_authentication(signature))
             headers["Content-Type"] = "application/json"
             request.headers = headers
-        
+
         return request
 
     async def ws_authenticate(self, request: WSRequest) -> WSRequest:
@@ -61,7 +61,7 @@ class CoinDCXAuth(AuthBase):
         This method is intended to configure a websocket request to be authenticated.
         CoinDCX WebSocket authentication uses a channel-based approach.
         """
-        return request  
+        return request
 
     def generate_ws_auth_payload(self) -> Dict[str, Any]:
         """
@@ -71,7 +71,7 @@ class CoinDCXAuth(AuthBase):
         body = {"channel": "coindcx"}
         json_body = json.dumps(body, separators=(',', ':'))
         signature = self._generate_signature(json_body)
-        
+
         return {
             "channelName": "coindcx",
             "authSignature": signature,
@@ -90,7 +90,7 @@ class CoinDCXAuth(AuthBase):
     def _generate_signature(self, payload: str) -> str:
         """
         Generates HMAC SHA256 signature for the given payload.
-        
+
         :param payload: JSON string of the request body
         :return: Hexadecimal signature string
         """

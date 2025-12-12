@@ -278,7 +278,7 @@ class MarketsRecorder:
     def store_market_data(self, market_data_list: List[dict]):
         """
         Store multiple market data records in a single transaction.
-        
+
         Args:
             market_data_list: List of dicts with keys:
                 - exchange: str
@@ -291,22 +291,22 @@ class MarketsRecorder:
         """
         if not market_data_list:
             return
-            
+
         with self._sql_manager.get_new_session() as session:
             timestamp = self.db_timestamp
             for data in market_data_list:
                 best_bid = data['best_bid']
                 best_ask = data['best_ask']
-                
+
                 mid_price = data.get('mid_price')
                 if mid_price is None:
                     mid_price = (best_bid + best_ask) / 2
-                        
+
                 spread_pct = data.get('spread_pct')
                 if spread_pct is None:
                     spread = best_ask - best_bid
                     spread_pct = (spread / mid_price) * 100 if mid_price > 0 else 0
-                
+
                 market_data = MarketData(
                     timestamp=timestamp,
                     exchange=data['exchange'],

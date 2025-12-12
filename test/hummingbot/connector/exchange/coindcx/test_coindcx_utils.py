@@ -11,12 +11,12 @@ class TestCoinDCXUtilsLogic(unittest.TestCase):
 
     # Define the logic locally to test patterns
     KNOWN_QUOTE_CURRENCIES = ["USDT", "USDC", "INR", "BTC", "ETH", "BUSD"]
-    
+
     def is_exchange_information_valid(self, exchange_info: dict) -> bool:
         """Replicate the validation logic."""
         status = exchange_info.get("status", "")
         return status.lower() == "active"
-    
+
     def coindcx_pair_to_hb_pair(self, coindcx_pair: str) -> str:
         """Replicate the pair conversion logic."""
         # Handle socket format (e.g., "B-BTC_USDT" -> "BTC-USDT")
@@ -24,21 +24,21 @@ class TestCoinDCXUtilsLogic(unittest.TestCase):
             parts = coindcx_pair.split("-", 1)
             if len(parts) == 2:
                 return parts[1].replace("_", "-")
-        
+
         # Handle standard format (e.g., "BTCUSDT" -> "BTC-USDT")
         for quote in self.KNOWN_QUOTE_CURRENCIES:
             if coindcx_pair.endswith(quote):
                 base = coindcx_pair[:-len(quote)]
                 return f"{base}-{quote}"
-        
+
         return coindcx_pair
-    
+
     def hb_pair_to_coindcx_symbol(self, hb_pair: str) -> str:
         """Replicate the pair conversion logic."""
         return hb_pair.replace("-", "")
 
     # ===== Exchange Information Validation Tests =====
-    
+
     def test_is_exchange_information_valid_active_status(self):
         """Test that active markets are considered valid."""
         exchange_info = {
@@ -87,7 +87,7 @@ class TestCoinDCXUtilsLogic(unittest.TestCase):
         self.assertFalse(self.is_exchange_information_valid(exchange_info))
 
     # ===== CoinDCX to Hummingbot Pair Conversion Tests =====
-    
+
     def test_coindcx_pair_to_hb_pair_usdt(self):
         """Test converting BTCUSDT to BTC-USDT."""
         result = self.coindcx_pair_to_hb_pair("BTCUSDT")
@@ -124,7 +124,7 @@ class TestCoinDCXUtilsLogic(unittest.TestCase):
         self.assertEqual(result, "UNKNOWNPAIR")
 
     # ===== Hummingbot to CoinDCX Symbol Conversion Tests =====
-    
+
     def test_hb_pair_to_coindcx_symbol(self):
         """Test converting BTC-USDT to BTCUSDT."""
         result = self.hb_pair_to_coindcx_symbol("BTC-USDT")
@@ -143,23 +143,23 @@ class TestCoinDCXUtilsLogic(unittest.TestCase):
 
 class TestCoinDCXPairConversionRoundTrip(unittest.TestCase):
     """Test that pair conversion works both ways."""
-    
+
     KNOWN_QUOTE_CURRENCIES = ["USDT", "USDC", "INR", "BTC", "ETH", "BUSD"]
-    
+
     def coindcx_pair_to_hb_pair(self, coindcx_pair: str) -> str:
         """Replicate the pair conversion logic."""
         if coindcx_pair.startswith(("B-", "I-")):
             parts = coindcx_pair.split("-", 1)
             if len(parts) == 2:
                 return parts[1].replace("_", "-")
-        
+
         for quote in self.KNOWN_QUOTE_CURRENCIES:
             if coindcx_pair.endswith(quote):
                 base = coindcx_pair[:-len(quote)]
                 return f"{base}-{quote}"
-        
+
         return coindcx_pair
-    
+
     def hb_pair_to_coindcx_symbol(self, hb_pair: str) -> str:
         """Replicate the pair conversion logic."""
         return hb_pair.replace("-", "")
@@ -169,7 +169,7 @@ class TestCoinDCXPairConversionRoundTrip(unittest.TestCase):
         hb_pair = "BTC-USDT"
         coindcx_symbol = self.hb_pair_to_coindcx_symbol(hb_pair)
         result = self.coindcx_pair_to_hb_pair(coindcx_symbol)
-        
+
         self.assertEqual(result, hb_pair)
 
     def test_roundtrip_inr_pair(self):
@@ -177,7 +177,7 @@ class TestCoinDCXPairConversionRoundTrip(unittest.TestCase):
         hb_pair = "BTC-INR"
         coindcx_symbol = self.hb_pair_to_coindcx_symbol(hb_pair)
         result = self.coindcx_pair_to_hb_pair(coindcx_symbol)
-        
+
         self.assertEqual(result, hb_pair)
 
     def test_roundtrip_eth_btc(self):
@@ -185,7 +185,7 @@ class TestCoinDCXPairConversionRoundTrip(unittest.TestCase):
         hb_pair = "ETH-BTC"
         coindcx_symbol = self.hb_pair_to_coindcx_symbol(hb_pair)
         result = self.coindcx_pair_to_hb_pair(coindcx_symbol)
-        
+
         self.assertEqual(result, hb_pair)
 
 

@@ -1,4 +1,4 @@
-from decimal import Decimal
+
 
 from hummingbot.connector.exchange.coindcx import coindcx_utils as utils
 

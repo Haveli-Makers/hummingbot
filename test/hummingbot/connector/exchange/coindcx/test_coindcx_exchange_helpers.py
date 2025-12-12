@@ -1,8 +1,8 @@
-from decimal import Decimal
 
+
+from hummingbot.connector.exchange.coindcx import coindcx_constants as CONSTANTS
 from hummingbot.connector.exchange.coindcx.coindcx_exchange import CoindcxExchange
 from hummingbot.core.data_type.common import OrderType
-from hummingbot.connector.exchange.coindcx import coindcx_constants as CONSTANTS
 
 
 def test_order_type_mappings_and_error_checks():

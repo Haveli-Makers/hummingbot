@@ -1,4 +1,4 @@
-import asyncio
+
 from decimal import Decimal
 
 import pytest
@@ -60,10 +60,11 @@ async def test_parse_trading_pair():
 async def test_get_prices_and_bid_ask_prices(monkeypatch):
     rs = CoindcxRateSource()
 
-    # Prepare fake markets response
-    markets = [
-        {"coindcx_name": "BTCUSDT", "base_currency_short_name": "USDT", "target_currency_short_name": "BTC"},
-    ]
+    # # Prepare fake markets response
+    # markets = [
+    #     {"coindcx_name": "BTCUSDT", "base_currency_short_name": "USDT", "target_currency_short_name": "BTC"},
+    # ]
+    # print(markets)
 
     # Mock _fetch_markets to return mapping
     async def fake_fetch_markets():
@@ -91,4 +92,3 @@ async def test_get_prices_and_bid_ask_prices(monkeypatch):
     assert entry["bid"] == Decimal("100")
     assert entry["ask"] == Decimal("110")
     assert entry["mid"] == (Decimal("100") + Decimal("110")) / Decimal("2")
-

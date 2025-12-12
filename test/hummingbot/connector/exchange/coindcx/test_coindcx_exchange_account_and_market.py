@@ -1,6 +1,4 @@
 import asyncio
-from decimal import Decimal
-import types
 
 from hummingbot.connector.exchange.coindcx.coindcx_exchange import CoindcxExchange
 
@@ -45,6 +43,7 @@ def test_request_order_status_and_update_balances_and_last_price(monkeypatch):
         return [{"symbol": "BTCUSDT", "last_price": 123.45}]
 
     inst._api_get = api_get
+
     async def fake_symbol(trading_pair: str):
         return "BTCUSDT"
 
@@ -85,8 +84,6 @@ def test_initialize_trading_pair_symbols_from_exchange_info():
         called['mapping'] = mapping
 
     inst._set_trading_pair_symbol_map = setter
-
-    from hummingbot.connector.exchange.coindcx import coindcx_utils
 
     info = {"symbol": "BTCUSDT", "target_currency_short_name": "BTC", "base_currency_short_name": "USDT", "status": "active"}
     inst._initialize_trading_pair_symbols_from_exchange_info(info)

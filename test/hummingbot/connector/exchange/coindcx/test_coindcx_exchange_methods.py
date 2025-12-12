@@ -1,10 +1,8 @@
 import asyncio
 import types
 
-from decimal import Decimal
-
-from hummingbot.connector.exchange.coindcx.coindcx_exchange import CoindcxExchange
 from hummingbot.connector.exchange.coindcx import coindcx_constants as CONSTANTS
+from hummingbot.connector.exchange.coindcx.coindcx_exchange import CoindcxExchange
 
 
 def test_is_request_exception_related_to_time_synchronizer_false():

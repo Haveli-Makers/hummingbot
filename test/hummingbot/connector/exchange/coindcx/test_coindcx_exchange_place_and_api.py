@@ -26,6 +26,7 @@ def test_get_all_pairs_prices_calls_api():
 
 def test_place_order_various_response_shapes():
     inst = make_inst()
+
     async def fake_symbol(trading_pair: str):
         return "BTCUSDT"
 

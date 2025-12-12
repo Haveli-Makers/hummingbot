@@ -1,7 +1,7 @@
 import asyncio
 
-from hummingbot.connector.exchange.coindcx.coindcx_exchange import CoindcxExchange
 from hummingbot.connector.exchange.coindcx.coindcx_api_order_book_data_source import CoinDCXAPIOrderBookDataSource
+from hummingbot.connector.exchange.coindcx.coindcx_exchange import CoindcxExchange
 
 
 def test_format_trading_rules_handles_exception():

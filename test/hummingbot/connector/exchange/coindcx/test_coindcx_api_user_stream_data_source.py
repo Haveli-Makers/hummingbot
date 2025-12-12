@@ -1,9 +1,11 @@
 import asyncio
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
+
 from hummingbot.connector.exchange.coindcx.coindcx_api_user_stream_data_source import CoinDCXAPIUserStreamDataSource
 from hummingbot.connector.exchange.coindcx.coindcx_auth import CoinDCXAuth
 from hummingbot.core.web_assistant.connections.data_types import WSJSONRequest
+
 
 class CoinDCXAPIUserStreamDataSourceTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -49,6 +51,7 @@ class CoinDCXAPIUserStreamDataSourceTest(unittest.IsolatedAsyncioTestCase):
         put_nowait = AsyncMock()
         queue.put_nowait = put_nowait
         # Patch async for
+
         async def fake_iter():
             yield ws_response
         self.ws_assistant.iter_messages = fake_iter
@@ -72,6 +75,7 @@ class CoinDCXAPIUserStreamDataSourceTest(unittest.IsolatedAsyncioTestCase):
             await self.data_source.listen_for_user_stream(asyncio.Queue())
         self.data_source.logger().error.assert_called()
         self.data_source._on_user_stream_interruption.assert_awaited()
+
 
 if __name__ == "__main__":
     unittest.main()

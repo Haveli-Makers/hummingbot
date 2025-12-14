@@ -2,7 +2,7 @@
 import json
 import re
 from decimal import Decimal
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pytest
 from aioresponses import aioresponses
@@ -14,7 +14,7 @@ from hummingbot.connector.test_support.exchange_connector_test import AbstractEx
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder
-from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TradeFeeBase
+from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TokenAmount, TradeFeeBase
 
 
 class CoindcxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
@@ -165,12 +165,12 @@ class CoindcxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
             {
                 "currency": self.base_asset,
                 "balance": 10.0,
-                "locked_balance": 1.0
+                "locked_balance": 5.0
             },
             {
                 "currency": self.quote_asset,
-                "balance": 1000.0,
-                "locked_balance": 100.0
+                "balance": 2000.0,
+                "locked_balance": 0.0
             }
         ]
 
@@ -259,8 +259,7 @@ class CoindcxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
     @property
     def _expected_fill_fee(self):
         self._fill_fee = DeductedFromReturnsTradeFee(
-            percent=Decimal("0.001"),
-            percent_token=self.quote_asset
+            flat_fees=[TokenAmount(amount=Decimal("0.1"), token=self.quote_asset)]
         )
         return self._fill_fee
 
@@ -298,6 +297,17 @@ class CoindcxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
             **kwargs
         )
 
+    def configure_erroneous_trading_rules_response(
+            self,
+            mock_api: aioresponses,
+            callback: Optional[Callable] = lambda *args, **kwargs: None,
+    ) -> List[str]:
+
+        url = self.trading_rules_url
+        response = self.trading_rules_request_erroneous_mock_response
+        mock_api.get(url, body=json.dumps(response), callback=callback)
+        return [url]
+
     @property
     def trading_rules_request_erroneous_mock_response(self):
         return [
@@ -306,7 +316,7 @@ class CoindcxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
                 "symbol": self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset),
                 "base_currency_short_name": "",
                 "target_currency_short_name": "",
-                "min_quantity": 0.001,
+                "min_quantity": -1,
                 "max_quantity": 1000000,
                 "min_price": 0.000001,
                 "max_price": 1000000,
@@ -324,7 +334,7 @@ class CoindcxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
             {
                 "currency": self.base_asset,
                 "balance": 10.0,
-                "locked_balance": 1.0
+                "locked_balance": 5.0
             }
         ]
 
@@ -335,7 +345,7 @@ class CoindcxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
             "data": {
                 "currency": self.base_asset,
                 "balance": 10.0,
-                "locked_balance": 1.0
+                "locked_balance": 5.0
             }
         }
 
@@ -351,7 +361,8 @@ class CoindcxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
 
     def validate_trades_request(self, order: InFlightOrder, request_call: RequestCall):
         request_data = json.loads(request_call.kwargs["data"])
-        self.assertEqual(order.exchange_order_id, request_data.get("order_id"))
+        expected_symbol = self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset)
+        self.assertEqual(expected_symbol, request_data.get("symbol"))
 
     def configure_successful_cancelation_response(
             self,
@@ -388,8 +399,12 @@ class CoindcxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
             successful_order: InFlightOrder,
             erroneous_order: InFlightOrder,
             mock_api: aioresponses) -> List[str]:
-        # CoinDCX doesn't support cancel all, so just return empty list
-        return []
+        url = web_utils.private_rest_url(CONSTANTS.CANCEL_ORDER_PATH_URL, domain=self.exchange._domain)
+        # First cancellation succeeds
+        mock_api.post(url, body=json.dumps({"status": "cancelled"}))
+        # Second cancellation fails
+        mock_api.post(url, body=json.dumps({"error": "Cancel failed"}), status=400)
+        return [url, url]
 
     def configure_completely_filled_order_status_response(
             self,
@@ -409,7 +424,7 @@ class CoindcxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
             self,
             order: InFlightOrder,
             mock_api: aioresponses,
-            callback: Optional[Callable] = lambda *args, **kwargs: None) -> Union[str, List[str]]:
+            callback: Optional[Callable] = lambda *args, **kwargs: None) -> List[str]:
         url = web_utils.private_rest_url(CONSTANTS.ORDER_STATUS_PATH_URL, domain=self.exchange._domain)
         response = {
             "id": order.exchange_order_id,
@@ -417,7 +432,7 @@ class CoindcxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
             "updated_at": 1640000000000
         }
         mock_api.post(url, body=json.dumps(response), callback=callback)
-        return url
+        return [url]
 
     def configure_open_order_status_response(
             self,
@@ -437,7 +452,7 @@ class CoindcxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
             self,
             order: InFlightOrder,
             mock_api: aioresponses,
-            callback: Optional[Callable] = lambda *args, **kwargs: None) -> str:
+            callback: Optional[Callable] = lambda *args, **kwargs: None) -> List[str]:
         url = web_utils.private_rest_url(CONSTANTS.ORDER_STATUS_PATH_URL, domain=self.exchange._domain)
         mock_api.post(url, status=500, callback=callback)
         return url
@@ -479,17 +494,17 @@ class CoindcxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
             self,
             order: InFlightOrder,
             mock_api: aioresponses,
-            callback: Optional[Callable] = lambda *args, **kwargs: None) -> str:
+            callback: Optional[Callable] = lambda *args, **kwargs: None) -> List[str]:
         url = web_utils.private_rest_url(CONSTANTS.ORDER_STATUS_PATH_URL, domain=self.exchange._domain)
         response = {"error": "Order not found"}
         mock_api.post(url, body=json.dumps(response), callback=callback, status=404)
-        return url
+        return [url]
 
     def configure_partially_filled_order_status_response(
             self,
             order: InFlightOrder,
             mock_api: aioresponses,
-            callback: Optional[Callable] = lambda *args, **kwargs: None) -> List[str]:
+            callback: Optional[Callable] = lambda *args, **kwargs: None) -> str:
         url = web_utils.private_rest_url(CONSTANTS.ORDER_STATUS_PATH_URL, domain=self.exchange._domain)
         response = {
             "id": order.exchange_order_id,
@@ -497,7 +512,7 @@ class CoindcxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
             "updated_at": 1640000000000
         }
         mock_api.post(url, body=json.dumps(response), callback=callback)
-        return [url]
+        return url
 
     def configure_full_fill_trade_response(
             self,
@@ -530,7 +545,7 @@ class CoindcxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
                 "order_id": order.exchange_order_id,
                 "price": float(self.expected_partial_fill_price),
                 "quantity": float(self.expected_partial_fill_amount),
-                "fee_amount": 0.05,
+                "fee_amount": 0.1,
                 "timestamp": 1640000000000
             }
         ]
@@ -564,6 +579,19 @@ class CoindcxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
 
     def _configure_successful_response(self, url: str, regex: str, response: Any, **kwargs):
         self._configure_response(url, regex, response, **kwargs)
+
+    def _configure_balance_response(
+            self,
+            response: Dict[str, Any],
+            mock_api: aioresponses,
+            callback: Optional[Callable] = lambda *args, **kwargs: None) -> str:
+
+        url = self.balance_url
+        mock_api.post(
+            re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?")),
+            body=json.dumps(response),
+            callback=callback)
+        return url
 
     # @patch("hummingbot.connector.exchange.coindcx.coindcx_exchange.CoindcxExchange._time_synchronizer")
     def setUp(self):  # , mock_time_synchronizer):

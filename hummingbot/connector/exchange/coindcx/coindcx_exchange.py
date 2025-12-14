@@ -145,9 +145,12 @@ class CoindcxExchange(ExchangePyBase):
         ) or CONSTANTS.ORDER_NOT_EXIST_MESSAGE in str(status_update_exception)
 
     def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
-        return str(CONSTANTS.UNKNOWN_ORDER_ERROR_CODE) in str(
-            cancelation_exception
-        ) or CONSTANTS.UNKNOWN_ORDER_MESSAGE in str(cancelation_exception)
+        # Consider only 404/Order not found as "order not found" during cancel
+        exc_str = str(cancelation_exception)
+        return (
+            str(CONSTANTS.ORDER_NOT_EXIST_ERROR_CODE) in exc_str
+            or CONSTANTS.ORDER_NOT_EXIST_MESSAGE in exc_str
+        )
 
     def _create_web_assistants_factory(self) -> WebAssistantsFactory:
         return web_utils.build_api_factory(
@@ -316,6 +319,10 @@ class CoindcxExchange(ExchangePyBase):
                 step_size = Decimal(str(rule.get("step", 1)))
                 min_notional = Decimal(str(rule.get("min_notional", 0)))
 
+                # Validate basic limits
+                if min_order_size <= 0:
+                    raise ValueError("Invalid min_order_size")
+
                 # Calculate price increment from precision
                 base_precision = int(rule.get("base_currency_precision", 8))
                 price_increment = Decimal(10) ** (-base_precision)
@@ -437,7 +444,6 @@ class CoindcxExchange(ExchangePyBase):
             fee = TradeFeeBase.new_spot_fee(
                 fee_schema=self.trade_fee_schema(),
                 trade_type=tracked_order.trade_type,
-                percent_token=fee_token,
                 flat_fees=[TokenAmount(amount=fee_amount, token=fee_token)]
             )
 
@@ -510,7 +516,6 @@ class CoindcxExchange(ExchangePyBase):
                                 fee = TradeFeeBase.new_spot_fee(
                                     fee_schema=self.trade_fee_schema(),
                                     trade_type=tracked_order.trade_type,
-                                    percent_token=quote,
                                     flat_fees=[TokenAmount(amount=fee_amount, token=quote)]
                                 )
 
@@ -559,7 +564,6 @@ class CoindcxExchange(ExchangePyBase):
                         fee = TradeFeeBase.new_spot_fee(
                             fee_schema=self.trade_fee_schema(),
                             trade_type=order.trade_type,
-                            percent_token=quote,
                             flat_fees=[TokenAmount(amount=fee_amount, token=quote)]
                         )
 

@@ -242,5 +242,5 @@ class CubeRateSourceTest(IsolatedAsyncioWrapperTestCase):
         self.assertIn("ask", price_data)
         self.assertIn("mid", price_data)
         self.assertIn("spread", price_data)
-        self.assertIn("spread_pct", price_data)
+        self.assertIn("spread", price_data)
         self.assertNotIn(self.ignored_trading_pair, bid_ask_prices)

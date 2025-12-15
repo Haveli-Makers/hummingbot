@@ -166,12 +166,6 @@ class SpreadCapture(ScriptStrategyBase):
 
     async def fetch_and_store_spread(self):
 
-        now = int(time.time())
-        if now - self.last_run < self.interval_sec:
-            return
-
-        self.last_run = now
-
         try:
             bid_ask_prices = await self._rate_source.get_bid_ask_prices(quote_token=self.quote_token)
 
@@ -191,10 +185,10 @@ class SpreadCapture(ScriptStrategyBase):
                 bid = float(price_data["bid"])
                 ask = float(price_data["ask"])
                 mid_price = float(price_data["mid"])
-                spread_pct = float(price_data["spread_pct"])
+                spread = float(price_data["spread"])
 
                 self.logger().info(
-                    f"{trading_pair} → BID: {bid}, ASK: {ask}, SPREAD_PCT: {spread_pct:.4f}%"
+                    f"{trading_pair} → BID: {bid}, ASK: {ask}, SPREAD: {spread:.4f}%"
                 )
 
                 market_data_batch.append(
@@ -204,7 +198,7 @@ class SpreadCapture(ScriptStrategyBase):
                         "best_bid": bid,
                         "best_ask": ask,
                         "mid_price": mid_price,
-                        "spread_pct": spread_pct,
+                        "spread": spread,
                     }
                 )
 
@@ -245,4 +239,10 @@ class SpreadCapture(ScriptStrategyBase):
     def on_tick(self):
         if not self._initialized:
             return
+
+        now = int(time.time())
+        if now - self.last_run < self.interval_sec:
+            return
+
+        self.last_run = now
         safe_ensure_future(self.fetch_and_store_spread())

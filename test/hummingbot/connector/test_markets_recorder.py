@@ -992,7 +992,7 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
                 'best_bid': 50000.0,
                 'best_ask': 50010.0,
                 'mid_price': 50005.0,
-                'spread_pct': 0.02,
+                'spread': 0.02,
             },
             {
                 'exchange': 'binance',
@@ -1000,7 +1000,7 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
                 'best_bid': 3000.0,
                 'best_ask': 3001.0,
                 'mid_price': 3000.5,
-                'spread_pct': 0.033,
+                'spread': 0.033,
             },
         ]
 
@@ -1024,7 +1024,7 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
         self.assertAlmostEqual(float(eth_record.best_bid), 3000.0, places=2)
 
     def test_store_market_data_calculates_missing_values(self):
-        """Test that store_market_data calculates mid_price, spread, spread_pct if not provided."""
+        """Test that store_market_data calculates mid_price, spread if not provided."""
         recorder = MarketsRecorder(
             sql=self.manager,
             markets=[self],
@@ -1056,8 +1056,8 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
         self.assertIsNotNone(record)
         self.assertEqual('kucoin', record.exchange)
         self.assertAlmostEqual(float(record.mid_price), 100.5, places=2)  # (100 + 101) / 2
-        # spread_pct = (1 / 100.5) * 100 ≈ 0.995
-        self.assertAlmostEqual(float(record.spread_pct), 0.995, places=2)
+        # spread = (1 / 100.5) * 100 ≈ 0.995
+        self.assertAlmostEqual(float(record.spread), 0.995, places=2)
 
     def test_store_market_data_empty_list(self):
         """Test that store_market_data handles empty list gracefully."""

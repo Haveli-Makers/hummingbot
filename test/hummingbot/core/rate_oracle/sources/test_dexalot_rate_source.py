@@ -142,4 +142,4 @@ class DexalotRateSourceTest(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(Decimal("11"), price_data["ask"])
         self.assertEqual(Decimal("10"), price_data["mid"])
         self.assertIn("spread", price_data)
-        self.assertIn("spread_pct", price_data)
+        self.assertIn("spread", price_data)

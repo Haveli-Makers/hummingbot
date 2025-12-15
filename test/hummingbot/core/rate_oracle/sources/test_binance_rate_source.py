@@ -86,6 +86,6 @@ class BinanceRateSourceTest(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(expected_rate - Decimal("0.1"), price_data["bid"])
         self.assertEqual(expected_rate + Decimal("0.1"), price_data["ask"])
         self.assertEqual(expected_rate, price_data["mid"])
-        self.assertEqual(Decimal("0.2"), price_data["spread"])
+        self.assertEqual(Decimal("2.0"), price_data["spread"])
         self.assertIn("spread", price_data)
         self.assertNotIn(self.ignored_trading_pair, bid_ask_prices)

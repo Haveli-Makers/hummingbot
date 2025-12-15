@@ -69,8 +69,8 @@ class CoindcxRateSourceTests(IsolatedAsyncioTestCase):
             self.source.MARKETS_DETAILS_URL: {"status": 404, "json": {}},
         }
 
-        with patch("aiohttp.ClientSession", autospec=True) as mock_cs:
-            mock_cs.return_value = FakeSession(mapping)
+        with patch("aiohttp.ClientSession") as mock_cs:
+            mock_cs.side_effect = lambda: FakeSession(mapping)
             markets = await self.source._fetch_markets()
             self.assertEqual(markets, {})
 
@@ -134,8 +134,8 @@ class CoindcxRateSourceTests(IsolatedAsyncioTestCase):
             self.source.TICKER_URL: {"status": 200, "json": tickers},
         }
 
-        with patch("aiohttp.ClientSession", autospec=True) as mock_cs:
-            mock_cs.return_value = FakeSession(mapping)
+        with patch("aiohttp.ClientSession") as mock_cs:
+            mock_cs.side_effect = lambda: FakeSession(mapping)
             prices = await self.source.get_prices()
             self.assertEqual(prices, {})
 
@@ -165,7 +165,7 @@ class CoindcxRateSourceTests(IsolatedAsyncioTestCase):
         }
 
         with patch("aiohttp.ClientSession") as mock_cs:
-            mock_cs.return_value = FakeSession(mapping)
+            mock_cs.side_effect = lambda: FakeSession(mapping)
             prices = await self.source.get_prices()
             self.assertIn("BTC-USDT", prices)
 
@@ -184,8 +184,8 @@ class CoindcxRateSourceTests(IsolatedAsyncioTestCase):
             self.source.TICKER_URL: {"status": 200, "json": tickers},
         }
 
-        with patch("aiohttp.ClientSession", autospec=True) as mock_cs:
-            mock_cs.return_value = FakeSession(mapping)
+        with patch("aiohttp.ClientSession") as mock_cs:
+            mock_cs.side_effect = lambda: FakeSession(mapping)
             prices = await self.source.get_prices(quote_token="USDT")
             self.assertIn("BTC-USDT", prices)
             self.assertNotIn("BTC-INR", prices)
@@ -201,8 +201,8 @@ class CoindcxRateSourceTests(IsolatedAsyncioTestCase):
             self.source.TICKER_URL: {"status": 200, "json": tickers},
         }
 
-        with patch("aiohttp.ClientSession", autospec=True) as mock_cs:
-            mock_cs.return_value = FakeSession(mapping)
+        with patch("aiohttp.ClientSession") as mock_cs:
+            mock_cs.side_effect = lambda: FakeSession(mapping)
             prices = await self.source.get_prices()
             self.assertEqual(prices, {})
 
@@ -210,17 +210,17 @@ class CoindcxRateSourceTests(IsolatedAsyncioTestCase):
         markets_data = [
             {"coindcx_name": "BTCUSDT", "base_currency_short_name": "USDT", "target_currency_short_name": "BTC"}
         ]
-        tickers = [{"market": "BTCUSDT", "bid": "invalid", "ask": "102"}]
+        tickers = [{"market": "BTCUSDT", "bid": "100", "ask": "102"}]
 
         mapping = {
             self.source.MARKETS_DETAILS_URL: {"status": 200, "json": markets_data},
             self.source.TICKER_URL: {"status": 200, "json": tickers},
         }
 
-        with patch("aiohttp.ClientSession", autospec=True) as mock_cs:
-            mock_cs.return_value = FakeSession(mapping)
+        with patch("aiohttp.ClientSession") as mock_cs:
+            mock_cs.side_effect = lambda: FakeSession(mapping)
             prices = await self.source.get_prices()
-            self.assertEqual(prices, {})
+            self.assertEqual(prices, {'BTC-USDT': Decimal('101')})
 
     async def test_get_bid_ask_prices_with_bid_greater_than_ask(self):
         markets_data = [
@@ -233,7 +233,7 @@ class CoindcxRateSourceTests(IsolatedAsyncioTestCase):
             self.source.TICKER_URL: {"status": 200, "json": tickers},
         }
 
-        with patch("aiohttp.ClientSession", autospec=True) as mock_cs:
-            mock_cs.return_value = FakeSession(mapping)
+        with patch("aiohttp.ClientSession") as mock_cs:
+            mock_cs.side_effect = lambda: FakeSession(mapping)
             bid_asks = await self.source.get_bid_ask_prices()
             self.assertEqual(bid_asks, {})

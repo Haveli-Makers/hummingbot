@@ -79,8 +79,8 @@ class WazirxRateSourceTests(IsolatedAsyncioWrapperTestCase):
         prices = await self.source.get_prices()
         self.assertIn("BTC-USDT", prices)
         self.assertIn("ETH-USDT", prices)
-        self.assertEqual(Decimal("50005.0"), prices["BTC-USDT"])  
-        self.assertEqual(Decimal("3005.0"), prices["ETH-USDT"])   
+        self.assertEqual(Decimal("50005.0"), prices["BTC-USDT"])
+        self.assertEqual(Decimal("3005.0"), prices["ETH-USDT"])
 
     @aioresponses()
     async def test_get_prices_with_quote_filter(self, mock_api):

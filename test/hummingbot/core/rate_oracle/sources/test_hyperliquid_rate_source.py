@@ -1,6 +1,7 @@
 import json
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
+from unittest.mock import patch
 
 from aioresponses import aioresponses
 
@@ -78,7 +79,7 @@ class HyperliquidRateSourceTest(IsolatedAsyncioWrapperTestCase):
                 {
                     'prevDayPx': "COINALPHA/USDC",
                     'dayNtlVlm': '4265022.87833',
-                    'markPx': '10',
+                    'price': '10',
                     'midPx': '10',
                     'circulatingSupply': '598274922.83822',
                     'coin': "COINALPHA/USDC",
@@ -86,7 +87,7 @@ class HyperliquidRateSourceTest(IsolatedAsyncioWrapperTestCase):
                 {
                     'prevDayPx': '25.236',
                     'dayNtlVlm': '315299.16652',
-                    'markPx': '25.011',
+                    'price': '25.011',
                     'midPx': '24.9835',
                     'circulatingSupply': '997372.88712882',
                     'coin': self.ignored_trading_pair,
@@ -148,18 +149,18 @@ class HyperliquidRateSourceTest(IsolatedAsyncioWrapperTestCase):
                 {
                     'prevDayPx': '0.22916',
                     'dayNtlVlm': '4265022.87833',
-                    'markPx': '10',
+                    'price': '10',
                     'midPx': '10',
                     'circulatingSupply': '598274922.83822',
-                    'coin': "COINALPHA/USDC"
+                    'symbol': "COINALPHA/USDC"
                 },
                 {
                     'prevDayPx': '25.236',
                     'dayNtlVlm': '315299.16652',
-                    'markPx': '25.011',
+                    'price': '25.011',
                     'midPx': '24.9835',
                     'circulatingSupply': '997372.88712882',
-                    'coin': self.ignored_trading_pair
+                    'symbol': self.ignored_trading_pair
                 }
             ]
         ]
@@ -180,3 +181,48 @@ class HyperliquidRateSourceTest(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(expected_rate, prices[self.trading_pair])
         # self.assertIn(self.us_trading_pair, prices)
         self.assertNotIn(self.ignored_trading_pair, prices)
+
+    @aioresponses()
+    async def test_get_bid_ask_prices(self, mock_api):
+        expected_rate = Decimal("10")
+        self.setup_hyperliquid_responses(mock_api=mock_api, expected_rate=expected_rate)
+
+        async def mock_trading_pair_associated_to_exchange_symbol(symbol):
+            if symbol == "COINALPHA/USDC":
+                return self.trading_pair
+            else:
+                raise KeyError(f"Unknown symbol {symbol}")
+
+        rate_source = HyperliquidRateSource()
+        rate_source._ensure_exchange()  # ensure exchange is created
+        with patch.object(rate_source._exchange, 'trading_pair_associated_to_exchange_symbol', side_effect=mock_trading_pair_associated_to_exchange_symbol):
+            bid_ask_prices = await rate_source.get_bid_ask_prices()
+
+        self.assertIn(self.trading_pair, bid_ask_prices)
+        entry = bid_ask_prices[self.trading_pair]
+        self.assertEqual(Decimal("10"), entry["bid"])
+        self.assertEqual(Decimal("10"), entry["ask"])
+        self.assertEqual(expected_rate, entry["mid"])
+        self.assertEqual(Decimal("0"), entry["spread"])
+        self.assertEqual(Decimal("0"), entry["spread_pct"])
+        self.assertNotIn(self.ignored_trading_pair, bid_ask_prices)
+
+    @aioresponses()
+    async def test_get_prices_exception(self, mock_api):
+        hyperliquid_prices_global_url = web_utils.public_rest_url(path_url=CONSTANTS.TICKER_PRICE_CHANGE_URL)
+        mock_api.post(hyperliquid_prices_global_url, exception=Exception("API error"))
+
+        rate_source = HyperliquidRateSource()
+        prices = await rate_source.get_prices()
+
+        self.assertEqual({}, prices)
+
+    @aioresponses()
+    async def test_get_bid_ask_prices_exception(self, mock_api):
+        hyperliquid_prices_global_url = web_utils.public_rest_url(path_url=CONSTANTS.TICKER_PRICE_CHANGE_URL)
+        mock_api.post(hyperliquid_prices_global_url, exception=Exception("API error"))
+
+        rate_source = HyperliquidRateSource()
+        prices = await rate_source.get_bid_ask_prices()
+
+        self.assertEqual({}, prices)

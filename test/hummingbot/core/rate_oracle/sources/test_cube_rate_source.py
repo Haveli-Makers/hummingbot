@@ -227,3 +227,41 @@ class CubeRateSourceTest(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(expected_rate, prices[self.trading_pair])
         self.assertIn(self.cube_test_trading_pair, prices)
         self.assertNotIn(self.ignored_trading_pair, prices)
+
+    @aioresponses()
+    async def test_get_bid_ask_prices(self, mock_api):
+        expected_rate = 10
+        self.setup_cube_responses(mock_api=mock_api, expected_rate=expected_rate)
+
+        rate_source = CubeRateSource()
+        bid_ask_prices = await rate_source.get_bid_ask_prices()
+
+        self.assertIn(self.trading_pair, bid_ask_prices)
+        entry = bid_ask_prices[self.trading_pair]
+        self.assertEqual(expected_rate, entry["bid"])
+        self.assertEqual(expected_rate, entry["ask"])
+        self.assertEqual(expected_rate, entry["mid"])
+        self.assertEqual(0, entry["spread"])
+        self.assertEqual(0, entry["spread_pct"])
+
+    @aioresponses()
+    async def test_get_prices_exception(self, mock_api):
+        # Setup mock to raise exception
+        cube_prices_live_url = web_utils.public_rest_url(path_url=CONSTANTS.TICKER_BOOK_PATH_URL, domain="live")
+        mock_api.get(cube_prices_live_url, exception=Exception("API error"))
+
+        rate_source = CubeRateSource()
+        prices = await rate_source.get_prices()
+
+        self.assertEqual({}, prices)
+
+    @aioresponses()
+    async def test_get_bid_ask_prices_exception(self, mock_api):
+        # Setup mock to raise exception
+        cube_prices_live_url = web_utils.public_rest_url(path_url=CONSTANTS.TICKER_BOOK_PATH_URL, domain="live")
+        mock_api.get(cube_prices_live_url, exception=Exception("API error"))
+
+        rate_source = CubeRateSource()
+        bid_ask_prices = await rate_source.get_bid_ask_prices()
+
+        self.assertEqual({}, bid_ask_prices)

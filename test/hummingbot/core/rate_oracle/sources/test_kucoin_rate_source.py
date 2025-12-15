@@ -1,6 +1,7 @@
 import json
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
+from unittest.mock import AsyncMock, patch
 
 from aioresponses import aioresponses
 
@@ -70,3 +71,42 @@ class KucoinRateSourceTest(IsolatedAsyncioWrapperTestCase):
         self.assertIn(self.trading_pair, prices)
         self.assertEqual(expected_rate, prices[self.trading_pair])
         self.assertNotIn(self.ignored_trading_pair, prices)
+
+    @aioresponses()
+    async def test_get_bid_ask_prices(self, mock_api):
+        expected_rate = Decimal("10")
+        self.setup_kucoin_responses(mock_api=mock_api, expected_rate=expected_rate)
+
+        rate_source = KucoinRateSource()
+        rate_source._ensure_exchange()  # ensure exchange is created
+        with patch.object(rate_source._exchange, 'trading_pair_associated_to_exchange_symbol', new_callable=AsyncMock) as mock_method:
+            mock_method.return_value = self.trading_pair
+            prices = await rate_source.get_bid_ask_prices()
+
+        self.assertIn(self.trading_pair, prices)
+        self.assertEqual(Decimal("9.9"), prices[self.trading_pair]["bid"])
+        self.assertEqual(Decimal("10.1"), prices[self.trading_pair]["ask"])
+        self.assertEqual(expected_rate, prices[self.trading_pair]["mid"])
+        self.assertEqual(Decimal("0.2"), prices[self.trading_pair]["spread"])
+        self.assertEqual(Decimal("2"), prices[self.trading_pair]["spread_pct"])
+        self.assertNotIn(self.ignored_trading_pair, prices)
+
+    @aioresponses()
+    async def test_get_prices_exception(self, mock_api):
+        prices_url = f"{CONSTANTS.BASE_PATH_URL['main']}{CONSTANTS.ALL_TICKERS_PATH_URL}"
+        mock_api.get(url=prices_url, exception=Exception("API Error"))
+
+        rate_source = KucoinRateSource()
+        prices = await rate_source.get_prices()
+
+        self.assertEqual({}, prices)
+
+    @aioresponses()
+    async def test_get_bid_ask_prices_exception(self, mock_api):
+        prices_url = f"{CONSTANTS.BASE_PATH_URL['main']}{CONSTANTS.ALL_TICKERS_PATH_URL}"
+        mock_api.get(url=prices_url, exception=Exception("API Error"))
+
+        rate_source = KucoinRateSource()
+        prices = await rate_source.get_bid_ask_prices()
+
+        self.assertEqual({}, prices)

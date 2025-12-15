@@ -57,3 +57,42 @@ class AscendExRateSourceTest(IsolatedAsyncioWrapperTestCase):
         self.assertIn(self.trading_pair, prices)
         self.assertEqual(expected_rate, prices[self.trading_pair])
         self.assertNotIn(self.ignored_trading_pair, prices)
+
+    @aioresponses()
+    async def test_get_bid_ask_prices(self, mock_api):
+        expected_bid = Decimal("9.9")
+        expected_ask = Decimal("10.1")
+        self.setup_ascend_ex_responses(mock_api=mock_api, expected_rate=Decimal("10"))
+
+        rate_source = AscendExRateSource()
+        bid_ask_prices = await rate_source.get_bid_ask_prices()
+
+        self.assertIn(self.trading_pair, bid_ask_prices)
+        entry = bid_ask_prices[self.trading_pair]
+        self.assertEqual(expected_bid, entry["bid"])
+        self.assertEqual(expected_ask, entry["ask"])
+        self.assertEqual(Decimal("10"), entry["mid"])
+        self.assertEqual(Decimal("0.2"), entry["spread"])
+        self.assertEqual(Decimal("2"), entry["spread_pct"])
+
+    @aioresponses()
+    async def test_get_prices_exception(self, mock_api):
+        # Setup mock to raise exception
+        prices_url = f"{CONSTANTS.PUBLIC_REST_URL}{CONSTANTS.TICKER_PATH_URL}"
+        mock_api.get(url=prices_url, exception=Exception("API error"))
+
+        rate_source = AscendExRateSource()
+        prices = await rate_source.get_prices()
+
+        self.assertEqual({}, prices)
+
+    @aioresponses()
+    async def test_get_bid_ask_prices_exception(self, mock_api):
+        # Setup mock to raise exception
+        prices_url = f"{CONSTANTS.PUBLIC_REST_URL}{CONSTANTS.TICKER_PATH_URL}"
+        mock_api.get(url=prices_url, exception=Exception("API error"))
+
+        rate_source = AscendExRateSource()
+        bid_ask_prices = await rate_source.get_bid_ask_prices()
+
+        self.assertEqual({}, bid_ask_prices)

@@ -1,6 +1,7 @@
 import json
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
+from unittest.mock import patch
 
 from aioresponses import aioresponses
 
@@ -53,8 +54,8 @@ class GateIoRateSourceTest(IsolatedAsyncioWrapperTestCase):
                 "low_24h": "0.48598",
                 "base_volume": "122140",
                 "quote_volume": "122140",
-                "lowest_ask": str(expected_rate - Decimal("0.1")),
-                "highest_bid": str(expected_rate + Decimal("0.1")),
+                "lowest_ask": str(expected_rate + Decimal("0.1")),
+                "highest_bid": str(expected_rate - Decimal("0.1")),
                 "change_percentage": "-2.05",
                 "etf_net_value": "2.46316141",
                 "etf_pre_net_value": "2.43201848",
@@ -103,3 +104,48 @@ class GateIoRateSourceTest(IsolatedAsyncioWrapperTestCase):
         self.assertIn(self.trading_pair, prices)
         self.assertEqual(expected_rate, prices[self.trading_pair])
         self.assertNotIn(self.ignored_trading_pair, prices)
+
+    @aioresponses()
+    async def test_get_bid_ask_prices(self, mock_api):
+        expected_bid = Decimal("9.9")
+        expected_ask = Decimal("10.1")
+        self.setup_gate_io_responses(mock_api=mock_api, expected_rate=Decimal("10"))
+
+        async def mock_trading_pair_associated_to_exchange_symbol(currency_pair):
+            if currency_pair == self.trading_pair:
+                return self.trading_pair
+            elif currency_pair == self.ignored_trading_pair:
+                return self.ignored_trading_pair
+            else:
+                raise KeyError(f"Unknown pair {currency_pair}")
+
+        rate_source = GateIoRateSource()
+        rate_source._ensure_exchange()  # ensure exchange is created
+        with patch.object(rate_source._exchange, 'trading_pair_associated_to_exchange_symbol', side_effect=mock_trading_pair_associated_to_exchange_symbol):
+            prices = await rate_source.get_bid_ask_prices()
+
+        self.assertIn(self.trading_pair, prices)
+        self.assertEqual(expected_bid, prices[self.trading_pair]["bid"])
+        self.assertEqual(expected_ask, prices[self.trading_pair]["ask"])
+        self.assertEqual(Decimal("10"), prices[self.trading_pair]["mid"])
+        self.assertEqual(Decimal("0.2"), prices[self.trading_pair]["spread"])
+        self.assertEqual(Decimal("2"), prices[self.trading_pair]["spread_pct"])
+        self.assertNotIn(self.ignored_trading_pair, prices)
+
+    @aioresponses()
+    async def test_get_prices_exception(self, mock_api):
+        mock_api.get(url=f"{CONSTANTS.REST_URL}/{CONSTANTS.TICKER_PATH_URL}", exception=Exception("API Error"))
+
+        rate_source = GateIoRateSource()
+        prices = await rate_source.get_prices()
+
+        self.assertEqual({}, prices)
+
+    @aioresponses()
+    async def test_get_bid_ask_prices_exception(self, mock_api):
+        mock_api.get(url=f"{CONSTANTS.REST_URL}/{CONSTANTS.TICKER_PATH_URL}", exception=Exception("API Error"))
+
+        rate_source = GateIoRateSource()
+        prices = await rate_source.get_bid_ask_prices()
+
+        self.assertEqual({}, prices)

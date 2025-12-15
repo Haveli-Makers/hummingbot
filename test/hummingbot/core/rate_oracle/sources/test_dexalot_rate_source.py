@@ -102,8 +102,11 @@ class DexalotRateSourceTest(IsolatedAsyncioWrapperTestCase):
     @aioresponses()
     async def test_get_prices_exception(self, mock_api):
         rate_source = DexalotRateSource()
-        # Ensure exchange is created
+
         rate_source._ensure_exchange()
+
+        if hasattr(rate_source.get_prices, 'cache_clear'):
+            rate_source.get_prices.cache_clear()
         with patch.object(rate_source._exchange, 'get_all_pairs_prices', side_effect=Exception("API error")):
             prices = await rate_source.get_prices()
             self.assertEqual({}, prices)
@@ -111,8 +114,11 @@ class DexalotRateSourceTest(IsolatedAsyncioWrapperTestCase):
     @aioresponses()
     async def test_get_bid_ask_prices_exception(self, mock_api):
         rate_source = DexalotRateSource()
-        # Ensure exchange is created
+
         rate_source._ensure_exchange()
+
+        if hasattr(rate_source.get_bid_ask_prices, 'cache_clear'):
+            rate_source.get_bid_ask_prices.cache_clear()
         with patch.object(rate_source._exchange, 'get_all_pairs_prices', side_effect=Exception("API error")):
             bid_ask_prices = await rate_source.get_bid_ask_prices()
             self.assertEqual({}, bid_ask_prices)

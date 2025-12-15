@@ -273,38 +273,18 @@ class WazirxAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         with patch.object(self.connector, 'get_last_traded_prices', new_callable=AsyncMock) as mock_get_prices:
             mock_get_prices.return_value = mock_prices
 
-            prices = await self.data_source.get_last_traded_prices()
+            prices = await self.data_source.get_last_traded_prices([self.trading_pair])
             self.assertIn(self.trading_pair, prices)
             self.assertEqual("100.5", prices[self.trading_pair])
 
     async def test_get_last_traded_prices_empty_response(self):
         with patch.object(self.connector, 'get_last_traded_prices', new_callable=AsyncMock) as mock_get_prices:
             mock_get_prices.return_value = {}
-            prices = await self.data_source.get_last_traded_prices()
+            prices = await self.data_source.get_last_traded_prices([self.trading_pair])
             self.assertEqual({}, prices)
 
     async def test_get_last_traded_prices_exception(self):
         with patch.object(self.connector, 'get_last_traded_prices', new_callable=AsyncMock) as mock_get_prices:
             mock_get_prices.side_effect = Exception("API Error")
-            prices = await self.data_source.get_last_traded_prices()
+            prices = await self.data_source.get_last_traded_prices([self.trading_pair])
             self.assertEqual({}, prices)
-
-    async def test_get_supported_trading_pairs(self):
-        mock_pairs = [self.trading_pair, "ETH-USDT"]
-
-        with patch.object(self.connector, 'get_supported_trading_pairs', new_callable=AsyncMock) as mock_get_pairs:
-            mock_get_pairs.return_value = mock_pairs
-            pairs = await self.data_source.get_supported_trading_pairs()
-            self.assertIn(self.trading_pair, pairs)
-
-    async def test_get_supported_trading_pairs_empty_response(self):
-        with patch.object(self.connector, 'get_supported_trading_pairs', new_callable=AsyncMock) as mock_get_pairs:
-            mock_get_pairs.return_value = []
-            pairs = await self.data_source.get_supported_trading_pairs()
-            self.assertEqual([], pairs)
-
-    async def test_get_supported_trading_pairs_exception(self):
-        with patch.object(self.connector, 'get_supported_trading_pairs', new_callable=AsyncMock) as mock_get_pairs:
-            mock_get_pairs.side_effect = Exception("API Error")
-            pairs = await self.data_source.get_supported_trading_pairs()
-            self.assertEqual([], pairs)

@@ -27,4 +27,7 @@ class WazirxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 return await resp.json()
 
     async def get_last_traded_prices(self, trading_pairs: List[str], domain: Optional[str] = None) -> Dict[str, float]:
-        return await self._connector.get_last_traded_prices(trading_pairs=trading_pairs)
+        try:
+            return await self._connector.get_last_traded_prices(trading_pairs=trading_pairs)
+        except Exception:
+            return {}

@@ -5,10 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from bidict import bidict
 
 from hummingbot.connector.constants import s_decimal_NaN
-from hummingbot.connector.exchange.wazirx import (
-    wazirx_constants as CONSTANTS,
-    wazirx_web_utils as web_utils,
-)
+from hummingbot.connector.exchange.wazirx import wazirx_constants as CONSTANTS, wazirx_web_utils as web_utils
 from hummingbot.connector.exchange.wazirx.wazirx_api_order_book_data_source import WazirxAPIOrderBookDataSource
 from hummingbot.connector.exchange.wazirx.wazirx_api_user_stream_data_source import WazirxAPIUserStreamDataSource
 from hummingbot.connector.exchange.wazirx.wazirx_auth import WazirxAuth
@@ -167,7 +164,7 @@ class WazirxExchange(ExchangePyBase):
                 order_id = str(resp.get("orderId", ""))
                 executed_amount = float(resp.get("executedQty", 0))
                 return order_id, executed_amount
-            except Exception as e:
+            except Exception:
                 raise
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
@@ -181,7 +178,7 @@ class WazirxExchange(ExchangePyBase):
             try:
                 resp = await ra.execute_request(url=url, method="DELETE", params=api_params)
                 return resp.get("status") == "CANCELED"
-            except Exception as e:
+            except Exception:
                 return False
 
     async def _format_trading_rules(self, exchange_info_dict: Dict[str, Any]) -> List[TradingRule]:
@@ -195,7 +192,7 @@ class WazirxExchange(ExchangePyBase):
                 trading_pair = rule.get("symbol", "").upper()
                 if not trading_pair:
                     continue
-                
+
                 # Convert to hummingbot format
                 base_asset = rule.get("baseAsset", "")
                 quote_asset = rule.get("quoteAsset", "")
@@ -240,11 +237,11 @@ class WazirxExchange(ExchangePyBase):
         async for event_message in self._iter_user_event_queue():
             try:
                 event_type = event_message.get("event")
-                
+
                 if event_type == "orderUpdate":
                     order_data = event_message.get("order", {})
                     client_order_id = order_data.get("clientOrderId")
-                    
+
                     tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
                     if tracked_order is not None:
                         order_update = OrderUpdate(
@@ -280,18 +277,18 @@ class WazirxExchange(ExchangePyBase):
                 "symbol": symbol,
                 "orderId": order.exchange_order_id
             }
-            
+
             async with self._web_assistants_factory.build_rest_assistant() as ra:
                 try:
                     resp = await ra.execute_request(url=url, method="GET", params=params)
-                    
+
                     for trade in resp:
                         fee = TradeFeeBase.new_spot_fee(
                             fee_schema=self.trade_fee_schema(),
                             trade_type=order.trade_type,
                             percent_token=trade.get("commissionAsset", ""),
-                            flat_fees=[TokenAmount(amount=Decimal(trade.get("commission", "0")), 
-                                                  token=trade.get("commissionAsset", ""))]
+                            flat_fees=[TokenAmount(amount=Decimal(trade.get("commission", "0")),
+                                                   token=trade.get("commissionAsset", ""))]
                         )
                         trade_update = TradeUpdate(
                             trade_id=str(trade.get("id", "")),
@@ -317,12 +314,12 @@ class WazirxExchange(ExchangePyBase):
             "symbol": symbol,
             "orderId": tracked_order.exchange_order_id
         }
-        
+
         async with self._web_assistants_factory.build_rest_assistant() as ra:
             resp = await ra.execute_request(url=url, method="GET", params=params)
-            
+
             new_state = CONSTANTS.ORDER_STATE.get(resp.get("status"), OrderState.UNKNOWN)
-            
+
             order_update = OrderUpdate(
                 client_order_id=tracked_order.client_order_id,
                 exchange_order_id=str(resp.get("orderId", "")),
@@ -335,11 +332,11 @@ class WazirxExchange(ExchangePyBase):
 
     async def _update_balances(self):
         url = f"{CONSTANTS.REST_URL}{CONSTANTS.USER_BALANCES_PATH_URL}"
-        
+
         async with self._web_assistants_factory.build_rest_assistant() as ra:
             try:
                 resp = await ra.execute_request(url=url, method="GET")
-                
+
                 balances = resp.get("balances", [])
                 for balance_entry in balances:
                     asset_name = balance_entry.get("asset", "")
@@ -367,16 +364,16 @@ class WazirxExchange(ExchangePyBase):
         parameter.
         """
         result = {}
-        
+
         for trading_pair in trading_pairs:
             try:
                 symbol = trading_pair.replace("-", "").lower()
                 url = f"{CONSTANTS.REST_URL}{CONSTANTS.TICKERS_PATH_URL}"
                 params = {"symbol": symbol}
-                
+
                 async with self._web_assistants_factory.build_rest_assistant() as ra:
                     resp = await ra.execute_request(url=url, method="GET", params=params)
-                    
+
                     if isinstance(resp, list) and len(resp) > 0:
                         ticker_data = resp[0]
                         last_price = float(ticker_data.get("lastPrice", "0"))
@@ -384,9 +381,9 @@ class WazirxExchange(ExchangePyBase):
                     elif isinstance(resp, dict):
                         last_price = float(resp.get("lastPrice", "0"))
                         result[trading_pair] = last_price
-                        
+
             except Exception as e:
                 self.logger().error(f"Error fetching last traded price for {trading_pair}: {e}")
                 result[trading_pair] = 0.0
-                
+
         return result

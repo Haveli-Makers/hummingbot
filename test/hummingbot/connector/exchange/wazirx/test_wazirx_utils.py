@@ -15,7 +15,7 @@ class WazirxUtilTestCases(unittest.TestCase):
         cls.ex_trading_pair = f"{cls.base_asset}{cls.quote_asset}"
 
     def test_wazirx_pair_to_hb_pair(self):
-        
+
         self.assertEqual("BTC-USDT", utils.wazirx_pair_to_hb_pair("btcusdt"))
         self.assertEqual("ETH-INR", utils.wazirx_pair_to_hb_pair("ethinr"))
         self.assertEqual("BTC-BTC", utils.wazirx_pair_to_hb_pair("btcbtc"))

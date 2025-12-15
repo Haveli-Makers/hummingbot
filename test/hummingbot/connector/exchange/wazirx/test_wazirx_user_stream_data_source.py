@@ -1,7 +1,7 @@
 import asyncio
 import re
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
-from typing import  Optional
+from typing import Optional
 from unittest.mock import MagicMock, patch
 
 from aioresponses import aioresponses
@@ -104,7 +104,7 @@ class WazirxUserStreamDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         )
 
         await asyncio.sleep(0.1)
-        
+
         self.listening_task.cancel()
         try:
             await self.listening_task
@@ -149,7 +149,7 @@ class WazirxUserStreamDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         )
 
         await asyncio.sleep(0.1)
-        
+
         self.listening_task.cancel()
         try:
             await self.listening_task
@@ -169,10 +169,10 @@ class WazirxUserStreamDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
                 "symbol": "btcusdt"
             }
         }
-        
+
         msg_queue = asyncio.Queue()
         await self.data_source._process_event_message(order_update_event, msg_queue)
-        
+
         self.assertEqual(1, msg_queue.qsize())
         msg = msg_queue.get_nowait()
         self.assertEqual(order_update_event, msg)
@@ -187,10 +187,10 @@ class WazirxUserStreamDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
                 "total": "0.5"
             }
         }
-        
+
         msg_queue = asyncio.Queue()
         await self.data_source._process_event_message(balance_update_event, msg_queue)
-        
+
         self.assertEqual(1, msg_queue.qsize())
         msg = msg_queue.get_nowait()
         self.assertEqual(balance_update_event, msg)
@@ -206,10 +206,10 @@ class WazirxUserStreamDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
                 ]
             }
         }
-        
+
         msg_queue = asyncio.Queue()
         await self.data_source._process_event_message(user_update_event, msg_queue)
-        
+
         self.assertEqual(1, msg_queue.qsize())
         msg = msg_queue.get_nowait()
         self.assertEqual(user_update_event, msg)
@@ -220,10 +220,10 @@ class WazirxUserStreamDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
             "timestamp": 1640995200000,
             "data": "some data"
         }
-        
+
         msg_queue = asyncio.Queue()
         await self.data_source._process_event_message(unknown_event, msg_queue)
-        
+
         self.assertEqual(1, msg_queue.qsize())
         msg = msg_queue.get_nowait()
         self.assertEqual(unknown_event, msg)

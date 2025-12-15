@@ -1,8 +1,8 @@
 
 import asyncio
 import json
-from typing import Dict
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
+from typing import Dict
 from unittest.mock import AsyncMock, patch
 
 from hummingbot.connector.exchange.wazirx.wazirx_api_order_book_data_source import WazirxAPIOrderBookDataSource

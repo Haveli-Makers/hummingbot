@@ -1,9 +1,10 @@
-import aiohttp
 from typing import Any, Dict, List, Optional
 
+import aiohttp
+
 from hummingbot.connector.exchange.wazirx import wazirx_constants as CONSTANTS
-from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.connector.exchange_py_base import ExchangePyBase
+from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 
 
 class WazirxAPIOrderBookDataSource(OrderBookTrackerDataSource):

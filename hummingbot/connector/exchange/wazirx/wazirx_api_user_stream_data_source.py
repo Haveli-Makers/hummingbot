@@ -4,8 +4,8 @@ from typing import Any, Dict, List, Optional
 import aiohttp
 
 from hummingbot.connector.exchange.wazirx import wazirx_constants as CONSTANTS
-from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
 from hummingbot.connector.exchange_py_base import ExchangePyBase
+from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
 
 
 class WazirxAPIUserStreamDataSource(UserStreamTrackerDataSource):
@@ -56,7 +56,7 @@ class WazirxAPIUserStreamDataSource(UserStreamTrackerDataSource):
         """
         self._user_stream_queue = output
         self._stopping = False
-        
+
         while not self._stopping:
             try:
                 await self._fetch_and_enqueue()

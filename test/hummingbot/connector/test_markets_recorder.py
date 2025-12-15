@@ -987,9 +987,21 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
             ),
         )
 
-        # Store an executor
-        executor = Executors(id="test_executor", timestamp=123, controller_id="test_controller", type="position_executor", config={"test": "config"})
-        recorder.store_or_update_executor(executor)
+        # Store an executor using a mock PositionExecutor
+        position_executor_mock = MagicMock(spec=PositionExecutor)
+        position_executor_config = PositionExecutorConfig(
+            id="test_executor", timestamp=123, trading_pair="ETH-USDT", connector_name="binance", side=TradeType.BUY,
+            entry_price=Decimal("1000"), amount=Decimal("1"), leverage=1,
+            triple_barrier_config=TripleBarrierConfig(take_profit=Decimal("0.1"), stop_loss=Decimal("0.2")),
+        )
+        position_executor_mock.config = position_executor_config
+        position_executor_mock.executor_info = ExecutorInfo(
+            id="test_executor", timestamp=123, type="position_executor", close_timestamp=None, close_type=None,
+            status=RunnableStatus.RUNNING, controller_id="test_controller", custom_info={},
+            config=position_executor_config, net_pnl_pct=Decimal("0.0"), net_pnl_quote=Decimal("0"),
+            cum_fees_quote=Decimal("0"), filled_amount_quote=Decimal("0"), is_active=True, is_trading=False)
+
+        recorder.store_or_update_executor(position_executor_mock)
 
         # Test get_executors_by_ids
         executors = recorder.get_executors_by_ids(["test_executor"])

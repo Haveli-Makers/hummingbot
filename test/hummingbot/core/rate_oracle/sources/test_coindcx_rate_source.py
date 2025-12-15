@@ -164,7 +164,7 @@ class CoindcxRateSourceTests(IsolatedAsyncioTestCase):
             self.source.TICKER_URL: {"status": 200, "json": tickers},
         }
 
-        with patch("aiohttp.ClientSession", autospec=True) as mock_cs:
+        with patch("aiohttp.ClientSession") as mock_cs:
             mock_cs.return_value = FakeSession(mapping)
             prices = await self.source.get_prices()
             self.assertIn("BTC-USDT", prices)

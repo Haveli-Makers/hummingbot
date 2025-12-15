@@ -339,3 +339,221 @@ class WazirxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests)
     @aioresponses()
     def test_user_stream_update_for_unknown_order(self, mock_api):
         super().test_user_stream_update_for_unknown_order(mock_api)
+
+    def test_format_trading_rules(self):
+        raw_trading_rules = [
+            {
+                "symbol": "btcusdt",
+                "baseAsset": "BTC",
+                "quoteAsset": "USDT",
+                "status": "TRADING",
+                "baseAssetPrecision": 8,
+                "quoteAssetPrecision": 8,
+                "filters": [
+                    {
+                        "filterType": "LOT_SIZE",
+                        "minQty": "0.000001",
+                        "maxQty": "100000.0",
+                        "stepSize": "0.000001"
+                    },
+                    {
+                        "filterType": "PRICE_FILTER",
+                        "minPrice": "0.00000001",
+                        "maxPrice": "100000.0",
+                        "tickSize": "0.00000001"
+                    },
+                    {
+                        "filterType": "MIN_NOTIONAL",
+                        "minNotional": "0.0001"
+                    }
+                ]
+            }
+        ]
+        trading_rules = self.exchange._format_trading_rules(raw_trading_rules)
+        self.assertEqual(1, len(trading_rules))
+        rule = trading_rules[0]
+        self.assertEqual("BTC-USDT", rule.trading_pair)
+        self.assertEqual(Decimal("0.000001"), rule.min_order_size)
+        self.assertEqual(Decimal("100000.0"), rule.max_order_size)
+        self.assertEqual(Decimal("0.00000001"), rule.min_price_increment)
+        self.assertEqual(Decimal("0.000001"), rule.min_base_amount_increment)
+        self.assertEqual(Decimal("0.0001"), rule.min_notional_size)
+
+    def test_format_trading_rules_with_missing_filters(self):
+        raw_trading_rules = [
+            {
+                "symbol": "btcusdt",
+                "baseAsset": "BTC",
+                "quoteAsset": "USDT",
+                "status": "TRADING",
+                "baseAssetPrecision": 8,
+                "quoteAssetPrecision": 8,
+                "filters": []
+            }
+        ]
+        trading_rules = self.exchange._format_trading_rules(raw_trading_rules)
+        self.assertEqual(1, len(trading_rules))
+        rule = trading_rules[0]
+        self.assertEqual("BTC-USDT", rule.trading_pair)
+        self.assertEqual(Decimal("1e-8"), rule.min_order_size)
+        self.assertEqual(Decimal("1e8"), rule.max_order_size)
+
+    def test_format_trading_rules_with_invalid_data(self):
+        raw_trading_rules = [
+            {
+                "symbol": "btcusdt",
+                "baseAsset": "BTC",
+                "quoteAsset": "USDT",
+                "status": "TRADING",
+                "baseAssetPrecision": 8,
+                "quoteAssetPrecision": 8,
+                "filters": [
+                    {
+                        "filterType": "LOT_SIZE",
+                        "minQty": "invalid",
+                        "maxQty": "100000.0",
+                        "stepSize": "0.000001"
+                    }
+                ]
+            }
+        ]
+        trading_rules = self.exchange._format_trading_rules(raw_trading_rules)
+        self.assertEqual(1, len(trading_rules))
+        rule = trading_rules[0]
+        self.assertEqual("BTC-USDT", rule.trading_pair)
+        self.assertEqual(Decimal("1e-8"), rule.min_order_size)
+
+    @aioresponses()
+    def test_create_order_buy_limit(self, mock_api):
+        mock_api.post(
+            self.order_creation_url,
+            body=json.dumps(self.order_creation_request_mock_response)
+        )
+
+        order_id = self.exchange.create_order(
+            trade_type=self.buy_trade_type,
+            order_id="test_order",
+            trading_pair=self.trading_pair,
+            amount=Decimal("100"),
+            order_type=OrderType.LIMIT,
+            price=Decimal("0.000005")
+        )
+
+        self.assertEqual("test_order", order_id)
+
+    @aioresponses()
+    def test_create_order_sell_market(self, mock_api):
+        mock_response = self.order_creation_request_mock_response.copy()
+        mock_response["type"] = "MARKET"
+        mock_response["side"] = "SELL"
+
+        mock_api.post(
+            self.order_creation_url,
+            body=json.dumps(mock_response)
+        )
+
+        order_id = self.exchange.create_order(
+            trade_type=self.sell_trade_type,
+            order_id="test_order_sell",
+            trading_pair=self.trading_pair,
+            amount=Decimal("100"),
+            order_type=OrderType.MARKET,
+            price=None
+        )
+
+        self.assertEqual("test_order_sell", order_id)
+
+    @aioresponses()
+    def test_cancel_order_by_id(self, mock_api):
+        cancel_url = web_utils.private_rest_url(CONSTANTS.CANCEL_ORDER_PATH_URL, domain=self.exchange._domain)
+        mock_api.delete(
+            cancel_url,
+            body=json.dumps({"symbol": self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset)})
+        )
+
+        result = self.exchange.cancel_order("test_client_order_id", "BTC-USDT", "12345")
+        self.assertTrue(result)
+
+    @aioresponses()
+    def test_get_order_status(self, mock_api):
+        status_url = web_utils.private_rest_url(CONSTANTS.ORDER_STATUS_PATH_URL, domain=self.exchange._domain)
+        mock_api.get(
+            status_url,
+            payload={
+                "symbol": self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset),
+                "orderId": "12345",
+                "status": "FILLED",
+                "executedQty": "100.00000000",
+                "cummulativeQuoteQty": "0.00050000"
+            }
+        )
+
+        status = self.exchange.get_order_status("BTC-USDT", "12345")
+        self.assertIsNotNone(status)
+
+    @aioresponses()
+    def test_update_balances_direct(self, mock_api):
+        mock_api.get(
+            self.balance_url,
+            body=json.dumps(self.balance_request_mock_response_for_base_and_quote)
+        )
+
+        self.exchange._update_balances()
+        self.assertIn(self.base_asset, self.exchange._account_balances)
+        self.assertIn(self.quote_asset, self.exchange._account_balances)
+
+    def test_process_user_stream_event_order_update(self):
+        event_data = {
+            "eventType": "executionReport",
+            "symbol": "btcusdt",
+            "orderId": 12345,
+            "clientOrderId": "test_client_order",
+            "side": "BUY",
+            "orderType": "LIMIT",
+            "orderStatus": "FILLED",
+            "quantity": "100.00000000",
+            "price": "0.00000500",
+            "executedQty": "100.00000000",
+            "cummulativeQuoteQty": "0.00050000"
+        }
+
+        self.exchange._process_user_stream_event(event_data)
+
+    def test_process_user_stream_event_balance_update(self):
+        event_data = {
+            "eventType": "balanceUpdate",
+            "asset": "BTC",
+            "free": "1.00000000",
+            "locked": "0.50000000"
+        }
+
+        self.exchange._process_user_stream_event(event_data)
+
+    def test_process_user_stream_event_invalid(self):
+        event_data = {
+            "eventType": "invalid",
+            "data": "test"
+        }
+
+        self.exchange._process_user_stream_event(event_data)
+
+    def test_get_fee_returns_zero_fee(self):
+        fee = self.exchange.get_fee("BTC", "USDT", OrderType.LIMIT, self.buy_trade_type, Decimal("100"), Decimal("0.000005"))
+        self.assertIsNotNone(fee)
+        self.assertEqual(Decimal("0"), fee.percent)
+
+    def test_get_order_price_quantum(self):
+        quantum = self.exchange.get_order_price_quantum("BTC-USDT", Decimal("0.000005"))
+        self.assertIsNotNone(quantum)
+
+    def test_get_order_size_quantum(self):
+        quantum = self.exchange.get_order_size_quantum("BTC-USDT", Decimal("100"))
+        self.assertIsNotNone(quantum)
+
+    def test_quantize_order_amount(self):
+        quantized = self.exchange.quantize_order_amount("BTC-USDT", Decimal("100.12345678"))
+        self.assertIsNotNone(quantized)
+
+    def test_quantize_order_price(self):
+        quantized = self.exchange.quantize_order_price("BTC-USDT", Decimal("0.000005123456"))
+        self.assertIsNotNone(quantized)

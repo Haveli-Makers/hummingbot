@@ -5,7 +5,6 @@ from typing import Dict, Optional
 import aiohttp
 
 from hummingbot.core.rate_oracle.sources.rate_source_base import RateSourceBase
-from hummingbot.core.utils import async_ttl_cache
 
 
 class CoindcxRateSource(RateSourceBase):
@@ -81,7 +80,6 @@ class CoindcxRateSource(RateSourceBase):
 
         return {}
 
-    @async_ttl_cache(ttl=30, maxsize=1)
     async def get_prices(self, quote_token: Optional[str] = None) -> Dict[str, Decimal]:
         """
         Fetches mid prices for all trading pairs.
@@ -136,7 +134,6 @@ class CoindcxRateSource(RateSourceBase):
 
         return results
 
-    @async_ttl_cache(ttl=30, maxsize=1)
     async def get_bid_ask_prices(self, quote_token: Optional[str] = None) -> Dict[str, Dict[str, Decimal]]:
         """
         Fetches best bid and ask prices for all trading pairs.

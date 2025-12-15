@@ -156,7 +156,6 @@ class CoindcxRateSourceTests(IsolatedAsyncioTestCase):
             self.assertEqual(prices, {})
 
     async def test_get_prices_with_parse_trading_pair_fallback(self):
-        # No markets data, should use _parse_trading_pair
         tickers = [{"market": "BTCUSDT", "bid": "100", "ask": "102"}]
 
         mapping = {

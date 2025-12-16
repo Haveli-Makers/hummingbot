@@ -139,7 +139,7 @@ class CoindcxRateSource(RateSourceBase):
         Fetches best bid and ask prices for all trading pairs.
 
         :param quote_token: A quote symbol, if specified only pairs with the quote symbol are included
-        :return: A dictionary of trading pairs to {"bid": Decimal, "ask": Decimal, "mid": Decimal, "spread": Decimal, "spread_pct": Decimal}
+        :return: A dictionary of trading pairs to {"bid": Decimal, "ask": Decimal, "mid": Decimal, "spread": Decimal}
         """
         results = {}
         try:

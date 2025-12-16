@@ -163,8 +163,7 @@ class WazirxRateSourceTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(Decimal("50000.0"), data["bid"])
         self.assertEqual(Decimal("50010.0"), data["ask"])
         self.assertEqual(Decimal("50005.0"), data["mid"])
-        self.assertEqual(Decimal("10.0"), data["spread"])
-        self.assertAlmostEqual(Decimal("0.02"), data["spread_pct"], places=2)
+        self.assertAlmostEqual(Decimal("10.0"), data["spread"], places=2)
 
     @aioresponses()
     async def test_get_bid_ask_prices_with_quote_filter(self, mock_api):

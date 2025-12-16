@@ -12,6 +12,7 @@ class MarketData(HummingbotBase):
         PrimaryKeyConstraint("timestamp", "exchange", "trading_pair"),
         Index("idx_market_data_timestamp", "timestamp"),
         Index("idx_market_data_trading_pair", "trading_pair"),
+        Index("idx_market_data_exchange", "exchange"),
     )
 
     timestamp = Column(SqliteDecimal(6), nullable=False)
@@ -20,7 +21,7 @@ class MarketData(HummingbotBase):
     mid_price = Column(SqliteDecimal(6), nullable=False)
     best_bid = Column(SqliteDecimal(6), nullable=False)
     best_ask = Column(SqliteDecimal(6), nullable=False)
-    spread_pct = Column(SqliteDecimal(6), nullable=True)
+    spread = Column(SqliteDecimal(6), nullable=True)
     order_book = Column(JSON)
 
     def __repr__(self) -> str:

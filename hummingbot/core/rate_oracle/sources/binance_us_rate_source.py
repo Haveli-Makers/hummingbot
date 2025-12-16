@@ -44,7 +44,7 @@ class BinanceUSRateSource(RateSourceBase):
         Fetches best bid and ask prices for all trading pairs from Binance US.
 
         :param quote_token: A quote symbol, if specified only pairs with the quote symbol are included
-        :return: A dictionary of trading pairs to {"bid": Decimal, "ask": Decimal, "mid": Decimal, "spread": Decimal, "spread_pct": Decimal}
+        :return: A dictionary of trading pairs to {"bid": Decimal, "ask": Decimal, "mid": Decimal, "spread": Decimal}
         """
         self._ensure_exchanges()
         results = {}
@@ -73,8 +73,7 @@ class BinanceUSRateSource(RateSourceBase):
                             "bid": bid,
                             "ask": ask,
                             "mid": (bid + ask) / Decimal("2"),
-                            "spread": ask - bid,
-                            "spread_pct": ((ask - bid) / ((bid + ask) / Decimal("2"))) * Decimal("100")
+                            "spread": ((ask - bid) / ((bid + ask) / Decimal("2"))) * Decimal("100")
                         }
         except Exception:
             self.logger().exception(

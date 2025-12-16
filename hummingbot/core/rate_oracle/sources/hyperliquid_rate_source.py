@@ -50,7 +50,7 @@ class HyperliquidRateSource(RateSourceBase):
         Note: Hyperliquid API may not provide separate bid/ask, using price as mid.
 
         :param quote_token: A quote symbol, if specified only pairs with the quote symbol are included
-        :return: A dictionary of trading pairs to {"bid": Decimal, "ask": Decimal, "mid": Decimal, "spread": Decimal, "spread_pct": Decimal}
+        :return: A dictionary of trading pairs to {"bid": Decimal, "ask": Decimal, "mid": Decimal, "spread": Decimal}
         """
         self._ensure_exchange()
         results = {}
@@ -78,8 +78,7 @@ class HyperliquidRateSource(RateSourceBase):
                             "bid": bid,
                             "ask": ask,
                             "mid": mid,
-                            "spread": ask - bid,
-                            "spread_pct": ((ask - bid) / mid) * Decimal("100") if mid > 0 else Decimal("0")
+                            "spread": ((ask - bid) / mid) * Decimal("100") if mid > 0 else Decimal("0")
                         }
         except Exception:
             self.logger().exception(

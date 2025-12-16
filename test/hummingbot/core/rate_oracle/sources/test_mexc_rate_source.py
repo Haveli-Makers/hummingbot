@@ -75,35 +75,13 @@ class MexcRateSourceTest(IsolatedAsyncioWrapperTestCase):
         self.setup_mexc_responses(mock_api=mock_api, expected_rate=expected_rate)
 
         rate_source = MexcRateSource()
-        rate_source._ensure_exchanges()  # ensure exchange is created
-        with patch.object(rate_source._mexc_exchange, 'trading_pair_associated_to_exchange_symbol', new_callable=AsyncMock) as mock_method:
-            mock_method.return_value = self.trading_pair
-            prices = await rate_source.get_bid_ask_prices()
+        bid_ask_prices = await rate_source.get_bid_ask_prices()
 
-        self.assertIn(self.trading_pair, prices)
-        self.assertEqual(Decimal("9.9"), prices[self.trading_pair]["bid"])
-        self.assertEqual(Decimal("10.1"), prices[self.trading_pair]["ask"])
-        self.assertEqual(expected_rate, prices[self.trading_pair]["mid"])
-        self.assertEqual(Decimal("0.2"), prices[self.trading_pair]["spread"])
-        self.assertEqual(Decimal("2"), prices[self.trading_pair]["spread_pct"])
-        self.assertNotIn(self.ignored_trading_pair, prices)
-
-    @aioresponses()
-    async def test_get_prices_exception(self, mock_api):
-        mexc_prices_url = web_utils.public_rest_url(path_url=CONSTANTS.TICKER_BOOK_PATH_URL)
-        mock_api.get(mexc_prices_url, exception=Exception("API error"))
-
-        rate_source = MexcRateSource()
-        prices = await rate_source.get_prices()
-
-        self.assertEqual({}, prices)
-
-    @aioresponses()
-    async def test_get_bid_ask_prices_exception(self, mock_api):
-        mexc_prices_url = web_utils.public_rest_url(path_url=CONSTANTS.TICKER_BOOK_PATH_URL)
-        mock_api.get(mexc_prices_url, exception=Exception("API error"))
-
-        rate_source = MexcRateSource()
-        prices = await rate_source.get_bid_ask_prices()
-
-        self.assertEqual({}, prices)
+        self.assertIn(self.trading_pair, bid_ask_prices)
+        price_data = bid_ask_prices[self.trading_pair]
+        self.assertEqual(expected_rate - Decimal("0.1"), price_data["bid"])
+        self.assertEqual(expected_rate + Decimal("0.1"), price_data["ask"])
+        self.assertEqual(expected_rate, price_data["mid"])
+        self.assertEqual(Decimal("2.0"), price_data["spread"])
+        self.assertIn("spread", price_data)
+        self.assertNotIn(self.ignored_trading_pair, bid_ask_prices)

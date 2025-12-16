@@ -53,8 +53,8 @@ class GateIoRateSourceTest(IsolatedAsyncioWrapperTestCase):
                 "low_24h": "0.48598",
                 "base_volume": "122140",
                 "quote_volume": "122140",
-                "lowest_ask": str(expected_rate - Decimal("0.1")),
-                "highest_bid": str(expected_rate + Decimal("0.1")),
+                "lowest_ask": str(expected_rate + Decimal("0.1")),
+                "highest_bid": str(expected_rate - Decimal("0.1")),
                 "change_percentage": "-2.05",
                 "etf_net_value": "2.46316141",
                 "etf_pre_net_value": "2.43201848",
@@ -82,8 +82,8 @@ class GateIoRateSourceTest(IsolatedAsyncioWrapperTestCase):
                 "low_24h": "0.0001658",
                 "base_volume": "14595.7",
                 "quote_volume": "14595.7",
-                "lowest_ask": str(expected_rate - Decimal("0.1")),
-                "highest_bid": str(expected_rate + Decimal("0.1")),
+                "lowest_ask": str(expected_rate + Decimal("0.1")),
+                "highest_bid": str(expected_rate - Decimal("0.1")),
                 "etf_net_value": "2.46316141",
                 "etf_pre_net_value": "2.43201848",
                 "etf_pre_timestamp": 1611244800,
@@ -103,3 +103,21 @@ class GateIoRateSourceTest(IsolatedAsyncioWrapperTestCase):
         self.assertIn(self.trading_pair, prices)
         self.assertEqual(expected_rate, prices[self.trading_pair])
         self.assertNotIn(self.ignored_trading_pair, prices)
+
+    @aioresponses()
+    async def test_get_bid_ask_prices(self, mock_api):
+        expected_rate = Decimal("10")
+        self.setup_gate_io_responses(mock_api=mock_api, expected_rate=expected_rate)
+
+        rate_source = GateIoRateSource()
+        bid_ask_prices = await rate_source.get_bid_ask_prices()
+
+        self.assertIn(self.trading_pair, bid_ask_prices)
+        price_data = bid_ask_prices[self.trading_pair]
+        # Note: Gate.io response has lowest_ask and highest_bid swapped in meaning
+        self.assertIn("bid", price_data)
+        self.assertIn("ask", price_data)
+        self.assertIn("mid", price_data)
+        self.assertIn("spread", price_data)
+        self.assertIn("spread", price_data)
+        self.assertNotIn(self.ignored_trading_pair, bid_ask_prices)

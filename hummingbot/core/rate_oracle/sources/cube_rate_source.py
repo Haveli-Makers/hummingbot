@@ -32,7 +32,33 @@ class CubeRateSource(RateSourceBase):
         for task_result in task_results:
             if isinstance(task_result, Exception):
                 self.logger().error(
-                    msg="Unexpected error while retrieving rates from Binance. Check the log file for more info.",
+                    msg="Unexpected error while retrieving rates from Cube. Check the log file for more info.",
+                    exc_info=task_result,
+                )
+                break
+            else:
+                results.update(task_result)
+        return results
+
+    @async_ttl_cache(ttl=30, maxsize=1)
+    async def get_bid_ask_prices(self, quote_token: Optional[str] = None) -> Dict[str, Dict[str, Decimal]]:
+        """
+        Fetches best bid and ask prices for all trading pairs.
+
+        :param quote_token: A quote symbol, if specified only pairs with the quote symbol are included
+        :return: A dictionary of trading pairs to {"bid": Decimal, "ask": Decimal, "mid": Decimal, "spread": Decimal}
+        """
+        self._ensure_exchanges()
+        results = {}
+        tasks = [
+            self._get_cube_bid_ask_prices(exchange=self._cube_exchange, quote_token=quote_token),
+            self._get_cube_bid_ask_prices(exchange=self._cube_staging_exchange, quote_token=quote_token),
+        ]
+        task_results = await safe_gather(*tasks, return_exceptions=True)
+        for task_result in task_results:
+            if isinstance(task_result, Exception):
+                self.logger().error(
+                    msg="Unexpected error while retrieving bid/ask prices from Cube. Check the log file for more info.",
                     exc_info=task_result,
                 )
                 break
@@ -48,7 +74,7 @@ class CubeRateSource(RateSourceBase):
     @staticmethod
     async def _get_cube_prices(exchange: 'CubeExchange', quote_token: str = None) -> Dict[str, Decimal]:
         """
-        Fetches binance prices
+        Fetches Cube prices
 
         :param exchange: The exchange instance from which to query prices.
         :param quote_token: A quote symbol, if specified only pairs with the quote symbol are included for prices
@@ -70,6 +96,41 @@ class CubeRateSource(RateSourceBase):
             ask_price = pair_price.get("ask")
             if bid_price is not None and ask_price is not None and 0 < Decimal(bid_price) <= Decimal(ask_price):
                 results[trading_pair] = (Decimal(bid_price) + Decimal(ask_price)) / Decimal("2")
+
+        return results
+
+    @staticmethod
+    async def _get_cube_bid_ask_prices(exchange: 'CubeExchange', quote_token: str = None) -> Dict[str, Dict[str, Decimal]]:
+        """
+        Fetches Cube bid and ask prices.
+
+        :param exchange: The exchange instance from which to query prices.
+        :param quote_token: A quote symbol, if specified only pairs with the quote symbol are included
+        :return: A dictionary of trading pairs to {"bid": Decimal, "ask": Decimal, "mid": Decimal, "spread": Decimal}
+        """
+        pairs_prices = await exchange.get_all_pairs_prices()
+        results = {}
+        for pair_price in pairs_prices:
+            try:
+                trading_pair = await exchange.trading_pair_associated_to_exchange_symbol(
+                    symbol=pair_price["ticker_id"].upper())
+            except KeyError:
+                continue
+            if quote_token is not None:
+                base, quote = split_hb_trading_pair(trading_pair=trading_pair)
+                if quote != quote_token:
+                    continue
+            bid_price = pair_price.get("bid")
+            ask_price = pair_price.get("ask")
+            if bid_price is not None and ask_price is not None and 0 < Decimal(bid_price) <= Decimal(ask_price):
+                bid = Decimal(bid_price)
+                ask = Decimal(ask_price)
+                results[trading_pair] = {
+                    "bid": bid,
+                    "ask": ask,
+                    "mid": (bid + ask) / Decimal("2"),
+                    "spread": ((ask - bid) / ((bid + ask) / Decimal("2"))) * Decimal("100")
+                }
 
         return results
 

@@ -484,7 +484,7 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
             market_data = session.query(MarketData).all()
         self.assertEqual(0, len(market_data))
 
-        # Test with data including mid_price and spread_pct
+        # Test with data including mid_price and spread
         market_data_list = [
             {
                 'exchange': 'binance',
@@ -492,7 +492,7 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
                 'best_bid': 100.0,
                 'best_ask': 101.0,
                 'mid_price': 100.5,
-                'spread_pct': 1.0,
+                'spread': 1.0,
                 'order_book': {'bid': [], 'ask': []}
             }
         ]
@@ -501,16 +501,16 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
             market_data = session.query(MarketData).all()
         self.assertEqual(1, len(market_data))
         self.assertEqual(100.5, market_data[0].mid_price)
-        self.assertEqual(1.0, market_data[0].spread_pct)
+        self.assertEqual(1.0, market_data[0].spread)
 
-        # Test with data missing mid_price and spread_pct
+        # Test with data missing mid_price and spread
         market_data_list2 = [
             {
                 'exchange': 'binance',
                 'trading_pair': 'BTC-USDT',
                 'best_bid': 200.0,
                 'best_ask': 202.0,
-                # mid_price and spread_pct not provided
+                # mid_price and spread not provided
             }
         ]
         recorder.store_market_data(market_data_list2)
@@ -519,8 +519,8 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(2, len(market_data))
         # Check the second one
         self.assertEqual(201.0, market_data[1].mid_price)  # (200+202)/2
-        expected_spread_pct = ((202.0 - 200.0) / 201.0) * 100
-        self.assertAlmostEqual(expected_spread_pct, float(market_data[1].spread_pct), places=5)
+        expected_spread = ((202.0 - 200.0) / 201.0) * 100
+        self.assertAlmostEqual(expected_spread, float(market_data[1].spread), places=5)
 
     def test_update_or_store_position(self):
         recorder = MarketsRecorder(

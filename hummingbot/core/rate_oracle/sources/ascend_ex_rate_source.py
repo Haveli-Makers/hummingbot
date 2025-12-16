@@ -53,11 +53,15 @@ class AscendExRateSource(RateSourceBase):
                 bid = Decimal(str(record["bid"][0]))
                 ask = Decimal(str(record["ask"][0]))
                 if bid > 0 and ask > 0 and bid <= ask:
+                    mid = (bid + ask) / Decimal("2")
+                    spread = ask - bid
+                    spread_pct = (spread / mid) * Decimal("100")
                     results[pair] = {
                         "bid": bid,
                         "ask": ask,
-                        "mid": (bid + ask) / Decimal("2"),
-                        "spread": ((ask - bid) / ((bid + ask) / Decimal("2"))) * Decimal("100")
+                        "mid": mid,
+                        "spread": spread,
+                        "spread_pct": spread_pct,
                     }
         except Exception:
             self.logger().exception(

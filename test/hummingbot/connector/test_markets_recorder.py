@@ -1073,7 +1073,7 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual("BTC-USDT", orders[0].symbol)
         self.assertEqual("NEW_MARKET_OID1", orders[0].id)
 
-    def test_store_market_data(self):
+    def test_store_market_data_batch(self):
         """Test storing multiple market data records in a single batch."""
         recorder = MarketsRecorder(
             sql=self.manager,

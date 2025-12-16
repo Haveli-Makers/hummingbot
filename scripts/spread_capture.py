@@ -22,8 +22,6 @@ SUPPORTED_CONNECTORS = [
     "cube",
     "hyperliquid",
     "dexalot",
-    "coindcx",
-    "wazirx",
 ]
 
 
@@ -74,7 +72,7 @@ def get_rate_source(connector_name: str) -> RateSourceBase:
     """
     connector_name_lower = connector_name.lower()
 
-    if connector_name_lower == ("binance"):
+    if connector_name_lower in ("binance"):
         from hummingbot.core.rate_oracle.sources.binance_rate_source import BinanceRateSource
 
         return BinanceRateSource()
@@ -110,16 +108,6 @@ def get_rate_source(connector_name: str) -> RateSourceBase:
         from hummingbot.core.rate_oracle.sources.dexalot_rate_source import DexalotRateSource
 
         return DexalotRateSource()
-    elif connector_name_lower == "coindcx":
-        from hummingbot.core.rate_oracle.sources.coindcx_rate_source import CoindcxRateSource
-
-        return CoindcxRateSource()
-
-    elif connector_name_lower == "wazirx":
-        from hummingbot.core.rate_oracle.sources.wazirx_rate_source import WazirxRateSource
-
-        return WazirxRateSource()
-
     else:
         raise ValueError(
             f"Unsupported connector: {connector_name}. Supported connectors: " f"{', '.join(SUPPORTED_CONNECTORS)}"
@@ -143,9 +131,7 @@ class SpreadCapture(ScriptStrategyBase):
         """Initialize markets from config. Called by the start command."""
         cls.markets = {}
 
-    def __init__(self, connectors: Dict[str, ConnectorBase], config: Optional[SpreadCaptureConfig] = None):
-        if config is None:
-            config = SpreadCaptureConfig()
+    def __init__(self, connectors: Dict[str, ConnectorBase], config: SpreadCaptureConfig):
         super().__init__(connectors, config)
 
         # Load configuration from the config object
@@ -180,12 +166,6 @@ class SpreadCapture(ScriptStrategyBase):
 
     async def fetch_and_store_spread(self):
 
-        now = int(time.time())
-        if now - self.last_run < self.interval_sec:
-            return
-
-        self.last_run = now
-
         try:
             bid_ask_prices = await self._rate_source.get_bid_ask_prices(quote_token=self.quote_token)
 
@@ -205,10 +185,10 @@ class SpreadCapture(ScriptStrategyBase):
                 bid = float(price_data["bid"])
                 ask = float(price_data["ask"])
                 mid_price = float(price_data["mid"])
-                spread_pct = float(price_data["spread_pct"])
+                spread = float(price_data["spread"])
 
                 self.logger().info(
-                    f"{trading_pair} → BID: {bid}, ASK: {ask}, SPREAD_PCT: {spread_pct:.4f}%"
+                    f"{trading_pair} → BID: {bid}, ASK: {ask}, SPREAD: {spread:.4f}%"
                 )
 
                 market_data_batch.append(
@@ -218,7 +198,7 @@ class SpreadCapture(ScriptStrategyBase):
                         "best_bid": bid,
                         "best_ask": ask,
                         "mid_price": mid_price,
-                        "spread_pct": spread_pct,
+                        "spread": spread,
                     }
                 )
 
@@ -259,4 +239,10 @@ class SpreadCapture(ScriptStrategyBase):
     def on_tick(self):
         if not self._initialized:
             return
+
+        now = int(time.time())
+        if now - self.last_run < self.interval_sec:
+            return
+
+        self.last_run = now
         safe_ensure_future(self.fetch_and_store_spread())

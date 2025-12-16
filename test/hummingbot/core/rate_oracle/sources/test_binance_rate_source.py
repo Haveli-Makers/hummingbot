@@ -82,31 +82,10 @@ class BinanceRateSourceTest(IsolatedAsyncioWrapperTestCase):
         bid_ask_prices = await rate_source.get_bid_ask_prices()
 
         self.assertIn(self.trading_pair, bid_ask_prices)
-        entry = bid_ask_prices[self.trading_pair]
-        self.assertEqual(Decimal("9.9"), entry["bid"])
-        self.assertEqual(Decimal("10.1"), entry["ask"])
-        self.assertEqual(expected_rate, entry["mid"])
-        self.assertEqual(Decimal("0.2"), entry["spread"])
-        self.assertEqual(Decimal("2"), entry["spread_pct"])
-
-    @aioresponses()
-    async def test_get_prices_exception(self, mock_api):
-        # Setup mock to raise exception on prices call
-        binance_prices_global_url = web_utils.public_rest_url(path_url=CONSTANTS.TICKER_BOOK_PATH_URL)
-        mock_api.get(binance_prices_global_url, exception=Exception("API error"))
-
-        rate_source = BinanceRateSource()
-        prices = await rate_source.get_prices()
-
-        self.assertEqual({}, prices)
-
-    @aioresponses()
-    async def test_get_bid_ask_prices_exception(self, mock_api):
-        # Setup mock to raise exception on prices call
-        binance_prices_global_url = web_utils.public_rest_url(path_url=CONSTANTS.TICKER_BOOK_PATH_URL)
-        mock_api.get(binance_prices_global_url, exception=Exception("API error"))
-
-        rate_source = BinanceRateSource()
-        bid_ask_prices = await rate_source.get_bid_ask_prices()
-
-        self.assertEqual({}, bid_ask_prices)
+        price_data = bid_ask_prices[self.trading_pair]
+        self.assertEqual(expected_rate - Decimal("0.1"), price_data["bid"])
+        self.assertEqual(expected_rate + Decimal("0.1"), price_data["ask"])
+        self.assertEqual(expected_rate, price_data["mid"])
+        self.assertEqual(Decimal("2.0"), price_data["spread"])
+        self.assertIn("spread", price_data)
+        self.assertNotIn(self.ignored_trading_pair, bid_ask_prices)

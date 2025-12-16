@@ -123,8 +123,7 @@ class BinanceRateSource(RateSourceBase):
                     "bid": bid,
                     "ask": ask,
                     "mid": (bid + ask) / Decimal("2"),
-                    "spread": ask - bid,
-                    "spread_pct": ((ask - bid) / ((bid + ask) / Decimal("2"))) * Decimal("100")
+                    "spread": ((ask - bid) / ((bid + ask) / Decimal("2"))) * Decimal("100")
                 }
 
         return results

@@ -46,7 +46,7 @@ class CubeRateSource(RateSourceBase):
         Fetches best bid and ask prices for all trading pairs.
 
         :param quote_token: A quote symbol, if specified only pairs with the quote symbol are included
-        :return: A dictionary of trading pairs to {"bid": Decimal, "ask": Decimal, "mid": Decimal, "spread": Decimal, "spread_pct": Decimal}
+        :return: A dictionary of trading pairs to {"bid": Decimal, "ask": Decimal, "mid": Decimal, "spread": Decimal}
         """
         self._ensure_exchanges()
         results = {}
@@ -106,7 +106,7 @@ class CubeRateSource(RateSourceBase):
 
         :param exchange: The exchange instance from which to query prices.
         :param quote_token: A quote symbol, if specified only pairs with the quote symbol are included
-        :return: A dictionary of trading pairs to {"bid": Decimal, "ask": Decimal, "mid": Decimal, "spread": Decimal, "spread_pct": Decimal}
+        :return: A dictionary of trading pairs to {"bid": Decimal, "ask": Decimal, "mid": Decimal, "spread": Decimal}
         """
         pairs_prices = await exchange.get_all_pairs_prices()
         results = {}
@@ -129,8 +129,7 @@ class CubeRateSource(RateSourceBase):
                     "bid": bid,
                     "ask": ask,
                     "mid": (bid + ask) / Decimal("2"),
-                    "spread": ask - bid,
-                    "spread_pct": ((ask - bid) / ((bid + ask) / Decimal("2"))) * Decimal("100")
+                    "spread": ((ask - bid) / ((bid + ask) / Decimal("2"))) * Decimal("100")
                 }
 
         return results

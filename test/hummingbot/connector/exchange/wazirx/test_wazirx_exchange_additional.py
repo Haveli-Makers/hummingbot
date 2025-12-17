@@ -1,10 +1,9 @@
-import pytest
-import asyncio
-from decimal import Decimal
+
 from types import SimpleNamespace
 
+import pytest
+
 from hummingbot.connector.exchange.wazirx.wazirx_exchange import WazirxExchange
-from hummingbot.core.data_type.in_flight_order import InFlightOrder
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.trade_fee import TradeFeeBase
 
@@ -56,7 +55,7 @@ async def test_format_trading_rules_with_list_input():
 
 @pytest.mark.asyncio
 async def test_format_trading_rules_with_dict_input():
-    exchange = WazirxExchange("k", "s", trading_pairs=["ETH-USDT"]) 
+    exchange = WazirxExchange("k", "s", trading_pairs=["ETH-USDT"])
     payload = {"symbols": [
         {"symbol": "ETHUSDT", "baseAsset": "ETH", "quoteAsset": "USDT", "filters": []}
     ]}
@@ -68,7 +67,7 @@ async def test_format_trading_rules_with_dict_input():
 
 @pytest.mark.asyncio
 async def test_get_last_traded_prices_list_response():
-    exchange = WazirxExchange("k", "s", trading_pairs=["BTC-USDT"]) 
+    exchange = WazirxExchange("k", "s", trading_pairs=["BTC-USDT"])
     # simulate list response
     resp = [{"lastPrice": "123.45"}]
     exchange._web_assistants_factory = DummyFactory(resp=resp)
@@ -79,7 +78,7 @@ async def test_get_last_traded_prices_list_response():
 
 @pytest.mark.asyncio
 async def test_get_last_traded_prices_dict_response():
-    exchange = WazirxExchange("k", "s", trading_pairs=["BTC-USDT"]) 
+    exchange = WazirxExchange("k", "s", trading_pairs=["BTC-USDT"])
     # simulate dict response
     resp = {"lastPrice": "200.0"}
     exchange._web_assistants_factory = DummyFactory(resp=resp)
@@ -90,7 +89,7 @@ async def test_get_last_traded_prices_dict_response():
 
 @pytest.mark.asyncio
 async def test_get_last_traded_prices_handles_exceptions():
-    exchange = WazirxExchange("k", "s", trading_pairs=["BTC-USDT"]) 
+    exchange = WazirxExchange("k", "s", trading_pairs=["BTC-USDT"])
     exchange._web_assistants_factory = DummyFactory(resp=None, raise_exc=True)
 
     prices = await exchange.get_last_traded_prices(["BTC-USDT"])
@@ -99,7 +98,7 @@ async def test_get_last_traded_prices_handles_exceptions():
 
 @pytest.mark.asyncio
 async def test_all_trade_updates_for_order_and_request_order_status():
-    exchange = WazirxExchange("k", "s", trading_pairs=["BTC-USDT"]) 
+    exchange = WazirxExchange("k", "s", trading_pairs=["BTC-USDT"])
     # trades response
     trades_resp = [
         {
@@ -127,4 +126,3 @@ async def test_all_trade_updates_for_order_and_request_order_status():
 
     # (request_order_status behavior depends on connector ORDER_STATE mapping and OrderState members;
     #  the trade-updates part above is the primary target of this test)
-

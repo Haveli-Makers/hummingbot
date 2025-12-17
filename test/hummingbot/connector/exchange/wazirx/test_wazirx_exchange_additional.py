@@ -1,11 +1,12 @@
 
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
 
 from hummingbot.connector.exchange.wazirx.wazirx_exchange import WazirxExchange
 from hummingbot.core.data_type.common import TradeType
-from hummingbot.core.data_type.trade_fee import TradeFeeBase
+from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TradeFeeBase
 
 
 class DummyRA:
@@ -117,7 +118,11 @@ async def test_all_trade_updates_for_order_and_request_order_status():
     order = SimpleNamespace(client_order_id="c1", exchange_order_id="42", trading_pair="BTC-USDT", trade_type=TradeType.BUY)
     # avoid schema lookup errors during fee construction by patching fee factory
     exchange._trade_fee_schema = {}
-    TradeFeeBase.new_spot_fee = staticmethod(lambda *a, **k: SimpleNamespace())
+    # return a real TradeFee instance so other tests are not broken by a SimpleNamespace
+    TradeFeeBase.new_spot_fee = staticmethod(
+        lambda fee_schema, trade_type, percent=Decimal(0), percent_token=None, flat_fees=None:
+        AddedToCostTradeFee(percent=percent, percent_token=percent_token, flat_fees=flat_fees or [])
+    )
     updates = await exchange._all_trade_updates_for_order(order)
     assert len(updates) == 1
     tu = updates[0]

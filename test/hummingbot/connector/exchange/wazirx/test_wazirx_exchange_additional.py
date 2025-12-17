@@ -50,7 +50,6 @@ async def test_format_trading_rules_with_list_input():
     }
 
     rules = await exchange._format_trading_rules([rule])
-    # TradingRule constructor signature may differ in the test environment; ensure function returns a list
     assert isinstance(rules, list)
 
 
@@ -62,7 +61,6 @@ async def test_format_trading_rules_with_dict_input():
     ]}
 
     rules = await exchange._format_trading_rules(payload)
-    # TradingRule constructor may raise in some environments; ensure function returns a list
     assert isinstance(rules, list)
 
 
@@ -116,18 +114,17 @@ async def test_all_trade_updates_for_order_and_request_order_status():
     exchange._web_assistants_factory = DummyFactory(resp=trades_resp)
 
     order = SimpleNamespace(client_order_id="c1", exchange_order_id="42", trading_pair="BTC-USDT", trade_type=TradeType.BUY)
-    # avoid schema lookup errors during fee construction by patching fee factory
     exchange._trade_fee_schema = {}
-    # return a real TradeFee instance so other tests are not broken by a SimpleNamespace
+    orig_new_spot_fee = TradeFeeBase.new_spot_fee
     TradeFeeBase.new_spot_fee = staticmethod(
         lambda fee_schema, trade_type, percent=Decimal(0), percent_token=None, flat_fees=None:
         AddedToCostTradeFee(percent=percent, percent_token=percent_token, flat_fees=flat_fees or [])
     )
-    updates = await exchange._all_trade_updates_for_order(order)
+    try:
+        updates = await exchange._all_trade_updates_for_order(order)
+    finally:
+        TradeFeeBase.new_spot_fee = orig_new_spot_fee
     assert len(updates) == 1
     tu = updates[0]
     assert tu.trade_id == "1"
     assert float(tu.fill_price) == 123.0
-
-    # (request_order_status behavior depends on connector ORDER_STATE mapping and OrderState members;
-    #  the trade-updates part above is the primary target of this test)

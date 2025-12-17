@@ -16,6 +16,37 @@ from hummingbot.core.data_type.in_flight_order import InFlightOrder
 from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TokenAmount, TradeFeeBase
 
 
+# Simple dummy Rest Assistant and Factory used by tests when monkeypatching
+class DummyRA:
+    def __init__(self, response=None, resp=None, exc=None, raise_exc=False):
+        self._response = response if response is not None else resp
+        self._exc = exc
+        self._raise = raise_exc
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def execute_request(self, *args, **kwargs):
+        if self._exc is not None:
+            raise self._exc
+        if self._raise:
+            raise Exception("dummy error")
+        return self._response
+
+
+class DummyFactory:
+    def __init__(self, response=None, resp=None, exc=None, raise_exc=False):
+        self._response = response if response is not None else resp
+        self._exc = exc
+        self._raise = raise_exc
+
+    def build_rest_assistant(self):
+        return DummyRA(response=self._response, resp=self._response, exc=self._exc, raise_exc=self._raise)
+
+
 class WazirxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
 
     @property
@@ -569,6 +600,18 @@ class WazirxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests)
         self.assertTrue(self.exchange._is_order_not_found_during_status_update_error(Exception("Order does not exist")))
         self.assertFalse(self.exchange._is_order_not_found_during_status_update_error(Exception("Other error")))
 
+        # Additional properties to increase coverage
+        self.assertEqual(self.exchange.domain, CONSTANTS.DEFAULT_DOMAIN)
+        self.assertEqual(self.exchange.client_order_id_max_length, CONSTANTS.MAX_ORDER_ID_LEN)
+        self.assertEqual(self.exchange.client_order_id_prefix, CONSTANTS.HBOT_ORDER_ID_PREFIX)
+        self.assertEqual(self.exchange.trading_rules_request_path, CONSTANTS.TICKERS_PATH_URL)
+        self.assertEqual(self.exchange.trading_pairs_request_path, CONSTANTS.TICKERS_PATH_URL)
+        self.assertEqual(self.exchange.check_network_request_path, CONSTANTS.TICKERS_PATH_URL)
+        self.assertEqual(self.exchange.trading_pairs, [self.trading_pair])
+        self.assertTrue(self.exchange.is_trading_required)
+        self.assertTrue(self.exchange._is_order_not_found_during_cancelation_error(Exception("Order does not exist")))
+        self.assertFalse(self.exchange._is_order_not_found_during_cancelation_error(Exception("Other error")))
+
     @pytest.mark.asyncio
     async def test_get_last_traded_prices_list_and_dict_and_exception(self):
         class DummyRA:
@@ -671,3 +714,176 @@ class WazirxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests)
         self.exchange._web_assistants_factory.build_rest_assistant = lambda: DummyRA(response=cancel_resp)
         cancelled = await self.exchange._place_cancel("555", tracked_order)
         assert cancelled is True
+
+    def test_format_trading_rules_with_dict_input(self):
+        raw_trading_rules = {
+            "symbols": [
+                {
+                    "symbol": "btcusdt",
+                    "baseAsset": "BTC",
+                    "quoteAsset": "USDT",
+                    "status": "TRADING",
+                    "baseAssetPrecision": 8,
+                    "quoteAssetPrecision": 8,
+                    "filters": [
+                        {
+                            "filterType": "LOT_SIZE",
+                            "minQty": "0.000001",
+                            "maxQty": "100000.0",
+                            "stepSize": "0.000001"
+                        },
+                        {
+                            "filterType": "PRICE_FILTER",
+                            "minPrice": "0.00000001",
+                            "maxPrice": "100000.0",
+                            "tickSize": "0.00000001"
+                        },
+                        {
+                            "filterType": "MIN_NOTIONAL",
+                            "minNotional": "0.0001"
+                        }
+                    ]
+                }
+            ]
+        }
+        trading_rules = self.exchange._format_trading_rules(raw_trading_rules)
+        self.assertEqual(1, len(trading_rules))
+        rule = trading_rules[0]
+        self.assertEqual("BTC-USDT", rule.trading_pair)
+        self.assertEqual(Decimal("0.000001"), rule.min_order_size)
+        self.assertEqual(Decimal("100000.0"), rule.max_order_size)
+        self.assertEqual(Decimal("0.00000001"), rule.min_price_increment)
+        self.assertEqual(Decimal("0.000001"), rule.min_base_amount_increment)
+        self.assertEqual(Decimal("0.0001"), rule.min_notional_size)
+
+    def test_format_trading_rules_with_missing_symbol(self):
+        raw_trading_rules = [
+            {
+                "symbol": "",
+                "baseAsset": "BTC",
+                "quoteAsset": "USDT",
+                "status": "TRADING",
+                "baseAssetPrecision": 8,
+                "quoteAssetPrecision": 8,
+                "filters": []
+            }
+        ]
+        trading_rules = self.exchange._format_trading_rules(raw_trading_rules)
+        self.assertEqual(0, len(trading_rules))
+
+    def test_format_trading_rules_with_missing_base_asset(self):
+        raw_trading_rules = [
+            {
+                "symbol": "btcusdt",
+                "baseAsset": "",
+                "quoteAsset": "USDT",
+                "status": "TRADING",
+                "baseAssetPrecision": 8,
+                "quoteAssetPrecision": 8,
+                "filters": []
+            }
+        ]
+        trading_rules = self.exchange._format_trading_rules(raw_trading_rules)
+        self.assertEqual(0, len(trading_rules))
+
+    @pytest.mark.asyncio
+    async def test_all_trade_updates_for_order_no_exchange_id(self):
+        order = InFlightOrder("c1", self.trading_pair, OrderType.LIMIT, self.buy_trade_type, Decimal("100"), 0, price=Decimal("0.000005"), exchange_order_id=None)
+        updates = await self.exchange._all_trade_updates_for_order(order)
+        assert updates == []
+
+    @pytest.mark.asyncio
+    async def test_all_trade_updates_for_order_exception(self):
+        order = InFlightOrder("c1", self.trading_pair, OrderType.LIMIT, self.buy_trade_type, Decimal("100"), 0, price=Decimal("0.000005"), exchange_order_id="123")
+        self.exchange._web_assistants_factory.build_rest_assistant = lambda: DummyRA(exc=Exception("boom"))
+        updates = await self.exchange._all_trade_updates_for_order(order)
+        assert updates == []
+
+    @pytest.mark.asyncio
+    async def test_update_balances_exception(self):
+        self.exchange._web_assistants_factory.build_rest_assistant = lambda: DummyRA(exc=Exception("boom"))
+        await self.exchange._update_balances()
+        # Logger error is called, balances not updated
+
+    @pytest.mark.asyncio
+    async def test_place_order_exception(self):
+        self.exchange._web_assistants_factory.build_rest_assistant = lambda: DummyRA(exc=Exception("boom"))
+        with pytest.raises(Exception):
+            await self.exchange._place_order("c2", self.trading_pair, Decimal("100"), self.buy_trade_type, OrderType.LIMIT, Decimal("0.000005"))
+
+    @pytest.mark.asyncio
+    async def test_place_cancel_exception(self):
+        tracked_order = InFlightOrder("c3", self.trading_pair, OrderType.LIMIT, self.buy_trade_type, Decimal("100"), 0, price=Decimal("0.000005"), exchange_order_id="555")
+        self.exchange._web_assistants_factory.build_rest_assistant = lambda: DummyRA(exc=Exception("boom"))
+        result = await self.exchange._place_cancel("555", tracked_order)
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_user_stream_event_listener_exception(self):
+        async def mock_iter_queue():
+            yield {"event": "orderUpdate", "order": None}  # Causes AttributeError
+            raise asyncio.CancelledError
+
+        from hummingbot.connector.exchange_py_base import ExchangePyBase
+        original_iter = ExchangePyBase._iter_user_event_queue
+        try:
+            ExchangePyBase._iter_user_event_queue = mock_iter_queue
+            with pytest.raises(asyncio.CancelledError):
+                await self.exchange._user_stream_event_listener()
+        finally:
+            ExchangePyBase._iter_user_event_queue = original_iter
+
+    @pytest.mark.asyncio
+    async def test_get_last_traded_prices_invalid_resp(self):
+        self.exchange._web_assistants_factory.build_rest_assistant = lambda: DummyRA(response="invalid")
+        prices = await self.exchange.get_last_traded_prices([self.trading_pair])
+        assert self.trading_pair not in prices
+
+    def test_authenticator_and_factory_and_data_sources(self):
+        # Authenticator
+        from hummingbot.connector.exchange.wazirx.wazirx_api_order_book_data_source import WazirxAPIOrderBookDataSource
+        from hummingbot.connector.exchange.wazirx.wazirx_api_user_stream_data_source import (
+            WazirxAPIUserStreamDataSource,
+        )
+        from hummingbot.connector.exchange.wazirx.wazirx_auth import WazirxAuth
+        from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
+
+        auth = self.exchange.authenticator
+        self.assertIsInstance(auth, WazirxAuth)
+
+        factory = self.exchange._create_web_assistants_factory()
+        self.assertIsInstance(factory, WebAssistantsFactory)
+
+        ob_ds = self.exchange._create_order_book_data_source()
+        self.assertIsInstance(ob_ds, WazirxAPIOrderBookDataSource)
+
+        us_ds = self.exchange._create_user_stream_data_source()
+        self.assertIsInstance(us_ds, WazirxAPIUserStreamDataSource)
+
+    def test_initialize_trading_pair_symbols_from_exchange_info(self):
+        exchange_info = {
+            "symbols": [
+                {"symbol": self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset),
+                 "baseAsset": self.base_asset,
+                 "quoteAsset": self.quote_asset}
+            ]
+        }
+        # initialize
+        self.exchange._initialize_trading_pair_symbols_from_exchange_info(exchange_info)
+        # trading_pair_symbol_map should be available via async call
+        mapping = self.async_run_with_timeout(self.exchange.trading_pair_symbol_map())
+        ex_symbol = self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset).lower()
+        self.assertIn(ex_symbol, mapping)
+        self.assertEqual(mapping[ex_symbol], self.trading_pair)
+
+    def test_get_order_book_raises_when_missing_and_tick_sets_notifier(self):
+        # get_order_book should raise when no order book exists
+        with self.assertRaises(ValueError):
+            self.exchange.get_order_book("NOT-EXIST")
+
+        # tick should set the poll notifier when timestamp advances past poll interval
+        self.exchange._last_timestamp = 0
+        # choose timestamp > TICK_INTERVAL_LIMIT so poll_interval becomes SHORT_POLL_INTERVAL
+        timestamp = self.exchange.TICK_INTERVAL_LIMIT + 1
+        self.exchange.tick(timestamp)
+        self.assertTrue(self.exchange._poll_notifier.is_set())

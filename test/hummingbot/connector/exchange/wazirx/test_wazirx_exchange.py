@@ -1,7 +1,9 @@
 
+import asyncio
 import json
 from decimal import Decimal
 
+import pytest
 from aioresponses import aioresponses
 from aioresponses.core import RequestCall
 
@@ -557,3 +559,115 @@ class WazirxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests)
     def test_quantize_order_price(self):
         quantized = self.exchange.quantize_order_price("BTC-USDT", Decimal("0.000005123456"))
         self.assertIsNotNone(quantized)
+
+    def test_properties_and_helpers(self):
+        self.assertEqual(self.exchange.name, "wazirx")
+        self.assertTrue(self.exchange.is_cancel_request_in_exchange_synchronous)
+        self.assertEqual(self.exchange.supported_order_types(), [OrderType.LIMIT, OrderType.MARKET])
+
+        self.assertFalse(self.exchange._is_request_exception_related_to_time_synchronizer(Exception()))
+        self.assertTrue(self.exchange._is_order_not_found_during_status_update_error(Exception("Order does not exist")))
+        self.assertFalse(self.exchange._is_order_not_found_during_status_update_error(Exception("Other error")))
+
+    @pytest.mark.asyncio
+    async def test_get_last_traded_prices_list_and_dict_and_exception(self):
+        class DummyRA:
+            def __init__(self, response=None, exc=None):
+                self._response = response
+                self._exc = exc
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def execute_request(self, *args, **kwargs):
+                if self._exc:
+                    raise self._exc
+                return self._response
+
+        list_resp = [{"symbol": self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset), "lastPrice": "0.00000500"}]
+        self.exchange._web_assistants_factory.build_rest_assistant = lambda: DummyRA(response=list_resp)
+        prices = await self.exchange.get_last_traded_prices([self.trading_pair])
+        assert prices[self.trading_pair] == 5e-06
+
+        dict_resp = {"symbol": self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset), "lastPrice": "0.00001000"}
+        self.exchange._web_assistants_factory.build_rest_assistant = lambda: DummyRA(response=dict_resp)
+        prices = await self.exchange.get_last_traded_prices([self.trading_pair])
+        assert prices[self.trading_pair] == 1e-05
+
+        self.exchange._web_assistants_factory.build_rest_assistant = lambda: DummyRA(exc=Exception("boom"))
+        prices = await self.exchange.get_last_traded_prices([self.trading_pair])
+        assert prices[self.trading_pair] == 0.0
+
+    @pytest.mark.asyncio
+    async def test_user_stream_event_listener_processes_order_and_balance_and_unknown(self):
+        from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
+
+        order = InFlightOrder("test_client_order", self.trading_pair, OrderType.LIMIT, self.buy_trade_type, Decimal("100"), 0, price=Decimal("0.000005"))
+        self.exchange._order_tracker.all_updatable_orders["test_client_order"] = order
+
+        async def mock_iter_queue():
+            yield {"event": "orderUpdate", "order": {"clientOrderId": "test_client_order", "status": "FILLED", "orderId": 123}, "timestamp": 1000}
+            yield {"event": "balanceUpdate", "balance": {"asset": self.base_asset, "free": "1.00000000", "locked": "0.00000000"}}
+            yield {"event": "unknownEvent", "data": "x"}
+            raise asyncio.CancelledError
+
+        from hummingbot.connector.exchange_py_base import ExchangePyBase
+
+        original_iter = ExchangePyBase._iter_user_event_queue
+        try:
+            ExchangePyBase._iter_user_event_queue = mock_iter_queue
+            with pytest.raises(asyncio.CancelledError):
+                await self.exchange._user_stream_event_listener()
+
+            assert self.exchange._account_available_balances.get(self.base_asset) == Decimal("1.00000000")
+            assert self.exchange._account_balances.get(self.base_asset) == Decimal("1.00000000")
+            assert order.current_state == OrderState.FILLED
+        finally:
+            ExchangePyBase._iter_user_event_queue = original_iter
+
+    @pytest.mark.asyncio
+    async def test_all_trade_updates_and_request_order_status_and_place_and_cancel(self):
+
+        class DummyRA:
+            def __init__(self, response=None):
+                self._response = response
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def execute_request(self, *args, **kwargs):
+                return self._response
+
+        # Test _all_trade_updates_for_order
+        order = InFlightOrder("c1", self.trading_pair, OrderType.LIMIT, self.buy_trade_type, Decimal("100"), 0, price=Decimal("0.000005"), exchange_order_id="123")
+        trade_resp = [{"id": "987654321", "commission": "0.00005", "commissionAsset": self.quote_asset, "qty": "50", "quoteQty": "0.00025", "price": "0.000005", "orderId": "123", "time": 1639598493658}]
+        self.exchange._web_assistants_factory.build_rest_assistant = lambda: DummyRA(response=trade_resp)
+        updates = await self.exchange._all_trade_updates_for_order(order)
+        assert len(updates) == 1
+        assert updates[0].trade_id == "987654321"
+
+        # Test _request_order_status
+        status_resp = {"symbol": self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset), "orderId": "123", "status": "FILLED", "updateTime": 1639598493658}
+        self.exchange._web_assistants_factory.build_rest_assistant = lambda: DummyRA(response=status_resp)
+        ou = await self.exchange._request_order_status(order)
+        assert ou.new_state.name == "FILLED"
+
+        # Test _place_order
+        place_resp = {"orderId": "4444", "executedQty": "10"}
+        self.exchange._web_assistants_factory.build_rest_assistant = lambda: DummyRA(response=place_resp)
+        order_id, executed_amount = await self.exchange._place_order("c2", self.trading_pair, Decimal("100"), self.buy_trade_type, OrderType.LIMIT, Decimal("0.000005"))
+        assert order_id == "4444"
+        assert executed_amount == 10.0
+
+        # Test _place_cancel
+        cancel_resp = {"status": "CANCELED"}
+        tracked_order = InFlightOrder("c3", self.trading_pair, OrderType.LIMIT, self.buy_trade_type, Decimal("100"), 0, price=Decimal("0.000005"), exchange_order_id="555")
+        self.exchange._web_assistants_factory.build_rest_assistant = lambda: DummyRA(response=cancel_resp)
+        cancelled = await self.exchange._place_cancel("555", tracked_order)
+        assert cancelled is True

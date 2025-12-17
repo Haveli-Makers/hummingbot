@@ -185,69 +185,101 @@ class WazirxExchange(ExchangePyBase):
         """
         Format trading rules from exchange info
         """
-        trading_pair_rules = exchange_info_dict.get("symbols", [])
-        retval = []
+        if isinstance(exchange_info_dict, list):
+            trading_pair_rules = exchange_info_dict
+        else:
+            trading_pair_rules = exchange_info_dict.get("symbols", [])
+
+        retval: List[TradingRule] = []
+
         for rule in trading_pair_rules:
             try:
-                trading_pair = rule.get("symbol", "").upper()
-                if not trading_pair:
+                symbol = rule.get("symbol", "")
+                if not symbol:
                     continue
 
-                # Convert to hummingbot format
                 base_asset = rule.get("baseAsset", "")
                 quote_asset = rule.get("quoteAsset", "")
-                if base_asset and quote_asset:
-                    hb_trading_pair = f"{base_asset}-{quote_asset}"
-                else:
+                if not base_asset or not quote_asset:
                     continue
+
+                hb_trading_pair = f"{base_asset}-{quote_asset}"
 
                 filters = rule.get("filters", [])
                 price_filter = next((f for f in filters if f.get("filterType") == "PRICE_FILTER"), {})
                 lot_size_filter = next((f for f in filters if f.get("filterType") == "LOT_SIZE"), {})
-                min_notional_filter = next((f for f in filters if f.get("filterType") in ["MIN_NOTIONAL", "NOTIONAL"]), {})
+                min_notional_filter = next(
+                    (f for f in filters if f.get("filterType") in ["MIN_NOTIONAL", "NOTIONAL"]),
+                    {},
+                )
 
-                min_order_size = Decimal(lot_size_filter.get("minQty", "0"))
-                tick_size = Decimal(price_filter.get("tickSize", "0"))
-                step_size = Decimal(lot_size_filter.get("stepSize", "0"))
-                min_notional = Decimal(min_notional_filter.get("minNotional", "0"))
+                try:
+                    min_order_size = Decimal(lot_size_filter.get("minQty", "1e-8"))
+                except Exception:
+                    min_order_size = Decimal("1e-8")
 
-                retval.append(
-                    TradingRule(hb_trading_pair,
-                                min_order_size=min_order_size,
-                                min_price_increment=tick_size,
-                                min_base_amount_increment=step_size,
-                                min_notional_size=min_notional))
+                try:
+                    max_order_size = Decimal(lot_size_filter.get("maxQty", "1e8"))
+                except Exception:
+                    max_order_size = Decimal("1e8")
 
+                try:
+                    tick_size = Decimal(price_filter.get("tickSize", "1e-8"))
+                except Exception:
+                    tick_size = Decimal("1e-8")
+
+                try:
+                    step_size = Decimal(lot_size_filter.get("stepSize", "1e-8"))
+                except Exception:
+                    step_size = Decimal("1e-8")
+
+                try:
+                    min_notional = Decimal(min_notional_filter.get("minNotional", "0"))
+                except Exception:
+                    min_notional = Decimal("0")
+
+                trading_rule = TradingRule(
+                    trading_pair=hb_trading_pair,
+                    min_order_size=min_order_size,
+                    max_order_size=max_order_size,
+                    min_price_increment=tick_size,
+                    min_base_amount_increment=step_size,
+                    min_quote_amount_increment=step_size,
+                    min_notional_size=min_notional,
+                    max_notional_size=Decimal("1e8"),
+                )
+                retval.append(trading_rule)
             except Exception:
                 self.logger().exception(f"Error parsing the trading pair rule {rule}. Skipping.")
+
         return retval
 
     async def _update_trading_fees(self):
         """
         Update fees information from the exchange
         """
-        pass
+        return
 
     async def _user_stream_event_listener(self):
         """
-        This functions runs in background continuously processing the events received from the exchange by the user
-        stream data source. It keeps reading events from the queue until the task is interrupted.
-        The events received are balance updates, order updates and trade events.
+        Process events received from the user stream data source.
         """
         async for event_message in self._iter_user_event_queue():
             try:
                 event_type = event_message.get("event")
-
                 if event_type == "orderUpdate":
                     order_data = event_message.get("order", {})
                     client_order_id = order_data.get("clientOrderId")
-
                     tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
                     if tracked_order is not None:
+                        new_state = CONSTANTS.ORDER_STATE.get(
+                            order_data.get("status"),
+                            OrderState.UNKNOWN,
+                        )
                         order_update = OrderUpdate(
                             trading_pair=tracked_order.trading_pair,
                             update_timestamp=event_message.get("timestamp", 0) / 1000,
-                            new_state=CONSTANTS.ORDER_STATE.get(order_data.get("status"), OrderState.UNKNOWN),
+                            new_state=new_state,
                             client_order_id=client_order_id,
                             exchange_order_id=str(order_data.get("orderId", "")),
                         )
@@ -256,10 +288,15 @@ class WazirxExchange(ExchangePyBase):
                 elif event_type == "balanceUpdate":
                     balance_data = event_message.get("balance", {})
                     asset_name = balance_data.get("asset")
-                    free_balance = Decimal(balance_data.get("free", "0"))
-                    total_balance = Decimal(balance_data.get("total", "0"))
-                    self._account_available_balances[asset_name] = free_balance
-                    self._account_balances[asset_name] = total_balance
+                    if asset_name is not None:
+                        free_balance = Decimal(balance_data.get("free", "0"))
+                        locked_balance = Decimal(balance_data.get("locked", "0"))
+                        total_balance = free_balance + locked_balance
+                        self._account_available_balances[asset_name] = free_balance
+                        self._account_balances[asset_name] = total_balance
+
+                else:
+                    continue
 
             except asyncio.CancelledError:
                 raise
@@ -268,28 +305,32 @@ class WazirxExchange(ExchangePyBase):
                 await self._sleep(5.0)
 
     async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
-        trade_updates = []
+        trade_updates: List[TradeUpdate] = []
 
         if order.exchange_order_id is not None:
             symbol = order.trading_pair.replace("-", "").lower()
             url = f"{CONSTANTS.REST_URL}/api/v3/myTrades"
             params = {
                 "symbol": symbol,
-                "orderId": order.exchange_order_id
+                "orderId": order.exchange_order_id,
             }
 
             async with self._web_assistants_factory.build_rest_assistant() as ra:
                 try:
                     resp = await ra.execute_request(url=url, method="GET", params=params)
-
                     for trade in resp:
                         fee = TradeFeeBase.new_spot_fee(
                             fee_schema=self.trade_fee_schema(),
                             trade_type=order.trade_type,
                             percent_token=trade.get("commissionAsset", ""),
-                            flat_fees=[TokenAmount(amount=Decimal(trade.get("commission", "0")),
-                                                   token=trade.get("commissionAsset", ""))]
+                            flat_fees=[
+                                TokenAmount(
+                                    amount=Decimal(trade.get("commission", "0")),
+                                    token=trade.get("commissionAsset", ""),
+                                )
+                            ],
                         )
+
                         trade_update = TradeUpdate(
                             trade_id=str(trade.get("id", "")),
                             client_order_id=order.client_order_id,
@@ -312,23 +353,21 @@ class WazirxExchange(ExchangePyBase):
         url = f"{CONSTANTS.REST_URL}{CONSTANTS.ORDER_STATUS_PATH_URL}"
         params = {
             "symbol": symbol,
-            "orderId": tracked_order.exchange_order_id
+            "orderId": tracked_order.exchange_order_id,
         }
 
         async with self._web_assistants_factory.build_rest_assistant() as ra:
             resp = await ra.execute_request(url=url, method="GET", params=params)
 
-            new_state = CONSTANTS.ORDER_STATE.get(resp.get("status"), OrderState.UNKNOWN)
-
-            order_update = OrderUpdate(
-                client_order_id=tracked_order.client_order_id,
-                exchange_order_id=str(resp.get("orderId", "")),
-                trading_pair=tracked_order.trading_pair,
-                update_timestamp=resp.get("updateTime", 0) / 1000,
-                new_state=new_state,
-            )
-
-            return order_update
+        new_state = CONSTANTS.ORDER_STATE.get(resp.get("status"), OrderState.UNKNOWN)
+        order_update = OrderUpdate(
+            client_order_id=tracked_order.client_order_id,
+            exchange_order_id=str(resp.get("orderId", "")),
+            trading_pair=tracked_order.trading_pair,
+            update_timestamp=resp.get("updateTime", 0) / 1000,
+            new_state=new_state,
+        )
+        return order_update
 
     async def _update_balances(self):
         url = f"{CONSTANTS.REST_URL}{CONSTANTS.USER_BALANCES_PATH_URL}"

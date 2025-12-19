@@ -129,9 +129,15 @@ class CoindcxExchange(ExchangePyBase):
         """
         Returns the prices for all trading pairs.
         """
-        # Get market details which includes last prices
-        pairs_prices = await self._api_get(path_url=CONSTANTS.MARKETS_DETAILS_PATH_URL)
+        pairs_prices = await self._api_get(path_url=CONSTANTS.TICKER_PATH_URL)
         return pairs_prices
+
+    async def get_markets_details(self) -> List[Dict[str, Any]]:
+        """
+        Returns markets details (metadata) for all trading pairs.
+        """
+        markets = await self._api_get(path_url=CONSTANTS.MARKETS_DETAILS_PATH_URL)
+        return markets
 
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
         """
@@ -269,7 +275,6 @@ class CoindcxExchange(ExchangePyBase):
         """
         api_params = {}
 
-        # Use exchange order ID if available, otherwise use client order ID
         if tracked_order.exchange_order_id:
             api_params["id"] = tracked_order.exchange_order_id
         else:
@@ -280,7 +285,6 @@ class CoindcxExchange(ExchangePyBase):
             data=api_params,
             is_auth_required=True)
 
-        # Check if cancellation was successful
         if cancel_result is not None:
             return True
         return False
@@ -319,15 +323,12 @@ class CoindcxExchange(ExchangePyBase):
                 step_size = Decimal(str(rule.get("step", 1)))
                 min_notional = Decimal(str(rule.get("min_notional", 0)))
 
-                # Validate basic limits
                 if min_order_size <= 0:
                     raise ValueError("Invalid min_order_size")
 
-                # Calculate price increment from precision
                 base_precision = int(rule.get("base_currency_precision", 8))
                 price_increment = Decimal(10) ** (-base_precision)
 
-                # Calculate quantity increment from target precision
                 target_precision = int(rule.get("target_currency_precision", 8))
                 quantity_increment = Decimal(10) ** (-target_precision)
                 if step_size > 0:
@@ -368,7 +369,6 @@ class CoindcxExchange(ExchangePyBase):
             try:
                 event_type = event_message.get("event", event_message.get("e", ""))
 
-                # Handle order updates
                 if event_type in ["order-update", CONSTANTS.ORDER_UPDATE_EVENT_TYPE]:
                     order_data = event_message.get("data", event_message)
 
@@ -378,7 +378,6 @@ class CoindcxExchange(ExchangePyBase):
                     else:
                         await self._process_order_update(order_data)
 
-                # Handle trade updates
                 elif event_type in ["trade-update", CONSTANTS.TRADE_UPDATE_EVENT_TYPE]:
                     trade_data = event_message.get("data", event_message)
 
@@ -388,7 +387,6 @@ class CoindcxExchange(ExchangePyBase):
                     else:
                         await self._process_trade_update(trade_data)
 
-                # Handle balance updates
                 elif event_type in ["balance-update", CONSTANTS.BALANCE_UPDATE_EVENT_TYPE]:
                     balance_data = event_message.get("data", event_message)
 
@@ -436,7 +434,6 @@ class CoindcxExchange(ExchangePyBase):
         if tracked_order is not None:
             fee_amount = Decimal(str(trade_data.get("f", trade_data.get("fee_amount", 0))))
 
-            # Determine fee token (usually the quote currency for spot trades)
             trading_pair = tracked_order.trading_pair
             base, quote = trading_pair.split("-")
             fee_token = quote
@@ -506,7 +503,6 @@ class CoindcxExchange(ExchangePyBase):
                     for trade in trades:
                         order_id = str(trade.get("order_id", ""))
 
-                        # Check if this trade belongs to any tracked order
                         for tracked_order in self._order_tracker.all_fillable_orders.values():
                             if tracked_order.exchange_order_id == order_id:
                                 fee_amount = Decimal(str(trade.get("fee_amount", 0)))
@@ -679,8 +675,8 @@ class CoindcxExchange(ExchangePyBase):
 
         for symbol_data in filter(coindcx_utils.is_exchange_information_valid, markets_list):
             symbol = symbol_data.get("symbol", symbol_data.get("coindcx_name", ""))
-            base = symbol_data.get("target_currency_short_name", "")  # In CoinDCX, target is the base
-            quote = symbol_data.get("base_currency_short_name", "")   # In CoinDCX, base is the quote
+            base = symbol_data.get("target_currency_short_name", "")  
+            quote = symbol_data.get("base_currency_short_name", "")   
 
             if symbol and base and quote:
                 trading_pair = combine_to_hb_trading_pair(base=base, quote=quote)
@@ -693,7 +689,6 @@ class CoindcxExchange(ExchangePyBase):
         Gets the last traded price for a trading pair.
         """
         try:
-            # Get market details for the specific pair
             exchange_info = await self._api_get(
                 path_url=CONSTANTS.MARKETS_DETAILS_PATH_URL
             )
@@ -703,7 +698,6 @@ class CoindcxExchange(ExchangePyBase):
             if isinstance(exchange_info, list):
                 for market in exchange_info:
                     if market.get("symbol", market.get("coindcx_name", "")) == symbol:
-                        # Try to get last price from different possible fields
                         last_price = market.get("last_price", market.get("last", 0))
                         return float(last_price)
 

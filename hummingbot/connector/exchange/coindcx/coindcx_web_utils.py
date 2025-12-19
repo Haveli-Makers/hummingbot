@@ -17,11 +17,9 @@ def public_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> st
     :param domain: not used for CoinDCX but kept for compatibility
     :return: the full URL to the endpoint
     """
-    # Some endpoints use public.coindcx.com
     if path_url.startswith("/market_data"):
-        return CONSTANTS.PUBLIC_REST_URL + path_url
-    return CONSTANTS.REST_URL + path_url
-
+        return CONSTANTS.BASE_URL.format(CONSTANTS.PUBLIC_DOMAIN) + path_url
+    return CONSTANTS.BASE_URL.format(domain) + path_url
 
 def private_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
     """
@@ -31,7 +29,7 @@ def private_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> s
     :param domain: not used for CoinDCX but kept for compatibility
     :return: the full URL to the endpoint
     """
-    return CONSTANTS.REST_URL + path_url
+    return CONSTANTS.BASE_URL.format(domain) + path_url
 
 
 def build_api_factory(
@@ -46,8 +44,6 @@ def build_api_factory(
     """
     throttler = throttler or create_throttler()
     time_synchronizer = time_synchronizer or TimeSynchronizer()
-
-    # CoinDCX doesn't require server time synchronization as we use local time
     time_provider = time_provider or (lambda: get_current_server_time())
 
     api_factory = WebAssistantsFactory(

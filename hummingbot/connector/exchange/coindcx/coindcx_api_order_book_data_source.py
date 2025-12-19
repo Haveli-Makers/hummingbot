@@ -22,13 +22,6 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
     Uses CoinDCX WebSocket for real-time updates and REST API for snapshots.
     """
 
-    HEARTBEAT_TIME_INTERVAL = 30.0
-    TRADE_STREAM_ID = 1
-    DIFF_STREAM_ID = 2
-    ONE_HOUR = 60 * 60
-
-    _logger: Optional[HummingbotLogger] = None
-
     def __init__(self,
                  trading_pairs: List[str],
                  connector: 'CoinDCXExchange',

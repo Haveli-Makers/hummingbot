@@ -1,12 +1,15 @@
 from hummingbot.core.api_throttler.data_types import LinkedLimitWeightPair, RateLimit
 from hummingbot.core.data_type.in_flight_order import OrderState
 
-DEFAULT_DOMAIN = ""
+DEFAULT_DOMAIN = "api.coindcx.com"
+
+BASE_URL = "https://{0}"
+PUBLIC_DOMAIN = "public.coindcx.com"
 
 HBOT_ORDER_ID_PREFIX = "hbot-"
 MAX_ORDER_ID_LEN = 36
 
-# Base URLs
+# Base URLs 
 REST_URL = "https://api.coindcx.com"
 PUBLIC_REST_URL = "https://public.coindcx.com"
 WSS_URL = "wss://stream.coindcx.com"

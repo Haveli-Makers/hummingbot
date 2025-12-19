@@ -78,7 +78,7 @@ class HyperliquidRateSourceTest(IsolatedAsyncioWrapperTestCase):
                 {
                     'prevDayPx': "COINALPHA/USDC",
                     'dayNtlVlm': '4265022.87833',
-                    'price': '10',
+                    'markPx': '10',
                     'midPx': '10',
                     'circulatingSupply': '598274922.83822',
                     'coin': "COINALPHA/USDC",
@@ -86,7 +86,7 @@ class HyperliquidRateSourceTest(IsolatedAsyncioWrapperTestCase):
                 {
                     'prevDayPx': '25.236',
                     'dayNtlVlm': '315299.16652',
-                    'price': '25.011',
+                    'markPx': '25.011',
                     'midPx': '24.9835',
                     'circulatingSupply': '997372.88712882',
                     'coin': self.ignored_trading_pair,
@@ -148,18 +148,18 @@ class HyperliquidRateSourceTest(IsolatedAsyncioWrapperTestCase):
                 {
                     'prevDayPx': '0.22916',
                     'dayNtlVlm': '4265022.87833',
-                    'price': '10',
+                    'markPx': '10',
                     'midPx': '10',
                     'circulatingSupply': '598274922.83822',
-                    'symbol': "COINALPHA/USDC"
+                    'coin': "COINALPHA/USDC"
                 },
                 {
                     'prevDayPx': '25.236',
                     'dayNtlVlm': '315299.16652',
-                    'price': '25.011',
+                    'markPx': '25.011',
                     'midPx': '24.9835',
                     'circulatingSupply': '997372.88712882',
-                    'symbol': self.ignored_trading_pair
+                    'coin': self.ignored_trading_pair
                 }
             ]
         ]

@@ -14,6 +14,11 @@ from hummingbot.logger import HummingbotLogger
 class OrderBookTrackerDataSource(metaclass=ABCMeta):
     FULL_ORDER_BOOK_RESET_DELTA_SECONDS = 60 * 60
 
+    HEARTBEAT_TIME_INTERVAL = 30.0
+    TRADE_STREAM_ID = 1
+    DIFF_STREAM_ID = 2
+    ONE_HOUR = 60 * 60
+
     _logger: Optional[HummingbotLogger] = None
 
     def __init__(self, trading_pairs: List[str]):

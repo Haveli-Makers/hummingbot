@@ -1,10 +1,12 @@
-import time
 from decimal import Decimal
-from typing import Dict, Optional
-
-import aiohttp
+from typing import Dict, Optional, TYPE_CHECKING
 
 from hummingbot.core.rate_oracle.sources.rate_source_base import RateSourceBase
+from hummingbot.core.utils import async_ttl_cache
+from hummingbot.core.utils.async_utils import safe_gather
+
+if TYPE_CHECKING:
+    from hummingbot.connector.exchange.coindcx.coindcx_exchange import CoindcxExchange
 
 
 class CoindcxRateSource(RateSourceBase):
@@ -13,73 +15,16 @@ class CoindcxRateSource(RateSourceBase):
     Fetches ticker data directly from CoinDCX public API.
     """
 
-    TICKER_URL = "https://api.coindcx.com/exchange/ticker"
-    MARKETS_DETAILS_URL = "https://api.coindcx.com/exchange/v1/markets_details"
-    MARKETS_CACHE_TTL = 300
-
-    # Common quote currencies to parse symbols
-    QUOTE_CURRENCIES = ["USDT", "USDC", "INR", "BTC", "ETH", "DAI", "BUSD", "TRX"]
-
     def __init__(self):
         super().__init__()
-        self._markets_cache: Optional[Dict[str, Dict]] = None
-        self._markets_cache_time: float = 0
-
+        self._coindcx_exchange: Optional["CoindcxExchange"] = None 
+        
     @property
     def name(self) -> str:
         return "coindcx"
 
-    def _parse_trading_pair(self, symbol: str) -> Optional[Dict]:
-        """
-        Parse a CoinDCX symbol into base and quote currencies.
-        CoinDCX symbols are like "BTCUSDT", "BTCINR", etc.
-        """
-        symbol_upper = symbol.upper()
-        for quote in self.QUOTE_CURRENCIES:
-            if symbol_upper.endswith(quote):
-                base = symbol_upper[:-len(quote)]
-                if base:
-                    return {
-                        "trading_pair": f"{base}-{quote}",
-                        "base": base,
-                        "quote": quote
-                    }
-        return None
-
-    async def _fetch_markets(self) -> Dict[str, Dict]:
-        """Fetch market details and cache symbol to trading pair mapping."""
-        current_time = time.time()
-        if self._markets_cache is not None and (current_time - self._markets_cache_time) < self.MARKETS_CACHE_TTL:
-            return self._markets_cache
-
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(self.MARKETS_DETAILS_URL) as response:
-                    if response.status == 200:
-                        markets = await response.json()
-                        self._markets_cache = {}
-                        for market in markets:
-                            # CoinDCX markets_details has reversed naming:
-                            # - base_currency_short_name is actually the quote (e.g., USDT for BTCUSDT)
-                            # - target_currency_short_name is actually the base (e.g., BTC for BTCUSDT)
-                            symbol = market.get("coindcx_name", "")
-                            quote = market.get("base_currency_short_name", "")  # This is the quote
-                            base = market.get("target_currency_short_name", "")  # This is the base
-                            if symbol and base and quote:
-                                # Hummingbot format: BASE-QUOTE (e.g., BTC-USDT)
-                                trading_pair = f"{base}-{quote}"
-                                self._markets_cache[symbol] = {
-                                    "trading_pair": trading_pair,
-                                    "base": base,
-                                    "quote": quote
-                                }
-                        self._markets_cache_time = current_time
-                        return self._markets_cache
-        except Exception as e:
-            self.logger().warning(f"Error fetching markets details: {e}")
-
-        return {}
-
+    # Connector is expected to resolve exchange symbols to trading pairs; no local parser kept.
+    @async_ttl_cache(ttl=30, maxsize=1)
     async def get_prices(self, quote_token: Optional[str] = None) -> Dict[str, Decimal]:
         """
         Fetches mid prices for all trading pairs.
@@ -87,53 +32,26 @@ class CoindcxRateSource(RateSourceBase):
         :param quote_token: A quote symbol, if specified only pairs with the quote symbol are included
         :return: A dictionary of trading pairs to mid prices
         """
-        results = {}
-        try:
-            markets = await self._fetch_markets()
+        self._ensure_exchanges()
+        results: Dict[str, Decimal] = {}
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(self.TICKER_URL) as response:
-                    if response.status == 200:
-                        data = await response.json()
-
-                        tickers = data if isinstance(data, list) else data.get("data", data)
-                        if isinstance(tickers, dict):
-                            tickers = list(tickers.values()) if not isinstance(list(tickers.values())[0], str) else []
-
-                        for ticker in tickers:
-                            if isinstance(ticker, str):
-                                continue
-
-                            symbol = ticker.get("market", "")
-
-                            market_info = markets.get(symbol)
-                            if not market_info:
-                                market_info = self._parse_trading_pair(symbol)
-
-                            if not market_info:
-                                continue
-
-                            trading_pair = market_info["trading_pair"]
-
-                            if quote_token and market_info["quote"] != quote_token:
-                                continue
-
-                            bid = ticker.get("bid")
-                            ask = ticker.get("ask")
-
-                            if bid is not None and ask is not None:
-                                try:
-                                    bid_dec = Decimal(str(bid))
-                                    ask_dec = Decimal(str(ask))
-                                    if bid_dec > 0 and ask_dec > 0:
-                                        results[trading_pair] = (bid_dec + ask_dec) / Decimal("2")
-                                except Exception:
-                                    continue
-        except Exception as e:
-            self.logger().error(f"Error fetching CoinDCX prices: {e}")
+        tasks = [
+            self._get_coindcx_prices(exchange=self._coindcx_exchange, quote_token=quote_token),
+        ]
+        task_results = await safe_gather(*tasks, return_exceptions=True)
+        for task_result in task_results:
+            if isinstance(task_result, Exception):
+                self.logger().error(
+                    msg="Unexpected error while retrieving rates from CoinDCX. Check the log file for more info.",
+                    exc_info=task_result,
+                )
+                break
+            else:
+                results.update(task_result)
 
         return results
 
+    @async_ttl_cache(ttl=30, maxsize=1)
     async def get_bid_ask_prices(self, quote_token: Optional[str] = None) -> Dict[str, Dict[str, Decimal]]:
         """
         Fetches best bid and ask prices for all trading pairs.
@@ -141,58 +59,118 @@ class CoindcxRateSource(RateSourceBase):
         :param quote_token: A quote symbol, if specified only pairs with the quote symbol are included
         :return: A dictionary of trading pairs to {"bid": Decimal, "ask": Decimal, "mid": Decimal, "spread": Decimal, "spread_pct": Decimal}
         """
-        results = {}
-        try:
-            markets = await self._fetch_markets()
+        self._ensure_exchanges()
+        results: Dict[str, Dict[str, Decimal]] = {}
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(self.TICKER_URL) as response:
-                    if response.status == 200:
-                        data = await response.json()
-
-                        tickers = data if isinstance(data, list) else data.get("data", data)
-                        if isinstance(tickers, dict):
-                            tickers = list(tickers.values()) if not isinstance(list(tickers.values())[0], str) else []
-
-                        for ticker in tickers:
-                            if isinstance(ticker, str):
-                                continue
-
-                            symbol = ticker.get("market", "")
-
-                            market_info = markets.get(symbol)
-                            if not market_info:
-                                market_info = self._parse_trading_pair(symbol)
-
-                            if not market_info:
-                                continue
-
-                            trading_pair = market_info["trading_pair"]
-
-                            if quote_token and market_info["quote"] != quote_token:
-                                continue
-
-                            bid = ticker.get("bid")
-                            ask = ticker.get("ask")
-
-                            if bid is not None and ask is not None:
-                                try:
-                                    bid_dec = Decimal(str(bid))
-                                    ask_dec = Decimal(str(ask))
-                                    if bid_dec > 0 and ask_dec > 0 and bid_dec <= ask_dec:
-                                        mid = (bid_dec + ask_dec) / Decimal("2")
-                                        spread = ask_dec - bid_dec
-                                        spread_pct = (spread / mid) * Decimal("100") if mid > 0 else Decimal("0")
-                                        results[trading_pair] = {
-                                            "bid": bid_dec,
-                                            "ask": ask_dec,
-                                            "mid": mid,
-                                            "spread": spread,
-                                            "spread_pct": spread_pct
-                                        }
-                                except Exception:
-                                    continue
-        except Exception as e:
-            self.logger().error(f"Error fetching CoinDCX bid/ask prices: {e}")
+        tasks = [
+            self._get_coindcx_bid_ask_prices(exchange=self._coindcx_exchange, quote_token=quote_token),
+        ]
+        task_results = await safe_gather(*tasks, return_exceptions=True)
+        for task_result in task_results:
+            if isinstance(task_result, Exception):
+                self.logger().error(
+                    msg="Unexpected error while retrieving bid/ask prices from CoinDCX. Check the log file for more info.",
+                    exc_info=task_result,
+                )
+                break
+            else:
+                results.update(task_result)
 
         return results
+
+    def _ensure_exchanges(self):
+        if self._coindcx_exchange is None:
+            self._coindcx_exchange = self._build_coindcx_connector_without_private_keys()
+
+    @staticmethod
+    async def _get_coindcx_prices(exchange: 'CoindcxExchange', quote_token: str = None) -> Dict[str, Decimal]:
+        results: Dict[str, Decimal] = {}
+        if exchange is None:
+            return results
+
+        # Try to use exchange method to get all pairs prices similar to Binance
+        try:
+            pairs_prices = await exchange.get_all_pairs_prices()
+        except Exception:
+            # If connector doesn't provide, return empty dict
+            return results
+
+        for pair_price in pairs_prices:
+            try:
+                trading_pair = await exchange.trading_pair_associated_to_exchange_symbol(symbol=pair_price.get("symbol") or pair_price.get("market"))
+            except Exception:
+                # Could not resolve trading pair via connector; skip this symbol
+                continue
+
+            if quote_token is not None:
+                base, quote = trading_pair.split("-")
+                if quote != quote_token:
+                    continue
+
+            bid_price = pair_price.get("bid") or pair_price.get("bidPrice")
+            ask_price = pair_price.get("ask") or pair_price.get("askPrice")
+            if bid_price is not None and ask_price is not None:
+                try:
+                    bid_dec = Decimal(str(bid_price))
+                    ask_dec = Decimal(str(ask_price))
+                    if bid_dec > 0 and ask_dec > 0:
+                        results[trading_pair] = (bid_dec + ask_dec) / Decimal("2")
+                except Exception:
+                    continue
+
+        return results
+
+    @staticmethod
+    async def _get_coindcx_bid_ask_prices(exchange: 'CoindcxExchange', quote_token: str = None) -> Dict[str, Dict[str, Decimal]]:
+        results: Dict[str, Dict[str, Decimal]] = {}
+        if exchange is None:
+            return results
+
+        try:
+            pairs_prices = await exchange.get_all_pairs_prices()
+        except Exception:
+            return results
+
+        for pair_price in pairs_prices:
+            try:
+                trading_pair = await exchange.trading_pair_associated_to_exchange_symbol(symbol=pair_price.get("symbol") or pair_price.get("market"))
+            except Exception:
+                # Could not resolve trading pair via connector; skip this symbol
+                continue
+
+            if quote_token is not None:
+                base, quote = trading_pair.split("-")
+                if quote != quote_token:
+                    continue
+
+            bid_price = pair_price.get("bid") or pair_price.get("bidPrice")
+            ask_price = pair_price.get("ask") or pair_price.get("askPrice")
+            if bid_price is not None and ask_price is not None:
+                try:
+                    bid = Decimal(str(bid_price))
+                    ask = Decimal(str(ask_price))
+                    if bid > 0 and ask > 0 and bid <= ask:
+                        mid = (bid + ask) / Decimal("2")
+                        spread = ask - bid
+                        spread_pct = (spread / mid) * Decimal("100") if mid > 0 else Decimal("0")
+                        results[trading_pair] = {
+                            "bid": bid,
+                            "ask": ask,
+                            "mid": mid,
+                            "spread": spread_pct,
+                        }
+                except Exception:
+                    continue
+
+        return results
+
+    @staticmethod
+    def _build_coindcx_connector_without_private_keys() -> 'CoindcxExchange':
+        from hummingbot.connector.exchange.coindcx.coindcx_exchange import CoindcxExchange
+
+        return CoindcxExchange(
+            coindcx_api_key="",
+            coindcx_api_secret="",
+            trading_pairs=[],
+            trading_required=False,
+        )

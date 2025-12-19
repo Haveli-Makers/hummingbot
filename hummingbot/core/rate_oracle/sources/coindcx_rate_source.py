@@ -23,7 +23,6 @@ class CoindcxRateSource(RateSourceBase):
     def name(self) -> str:
         return "coindcx"
 
-    # Connector is expected to resolve exchange symbols to trading pairs; no local parser kept.
     @async_ttl_cache(ttl=30, maxsize=1)
     async def get_prices(self, quote_token: Optional[str] = None) -> Dict[str, Decimal]:
         """
@@ -57,7 +56,7 @@ class CoindcxRateSource(RateSourceBase):
         Fetches best bid and ask prices for all trading pairs.
 
         :param quote_token: A quote symbol, if specified only pairs with the quote symbol are included
-        :return: A dictionary of trading pairs to {"bid": Decimal, "ask": Decimal, "mid": Decimal, "spread": Decimal, "spread_pct": Decimal}
+        :return: A dictionary of trading pairs to {"bid": Decimal, "ask": Decimal, "mid": Decimal, "spread": Decimal}
         """
         self._ensure_exchanges()
         results: Dict[str, Dict[str, Decimal]] = {}
@@ -88,18 +87,15 @@ class CoindcxRateSource(RateSourceBase):
         if exchange is None:
             return results
 
-        # Try to use exchange method to get all pairs prices similar to Binance
         try:
             pairs_prices = await exchange.get_all_pairs_prices()
         except Exception:
-            # If connector doesn't provide, return empty dict
             return results
 
         for pair_price in pairs_prices:
             try:
                 trading_pair = await exchange.trading_pair_associated_to_exchange_symbol(symbol=pair_price.get("symbol") or pair_price.get("market"))
             except Exception:
-                # Could not resolve trading pair via connector; skip this symbol
                 continue
 
             if quote_token is not None:
@@ -135,7 +131,6 @@ class CoindcxRateSource(RateSourceBase):
             try:
                 trading_pair = await exchange.trading_pair_associated_to_exchange_symbol(symbol=pair_price.get("symbol") or pair_price.get("market"))
             except Exception:
-                # Could not resolve trading pair via connector; skip this symbol
                 continue
 
             if quote_token is not None:

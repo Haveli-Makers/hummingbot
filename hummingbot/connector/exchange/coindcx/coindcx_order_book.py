@@ -35,7 +35,6 @@ class CoinDCXOrderBook(OrderBook):
         if metadata is None:
             metadata = {}
 
-        # Convert bids and asks from dict to list of [price, amount]
         bids = []
         asks = []
 
@@ -47,7 +46,6 @@ class CoinDCXOrderBook(OrderBook):
             for price, amount in msg["asks"].items():
                 asks.append([float(price), float(amount)])
 
-        # Sort bids (descending) and asks (ascending)
         bids.sort(key=lambda x: x[0], reverse=True)
         asks.sort(key=lambda x: x[0])
 
@@ -59,9 +57,9 @@ class CoinDCXOrderBook(OrderBook):
         }
 
         return OrderBookMessage(
-            message_type=OrderBookMessageType.SNAPSHOT,
-            content=content,
-            timestamp=timestamp
+            OrderBookMessageType.SNAPSHOT,
+            content,
+            timestamp,
         )
 
     @classmethod
@@ -90,7 +88,6 @@ class CoinDCXOrderBook(OrderBook):
         if metadata is None:
             metadata = {}
 
-        # Convert bids and asks from dict to list of [price, amount]
         bids = []
         asks = []
 
@@ -110,9 +107,9 @@ class CoinDCXOrderBook(OrderBook):
         }
 
         return OrderBookMessage(
-            message_type=OrderBookMessageType.DIFF,
-            content=content,
-            timestamp=timestamp
+            OrderBookMessageType.DIFF,
+            content,
+            timestamp,
         )
 
     @classmethod
@@ -141,20 +138,19 @@ class CoinDCXOrderBook(OrderBook):
         if metadata is None:
             metadata = {}
 
-        ts = float(msg.get("T", 0)) / 1000.0  # Convert from milliseconds
+        ts = float(msg.get("T", 0)) / 1000.0
 
         content = {
             "trading_pair": metadata.get("trading_pair"),
-            # CoinDCX 'm' flag maps to BUY when truthy in our tests/environment
             "trade_type": float(TradeType.BUY.value) if msg.get("m", 0) else float(TradeType.SELL.value),
-            "trade_id": msg.get("T"),  # Use timestamp as trade ID if not provided
+            "trade_id": msg.get("T"),
             "update_id": msg.get("T"),
             "price": float(msg.get("p", 0)),
             "amount": float(msg.get("q", 0))
         }
 
         return OrderBookMessage(
-            message_type=OrderBookMessageType.TRADE,
-            content=content,
-            timestamp=ts
+            OrderBookMessageType.TRADE,
+            content,
+            ts,
         )

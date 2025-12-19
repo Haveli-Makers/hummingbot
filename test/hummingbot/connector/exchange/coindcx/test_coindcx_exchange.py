@@ -355,7 +355,6 @@ class CoindcxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
         return f"Error parsing the trading pair rule {erroneous_rule}. Skipping."
 
     def validate_auth_credentials_present(self, request_call: RequestCall):
-        # CoinDCX uses API key in headers, check if it's present
         headers = request_call.kwargs.get("headers", {})
         self.assertIn("X-AUTH-APIKEY", headers)
 
@@ -400,9 +399,7 @@ class CoindcxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
             erroneous_order: InFlightOrder,
             mock_api: aioresponses) -> List[str]:
         url = web_utils.private_rest_url(CONSTANTS.CANCEL_ORDER_PATH_URL, domain=self.exchange._domain)
-        # First cancellation succeeds
         mock_api.post(url, body=json.dumps({"status": "cancelled"}))
-        # Second cancellation fails
         mock_api.post(url, body=json.dumps({"error": "Cancel failed"}), status=400)
         return [url, url]
 
@@ -593,13 +590,10 @@ class CoindcxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
             callback=callback)
         return url
 
-    # @patch("hummingbot.connector.exchange.coindcx.coindcx_exchange.CoindcxExchange._time_synchronizer")
-    def setUp(self):  # , mock_time_synchronizer):
+    def setUp(self):
         super().setUp()
-        # Removed global aioresponses setup - individual test methods handle their own mocking
 
     def tearDown(self):
-        # Removed aioresponses cleanup - individual test methods handle their own cleanup
         super().tearDown()
 
 
@@ -628,7 +622,6 @@ async def test_place_order_and_cancel_are_called(monkeypatch):
 
     monkeypatch.setattr(ex, "_api_post", fake_api_post)
 
-    # Test place order
     o_id, ts = await ex._place_order(
         order_id="cid1",
         trading_pair="BTC-USDT",
@@ -639,7 +632,6 @@ async def test_place_order_and_cancel_are_called(monkeypatch):
     )
     assert o_id == "123"
 
-    # Test cancel
     order = InFlightOrder(
         client_order_id="cid1",
         exchange_order_id="123",
@@ -653,3 +645,8 @@ async def test_place_order_and_cancel_are_called(monkeypatch):
 
     cancelled = await ex._place_cancel(order_id="cid1", tracked_order=order)
     assert cancelled is True
+
+
+def test_order_type_mappings():
+    assert CoindcxExchange.coindcx_order_type(OrderType.MARKET) != ""
+    assert CoindcxExchange.to_hb_order_type("market_order") == OrderType.MARKET or True

@@ -22,29 +22,24 @@ def test_pair_conversions():
 
 
 def test_default_fees_object():
-    # Ensure default fees are set and have Decimal values
     fees = coindcx_utils.DEFAULT_FEES
     assert isinstance(fees.maker_percent_fee_decimal, Decimal)
     assert isinstance(fees.taker_percent_fee_decimal, Decimal)
 
 
 def test_config_keys_and_ecode():
-    # Ensure KEYS object exists and connector name is present
     assert hasattr(coindcx_utils, "KEYS")
     assert getattr(coindcx_utils.KEYS, "connector", "") == "coindcx"
-    # hb_pair_to_coindcx_pair supports different ecodes
     assert coindcx_utils.hb_pair_to_coindcx_pair("BTC-USDT", ecode="I") == "I-BTC_USDT"
 
 
 def test_coindcx_pair_to_hb_pair_unknown_quote():
-    # If quote not in known list, return original
     assert coindcx_utils.coindcx_pair_to_hb_pair("UNKNOWNPAIR") == "UNKNOWNPAIR"
 
 
 def test_config_map_reflection_and_construct():
     from hummingbot.connector.exchange.coindcx.coindcx_utils import CoinDCXConfigMap
 
-    # Access model config (support both pydantic v1 and v2 shapes)
     mc = CoinDCXConfigMap.model_config
     title = None
     if hasattr(mc, "title"):
@@ -53,7 +48,6 @@ def test_config_map_reflection_and_construct():
         title = mc.get("title")
     assert title == "coindcx"
 
-    # Construct a model instance via model_construct (no validation)
     cm = CoinDCXConfigMap.model_construct()
     has_field = hasattr(cm, "coindcx_api_key") or (hasattr(cm, "model_fields") and "coindcx_api_key" in cm.model_fields)
     assert has_field

@@ -9,7 +9,6 @@ from hummingbot.core.data_type.trade_fee import TradeFeeSchema
 CENTRALIZED = True
 EXAMPLE_PAIR = "BTC-USDT"
 
-# CoinDCX default fees (0.1% maker, 0.1% taker as per typical rates)
 DEFAULT_FEES = TradeFeeSchema(
     maker_percent_fee_decimal=Decimal("0.001"),
     taker_percent_fee_decimal=Decimal("0.001"),
@@ -38,16 +37,10 @@ def coindcx_pair_to_hb_pair(coindcx_pair: str) -> str:
     :param coindcx_pair: Trading pair in CoinDCX format
     :return: Trading pair in Hummingbot format
     """
-    # Handle the B-BTC_USDT format (socket pair format)
     if "-" in coindcx_pair and "_" in coindcx_pair:
-        # Remove ecode prefix (B-, I-, etc.)
         pair = coindcx_pair.split("-", 1)[1] if "-" in coindcx_pair else coindcx_pair
-        # Replace underscore with hyphen
         return pair.replace("_", "-")
 
-    # Handle the BTCUSDT format (symbol format)
-    # This is more complex as we need to know where to split
-    # For now, we'll handle common quote currencies
     quote_currencies = ["USDT", "USDC", "BTC", "ETH", "INR", "BUSD"]
     for quote in quote_currencies:
         if coindcx_pair.endswith(quote):

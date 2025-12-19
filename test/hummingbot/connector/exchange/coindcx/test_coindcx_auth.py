@@ -27,18 +27,14 @@ class CoinDCXAuthTests(IsolatedAsyncioTestCase):
             self.assertEqual(payload.get("apiKey"), self.api_key)
 
     async def test_rest_authenticate_adds_headers_and_body(self):
-        # Fix time to make signature deterministic
         fixed_time = 1234.0
         with patch("time.time", return_value=fixed_time):
             request = RESTRequest(method=RESTMethod.POST, url="https://api.test", data={"a": 1})
             ret = await self.auth.rest_authenticate(request)
-            # Should return the same RESTRequest object
             self.assertIs(request, ret)
-            # Data should be JSON string and include timestamp
             data_obj = json.loads(request.data)
             self.assertEqual(data_obj.get("a"), 1)
             self.assertEqual(data_obj.get("timestamp"), int(fixed_time * 1000))
-            # Headers should include auth headers and content-type
             headers = request.headers
             self.assertIsNotNone(headers.get("X-AUTH-APIKEY"))
             self.assertIsNotNone(headers.get("X-AUTH-SIGNATURE"))

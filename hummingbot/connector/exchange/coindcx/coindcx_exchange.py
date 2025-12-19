@@ -236,7 +236,6 @@ class CoindcxExchange(ExchangePyBase):
                 data=api_params,
                 is_auth_required=True)
 
-            # CoinDCX returns orders in a list
             if isinstance(order_result, dict) and "orders" in order_result:
                 order_data = order_result["orders"][0]
             elif isinstance(order_result, list):
@@ -245,7 +244,6 @@ class CoindcxExchange(ExchangePyBase):
                 order_data = order_result
 
             o_id = str(order_data.get("id", order_id))
-            # Parse timestamp from created_at field
             created_at = order_data.get("created_at", "")
             if isinstance(created_at, (int, float)):
                 transact_time = created_at / 1e3
@@ -487,7 +485,6 @@ class CoindcxExchange(ExchangePyBase):
 
             self._last_trades_poll_coindcx_timestamp = self._time_synchronizer.time()
 
-            # Fetch trade history
             try:
                 trade_history_params = {
                     "limit": 100

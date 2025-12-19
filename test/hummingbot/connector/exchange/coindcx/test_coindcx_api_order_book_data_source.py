@@ -51,7 +51,6 @@ class CoinDCXAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
 
         self.resume_test_event = asyncio.Event()
 
-        # Map both symbol and channel formats to the trading pair (use plain dict to allow duplicate values)
         self.connector._set_trading_pair_symbol_map({self.ex_trading_pair_symbol: self.trading_pair, self.ex_trading_pair_channel: self.trading_pair})
 
     def tearDown(self) -> None:
@@ -81,7 +80,6 @@ class CoinDCXAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         return {"T": 123456789, "s": self.ex_trading_pair_symbol, "p": "0.001", "q": "100", "m": 1}
 
     def _order_diff_event(self):
-        # depth update using dict format expected by CoinDCX
         return {"ts": 123456789, "vs": 160, "bids": {"0.0024": "10"}, "asks": {"0.0026": "100"},
                 "channel": f"{self.ex_trading_pair_channel}@orderbook@20"}
 
@@ -123,21 +121,16 @@ class CoinDCXAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
     async def test_listen_for_subscriptions_subscribes_to_trades_and_order_diffs(self, ws_connect_mock):
         ws_connect_mock.return_value = self.mocking_assistant.create_websocket_mock()
 
-        # We'll verify that `type: 'join'` messages are sent for trade and orderbook channels
         self.listening_task = self.local_event_loop.create_task(self.data_source.listen_for_subscriptions())
 
-        # allow the listening task to perform sends
         await asyncio.sleep(0.1)
 
         sent_messages = self.mocking_assistant.json_messages_sent_through_websocket(ws_connect_mock.return_value)
 
-        # There should be two messages for two subscriptions
         self.assertEqual(2, len(sent_messages))
-        # Inspect the JSON payloads sent
         first_payload = sent_messages[0]
         second_payload = sent_messages[1]
 
-        # Expected join payloads
         expected_orderbook_channel = f"{self.ex_trading_pair_channel}@orderbook@20"
         expected_trades_channel = f"{self.ex_trading_pair_channel}@trades"
 
@@ -213,3 +206,47 @@ class CoinDCXAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         msg: OrderBookMessage = await msg_queue.get()
 
         self.assertEqual(1027024, msg.update_id)
+
+
+def test_channel_originating_message_trade_and_diff():
+    ds = CoinDCXAPIOrderBookDataSource(trading_pairs=[], connector=None, api_factory=None)
+
+    trade_event = {"p": 1, "q": 2, "T": 123}
+    diff_event = {"bids": [], "asks": []}
+
+    assert ds._channel_originating_message(trade_event) == ds._trade_messages_queue_key
+    assert ds._channel_originating_message(diff_event) == ds._diff_messages_queue_key
+
+
+def test_parse_trade_and_diff_message_async():
+    async def run_test():
+        class ConnectorStub:
+            async def trading_pair_associated_to_exchange_symbol(self, symbol: str):
+                return "BTC-USDT"
+
+        connector = ConnectorStub()
+        ds = CoinDCXAPIOrderBookDataSource(trading_pairs=[], connector=connector, api_factory=None)
+
+        q = asyncio.Queue()
+
+        raw_trade = {"s": "BTCUSDT", "T": 123456, "p": 1, "q": 2}
+        await ds._parse_trade_message(raw_trade, q)
+        item = q.get_nowait()
+        assert item is not None
+
+        q2 = asyncio.Queue()
+        raw_diff = {"bids": {"1": "2"}, "channel": "B-BTC_USDT@orderbook@20"}
+        await ds._parse_order_book_diff_message(raw_diff, q2)
+        item2 = q2.get_nowait()
+        assert item2 is not None
+
+        q3 = asyncio.Queue()
+        await ds._parse_trade_message({}, q3)
+        assert q3.empty()
+
+        q4 = asyncio.Queue()
+        raw_diff2 = {"bids": {"1": "2"}, "channel": "UNKNOWN"}
+        await ds._parse_order_book_diff_message(raw_diff2, q4)
+        assert q4.empty()
+
+    asyncio.run(run_test())

@@ -81,14 +81,12 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
             for trading_pair in self._trading_pairs:
                 coindcx_pair = hb_pair_to_coindcx_pair(trading_pair)
 
-                # Subscribe to order book depth
                 orderbook_channel = f"{coindcx_pair}@orderbook@20"
                 subscribe_orderbook = {
                     "channelName": orderbook_channel
                 }
                 await ws.send(WSJSONRequest(payload={"type": "join", **subscribe_orderbook}))
 
-                # Subscribe to trades
                 trades_channel = f"{coindcx_pair}@trades"
                 subscribe_trades = {
                     "channelName": trades_channel
@@ -134,7 +132,6 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         """
         Parses a trade message from CoinDCX WebSocket and adds it to the message queue.
         """
-        # Extract trading pair from the message
         pair_symbol = raw_message.get("s", "")
         if pair_symbol:
             trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=pair_symbol)

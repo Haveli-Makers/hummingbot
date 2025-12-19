@@ -1,5 +1,5 @@
 from decimal import Decimal
-from typing import Dict, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Dict, Optional
 
 from hummingbot.core.rate_oracle.sources.rate_source_base import RateSourceBase
 from hummingbot.core.utils import async_ttl_cache
@@ -17,8 +17,8 @@ class CoindcxRateSource(RateSourceBase):
 
     def __init__(self):
         super().__init__()
-        self._coindcx_exchange: Optional["CoindcxExchange"] = None 
-        
+        self._coindcx_exchange: Optional["CoindcxExchange"] = None
+
     @property
     def name(self) -> str:
         return "coindcx"

@@ -1,7 +1,7 @@
-import json
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
-from unittest.mock import patch, AsyncMock
+from unittest.mock import AsyncMock, patch
+
 from bidict import bidict
 
 from hummingbot.connector.utils import combine_to_hb_trading_pair
@@ -109,6 +109,7 @@ class CoindcxRateSourceTest(IsolatedAsyncioWrapperTestCase):
 
     async def test_static_helpers_direct_call(self):
         tickers = [{"market": "BTCUSDT", "bid": "100", "ask": "102"}]
+
         class CoinDCXExchange:
             def __init__(self, tickers):
                 self._tickers = tickers

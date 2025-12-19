@@ -21,6 +21,7 @@ def public_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> st
         return CONSTANTS.BASE_URL.format(CONSTANTS.PUBLIC_DOMAIN) + path_url
     return CONSTANTS.BASE_URL.format(domain) + path_url
 
+
 def private_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
     """
     Creates a full URL for provided private REST endpoint.

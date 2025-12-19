@@ -9,7 +9,7 @@ PUBLIC_DOMAIN = "public.coindcx.com"
 HBOT_ORDER_ID_PREFIX = "hbot-"
 MAX_ORDER_ID_LEN = 36
 
-# Base URLs 
+# Base URLs
 REST_URL = "https://api.coindcx.com"
 PUBLIC_REST_URL = "https://public.coindcx.com"
 WSS_URL = "wss://stream.coindcx.com"

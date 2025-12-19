@@ -675,8 +675,8 @@ class CoindcxExchange(ExchangePyBase):
 
         for symbol_data in filter(coindcx_utils.is_exchange_information_valid, markets_list):
             symbol = symbol_data.get("symbol", symbol_data.get("coindcx_name", ""))
-            base = symbol_data.get("target_currency_short_name", "")  
-            quote = symbol_data.get("base_currency_short_name", "")   
+            base = symbol_data.get("target_currency_short_name", "")
+            quote = symbol_data.get("base_currency_short_name", "")
 
             if symbol and base and quote:
                 trading_pair = combine_to_hb_trading_pair(base=base, quote=quote)

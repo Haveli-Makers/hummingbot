@@ -123,6 +123,7 @@ async def test_process_websocket_messages_handles_non_dict_data():
 
     assert q.empty()
 
+
 def test_process_websocket_messages_enqueueing():
     async def run_test():
         class AuthStub:

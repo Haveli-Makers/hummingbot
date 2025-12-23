@@ -46,9 +46,6 @@ class CoinDCXOrderBook(OrderBook):
             for price, amount in msg["asks"].items():
                 asks.append([float(price), float(amount)])
 
-        bids.sort(key=lambda x: x[0], reverse=True)
-        asks.sort(key=lambda x: x[0])
-
         content = {
             "trading_pair": metadata.get("trading_pair"),
             "update_id": msg.get("vs", int(timestamp * 1000)),

@@ -56,11 +56,16 @@ class CoindcxExchange(ExchangePyBase):
         """
         Converts Hummingbot OrderType to CoinDCX order type string.
         """
-        if order_type == OrderType.LIMIT or order_type == OrderType.LIMIT_MAKER:
-            return CONSTANTS.ORDER_TYPE_LIMIT
-        elif order_type == OrderType.MARKET:
+        if order_type == OrderType.MARKET:
             return CONSTANTS.ORDER_TYPE_MARKET
         return CONSTANTS.ORDER_TYPE_LIMIT
+
+    @staticmethod
+    def coindcx_side(trade_type: TradeType) -> str:
+        """
+        Converts Hummingbot TradeType to CoinDCX side string.
+        """
+        return CONSTANTS.SIDE_BUY if trade_type is TradeType.BUY else CONSTANTS.SIDE_SELL
 
     @staticmethod
     def to_hb_order_type(coindcx_type: str) -> OrderType:
@@ -216,7 +221,7 @@ class CoindcxExchange(ExchangePyBase):
         """
         order_result = None
         type_str = CoindcxExchange.coindcx_order_type(order_type)
-        side_str = CONSTANTS.SIDE_BUY if trade_type is TradeType.BUY else CONSTANTS.SIDE_SELL
+        side_str = CoindcxExchange.coindcx_side(trade_type)
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
 
         api_params = {
@@ -227,7 +232,7 @@ class CoindcxExchange(ExchangePyBase):
             "client_order_id": order_id
         }
 
-        if order_type is OrderType.LIMIT or order_type is OrderType.LIMIT_MAKER:
+        if order_type in [OrderType.LIMIT, OrderType.LIMIT_MAKER]:
             api_params["price_per_unit"] = float(price)
 
         try:

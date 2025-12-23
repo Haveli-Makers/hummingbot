@@ -144,12 +144,16 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         Parses an order book diff message from CoinDCX WebSocket and adds it to the message queue.
         """
         if "bids" in raw_message or "asks" in raw_message:
-            channel = raw_message.get("channel", "")
             trading_pair = None
 
-            if "@orderbook" in channel:
-                pair_part = channel.split("@")[0]
-                trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=pair_part)
+            pair_symbol = raw_message.get("s") or raw_message.get("symbol") or ""
+            if pair_symbol:
+                trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=pair_symbol)
+            else:
+                channel = raw_message.get("channel", "")
+                if "@orderbook" in channel:
+                    pair_part = channel.split("@")[0]
+                    trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=pair_part)
 
             if trading_pair:
                 order_book_message: OrderBookMessage = CoinDCXOrderBook.diff_message_from_exchange(

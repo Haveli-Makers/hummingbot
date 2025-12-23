@@ -69,9 +69,8 @@ class RemoteIfaceMQTTTests(TestCase):
         self.log_records = []
         # self.async_run_with_timeout(read_system_configs_from_yml())
         self.gateway = MQTTGateway(self.hbapp)
-        self.test_market: MockPaperExchange = MockPaperExchange(
-            client_config_map=self.client_config_map)
-        self.hbapp.markets = {
+        self.test_market: MockPaperExchange = MockPaperExchange()
+        self.hbapp.trading_core.connector_manager.connectors = {
             "test_market_paper_trade": self.test_market
         }
         self.resume_test_event = asyncio.Event()

@@ -70,15 +70,16 @@ async def test_build_client_creates_socketio_client():
 
     # q = asyncio.Queue()
 
-    with patch("hummingbot.connector.exchange.coindcx.coindcx_api_user_stream_data_source.socketio.AsyncClient") as mock_client_class:
+    import hummingbot.connector.exchange.coindcx.coindcx_api_user_stream_data_source as user_mod
+    with patch.object(user_mod, "socketio") as mock_socketio:
         mock_client = MagicMock()
+        mock_socketio.AsyncClient.return_value = mock_client
         mock_client.event = MagicMock(side_effect=lambda func: func)
         mock_client.on = MagicMock(side_effect=lambda event_type: lambda func: func)
-        mock_client_class.return_value = mock_client
 
         # client = data_source._build_client(q)
 
-        mock_client_class.assert_called_once_with(
+        mock_socketio.AsyncClient.assert_called_once_with(
             logger=False,
             reconnection=False,
             ssl_verify=False

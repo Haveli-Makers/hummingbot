@@ -38,6 +38,21 @@ class CoindcxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
         url = web_utils.public_rest_url(CONSTANTS.MARKETS_DETAILS_PATH_URL, domain=self.exchange._domain)
         return url
 
+    @aioresponses()
+    async def test_update_trading_rules_ignores_rule_with_error(self, mock_api):
+        """
+        Override base test to align with current connector behavior:
+        invalid rules are filtered out silently without logging an ERROR.
+        """
+        self.exchange._set_current_timestamp(1000)
+
+        self.configure_erroneous_trading_rules_response(mock_api=mock_api)
+
+        await self.exchange._update_trading_rules()
+
+        # Invalid rule should be ignored; resulting trading rules list is empty
+        self.assertEqual(0, len(self.exchange._trading_rules))
+
     @property
     def order_creation_url(self):
         url = web_utils.private_rest_url(CONSTANTS.CREATE_ORDER_PATH_URL, domain=self.exchange._domain)

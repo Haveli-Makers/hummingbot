@@ -24,7 +24,7 @@ class CoinDCXAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         cls.quote_asset = "HBOT"
         cls.trading_pair = f"{cls.base_asset}-{cls.quote_asset}"
         cls.ex_trading_pair_symbol = cls.base_asset + cls.quote_asset  # e.g., COINALPHAHBOT
-        cls.ex_trading_pair_channel = f"B-{cls.base_asset}_{cls.quote_asset}"
+        cls.ex_trading_pair_channel = f"I-{cls.base_asset}_{cls.quote_asset}"  # I for CoinDCX INR markets
         cls.domain = ""
 
     async def asyncSetUp(self) -> None:
@@ -117,50 +117,62 @@ class CoinDCXAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         with self.assertRaises(IOError):
             await self.data_source.get_new_order_book(self.trading_pair)
 
-    @patch("aiohttp.ClientSession.ws_connect", new_callable=AsyncMock)
-    async def test_listen_for_subscriptions_subscribes_to_trades_and_order_diffs(self, ws_connect_mock):
-        ws_connect_mock.return_value = self.mocking_assistant.create_websocket_mock()
+    @patch("hummingbot.connector.exchange.coindcx.coindcx_api_order_book_data_source.socketio.AsyncClient")
+    async def test_listen_for_subscriptions_subscribes_to_trades_and_order_diffs(self, mock_client_class):
+        mock_client = MagicMock()
+        mock_client.connect = AsyncMock()
+        mock_client.emit = AsyncMock()
+        mock_client.wait = AsyncMock(side_effect=asyncio.CancelledError)
+        mock_client.disconnect = AsyncMock()
+        
+        # Mock the decorator methods to return a no-op function
+        mock_client.event = MagicMock(side_effect=lambda func: func)
+        mock_client.on = MagicMock(side_effect=lambda event_type: lambda func: func)
+        
+        mock_client_class.return_value = mock_client
 
-        self.listening_task = self.local_event_loop.create_task(self.data_source.listen_for_subscriptions())
+        try:
+            self.listening_task = self.local_event_loop.create_task(self.data_source.listen_for_subscriptions())
+            await asyncio.sleep(0.2)
+        except asyncio.CancelledError:
+            pass
 
-        await asyncio.sleep(0.1)
+        # Verify Socket.IO client was created and connected
+        mock_client_class.assert_called_once()
+        mock_client.connect.assert_called_once()
 
-        sent_messages = self.mocking_assistant.json_messages_sent_through_websocket(ws_connect_mock.return_value)
-
-        self.assertEqual(2, len(sent_messages))
-        first_payload = sent_messages[0]
-        second_payload = sent_messages[1]
+        # Verify emit was called for both orderbook and trades channels
+        emit_calls = mock_client.emit.call_args_list
+        self.assertEqual(2, len(emit_calls))
 
         expected_orderbook_channel = f"{self.ex_trading_pair_channel}@orderbook@20"
         expected_trades_channel = f"{self.ex_trading_pair_channel}@trades"
 
-        self.assertEqual("join", first_payload.get("type"))
-        self.assertIn(expected_orderbook_channel, first_payload.get("channelName"))
-        self.assertEqual("join", second_payload.get("type"))
-        self.assertIn(expected_trades_channel, second_payload.get("channelName"))
+        first_call_args = emit_calls[0][0]
+        second_call_args = emit_calls[1][0]
 
-        self.assertTrue(self._is_logged(
-            "INFO",
-            "Subscribed to public order book and trade channels..."
-        ))
+        self.assertEqual("join", first_call_args[0])
+        self.assertEqual(expected_orderbook_channel, first_call_args[1]["channelName"])
+        self.assertEqual("join", second_call_args[0])
+        self.assertEqual(expected_trades_channel, second_call_args[1]["channelName"])
 
     async def test_subscribe_channels_raises_cancel_exception(self):
+        # _subscribe_channels is deprecated and now just passes
+        # No exception should be raised from the deprecated method
         mock_ws = MagicMock()
         mock_ws.send.side_effect = asyncio.CancelledError
 
-        with self.assertRaises(asyncio.CancelledError):
-            await self.data_source._subscribe_channels(mock_ws)
+        # Should not raise any exception since method is now a pass statement
+        await self.data_source._subscribe_channels(mock_ws)
 
     async def test_subscribe_channels_raises_exception_and_logs_error(self):
+        # _subscribe_channels is deprecated and now just passes
+        # No exception should be raised from the deprecated method
         mock_ws = MagicMock()
         mock_ws.send.side_effect = Exception("Test Error")
 
-        with self.assertRaises(Exception):
-            await self.data_source._subscribe_channels(mock_ws)
-
-        self.assertTrue(
-            self._is_logged("ERROR", "Unexpected error occurred subscribing to order book trading and delta streams...")
-        )
+        # Should not raise any exception since method is now a pass statement
+        await self.data_source._subscribe_channels(mock_ws)
 
     async def test_listen_for_trades_successful(self):
         mock_queue = AsyncMock()

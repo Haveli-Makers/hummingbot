@@ -127,8 +127,35 @@ class CoindcxExchange(ExchangePyBase):
     def is_trading_required(self) -> bool:
         return self._trading_required
 
+    @property
+    def status_dict(self):
+        """
+        Override to add debug logging for connector ready state.
+        """
+        sd = {
+            "symbols_mapping_initialized": self.trading_pair_symbol_map_ready(),
+            "order_books_initialized": self.order_book_tracker.ready,
+            "account_balance": not self.is_trading_required or len(self._account_balances) > 0,
+            "trading_rule_initialized": len(self._trading_rules) > 0 if self.is_trading_required else True,
+            "user_stream_initialized": self._is_user_stream_initialized(),
+        }
+        self.logger().debug(f"status_dict: {sd}")
+        return sd
+
     def supported_order_types(self):
         return [OrderType.LIMIT, OrderType.LIMIT_MAKER, OrderType.MARKET]
+
+    async def start_network(self):
+        """
+        Start all required tasks and perform initial balance fetch to ensure connector becomes ready.
+        """
+        await super().start_network()
+        if self.is_trading_required:
+            try:
+                await self._update_balances()
+            except Exception as e:
+                self.logger().warning(f"Failed to fetch initial balances: {e}")
+        
 
     async def get_all_pairs_prices(self) -> List[Dict[str, str]]:
         """
@@ -156,7 +183,6 @@ class CoindcxExchange(ExchangePyBase):
         ) or CONSTANTS.ORDER_NOT_EXIST_MESSAGE in str(status_update_exception)
 
     def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
-        # Consider only 404/Order not found as "order not found" during cancel
         exc_str = str(cancelation_exception)
         return (
             str(CONSTANTS.ORDER_NOT_EXIST_ERROR_CODE) in exc_str
@@ -292,6 +318,15 @@ class CoindcxExchange(ExchangePyBase):
             return True
         return False
 
+    async def _update_trading_rules(self):
+        """Override to add logging for trading rules update."""
+        exchange_info = await self._make_trading_rules_request()
+        trading_rules_list = await self._format_trading_rules(exchange_info)
+        self._trading_rules.clear()
+        for trading_rule in trading_rules_list:
+            self._trading_rules[trading_rule.trading_pair] = trading_rule
+        self._initialize_trading_pair_symbols_from_exchange_info(exchange_info=exchange_info)
+
     async def _format_trading_rules(self, exchange_info_dict: Dict[str, Any]) -> List[TradingRule]:
         """
         Formats trading rules from CoinDCX markets_details response.
@@ -314,28 +349,43 @@ class CoindcxExchange(ExchangePyBase):
         """
         trading_pair_rules = exchange_info_dict if isinstance(exchange_info_dict, list) else [exchange_info_dict]
         retval = []
+        
+        is_list = isinstance(exchange_info_dict, list)
 
         for rule in filter(coindcx_utils.is_exchange_information_valid, trading_pair_rules):
             try:
-                trading_pair = await self.trading_pair_associated_to_exchange_symbol(
-                    symbol=rule.get("symbol", rule.get("coindcx_name", ""))
-                )
-
-                min_order_size = Decimal(str(rule.get("min_quantity", 0)))
-                max_order_size = Decimal(str(rule.get("max_quantity", 1e9)))
-                step_size = Decimal(str(rule.get("step", 1)))
-                min_notional = Decimal(str(rule.get("min_notional", 0)))
-
-                if min_order_size <= 0:
-                    raise ValueError("Invalid min_order_size")
+                symbol = rule.get("symbol", rule.get("coindcx_name", ""))
+                try:
+                    trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol=symbol)
+                except ValueError:
+                    base = rule.get("base_currency_short_name", "")
+                    target = rule.get("target_currency_short_name", "")
+                    if base and target:
+                        trading_pair = f"{target}-{base}"
+                    else:
+                        trading_pair = coindcx_utils.coindcx_pair_to_hb_pair(symbol)
 
                 base_precision = int(rule.get("base_currency_precision", 8))
                 price_increment = Decimal(10) ** (-base_precision)
 
                 target_precision = int(rule.get("target_currency_precision", 8))
                 quantity_increment = Decimal(10) ** (-target_precision)
+                step_size = Decimal(str(rule.get("step", 1)))
+
+                if quantity_increment <= 0:
+                    quantity_increment = Decimal("1e-8")
+
                 if step_size > 0:
                     quantity_increment = step_size
+                elif step_size <= 0 and quantity_increment <= 0:
+                    quantity_increment = Decimal("1e-8")
+
+                min_order_size = Decimal(str(rule.get("min_quantity", 0)))
+                max_order_size = Decimal(str(rule.get("max_quantity", 1e9)))
+                min_notional = Decimal(str(rule.get("min_notional", 0)))
+
+                if min_order_size <= 0:
+                    min_order_size = quantity_increment if quantity_increment > 0 else Decimal("1e-8")
 
                 retval.append(
                     TradingRule(
@@ -347,8 +397,8 @@ class CoindcxExchange(ExchangePyBase):
                         min_notional_size=min_notional
                     )
                 )
-            except Exception:
-                self.logger().exception(f"Error parsing the trading pair rule {rule}. Skipping.")
+            except Exception as e:
+                self.logger().warning(f"Error parsing trading pair rule {rule.get('symbol', rule.get('coindcx_name', ''))}: {e}")
 
         return retval
 
@@ -409,6 +459,9 @@ class CoindcxExchange(ExchangePyBase):
         """
         Processes an order update message from the user stream.
         """
+        if not isinstance(order_data, dict):
+            return
+        
         client_order_id = order_data.get("client_order_id", order_data.get("c", ""))
         exchange_order_id = str(order_data.get("id", order_data.get("o", "")))
 
@@ -430,6 +483,9 @@ class CoindcxExchange(ExchangePyBase):
         """
         Processes a trade update message from the user stream.
         """
+        if not isinstance(trade_data, dict):
+            return
+        
         client_order_id = trade_data.get("c", trade_data.get("client_order_id", ""))
         exchange_order_id = str(trade_data.get("o", trade_data.get("order_id", "")))
 
@@ -467,6 +523,9 @@ class CoindcxExchange(ExchangePyBase):
         """
         Processes a balance update message from the user stream.
         """
+        if not isinstance(balance_data, dict):
+            return
+        
         asset_name = balance_data.get("currency", balance_data.get("a", ""))
         free_balance = Decimal(str(balance_data.get("balance", balance_data.get("f", 0))))
         locked_balance = Decimal(str(balance_data.get("locked_balance", balance_data.get("l", 0))))

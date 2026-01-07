@@ -5,7 +5,11 @@ from hummingbot.connector.exchange.coindcx import coindcx_utils
 
 
 def test_is_exchange_information_valid_true():
-    info = {"status": "active"}
+    info = {
+        "status": "active",
+        "min_quantity": 0.001,
+        "max_quantity": 1000000
+    }
     assert coindcx_utils.is_exchange_information_valid(info)
 
 

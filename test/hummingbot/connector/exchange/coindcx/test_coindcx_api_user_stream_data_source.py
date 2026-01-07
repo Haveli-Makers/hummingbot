@@ -1,10 +1,14 @@
 import asyncio
-from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from hummingbot.connector.exchange.coindcx.coindcx_api_user_stream_data_source import CoinDCXAPIUserStreamDataSource
+
+
+class DummyAuth:
+    def generate_ws_auth_payload(self):
+        return {"channel": "coindcx", "authToken": "test_token"}
 
 
 class DummyConnector:
@@ -13,154 +17,134 @@ class DummyConnector:
 
 
 @pytest.mark.asyncio
-async def test_process_websocket_messages_puts_events_in_queue():
-    data_source = CoinDCXAPIUserStreamDataSource(auth=None, trading_pairs=["BTC-USDT"], connector=DummyConnector(), api_factory=None, domain="")
-
-    async def _message_gen():
-        msgs = [
-            {"event": "order-update", "data": {"id": "1", "client_order_id": "c1", "status": "open"}},
-            {"event": "trade-update", "data": {"order_id": "1", "quantity": 1}},
-        ]
-        for m in msgs:
-            yield SimpleNamespace(data=m)
-
-    mock_ws = AsyncMock()
-    mock_ws.iter_messages = _message_gen
+async def test_handle_message_puts_message_in_queue():
+    """Test that _handle_message puts messages in the output queue"""
+    data_source = CoinDCXAPIUserStreamDataSource(
+        auth=DummyAuth(),
+        trading_pairs=["BTC-USDT"],
+        connector=DummyConnector(),
+        api_factory=None,
+        domain=""
+    )
 
     q = asyncio.Queue()
-    await data_source._process_websocket_messages(mock_ws, q)
+    test_message = {"id": "1", "client_order_id": "c1", "status": "open"}
 
-    collected = []
-    while not q.empty():
-        collected.append(q.get_nowait())
+    await data_source._handle_message(test_message, q)
 
-    assert len(collected) == 2
-    assert collected[0]["event"] == "order-update"
-    assert collected[1]["event"] == "trade-update"
-
-
-@pytest.mark.asyncio
-async def test_process_websocket_messages_handles_nested_data():
-    data_source = CoinDCXAPIUserStreamDataSource(auth=None, trading_pairs=["BTC-USDT"], connector=DummyConnector(), api_factory=None, domain="")
-
-    async def _message_gen():
-        yield SimpleNamespace(data={"data": {"currency": "BTC", "balance": 1}})
-
-    mock_ws = AsyncMock()
-    mock_ws.iter_messages = _message_gen
-
-    q = asyncio.Queue()
-    await data_source._process_websocket_messages(mock_ws, q)
-
+    assert not q.empty()
     item = q.get_nowait()
-    assert isinstance(item, dict)
-    assert item["currency"] == "BTC"
+    assert item == test_message
 
 
 @pytest.mark.asyncio
-async def test_process_websocket_messages_ignores_ping():
+async def test_handle_message_updates_last_recv_time():
+    """Test that _handle_message updates the last received time"""
     data_source = CoinDCXAPIUserStreamDataSource(
-        auth=None,
+        auth=DummyAuth(),
         trading_pairs=["BTC-USDT"],
         connector=DummyConnector(),
         api_factory=None,
         domain=""
     )
 
-    async def _message_gen():
-        yield SimpleNamespace(data={"event": "ping"})
-
-    mock_ws = AsyncMock()
-    mock_ws.iter_messages = _message_gen
-
+    initial_time = data_source.last_recv_time
     q = asyncio.Queue()
-    await data_source._process_websocket_messages(mock_ws, q)
 
-    assert q.empty()
+    await asyncio.sleep(0.01)  # Ensure time passes
+    await data_source._handle_message({"test": "data"}, q)
+
+    assert data_source.last_recv_time > initial_time
 
 
 @pytest.mark.asyncio
-async def test_process_websocket_messages_enqueues_fallback_dict():
+async def test_build_client_creates_socketio_client():
+    """Test that _build_client creates a Socket.IO client with proper handlers"""
     data_source = CoinDCXAPIUserStreamDataSource(
-        auth=None,
+        auth=DummyAuth(),
         trading_pairs=["BTC-USDT"],
         connector=DummyConnector(),
         api_factory=None,
         domain=""
     )
 
-    async def _message_gen():
-        yield SimpleNamespace(data={"foo": "bar"})
-
-    mock_ws = AsyncMock()
-    mock_ws.iter_messages = _message_gen
-
     q = asyncio.Queue()
-    await data_source._process_websocket_messages(mock_ws, q)
+    
+    with patch("hummingbot.connector.exchange.coindcx.coindcx_api_user_stream_data_source.socketio.AsyncClient") as mock_client_class:
+        mock_client = MagicMock()
+        mock_client.event = MagicMock(side_effect=lambda func: func)
+        mock_client.on = MagicMock(side_effect=lambda event_type: lambda func: func)
+        mock_client_class.return_value = mock_client
 
-    item = q.get_nowait()
-    assert item == {"foo": "bar"}
+        client = data_source._build_client(q)
+
+        # Verify client was created with correct parameters
+        mock_client_class.assert_called_once_with(
+            logger=False,
+            reconnection=False,
+            ssl_verify=False
+        )
+
+        # Verify event handlers were registered
+        assert mock_client.event.call_count >= 2  # connect and disconnect
+        assert mock_client.on.call_count >= 3  # balance, order, trade updates
 
 
 @pytest.mark.asyncio
-async def test_process_websocket_messages_handles_non_dict_data():
+async def test_disconnect_closes_client():
+    """Test that _disconnect properly closes the Socket.IO client"""
     data_source = CoinDCXAPIUserStreamDataSource(
-        auth=None,
+        auth=DummyAuth(),
         trading_pairs=["BTC-USDT"],
         connector=DummyConnector(),
         api_factory=None,
         domain=""
     )
 
-    async def _message_gen():
-        yield SimpleNamespace(data="raw-string")
+    mock_client = AsyncMock()
+    mock_client.disconnect = AsyncMock()
+    data_source._client = mock_client
 
-    mock_ws = AsyncMock()
-    mock_ws.iter_messages = _message_gen
+    await data_source._disconnect()
 
-    q = asyncio.Queue()
-    await data_source._process_websocket_messages(mock_ws, q)
-
-    assert q.empty()
+    mock_client.disconnect.assert_called_once()
+    assert data_source._client is None
 
 
-def test_process_websocket_messages_enqueueing():
-    async def run_test():
-        class AuthStub:
-            def generate_ws_auth_payload(self):
-                return {}
+@pytest.mark.asyncio
+async def test_disconnect_handles_exception():
+    """Test that _disconnect handles exceptions gracefully"""
+    data_source = CoinDCXAPIUserStreamDataSource(
+        auth=DummyAuth(),
+        trading_pairs=["BTC-USDT"],
+        connector=DummyConnector(),
+        api_factory=None,
+        domain=""
+    )
 
-        class FakeResp:
-            def __init__(self, data):
-                self.data = data
+    mock_client = AsyncMock()
+    mock_client.disconnect = AsyncMock(side_effect=Exception("Disconnect failed"))
+    data_source._client = mock_client
 
-        class FakeWS:
-            def __init__(self, messages):
-                self._messages = messages
+    # Should not raise exception
+    await data_source._disconnect()
 
-            async def iter_messages(self):
-                for m in self._messages:
-                    yield FakeResp(m)
+    # Client should still be set to None
+    assert data_source._client is None
 
-        ds = CoinDCXAPIUserStreamDataSource(auth=AuthStub(), trading_pairs=[], connector=None, api_factory=None)
 
-        q = asyncio.Queue()
+@pytest.mark.asyncio
+async def test_last_recv_time_property():
+    """Test that last_recv_time property returns correct value"""
+    data_source = CoinDCXAPIUserStreamDataSource(
+        auth=DummyAuth(),
+        trading_pairs=["BTC-USDT"],
+        connector=DummyConnector(),
+        api_factory=None,
+        domain=""
+    )
 
-        messages = [
-            {"event": "order-update", "o": {"id": 1}},
-            {"event": "balance-update", "a": "BTC", "balance": 1},
-            {"event": "ping"},
-            {"foo": "bar"},
-            {"data": {"nested": 1}},
-        ]
+    assert data_source.last_recv_time == 0.0
 
-        fake_ws = FakeWS(messages)
-        await ds._process_websocket_messages(fake_ws, q)
-
-        results = []
-        while not q.empty():
-            results.append(q.get_nowait())
-
-        assert any(isinstance(r, dict) for r in results)
-
-    asyncio.run(run_test())
+    data_source._last_recv_time = 12345.67
+    assert data_source.last_recv_time == 12345.67

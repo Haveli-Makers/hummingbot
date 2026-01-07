@@ -1,12 +1,10 @@
 import asyncio
+import socketio
 from typing import TYPE_CHECKING, List, Optional
 
 from hummingbot.connector.exchange.coindcx import coindcx_constants as CONSTANTS
 from hummingbot.connector.exchange.coindcx.coindcx_auth import CoinDCXAuth
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
-from hummingbot.core.web_assistant.connections.data_types import WSJSONRequest
-from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
-from hummingbot.core.web_assistant.ws_assistant import WSAssistant
 from hummingbot.logger import HummingbotLogger
 
 if TYPE_CHECKING:
@@ -15,15 +13,9 @@ if TYPE_CHECKING:
 
 class CoinDCXAPIUserStreamDataSource(UserStreamTrackerDataSource):
     """
-    User stream data source for CoinDCX.
-    Handles WebSocket connections for receiving user account updates including:
-    - Balance updates
-    - Order updates
-    - Trade updates
+    CoinDCX user stream uses Socket.IO. This data source connects with python-socketio AsyncClient
+    (aiohttp transport) and forwards balance/order/trade updates to the user stream queue.
     """
-
-    HEARTBEAT_TIME_INTERVAL = 30.0
-    PING_INTERVAL = 20.0
 
     _logger: Optional[HummingbotLogger] = None
 
@@ -31,119 +23,85 @@ class CoinDCXAPIUserStreamDataSource(UserStreamTrackerDataSource):
                  auth: CoinDCXAuth,
                  trading_pairs: List[str],
                  connector: 'CoinDCXExchange',
-                 api_factory: WebAssistantsFactory,
+                 api_factory,  
                  domain: str = CONSTANTS.DEFAULT_DOMAIN):
         super().__init__()
         self._auth: CoinDCXAuth = auth
         self._domain = domain
-        self._api_factory = api_factory
         self._connector = connector
-        self._ws_assistant: Optional[WSAssistant] = None
-        self._last_ws_message_sent_timestamp = 0
+        self._api_factory = api_factory
+        self._trading_pairs = trading_pairs
+        self._client: Optional[socketio.AsyncClient] = None
+        self._last_recv_time = 0.0
 
-    async def _get_ws_assistant(self) -> WSAssistant:
-        """
-        Creates a new WSAssistant instance.
-        """
-        return await self._api_factory.get_ws_assistant()
-
-    async def _connected_websocket_assistant(self) -> WSAssistant:
-        """
-        Creates an authenticated WebSocket connection for user stream data.
-        CoinDCX uses a 'join' message with authentication to subscribe to private channels.
-        """
-        ws: WSAssistant = await self._get_ws_assistant()
-        await ws.connect(
-            ws_url=CONSTANTS.WSS_URL,
-            ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL,
-            message_timeout=None
-        )
-
-        auth_payload = self._auth.generate_ws_auth_payload()
-        join_message = {
-            "type": "join",
-            **auth_payload
-        }
-
-        await ws.send(WSJSONRequest(payload=join_message))
-        self.logger().info("Authenticated and joined CoinDCX private channel")
-
-        self._ws_assistant = ws
-        return ws
-
-    async def _subscribe_channels(self, websocket_assistant: WSAssistant):
-        """
-        Subscribe to user-specific channels.
-        CoinDCX's private channel 'coindcx' automatically provides:
-        - balance-update events
-        - order-update events
-        - trade-update events
-
-        No additional subscription is needed after joining the authenticated channel.
-        """
-        try:
-            self.logger().info("Subscribed to CoinDCX user stream channels (balance, order, trade updates)")
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            self.logger().error(
-                "Unexpected error occurred subscribing to user stream channels...",
-                exc_info=True
-            )
-            raise
-
-    async def _process_websocket_messages(self, websocket_assistant: WSAssistant, queue: asyncio.Queue):
-        """
-        Processes incoming WebSocket messages and adds them to the queue.
-        Also handles periodic ping to keep the connection alive.
-        """
-        async for ws_response in websocket_assistant.iter_messages():
-            data = ws_response.data
-
-            if isinstance(data, dict):
-                event_type = data.get("event", data.get("e", ""))
-
-                if event_type in ["ping", "pong"]:
-                    continue
-
-                if event_type in [
-                    CONSTANTS.BALANCE_UPDATE_EVENT_TYPE,
-                    CONSTANTS.ORDER_UPDATE_EVENT_TYPE,
-                    CONSTANTS.TRADE_UPDATE_EVENT_TYPE,
-                    "balance-update",
-                    "order-update",
-                    "trade-update"
-                ]:
-                    queue.put_nowait(data)
-                elif "data" in data:
-                    queue.put_nowait(data["data"])
-                else:
-                    queue.put_nowait(data)
-
-    async def _on_user_stream_interruption(self, websocket_assistant: Optional[WSAssistant]):
-        """
-        Called when the user stream is interrupted.
-        Performs cleanup and resets state.
-        """
-        self._ws_assistant = None
-        await super()._on_user_stream_interruption(websocket_assistant=websocket_assistant)
+    @property
+    def last_recv_time(self) -> float:
+        return self._last_recv_time
 
     async def listen_for_user_stream(self, output: asyncio.Queue):
-        """
-        Main method to listen for user stream data.
-        Establishes connection and processes messages.
-        """
         while True:
             try:
-                ws_assistant = await self._connected_websocket_assistant()
-                await self._subscribe_channels(ws_assistant)
-                await self._process_websocket_messages(ws_assistant, output)
+                self._client = self._build_client(output)
+                await self._client.connect(CONSTANTS.SOCKET_IO_URL, transports=["websocket"])
+                await self._client.wait()
             except asyncio.CancelledError:
+                await self._disconnect()
                 raise
             except Exception:
-                self.logger().error(
-                    "Unexpected error in user stream listener loop.",
-                    exc_info=True
-                )
-                await self._on_user_stream_interruption(websocket_assistant=self._ws_assistant)
+                self.logger().exception("CoinDCX user stream error. Reconnecting in 5s...")
+                await self._disconnect()
                 await self._sleep(5.0)
+            else:
+                await self._disconnect()
+                await self._sleep(1.0)
+
+    def _build_client(self, output: asyncio.Queue) -> socketio.AsyncClient:
+        client = socketio.AsyncClient(
+            logger=False,
+            reconnection=False,
+            ssl_verify=False
+        )
+        auth_payload = self._auth.generate_ws_auth_payload()
+
+        @client.event
+        async def connect():
+            await client.emit("join", auth_payload)
+            self._last_recv_time = self._time()
+
+        @client.event
+        async def disconnect():
+            self.logger().warning("CoinDCX user stream disconnected")
+
+        @client.on(CONSTANTS.BALANCE_UPDATE_EVENT_TYPE)
+        async def on_balance(message):
+            await self._handle_message(message, output)
+
+        @client.on(CONSTANTS.ORDER_UPDATE_EVENT_TYPE)
+        async def on_order(message):
+            await self._handle_message(message, output)
+
+        @client.on(CONSTANTS.TRADE_UPDATE_EVENT_TYPE)
+        async def on_trade(message):
+            await self._handle_message(message, output)
+
+        @client.on("error")
+        async def on_error(message):
+            self.logger().warning(f"CoinDCX user stream error: {message}")
+
+        return client
+
+    async def _handle_message(self, message, output: asyncio.Queue):
+        self._last_recv_time = self._time()
+        await output.put(message)
+
+    async def _disconnect(self):
+        if self._client is not None:
+            try:
+                await self._client.disconnect()
+            except Exception:
+                self.logger().debug("CoinDCX user stream disconnect failed", exc_info=True)
+            self._client = None
+
+    async def stop(self):
+        await self._disconnect()
+        await super().stop()

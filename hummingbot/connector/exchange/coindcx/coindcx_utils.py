@@ -20,12 +20,32 @@ def is_exchange_information_valid(exchange_info: Dict[str, Any]) -> bool:
     """
     Verifies if a trading pair is enabled to operate with based on its exchange information.
     CoinDCX uses 'status' field to indicate if a market is active.
+    Also validates that critical fields have valid values.
 
     :param exchange_info: the exchange information for a trading pair
-    :return: True if the trading pair is enabled, False otherwise
+    :return: True if the trading pair is enabled and has valid data, False otherwise
     """
     status = exchange_info.get("status", "")
-    return status.lower() == "active"
+    if status.lower() != "active":
+        return False
+    
+    # Validate critical numeric fields
+    try:
+        min_quantity = float(exchange_info.get("min_quantity", 0))
+        max_quantity = float(exchange_info.get("max_quantity", 0))
+        
+        # min_quantity must be non-negative and max_quantity must be positive
+        if min_quantity < 0 or max_quantity <= 0:
+            return False
+            
+        # min_quantity should not exceed max_quantity
+        if min_quantity > max_quantity:
+            return False
+            
+    except (ValueError, TypeError):
+        return False
+    
+    return True
 
 
 def coindcx_pair_to_hb_pair(coindcx_pair: str) -> str:

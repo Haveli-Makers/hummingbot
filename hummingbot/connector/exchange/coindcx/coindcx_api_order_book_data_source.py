@@ -1,4 +1,5 @@
 import asyncio
+import socketio
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -7,9 +8,8 @@ from hummingbot.connector.exchange.coindcx.coindcx_order_book import CoinDCXOrde
 from hummingbot.connector.exchange.coindcx.coindcx_utils import hb_pair_to_coindcx_pair
 from hummingbot.core.data_type.order_book_message import OrderBookMessage
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
-from hummingbot.core.web_assistant.connections.data_types import RESTMethod, WSJSONRequest
+from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
-from hummingbot.core.web_assistant.ws_assistant import WSAssistant
 
 if TYPE_CHECKING:
     from hummingbot.connector.exchange.coindcx.coindcx_exchange import CoinDCXExchange
@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
     """
     Data source for CoinDCX order book and trade data.
-    Uses CoinDCX WebSocket for real-time updates and REST API for snapshots.
+    Uses Socket.IO for real-time updates and REST API for snapshots.
     """
 
     def __init__(self,
@@ -32,6 +32,7 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._diff_messages_queue_key = CONSTANTS.DIFF_EVENT_TYPE
         self._domain = domain
         self._api_factory = api_factory
+        self._client: Optional[socketio.AsyncClient] = None
 
     async def get_last_traded_prices(self,
                                      trading_pairs: List[str],
@@ -50,8 +51,7 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         :param trading_pair: the trading pair for which the order book will be retrieved
         :return: the response from the exchange (JSON dictionary)
         """
-        # Convert HB pair to CoinDCX pair format
-        coindcx_pair = hb_pair_to_coindcx_pair(trading_pair)
+        coindcx_pair = hb_pair_to_coindcx_pair(trading_pair, ecode=CONSTANTS.ECODE_COINDCX)
 
         params = {
             "pair": coindcx_pair
@@ -67,53 +67,97 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
         return data
 
-    async def _subscribe_channels(self, ws: WSAssistant):
+    async def listen_for_subscriptions(self):
         """
-        Subscribes to the trade events and diff orders events through the provided websocket connection.
-
-        CoinDCX WebSocket channels:
-        - {pair}@orderbook@{depth} for order book updates (e.g., B-BTC_USDT@orderbook@20)
-        - {pair}@trades for trade updates (e.g., B-BTC_USDT@trades)
-
-        :param ws: the websocket assistant used to connect to the exchange
+        Connects to Socket.IO and subscribes to order book and trade channels.
         """
-        try:
-            for trading_pair in self._trading_pairs:
-                coindcx_pair = hb_pair_to_coindcx_pair(trading_pair)
+        while True:
+            try:
+                trade_queue = self._message_queue[self._trade_messages_queue_key]
+                diff_queue = self._message_queue[self._diff_messages_queue_key]
 
-                orderbook_channel = f"{coindcx_pair}@orderbook@20"
-                subscribe_orderbook = {
-                    "channelName": orderbook_channel
-                }
-                await ws.send(WSJSONRequest(payload={"type": "join", **subscribe_orderbook}))
+                self._client = self._build_client(trade_queue, diff_queue)
+                await self._client.connect(CONSTANTS.SOCKET_IO_URL, transports=["websocket"])
+                
+                for trading_pair in self._trading_pairs:
+                    coindcx_pair = hb_pair_to_coindcx_pair(trading_pair, ecode=CONSTANTS.ECODE_COINDCX)
+                    orderbook_channel = f"{coindcx_pair}@orderbook@20"
+                    trades_channel = f"{coindcx_pair}@trades"
+                    await self._client.emit("join", {"channelName": orderbook_channel})
+                    await asyncio.sleep(0.05)
+                    await self._client.emit("join", {"channelName": trades_channel})
+                    await asyncio.sleep(0.05)
+                
+                self.logger().info("Subscribed to public order book and trade channels")
+                await self._client.wait()
+            except asyncio.CancelledError:
+                await self._disconnect()
+                raise
+            except Exception:
+                self.logger().exception("Unexpected error occurred when listening to order book streams. Retrying in 5 seconds...")
+                await self._disconnect()
+                await asyncio.sleep(5.0)
+            else:
+                await self._disconnect()
+                await asyncio.sleep(1.0)
 
-                trades_channel = f"{coindcx_pair}@trades"
-                subscribe_trades = {
-                    "channelName": trades_channel
-                }
-                await ws.send(WSJSONRequest(payload={"type": "join", **subscribe_trades}))
-
-            self.logger().info("Subscribed to public order book and trade channels...")
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            self.logger().error(
-                "Unexpected error occurred subscribing to order book trading and delta streams...",
-                exc_info=True
-            )
-            raise
-
-    async def _connected_websocket_assistant(self) -> WSAssistant:
-        """
-        Creates a new WebSocket connection to CoinDCX.
-        """
-        ws: WSAssistant = await self._api_factory.get_ws_assistant()
-        await ws.connect(
-            ws_url=CONSTANTS.WSS_URL,
-            ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL,
-            message_timeout=None
+    def _build_client(self, trade_queue: asyncio.Queue, diff_queue: asyncio.Queue) -> socketio.AsyncClient:
+        """Build Socket.IO client with event handlers for order book and trades."""
+        client = socketio.AsyncClient(
+            logger=False,
+            reconnection=False,
+            ssl_verify=False
         )
-        return ws
+
+        @client.event
+        async def connect():
+            self.logger().info("Connected to CoinDCX order book stream")
+
+        @client.event
+        async def disconnect():
+            self.logger().warning("CoinDCX order book stream disconnected")
+
+        @client.on(CONSTANTS.DEPTH_SNAPSHOT_EVENT_TYPE)
+        async def on_depth_snapshot(message):
+            self.logger().debug(f"Received depth-snapshot: {type(message)}")
+            if isinstance(message, dict) and ("bids" in message or "asks" in message):
+                await self._parse_order_book_diff_message(message, diff_queue)
+
+        @client.on(CONSTANTS.DIFF_EVENT_TYPE)
+        async def on_depth_update(message):
+            self.logger().debug(f"Received depth-update: {type(message)}")
+            if isinstance(message, dict) and ("bids" in message or "asks" in message):
+                await self._parse_order_book_diff_message(message, diff_queue)
+
+        @client.on(CONSTANTS.TRADE_EVENT_TYPE)
+        async def on_new_trade(message):
+            self.logger().debug(f"Received new-trade: {type(message)}")
+            if isinstance(message, dict) and "p" in message and "q" in message:
+                await self._parse_trade_message(message, trade_queue)
+
+        return client
+
+    async def _disconnect(self):
+        if self._client is not None:
+            try:
+                await self._client.disconnect()
+            except Exception:
+                self.logger().debug("CoinDCX order book stream disconnect failed", exc_info=True)
+            self._client = None
+
+    async def _subscribe_channels(self, ws):
+        """
+        Deprecated - subscriptions now handled in listen_for_subscriptions via Socket.IO emit.
+        Kept for compatibility.
+        """
+        pass
+
+    async def _connected_websocket_assistant(self):
+        """
+        Deprecated - Socket.IO connection now handled directly in listen_for_subscriptions.
+        Kept for compatibility.
+        """
+        pass
 
     async def _order_book_snapshot(self, trading_pair: str) -> OrderBookMessage:
         """
@@ -130,8 +174,9 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     async def _parse_trade_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
         """
-        Parses a trade message from CoinDCX WebSocket and adds it to the message queue.
+        Parses a trade message from CoinDCX Socket.IO and adds it to the message queue.
         """
+        self.logger().debug(f"Received trade message: {raw_message}")
         pair_symbol = raw_message.get("s", "")
         if pair_symbol:
             trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=pair_symbol)
@@ -141,8 +186,9 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     async def _parse_order_book_diff_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
         """
-        Parses an order book diff message from CoinDCX WebSocket and adds it to the message queue.
+        Parses an order book diff message from CoinDCX Socket.IO and adds it to the message queue.
         """
+        self.logger().debug(f"Received orderbook message: {raw_message}")
         if "bids" in raw_message or "asks" in raw_message:
             trading_pair = None
 

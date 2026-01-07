@@ -1,7 +1,8 @@
 import asyncio
-import socketio
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+import socketio
 
 from hummingbot.connector.exchange.coindcx import coindcx_constants as CONSTANTS, coindcx_web_utils as web_utils
 from hummingbot.connector.exchange.coindcx.coindcx_order_book import CoinDCXOrderBook
@@ -78,7 +79,7 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
                 self._client = self._build_client(trade_queue, diff_queue)
                 await self._client.connect(CONSTANTS.SOCKET_IO_URL, transports=["websocket"])
-                
+
                 for trading_pair in self._trading_pairs:
                     coindcx_pair = hb_pair_to_coindcx_pair(trading_pair, ecode=CONSTANTS.ECODE_COINDCX)
                     orderbook_channel = f"{coindcx_pair}@orderbook@20"
@@ -87,7 +88,7 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     await asyncio.sleep(0.05)
                     await self._client.emit("join", {"channelName": trades_channel})
                     await asyncio.sleep(0.05)
-                
+
                 self.logger().info("Subscribed to public order book and trade channels")
                 await self._client.wait()
             except asyncio.CancelledError:

@@ -28,23 +28,23 @@ def is_exchange_information_valid(exchange_info: Dict[str, Any]) -> bool:
     status = exchange_info.get("status", "")
     if status.lower() != "active":
         return False
-    
+
     # Validate critical numeric fields
     try:
         min_quantity = float(exchange_info.get("min_quantity", 0))
         max_quantity = float(exchange_info.get("max_quantity", 0))
-        
+
         # min_quantity must be non-negative and max_quantity must be positive
         if min_quantity < 0 or max_quantity <= 0:
             return False
-            
+
         # min_quantity should not exceed max_quantity
         if min_quantity > max_quantity:
             return False
-            
+
     except (ValueError, TypeError):
         return False
-    
+
     return True
 
 

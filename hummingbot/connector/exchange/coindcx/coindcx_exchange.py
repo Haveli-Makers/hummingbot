@@ -155,7 +155,6 @@ class CoindcxExchange(ExchangePyBase):
                 await self._update_balances()
             except Exception as e:
                 self.logger().warning(f"Failed to fetch initial balances: {e}")
-        
 
     async def get_all_pairs_prices(self) -> List[Dict[str, str]]:
         """
@@ -349,8 +348,8 @@ class CoindcxExchange(ExchangePyBase):
         """
         trading_pair_rules = exchange_info_dict if isinstance(exchange_info_dict, list) else [exchange_info_dict]
         retval = []
-        
-        is_list = isinstance(exchange_info_dict, list)
+
+        # is_list = isinstance(exchange_info_dict, list)
 
         for rule in filter(coindcx_utils.is_exchange_information_valid, trading_pair_rules):
             try:
@@ -461,7 +460,7 @@ class CoindcxExchange(ExchangePyBase):
         """
         if not isinstance(order_data, dict):
             return
-        
+
         client_order_id = order_data.get("client_order_id", order_data.get("c", ""))
         exchange_order_id = str(order_data.get("id", order_data.get("o", "")))
 
@@ -485,7 +484,7 @@ class CoindcxExchange(ExchangePyBase):
         """
         if not isinstance(trade_data, dict):
             return
-        
+
         client_order_id = trade_data.get("c", trade_data.get("client_order_id", ""))
         exchange_order_id = str(trade_data.get("o", trade_data.get("order_id", "")))
 
@@ -525,7 +524,7 @@ class CoindcxExchange(ExchangePyBase):
         """
         if not isinstance(balance_data, dict):
             return
-        
+
         asset_name = balance_data.get("currency", balance_data.get("a", ""))
         free_balance = Decimal(str(balance_data.get("balance", balance_data.get("f", 0))))
         locked_balance = Decimal(str(balance_data.get("locked_balance", balance_data.get("l", 0))))

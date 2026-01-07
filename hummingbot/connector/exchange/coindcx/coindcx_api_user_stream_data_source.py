@@ -1,6 +1,7 @@
 import asyncio
-import socketio
 from typing import TYPE_CHECKING, List, Optional
+
+import socketio
 
 from hummingbot.connector.exchange.coindcx import coindcx_constants as CONSTANTS
 from hummingbot.connector.exchange.coindcx.coindcx_auth import CoinDCXAuth
@@ -23,7 +24,7 @@ class CoinDCXAPIUserStreamDataSource(UserStreamTrackerDataSource):
                  auth: CoinDCXAuth,
                  trading_pairs: List[str],
                  connector: 'CoinDCXExchange',
-                 api_factory,  
+                 api_factory,
                  domain: str = CONSTANTS.DEFAULT_DOMAIN):
         super().__init__()
         self._auth: CoinDCXAuth = auth

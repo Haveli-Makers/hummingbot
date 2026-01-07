@@ -124,11 +124,11 @@ class CoinDCXAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         mock_client.emit = AsyncMock()
         mock_client.wait = AsyncMock(side_effect=asyncio.CancelledError)
         mock_client.disconnect = AsyncMock()
-        
+
         # Mock the decorator methods to return a no-op function
         mock_client.event = MagicMock(side_effect=lambda func: func)
         mock_client.on = MagicMock(side_effect=lambda event_type: lambda func: func)
-        
+
         mock_client_class.return_value = mock_client
 
         try:
@@ -137,11 +137,9 @@ class CoinDCXAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         except asyncio.CancelledError:
             pass
 
-        # Verify Socket.IO client was created and connected
         mock_client_class.assert_called_once()
         mock_client.connect.assert_called_once()
 
-        # Verify emit was called for both orderbook and trades channels
         emit_calls = mock_client.emit.call_args_list
         self.assertEqual(2, len(emit_calls))
 
@@ -157,21 +155,15 @@ class CoinDCXAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(expected_trades_channel, second_call_args[1]["channelName"])
 
     async def test_subscribe_channels_raises_cancel_exception(self):
-        # _subscribe_channels is deprecated and now just passes
-        # No exception should be raised from the deprecated method
         mock_ws = MagicMock()
         mock_ws.send.side_effect = asyncio.CancelledError
 
-        # Should not raise any exception since method is now a pass statement
         await self.data_source._subscribe_channels(mock_ws)
 
     async def test_subscribe_channels_raises_exception_and_logs_error(self):
-        # _subscribe_channels is deprecated and now just passes
-        # No exception should be raised from the deprecated method
         mock_ws = MagicMock()
         mock_ws.send.side_effect = Exception("Test Error")
 
-        # Should not raise any exception since method is now a pass statement
         await self.data_source._subscribe_channels(mock_ws)
 
     async def test_listen_for_trades_successful(self):

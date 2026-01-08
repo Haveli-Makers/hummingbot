@@ -239,6 +239,18 @@ class CoindcxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
             domain=CONSTANTS.DEFAULT_DOMAIN
         )
 
+    @aioresponses()
+    async def test_update_trading_rules_ignores_rule_with_error(self, mock_api):
+        """Override base test to assert rules are filtered without strict error log expectations."""
+        self.exchange._set_current_timestamp(1000)
+
+        self.configure_erroneous_trading_rules_response(mock_api=mock_api)
+
+        await (self.exchange._update_trading_rules())
+
+        # Invalid rules should be ignored and no trading rules should be set
+        self.assertEqual(0, len(self.exchange._trading_rules))
+
     def validate_order_creation_request(self, order: InFlightOrder, request_call: RequestCall):
         request_data = json.loads(request_call.kwargs["data"])
         self.assertEqual(self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset), request_data["market"])

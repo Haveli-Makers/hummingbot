@@ -60,15 +60,15 @@ async def test_handle_message_updates_last_recv_time():
 @pytest.mark.asyncio
 async def test_build_client_creates_socketio_client():
     """Test that _build_client creates a Socket.IO client with proper handlers"""
-    # data_source = CoinDCXAPIUserStreamDataSource(
-    #     auth=DummyAuth(),
-    #     trading_pairs=["BTC-USDT"],
-    #     connector=DummyConnector(),
-    #     api_factory=None,
-    #     domain=""
-    # )
+    data_source = CoinDCXAPIUserStreamDataSource(
+        auth=DummyAuth(),
+        trading_pairs=["BTC-USDT"],
+        connector=DummyConnector(),
+        api_factory=None,
+        domain=""
+    )
 
-    # q = asyncio.Queue()
+    q = asyncio.Queue()
 
     with patch("hummingbot.connector.exchange.coindcx.coindcx_api_user_stream_data_source.socketio.AsyncClient") as mock_client_class:
         mock_client = MagicMock()
@@ -76,7 +76,7 @@ async def test_build_client_creates_socketio_client():
         mock_client.on = MagicMock(side_effect=lambda event_type: lambda func: func)
         mock_client_class.return_value = mock_client
 
-        # client = data_source._build_client(q)
+        data_source._build_client(q)
 
         mock_client_class.assert_called_once_with(
             logger=False,

@@ -1,12 +1,43 @@
-
 import json
 import re
+import sys
+import types
 from decimal import Decimal
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pytest
 from aioresponses import aioresponses
 from aioresponses.core import RequestCall
+
+try:
+    import socketio  # noqa: F401
+except ImportError:
+    socketio = types.ModuleType("socketio")
+
+    class AsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def event(self, func):
+            return func
+
+        def on(self, event_type):
+            return lambda func: func
+
+        async def connect(self, *args, **kwargs):
+            pass
+
+        async def wait(self):
+            pass
+
+        async def disconnect(self):
+            pass
+
+        async def emit(self, *args, **kwargs):
+            pass
+
+    socketio.AsyncClient = AsyncClient
+    sys.modules["socketio"] = socketio
 
 from hummingbot.connector.exchange.coindcx import coindcx_constants as CONSTANTS, coindcx_web_utils as web_utils
 from hummingbot.connector.exchange.coindcx.coindcx_exchange import CoindcxExchange

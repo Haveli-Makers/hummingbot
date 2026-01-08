@@ -1,42 +1,10 @@
 import asyncio
 import json
 import re
-import sys
-import types
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from aioresponses.core import aioresponses
-
-try:
-    import socketio  # noqa: F401
-except ImportError:
-    socketio = types.ModuleType("socketio")
-
-    class AsyncClient:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def event(self, func):
-            return func
-
-        def on(self, event_type):
-            return lambda func: func
-
-        async def connect(self, *args, **kwargs):
-            pass
-
-        async def wait(self):
-            pass
-
-        async def disconnect(self):
-            pass
-
-        async def emit(self, *args, **kwargs):
-            pass
-
-    socketio.AsyncClient = AsyncClient
-    sys.modules["socketio"] = socketio
 
 from hummingbot.connector.exchange.coindcx import coindcx_constants as CONSTANTS, coindcx_web_utils as web_utils
 from hummingbot.connector.exchange.coindcx.coindcx_api_order_book_data_source import CoinDCXAPIOrderBookDataSource

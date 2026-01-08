@@ -1,39 +1,7 @@
 import asyncio
-import sys
-import types
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
-try:
-    import socketio  # noqa: F401
-except ImportError:
-    socketio = types.ModuleType("socketio")
-
-    class AsyncClient:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def event(self, func):
-            return func
-
-        def on(self, event_type):
-            return lambda func: func
-
-        async def connect(self, *args, **kwargs):
-            pass
-
-        async def wait(self):
-            pass
-
-        async def disconnect(self):
-            pass
-
-        async def emit(self, *args, **kwargs):
-            pass
-
-    socketio.AsyncClient = AsyncClient
-    sys.modules["socketio"] = socketio
 
 from hummingbot.connector.exchange.coindcx.coindcx_api_user_stream_data_source import CoinDCXAPIUserStreamDataSource
 

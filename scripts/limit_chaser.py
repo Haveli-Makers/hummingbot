@@ -1,5 +1,5 @@
-import os
 import asyncio
+import os
 from decimal import Decimal
 from typing import Dict, Optional
 
@@ -9,9 +9,12 @@ from hummingbot.client.config.config_data_types import BaseClientModel
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.core.data_type.common import PriceType, TradeType
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
-from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy, LimitChaserConfig, OrderExecutorConfig
+from hummingbot.strategy_v2.executors.order_executor.data_types import (
+    ExecutionStrategy,
+    LimitChaserConfig,
+    OrderExecutorConfig,
+)
 from hummingbot.strategy_v2.executors.order_executor.order_executor import OrderExecutor
-
 
 SUPPORTED_CONNECTORS = [
     "binance",

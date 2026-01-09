@@ -970,3 +970,115 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual("integration_test_market", orders[0].market)
         self.assertEqual("BTC-USDT", orders[0].symbol)
         self.assertEqual("NEW_MARKET_OID1", orders[0].id)
+
+    def test_store_market_data(self):
+        """Test storing multiple market data records in a single batch."""
+        recorder = MarketsRecorder(
+            sql=self.manager,
+            markets=[self],
+            config_file_path=self.config_file_path,
+            strategy_name=self.strategy_name,
+            market_data_collection=MarketDataCollectionConfigMap(
+                market_data_collection_enabled=False,
+                market_data_collection_interval=60,
+                market_data_collection_depth=20,
+            ),
+        )
+
+        market_data_list = [
+            {
+                'exchange': 'binance',
+                'trading_pair': 'BTC-USDT',
+                'best_bid': 50000.0,
+                'best_ask': 50010.0,
+                'mid_price': 50005.0,
+                'spread': 0.02,
+            },
+            {
+                'exchange': 'binance',
+                'trading_pair': 'ETH-USDT',
+                'best_bid': 3000.0,
+                'best_ask': 3001.0,
+                'mid_price': 3000.5,
+                'spread': 0.033,
+            },
+        ]
+
+        recorder.store_market_data(market_data_list)
+
+        with self.manager.get_new_session() as session:
+            query = session.query(MarketData)
+            records = query.all()
+
+        self.assertEqual(2, len(records))
+        btc_record = next((r for r in records if r.trading_pair == 'BTC-USDT'), None)
+        eth_record = next((r for r in records if r.trading_pair == 'ETH-USDT'), None)
+
+        self.assertIsNotNone(btc_record)
+        self.assertEqual('binance', btc_record.exchange)
+        self.assertAlmostEqual(float(btc_record.best_bid), 50000.0, places=2)
+        self.assertAlmostEqual(float(btc_record.best_ask), 50010.0, places=2)
+
+        self.assertIsNotNone(eth_record)
+        self.assertEqual('binance', eth_record.exchange)
+        self.assertAlmostEqual(float(eth_record.best_bid), 3000.0, places=2)
+
+    def test_store_market_data_calculates_missing_values(self):
+        """Test that store_market_data calculates mid_price, spread if not provided."""
+        recorder = MarketsRecorder(
+            sql=self.manager,
+            markets=[self],
+            config_file_path=self.config_file_path,
+            strategy_name=self.strategy_name,
+            market_data_collection=MarketDataCollectionConfigMap(
+                market_data_collection_enabled=False,
+                market_data_collection_interval=60,
+                market_data_collection_depth=20,
+            ),
+        )
+
+        # Only provide bid/ask, let the method calculate the rest
+        market_data_list = [
+            {
+                'exchange': 'kucoin',
+                'trading_pair': 'SOL-USDT',
+                'best_bid': 100.0,
+                'best_ask': 101.0,
+            },
+        ]
+
+        recorder.store_market_data(market_data_list)
+
+        with self.manager.get_new_session() as session:
+            query = session.query(MarketData).filter(MarketData.trading_pair == 'SOL-USDT')
+            record = query.first()
+
+        self.assertIsNotNone(record)
+        self.assertEqual('kucoin', record.exchange)
+        self.assertAlmostEqual(float(record.mid_price), 100.5, places=2)  # (100 + 101) / 2
+        # spread = (1 / 100.5) * 100 ≈ 0.995
+        self.assertAlmostEqual(float(record.spread), 0.995, places=2)
+
+    def test_store_market_data_empty_list(self):
+        """Test that store_market_data handles empty list gracefully."""
+        recorder = MarketsRecorder(
+            sql=self.manager,
+            markets=[self],
+            config_file_path=self.config_file_path,
+            strategy_name=self.strategy_name,
+            market_data_collection=MarketDataCollectionConfigMap(
+                market_data_collection_enabled=False,
+                market_data_collection_interval=60,
+                market_data_collection_depth=20,
+            ),
+        )
+
+        # Should not raise any exception
+        recorder.store_market_data([])
+
+        with self.manager.get_new_session() as session:
+            query = session.query(MarketData)
+            records = query.all()
+
+        # No records should be added
+        self.assertEqual(0, len(records))

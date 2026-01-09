@@ -48,6 +48,46 @@ class GateIoRateSource(RateSourceBase):
             )
         return results
 
+    @async_ttl_cache(ttl=30, maxsize=1)
+    async def get_bid_ask_prices(self, quote_token: Optional[str] = None) -> Dict[str, Dict[str, Decimal]]:
+        """
+        Fetches best bid and ask prices for all trading pairs.
+
+        :param quote_token: A quote symbol, if specified only pairs with the quote symbol are included
+        :return: A dictionary of trading pairs to {"bid": Decimal, "ask": Decimal, "mid": Decimal, "spread": Decimal}
+        """
+        self._ensure_exchange()
+        results = {}
+        try:
+            records = await self._exchange._api_get(
+                path_url=CONSTANTS.TICKER_PATH_URL,
+                is_auth_required=False,
+                limit_id=CONSTANTS.TICKER_PATH_URL
+            )
+            for record in records:
+                try:
+                    pair = await self._exchange.trading_pair_associated_to_exchange_symbol(record["currency_pair"])
+                except KeyError:
+                    continue
+
+                if str(record["lowest_ask"]) == '' or str(record["highest_bid"]) == '':
+                    continue
+
+                bid = Decimal(str(record["highest_bid"]))
+                ask = Decimal(str(record["lowest_ask"]))
+                if bid > 0 and ask > 0 and bid <= ask:
+                    results[pair] = {
+                        "bid": bid,
+                        "ask": ask,
+                        "mid": (bid + ask) / Decimal("2"),
+                        "spread": ((ask - bid) / ((bid + ask) / Decimal("2"))) * Decimal("100")
+                    }
+        except Exception:
+            self.logger().exception(
+                msg="Unexpected error while retrieving bid/ask prices from Gate.IO. Check the log file for more info.",
+            )
+        return results
+
     def _ensure_exchange(self):
         if self._exchange is None:
             self._exchange = self._build_gate_io_connector_without_private_keys()

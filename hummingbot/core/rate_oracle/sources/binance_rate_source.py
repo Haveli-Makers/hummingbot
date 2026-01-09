@@ -38,6 +38,31 @@ class BinanceRateSource(RateSourceBase):
                 results.update(task_result)
         return results
 
+    @async_ttl_cache(ttl=30, maxsize=1)
+    async def get_bid_ask_prices(self, quote_token: Optional[str] = None) -> Dict[str, Dict[str, Decimal]]:
+        """
+        Fetches best bid and ask prices for all trading pairs.
+
+        :param quote_token: A quote symbol, if specified only pairs with the quote symbol are included
+        :return: A dictionary of trading pairs to {"bid": Decimal, "ask": Decimal, "mid": Decimal}
+        """
+        self._ensure_exchanges()
+        results = {}
+        tasks = [
+            self._get_binance_bid_ask_prices(exchange=self._binance_exchange, quote_token=quote_token),
+        ]
+        task_results = await safe_gather(*tasks, return_exceptions=True)
+        for task_result in task_results:
+            if isinstance(task_result, Exception):
+                self.logger().error(
+                    msg="Unexpected error while retrieving bid/ask prices from Binance. Check the log file for more info.",
+                    exc_info=task_result,
+                )
+                break
+            else:
+                results.update(task_result)
+        return results
+
     def _ensure_exchanges(self):
         if self._binance_exchange is None:
             self._binance_exchange = self._build_binance_connector_without_private_keys(domain="com")
@@ -66,6 +91,40 @@ class BinanceRateSource(RateSourceBase):
             ask_price = pair_price.get("askPrice")
             if bid_price is not None and ask_price is not None and 0 < Decimal(bid_price) <= Decimal(ask_price):
                 results[trading_pair] = (Decimal(bid_price) + Decimal(ask_price)) / Decimal("2")
+
+        return results
+
+    @staticmethod
+    async def _get_binance_bid_ask_prices(exchange: 'BinanceExchange', quote_token: str = None) -> Dict[str, Dict[str, Decimal]]:
+        """
+        Fetches binance bid and ask prices.
+
+        :param exchange: The exchange instance from which to query prices.
+        :param quote_token: A quote symbol, if specified only pairs with the quote symbol are included
+        :return: A dictionary of trading pairs to {"bid": Decimal, "ask": Decimal, "mid": Decimal}
+        """
+        pairs_prices = await exchange.get_all_pairs_prices()
+        results = {}
+        for pair_price in pairs_prices:
+            try:
+                trading_pair = await exchange.trading_pair_associated_to_exchange_symbol(symbol=pair_price["symbol"])
+            except KeyError:
+                continue  # skip pairs that we don't track
+            if quote_token is not None:
+                base, quote = split_hb_trading_pair(trading_pair=trading_pair)
+                if quote != quote_token:
+                    continue
+            bid_price = pair_price.get("bidPrice")
+            ask_price = pair_price.get("askPrice")
+            if bid_price is not None and ask_price is not None and 0 < Decimal(bid_price) <= Decimal(ask_price):
+                bid = Decimal(bid_price)
+                ask = Decimal(ask_price)
+                results[trading_pair] = {
+                    "bid": bid,
+                    "ask": ask,
+                    "mid": (bid + ask) / Decimal("2"),
+                    "spread": ((ask - bid) / ((bid + ask) / Decimal("2"))) * Decimal("100")
+                }
 
         return results
 

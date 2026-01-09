@@ -90,6 +90,37 @@ class DexalotRateSourceTest(IsolatedAsyncioWrapperTestCase):
         await self.mocking_assistant.run_until_all_aiohttp_messages_delivered(ws_connect_mock.return_value)
         return prices
 
+    @patch("aiohttp.ClientSession.ws_connect", new_callable=AsyncMock)
+    async def setup_dexalot_bid_ask_responses(self, ws_connect_mock, mock_api, rate_source):
+        symbols_url = web_utils.public_rest_url(path_url=CONSTANTS.EXCHANGE_INFO_PATH_URL)
+        symbols_response = [
+            {'env': 'production-multi-subnet', 'pair': 'ALOT/USDC', 'base': 'ALOT', 'quote': 'USDC',
+             'basedisplaydecimals': 2, 'quotedisplaydecimals': 4,
+             'baseaddress': '0x093783055F9047C2BfF99c4e414501F8A147bC69',  # noqa: mock
+             'quoteaddress': '0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E',  # noqa: mock
+             'mintrade_amnt': '5.000000000000000000', 'maxtrade_amnt': '50000.000000000000000000',
+             'base_evmdecimals': 18, 'quote_evmdecimals': 6, 'allowswap': True,
+             'auctionmode': 0, 'auctionendtime': None, 'status': 'deployed',
+             'maker_rate_bps': 10, 'taker_rate_bps': 12, 'allowed_slippage_pct': 20,
+             'additional_ordertypes': None, 'taker_fee': 0.001, 'maker_fee': 0.0012},
+        ]
+        mock_api.get(url=symbols_url, body=json.dumps(symbols_response))
+        ws_connect_mock.return_value = self.mocking_assistant.create_websocket_mock()
+
+        result_subscribe = {'data': [
+            {'pair': 'ALOT/USDC', 'date': '2024-10-04T08:54:32.021Z', 'low': '9', 'high': '11',
+             'open': '0.56628', 'close': '0.5659', 'volume': '124062.5422952677657237',
+             'quote_volume': '70336.660027130678322247184899', 'change': '-0.0007'},
+        ], 'type': 'marketSnapShot'}
+
+        self.mocking_assistant.add_websocket_aiohttp_message(
+            websocket_mock=ws_connect_mock.return_value,
+            message=json.dumps(result_subscribe))
+        bid_ask_prices = await rate_source.get_bid_ask_prices()
+
+        await self.mocking_assistant.run_until_all_aiohttp_messages_delivered(ws_connect_mock.return_value)
+        return bid_ask_prices
+
     @aioresponses()
     async def test_get_prices(self, mock_api):
         expected_rate = Decimal("10")
@@ -99,3 +130,16 @@ class DexalotRateSourceTest(IsolatedAsyncioWrapperTestCase):
         self.assertIn(self.trading_pair, prices)
         self.assertEqual(expected_rate, prices[self.trading_pair])
         self.assertNotIn(self.ignored_trading_pair, prices)
+
+    @aioresponses()
+    async def test_get_bid_ask_prices(self, mock_api):
+        rate_source = DexalotRateSource()
+        bid_ask_prices = await self.setup_dexalot_bid_ask_responses(mock_api=mock_api, rate_source=rate_source)
+
+        self.assertIn(self.trading_pair, bid_ask_prices)
+        price_data = bid_ask_prices[self.trading_pair]
+        self.assertEqual(Decimal("9"), price_data["bid"])
+        self.assertEqual(Decimal("11"), price_data["ask"])
+        self.assertEqual(Decimal("10"), price_data["mid"])
+        self.assertIn("spread", price_data)
+        self.assertIn("spread", price_data)

@@ -13,8 +13,13 @@ from hummingbot.connector.test_support.exchange_connector_test import AbstractEx
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
-from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TokenAmount, TradeFeeBase
-from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee
+from hummingbot.core.data_type.trade_fee import (
+    AddedToCostTradeFee,
+    DeductedFromReturnsTradeFee,
+    TokenAmount,
+    TradeFeeBase,
+)
+
 
 class DummyRA:
     def __init__(self, response=None, resp=None, exc=None, raise_exc=False):
@@ -44,7 +49,7 @@ class DummyFactory:
 
     def build_rest_assistant(self):
         return DummyRA(response=self._response, resp=self._response, exc=self._exc, raise_exc=self._raise)
-    
+
     async def get_rest_assistant(self):
         """Async version for compatibility with wazirx_exchange."""
         return DummyRA(response=self._response, resp=self._response, exc=self._exc, raise_exc=self._raise)
@@ -949,12 +954,12 @@ async def test_get_last_traded_prices_handles_exceptions():
 @pytest.mark.asyncio
 async def test_all_trade_updates_for_order_and_request_order_status():
     """Test trade updates parsing for an open order.
-    
+
     Note: We mock _wazirx_request since that's what the exchange actually uses,
     not the web_assistants_factory directly.
     """
     exchange = WazirxExchange("k", "s", trading_pairs=["BTC-USDT"])
-    
+
     order = InFlightOrder(
         client_order_id="c1",
         exchange_order_id="42",
@@ -966,7 +971,7 @@ async def test_all_trade_updates_for_order_and_request_order_status():
         creation_timestamp=1650000000.0,
         initial_state=OrderState.OPEN
     )
-    
+
     trades_resp = [
         {
             "id": "1",
@@ -979,13 +984,13 @@ async def test_all_trade_updates_for_order_and_request_order_status():
             "time": 1650000000000,
         }
     ]
-    
+
     async def mock_wazirx_request(method, path, params=None, is_auth_required=False):
         return trades_resp
-    
+
     exchange._wazirx_request = mock_wazirx_request
     exchange._trade_fee_schema = {}
-    
+
     orig_new_spot_fee = TradeFeeBase.new_spot_fee
     TradeFeeBase.new_spot_fee = staticmethod(
         lambda fee_schema, trade_type, percent=Decimal(0), percent_token=None, flat_fees=None:
@@ -995,7 +1000,7 @@ async def test_all_trade_updates_for_order_and_request_order_status():
         updates = await exchange._all_trade_updates_for_order(order)
     finally:
         TradeFeeBase.new_spot_fee = orig_new_spot_fee
-    
+
     assert len(updates) == 1
     tu = updates[0]
     assert tu.trade_id == "1"

@@ -1,12 +1,10 @@
 import asyncio
 import logging
-import time
 from typing import Any, Dict, List, Optional
 
 import aiohttp
 
-from hummingbot.connector.exchange.wazirx import wazirx_constants as CONSTANTS
-from hummingbot.connector.exchange.wazirx import wazirx_web_utils as web_utils
+from hummingbot.connector.exchange.wazirx import wazirx_constants as CONSTANTS, wazirx_web_utils as web_utils
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.core.data_type.order_book_message import OrderBookMessage, OrderBookMessageType
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource

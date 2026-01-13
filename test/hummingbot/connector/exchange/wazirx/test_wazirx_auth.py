@@ -1,7 +1,4 @@
 import asyncio
-import hashlib
-import hmac
-from copy import copy
 from unittest import TestCase
 from unittest.mock import MagicMock
 
@@ -23,7 +20,7 @@ class WazirxAuthTests(TestCase):
 
     def test_rest_authenticate(self):
         """Test that rest_authenticate adds the API key header.
-        
+
         Note: Full authentication (timestamp, signature) happens in add_auth_params()
         which is called by _wazirx_request() in wazirx_exchange.py, not in rest_authenticate().
         This test verifies that rest_authenticate adds the API key header as expected.

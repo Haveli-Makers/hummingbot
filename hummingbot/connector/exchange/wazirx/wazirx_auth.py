@@ -3,7 +3,6 @@ import hashlib
 import hmac
 import time
 from typing import Any, Dict
-from urllib.parse import urlencode
 
 import aiohttp
 
@@ -47,10 +46,10 @@ class WazirxAuth(AuthBase):
                             current_ts = int(time.time() * 1000)
             except Exception:
                 current_ts = int(time.time() * 1000)
-            
+
             if current_ts <= self._last_timestamp:
                 current_ts = self._last_timestamp + 1
-            
+
             self._last_timestamp = current_ts
             return current_ts
 
@@ -78,12 +77,12 @@ class WazirxAuth(AuthBase):
         auth_params = dict(params)
         auth_params["recvWindow"] = self.RECV_WINDOW
         auth_params["timestamp"] = await self._get_timestamp()
-        
+
         query_string = self._generate_query_string(auth_params)
         signature = self.generate_signature(query_string)
         auth_params["signature"] = signature
         final_query_string = query_string + f"&signature={signature}"
-        
+
         return auth_params, final_query_string
 
     def get_headers(self) -> Dict[str, str]:

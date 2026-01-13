@@ -47,7 +47,7 @@ class WazirxExchange(ExchangePyBase):
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
         super().__init__(balance_asset_limit, rate_limits_share_pct)
-        
+
         if trading_required and trading_pairs:
             for pair in trading_pairs:
                 parts = pair.split("-")
@@ -152,7 +152,7 @@ class WazirxExchange(ExchangePyBase):
     ) -> Dict[str, Any]:
         """
         Make a request to WazirX API with proper authentication.
-        
+
         WazirX requires:
         - Content-Type: application/x-www-form-urlencoded for POST/DELETE
         - Parameters in body for POST/DELETE, query string for GET
@@ -160,13 +160,13 @@ class WazirxExchange(ExchangePyBase):
         """
         url = f"{CONSTANTS.REST_URL}{path}"
         params = params or {}
-        
+
         async with aiohttp.ClientSession() as session:
             if is_auth_required:
                 auth: WazirxAuth = self._auth
                 _, query_string = await auth.add_auth_params(params)
                 headers = auth.get_headers()
-                
+
                 if method.upper() == "GET":
                     full_url = f"{url}?{query_string}"
                     async with session.get(full_url, headers=headers) as response:
@@ -242,12 +242,12 @@ class WazirxExchange(ExchangePyBase):
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
         symbol = tracked_order.trading_pair.replace("-", "").lower()
-        
+
         exchange_order_id = tracked_order.exchange_order_id
         if not exchange_order_id:
             self.logger().warning(f"Cannot cancel order {order_id}: no exchange order ID available")
             return False
-            
+
         params = {
             "symbol": symbol,
             "orderId": exchange_order_id,
@@ -406,9 +406,9 @@ class WazirxExchange(ExchangePyBase):
                     params=params,
                     is_auth_required=True
                 )
-                
+
                 trades = resp if isinstance(resp, list) else resp.get("trades", [])
-                
+
                 for trade in trades:
                     fee = TradeFeeBase.new_spot_fee(
                         fee_schema=self.trade_fee_schema(),
@@ -488,7 +488,7 @@ class WazirxExchange(ExchangePyBase):
                 balances = resp
             else:
                 balances = resp.get("balances", [])
-            
+
             for balance_entry in balances:
                 asset_name = balance_entry.get("asset", "").upper()
                 free_balance = Decimal(balance_entry.get("free", "0"))
@@ -498,14 +498,13 @@ class WazirxExchange(ExchangePyBase):
         except Exception as e:
             self.logger().warning(f"Error updating balances (will retry): {e}")
 
-
     def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Dict[str, Any]):
         mapping = bidict()
         if isinstance(exchange_info, list):
             symbols_data = exchange_info
         else:
             symbols_data = exchange_info.get("symbols", [])
-        
+
         for symbol_data in symbols_data:
             symbol = symbol_data.get("symbol", "").lower()
             base_asset = symbol_data.get("baseAsset", "")

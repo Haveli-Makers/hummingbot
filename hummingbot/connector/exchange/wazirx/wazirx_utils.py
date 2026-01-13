@@ -1,5 +1,4 @@
 from decimal import Decimal
-from typing import Any, Dict
 
 from pydantic import ConfigDict, Field, SecretStr
 
@@ -14,6 +13,7 @@ DEFAULT_FEES = TradeFeeSchema(
     taker_percent_fee_decimal=Decimal("0.002"),
     buy_percent_fee_deducted_from_returns=True
 )
+
 
 def wazirx_pair_to_hb_pair(symbol: str) -> str:
     """Convert WazirX symbol like 'btcinr' or 'btcusdt' to Hummingbot format 'BTC-INR' or 'BTC-USDT'.
@@ -32,8 +32,10 @@ def wazirx_pair_to_hb_pair(symbol: str) -> str:
                 return f"{base}-{q}"
     return s
 
+
 def hb_pair_to_wazirx_symbol(hb_pair: str) -> str:
     return hb_pair.replace("-", "").upper()
+
 
 class WazirxConfigMap(BaseConnectorConfigMap):
     """

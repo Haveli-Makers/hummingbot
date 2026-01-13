@@ -11,12 +11,11 @@ from hummingbot.connector.exchange.wazirx import wazirx_constants as CONSTANTS, 
 from hummingbot.connector.exchange.wazirx.wazirx_exchange import WazirxExchange
 from hummingbot.connector.test_support.exchange_connector_test import AbstractExchangeConnectorTests
 from hummingbot.connector.trading_rule import TradingRule
-from hummingbot.core.data_type.common import OrderType
-from hummingbot.core.data_type.in_flight_order import InFlightOrder
+from hummingbot.core.data_type.common import OrderType, TradeType
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
 from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TokenAmount, TradeFeeBase
+from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee
 
-
-# Simple dummy Rest Assistant and Factory used by tests when monkeypatching
 class DummyRA:
     def __init__(self, response=None, resp=None, exc=None, raise_exc=False):
         self._response = response if response is not None else resp
@@ -44,6 +43,10 @@ class DummyFactory:
         self._raise = raise_exc
 
     def build_rest_assistant(self):
+        return DummyRA(response=self._response, resp=self._response, exc=self._exc, raise_exc=self._raise)
+    
+    async def get_rest_assistant(self):
+        """Async version for compatibility with wazirx_exchange."""
         return DummyRA(response=self._response, resp=self._response, exc=self._exc, raise_exc=self._raise)
 
 
@@ -868,22 +871,132 @@ class WazirxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests)
                  "quoteAsset": self.quote_asset}
             ]
         }
-        # initialize
         self.exchange._initialize_trading_pair_symbols_from_exchange_info(exchange_info)
-        # trading_pair_symbol_map should be available via async call
         mapping = self.async_run_with_timeout(self.exchange.trading_pair_symbol_map())
         ex_symbol = self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset).lower()
         self.assertIn(ex_symbol, mapping)
         self.assertEqual(mapping[ex_symbol], self.trading_pair)
 
     def test_get_order_book_raises_when_missing_and_tick_sets_notifier(self):
-        # get_order_book should raise when no order book exists
         with self.assertRaises(ValueError):
             self.exchange.get_order_book("NOT-EXIST")
 
-        # tick should set the poll notifier when timestamp advances past poll interval
         self.exchange._last_timestamp = 0
-        # choose timestamp > TICK_INTERVAL_LIMIT so poll_interval becomes SHORT_POLL_INTERVAL
         timestamp = self.exchange.TICK_INTERVAL_LIMIT + 1
         self.exchange.tick(timestamp)
         self.assertTrue(self.exchange._poll_notifier.is_set())
+
+
+@pytest.mark.asyncio
+async def test_format_trading_rules_with_list_input():
+    exchange = WazirxExchange("k", "s", trading_pairs=["BTC-USDT"])
+    rule = {
+        "symbol": "BTCUSDT",
+        "baseAsset": "BTC",
+        "quoteAsset": "USDT",
+        "filters": [
+            {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+            {"filterType": "LOT_SIZE", "minQty": "0.001", "maxQty": "1000", "stepSize": "0.001"},
+            {"filterType": "MIN_NOTIONAL", "minNotional": "10"},
+        ],
+    }
+
+    rules = await exchange._format_trading_rules([rule])
+    assert isinstance(rules, list)
+
+
+@pytest.mark.asyncio
+async def test_format_trading_rules_with_dict_input():
+    exchange = WazirxExchange("k", "s", trading_pairs=["ETH-USDT"])
+    payload = {"symbols": [
+        {"symbol": "ETHUSDT", "baseAsset": "ETH", "quoteAsset": "USDT", "filters": []}
+    ]}
+
+    rules = await exchange._format_trading_rules(payload)
+    assert isinstance(rules, list)
+
+
+@pytest.mark.asyncio
+async def test_get_last_traded_prices_list_response():
+    """Test that list responses are not processed (only dict responses are supported)."""
+    exchange = WazirxExchange("k", "s", trading_pairs=["BTC-USDT"])
+    resp = [{"lastPrice": "123.45"}]
+    exchange._web_assistants_factory = DummyFactory(resp=resp)
+
+    prices = await exchange.get_last_traded_prices(["BTC-USDT"])
+    assert prices.get("BTC-USDT", 0.0) == 0.0
+
+
+@pytest.mark.asyncio
+async def test_get_last_traded_prices_dict_response():
+    exchange = WazirxExchange("k", "s", trading_pairs=["BTC-USDT"])
+    resp = {"lastPrice": "200.0"}
+    exchange._web_assistants_factory = DummyFactory(resp=resp)
+
+    prices = await exchange.get_last_traded_prices(["BTC-USDT"])
+    assert prices["BTC-USDT"] == 200.0
+
+
+@pytest.mark.asyncio
+async def test_get_last_traded_prices_handles_exceptions():
+    exchange = WazirxExchange("k", "s", trading_pairs=["BTC-USDT"])
+    exchange._web_assistants_factory = DummyFactory(resp=None, raise_exc=True)
+
+    prices = await exchange.get_last_traded_prices(["BTC-USDT"])
+    assert prices["BTC-USDT"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_all_trade_updates_for_order_and_request_order_status():
+    """Test trade updates parsing for an open order.
+    
+    Note: We mock _wazirx_request since that's what the exchange actually uses,
+    not the web_assistants_factory directly.
+    """
+    exchange = WazirxExchange("k", "s", trading_pairs=["BTC-USDT"])
+    
+    order = InFlightOrder(
+        client_order_id="c1",
+        exchange_order_id="42",
+        trading_pair="BTC-USDT",
+        order_type=OrderType.LIMIT,
+        trade_type=TradeType.BUY,
+        price=Decimal("123.0"),
+        amount=Decimal("0.5"),
+        creation_timestamp=1650000000.0,
+        initial_state=OrderState.OPEN
+    )
+    
+    trades_resp = [
+        {
+            "id": "1",
+            "orderId": "42",
+            "commissionAsset": "USDT",
+            "commission": "0.1",
+            "qty": "0.5",
+            "quoteQty": "61.5",
+            "price": "123.0",
+            "time": 1650000000000,
+        }
+    ]
+    
+    async def mock_wazirx_request(method, path, params=None, is_auth_required=False):
+        return trades_resp
+    
+    exchange._wazirx_request = mock_wazirx_request
+    exchange._trade_fee_schema = {}
+    
+    orig_new_spot_fee = TradeFeeBase.new_spot_fee
+    TradeFeeBase.new_spot_fee = staticmethod(
+        lambda fee_schema, trade_type, percent=Decimal(0), percent_token=None, flat_fees=None:
+        AddedToCostTradeFee(percent=percent, percent_token=percent_token, flat_fees=flat_fees or [])
+    )
+    try:
+        updates = await exchange._all_trade_updates_for_order(order)
+    finally:
+        TradeFeeBase.new_spot_fee = orig_new_spot_fee
+    
+    assert len(updates) == 1
+    tu = updates[0]
+    assert tu.trade_id == "1"
+    assert float(tu.fill_price) == 123.0

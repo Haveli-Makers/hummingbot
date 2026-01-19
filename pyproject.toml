@@ -1,9 +1,9 @@
 [tool.pytest.ini_options]
 asyncio_default_fixture_loop_scope = "function"
 
-timeout = 300  
-timeout_method = "thread"  
-timeout_func_only = true 
+timeout = 300
+timeout_method = "thread"
+timeout_func_only = true
 addopts = """
     --ignore=test/hummingbot/connector/derivative/dydx_v4_perpetual/
     --ignore=test/hummingbot/connector/exchange/vertex/

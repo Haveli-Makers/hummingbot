@@ -78,11 +78,11 @@ jobs:
           conda activate hummingbot
           pre-commit run --files $(git diff --name-only origin/$GITHUB_BASE_REF)
 
-            - name: Run stable tests and calculate coverage
-          if: steps.program-changes.outputs.cache-hit != 'true' || steps.conda-dependencies.outputs.cache-hit != 'true'
-          shell: bash
-          timeout-minutes: 30  # Prevent 6hr hang
-          run: |
+      - name: Run stable tests and calculate coverage
+        if: steps.program-changes.outputs.cache-hit != 'true' || steps.conda-dependencies.outputs.cache-hit != 'true'
+        shell: bash
+        timeout-minutes: 30  # Prevent 6hr hang
+        run: |
             source $CONDA/etc/profile.d/conda.sh
             conda activate hummingbot
             pip install pytest-timeout pytest-xdist

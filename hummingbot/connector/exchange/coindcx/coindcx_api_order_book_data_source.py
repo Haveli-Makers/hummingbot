@@ -78,7 +78,7 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 diff_queue = self._message_queue[self._diff_messages_queue_key]
 
                 self._client = self._build_client(trade_queue, diff_queue)
-                await self._client.connect(CONSTANTS.SOCKET_IO_URL, transports=["websocket"])
+                await self._client.connect(CONSTANTS.WSS_URL, transports=["websocket"])
 
                 for trading_pair in self._trading_pairs:
                     coindcx_pair = hb_pair_to_coindcx_pair(trading_pair, ecode=CONSTANTS.ECODE_COINDCX)

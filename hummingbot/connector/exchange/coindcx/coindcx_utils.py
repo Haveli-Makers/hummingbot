@@ -29,16 +29,13 @@ def is_exchange_information_valid(exchange_info: Dict[str, Any]) -> bool:
     if status.lower() != "active":
         return False
 
-    # Validate critical numeric fields
     try:
         min_quantity = float(exchange_info.get("min_quantity", 0))
         max_quantity = float(exchange_info.get("max_quantity", 0))
 
-        # min_quantity must be non-negative and max_quantity must be positive
         if min_quantity < 0 or max_quantity <= 0:
             return False
 
-        # min_quantity should not exceed max_quantity
         if min_quantity > max_quantity:
             return False
 
@@ -61,7 +58,7 @@ def coindcx_pair_to_hb_pair(coindcx_pair: str) -> str:
         pair = coindcx_pair.split("-", 1)[1] if "-" in coindcx_pair else coindcx_pair
         return pair.replace("_", "-")
 
-    quote_currencies = ["USDT", "USDC", "BTC", "ETH", "INR", "BUSD"]
+    quote_currencies = ["INR", "USDT", "USDC", "BTC", "ETH", "BUSD"]
     for quote in quote_currencies:
         if coindcx_pair.endswith(quote):
             base = coindcx_pair[:-len(quote)]

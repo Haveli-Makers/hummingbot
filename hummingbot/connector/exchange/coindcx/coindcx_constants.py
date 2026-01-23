@@ -13,7 +13,6 @@ MAX_ORDER_ID_LEN = 36
 REST_URL = "https://api.coindcx.com"
 PUBLIC_REST_URL = "https://public.coindcx.com"
 WSS_URL = "wss://stream.coindcx.com"
-SOCKET_IO_URL = "wss://stream.coindcx.com"
 
 # Public API endpoints
 MARKETS_PATH_URL = "/exchange/v1/markets"

@@ -51,7 +51,6 @@ class CoinDCXAuth(AuthBase):
             if request.headers is not None:
                 headers.update(request.headers)
             headers.update(self.header_for_authentication(signature))
-            headers["Content-Type"] = "application/json"
             request.headers = headers
 
         return request
@@ -84,7 +83,8 @@ class CoinDCXAuth(AuthBase):
         """
         return {
             "X-AUTH-APIKEY": self.api_key,
-            "X-AUTH-SIGNATURE": signature
+            "X-AUTH-SIGNATURE": signature,
+            "Content-Type": "application/json"
         }
 
     def _generate_signature(self, payload: str) -> str:

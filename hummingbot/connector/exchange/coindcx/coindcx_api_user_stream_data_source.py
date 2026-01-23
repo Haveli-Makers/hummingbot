@@ -43,7 +43,7 @@ class CoinDCXAPIUserStreamDataSource(UserStreamTrackerDataSource):
         while True:
             try:
                 self._client = self._build_client(output)
-                await self._client.connect(CONSTANTS.SOCKET_IO_URL, transports=["websocket"])
+                await self._client.connect(CONSTANTS.WSS_URL, transports=["websocket"])
                 await self._client.wait()
             except asyncio.CancelledError:
                 await self._disconnect()

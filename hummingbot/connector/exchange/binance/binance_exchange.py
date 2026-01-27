@@ -32,6 +32,10 @@ class BinanceExchange(ExchangePyBase):
 
     web_utils = web_utils
 
+    # Cancel Replace modes for Binance
+    CANCEL_REPLACE_MODE_STOP_ON_FAILURE = "STOP_ON_FAILURE"
+    CANCEL_REPLACE_MODE_ALLOW_FAILURE = "ALLOW_FAILURE"
+
     def __init__(self,
                  binance_api_key: str,
                  binance_api_secret: str,
@@ -223,6 +227,106 @@ class BinanceExchange(ExchangePyBase):
         if cancel_result.get("status") == "CANCELED":
             return True
         return False
+
+    @property
+    def is_edit_order_supported_by_exchange(self) -> bool:
+        """
+        Binance supports native order editing via the cancelReplace endpoint.
+        This is an atomic operation that cancels an existing order and places a new one.
+        """
+        return True
+
+    async def _place_edit(
+        self,
+        client_order_id: str,
+        exchange_order_id: str,
+        trading_pair: str,
+        new_price: Decimal,
+        new_amount: Decimal,
+        **kwargs
+    ) -> Tuple[str, str, float]:
+        """
+        Binance native order edit using POST /api/v3/order/cancelReplace.
+        
+        This endpoint atomically cancels an existing order and places a new one.
+        
+        :param client_order_id: The client order ID of the order to edit
+        :param exchange_order_id: The exchange order ID of the order to edit
+        :param trading_pair: The trading pair
+        :param new_price: New price for the order
+        :param new_amount: New amount for the order
+        :return: Tuple of (new_client_order_id, new_exchange_order_id, timestamp)
+        """
+        tracked_order = self._order_tracker.fetch_tracked_order(client_order_id)
+        if tracked_order is None:
+            raise ValueError(f"Order {client_order_id} not found")
+        
+        symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+        side_str = CONSTANTS.SIDE_BUY if tracked_order.trade_type is TradeType.BUY else CONSTANTS.SIDE_SELL
+        type_str = BinanceExchange.binance_order_type(tracked_order.order_type)
+        
+        # Generate new client order ID for the replacement order
+        from hummingbot.connector.utils import get_new_client_order_id
+        new_client_order_id = get_new_client_order_id(
+            is_buy=(tracked_order.trade_type == TradeType.BUY),
+            trading_pair=trading_pair,
+            hbot_order_id_prefix=self.client_order_id_prefix,
+            max_id_len=self.client_order_id_max_length
+        )
+        
+        api_params = {
+            "symbol": symbol,
+            "side": side_str,
+            "type": type_str,
+            "cancelReplaceMode": self.CANCEL_REPLACE_MODE_STOP_ON_FAILURE,
+            "cancelOrigClientOrderId": client_order_id,
+            "newClientOrderId": new_client_order_id,
+            "quantity": f"{new_amount:f}",
+        }
+        
+        # Add price for limit orders
+        if tracked_order.order_type in [OrderType.LIMIT, OrderType.LIMIT_MAKER]:
+            api_params["price"] = f"{new_price:f}"
+        
+        # Add timeInForce for LIMIT orders
+        if tracked_order.order_type == OrderType.LIMIT:
+            api_params["timeInForce"] = CONSTANTS.TIME_IN_FORCE_GTC
+        
+        try:
+            result = await self._api_post(
+                path_url=CONSTANTS.ORDER_CANCEL_REPLACE_PATH_URL,
+                data=api_params,
+                is_auth_required=True,
+                limit_id=CONSTANTS.ORDER_CANCEL_REPLACE_PATH_URL
+            )
+            
+            # Check the result
+            cancel_result = result.get("cancelResult")
+            new_order_result = result.get("newOrderResult")
+            
+            if cancel_result == "SUCCESS" and new_order_result == "SUCCESS":
+                new_order_response = result.get("newOrderResponse", {})
+                new_exchange_order_id = str(new_order_response.get("orderId"))
+                transact_time = new_order_response.get("transactTime", 0) * 1e-3
+                
+                return new_client_order_id, new_exchange_order_id, transact_time
+            
+            elif cancel_result == "FAILURE":
+                cancel_response = result.get("cancelResponse", {})
+                error_msg = cancel_response.get("msg", "Unknown error")
+                raise Exception(f"Cancel failed during edit: {error_msg}")
+            
+            elif new_order_result == "FAILURE":
+                new_order_response = result.get("newOrderResponse", {})
+                error_msg = new_order_response.get("msg", "Unknown error")
+                raise Exception(f"New order failed during edit (original order was cancelled): {error_msg}")
+            
+            else:
+                raise Exception(f"Unexpected cancel-replace result: {result}")
+                
+        except Exception as e:
+            self.logger().error(f"Error during Binance cancel-replace: {e}")
+            raise
 
     async def _format_trading_rules(self, exchange_info_dict: Dict[str, Any]) -> List[TradingRule]:
         """

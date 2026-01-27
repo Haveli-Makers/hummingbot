@@ -27,6 +27,9 @@ class MarketEvent(Enum):
     SellOrderCreated = 201
     FundingPaymentCompleted = 202
     FundingInfo = 203
+    # Order Edit Events
+    OrderEdited = 210
+    OrderEditFailed = 211
     RangePositionLiquidityAdded = 300
     RangePositionLiquidityRemoved = 301
     RangePositionUpdate = 302
@@ -116,6 +119,31 @@ class OrderCancelledEvent:
 class OrderExpiredEvent(NamedTuple):
     timestamp: float
     order_id: str
+
+
+@dataclass
+@dataclass
+class OrderEditedEvent:
+    """Event emitted when an order is successfully edited (via native edit or cancel-replace)"""
+    timestamp: float
+    order_id: str
+    trading_pair: str
+    original_price: Decimal
+    new_price: Decimal
+    original_amount: Decimal
+    new_amount: Decimal
+    new_order_id: Optional[str] = None  # New order ID if cancel-replace was used
+    exchange_order_id: Optional[str] = None
+
+
+@dataclass
+class OrderEditFailedEvent:
+    """Event emitted when an order edit fails"""
+    timestamp: float
+    order_id: str
+    trading_pair: str
+    error_message: str
+    recoverable: bool = True  # False if order was cancelled but replacement failed
 
 
 @dataclass

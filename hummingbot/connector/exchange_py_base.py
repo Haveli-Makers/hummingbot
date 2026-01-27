@@ -2,7 +2,9 @@ import asyncio
 import copy
 import logging
 import math
+import random
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, AsyncIterable, Callable, Dict, List, Optional, Tuple
 
@@ -26,12 +28,36 @@ from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTr
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee
 from hummingbot.core.data_type.user_stream_tracker import UserStreamTracker
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
+from hummingbot.core.event.events import MarketEvent, OrderEditedEvent, OrderEditFailedEvent
 from hummingbot.core.network_iterator import NetworkStatus
 from hummingbot.core.utils.async_utils import safe_ensure_future, safe_gather
 from hummingbot.core.web_assistant.auth import AuthBase
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
+from hummingbot.exceptions import (
+    OrderEditBalanceTimeout,
+    OrderEditCancelFailed,
+    OrderEditError,
+    OrderEditReplacementFailed,
+    OrderNotEditableError,
+)
 from hummingbot.logger import HummingbotLogger
+
+
+@dataclass
+class PendingEditContext:
+    """Tracks state during cancel-replace operation"""
+    original_order: InFlightOrder
+    new_price: Decimal
+    new_amount: Decimal
+    cancel_initiated_at: float
+    cancel_confirmed: bool = False
+    cancel_confirmed_at: Optional[float] = None
+    expected_released_base: Decimal = Decimal("0")
+    expected_released_quote: Decimal = Decimal("0")
+    max_balance_wait_seconds: float = 30.0
+    balance_poll_interval: float = 1.0
+    max_retries: int = 3
 
 
 class ExchangePyBase(ExchangeBase, ABC):
@@ -387,6 +413,553 @@ class ExchangePyBase(ExchangeBase, ABC):
             )
         failed_cancellations = [CancellationResult(oid, False) for oid in order_id_set]
         return successful_cancellations + failed_cancellations
+
+    # === Order Editing ===
+
+    @property
+    def is_edit_order_supported_by_exchange(self) -> bool:
+        """
+        Override this property to return True if the exchange supports native order editing.
+        When True, the connector should implement _place_edit() method.
+        When False (default), edit_order() will use cancel-and-replace strategy.
+        """
+        return False
+
+    def edit_order(
+        self,
+        client_order_id: str,
+        trading_pair: str,
+        new_price: Optional[Decimal] = None,
+        new_amount: Optional[Decimal] = None,
+        **kwargs
+    ) -> str:
+        """
+        Edits an existing order. Uses native edit if supported by the exchange,
+        otherwise falls back to cancel-and-replace strategy.
+
+        :param client_order_id: The client order ID of the order to edit
+        :param trading_pair: The trading pair
+        :param new_price: New price (optional, keeps original if None)
+        :param new_amount: New amount (optional, keeps original if None)
+        :param kwargs: Additional exchange-specific parameters
+
+        :return: The client order ID (may be different if cancel-replace was used)
+        """
+        safe_ensure_future(self._execute_edit(
+            client_order_id=client_order_id,
+            trading_pair=trading_pair,
+            new_price=new_price,
+            new_amount=new_amount,
+            **kwargs
+        ))
+        return client_order_id
+
+    async def _execute_edit(
+        self,
+        client_order_id: str,
+        trading_pair: str,
+        new_price: Optional[Decimal],
+        new_amount: Optional[Decimal],
+        **kwargs
+    ) -> Optional[str]:
+        """
+        Routes to native edit or cancel-replace based on exchange support.
+
+        :return: New client order ID (same if native edit, different if cancel-replace)
+        """
+        tracked_order = self._order_tracker.fetch_tracked_order(client_order_id)
+
+        if tracked_order is None:
+            self.logger().warning(f"Order {client_order_id} not found for editing")
+            return None
+
+        # Validate order is editable
+        if not self._is_order_editable(tracked_order):
+            error_msg = f"Order {client_order_id} cannot be edited (current state: {tracked_order.current_state})"
+            self.logger().warning(error_msg)
+            self._emit_order_edit_failed_event(tracked_order, error_msg, recoverable=True)
+            return None
+
+        # Use original values if not provided
+        final_price = new_price if new_price is not None else tracked_order.price
+        final_amount = new_amount if new_amount is not None else tracked_order.amount
+
+        # Quantize the values
+        final_price = self.quantize_order_price(trading_pair, final_price)
+        final_amount = self.quantize_order_amount(trading_pair, final_amount)
+
+        try:
+            if self.is_edit_order_supported_by_exchange:
+                return await self._execute_native_edit(
+                    tracked_order=tracked_order,
+                    new_price=final_price,
+                    new_amount=final_amount,
+                    **kwargs
+                )
+            else:
+                return await self._execute_edit_via_cancel_replace(
+                    tracked_order=tracked_order,
+                    new_price=final_price,
+                    new_amount=final_amount,
+                    **kwargs
+                )
+        except OrderEditError as e:
+            self.logger().error(f"Order edit failed for {client_order_id}: {e}")
+            recoverable = not isinstance(e, (OrderEditBalanceTimeout, OrderEditReplacementFailed))
+            self._emit_order_edit_failed_event(tracked_order, str(e), recoverable=recoverable)
+            return None
+        except Exception as e:
+            self.logger().error(f"Unexpected error editing order {client_order_id}: {e}", exc_info=True)
+            self._emit_order_edit_failed_event(tracked_order, str(e), recoverable=True)
+            return None
+
+    def _is_order_editable(self, order: InFlightOrder) -> bool:
+        """Check if order can be edited based on its current state"""
+        editable_states = {
+            OrderState.OPEN,
+            OrderState.PARTIALLY_FILLED,
+            OrderState.PENDING_CREATE,  # May need exchange confirmation
+        }
+        return order.current_state in editable_states
+
+    async def _execute_native_edit(
+        self,
+        tracked_order: InFlightOrder,
+        new_price: Decimal,
+        new_amount: Decimal,
+        **kwargs
+    ) -> str:
+        """
+        Execute native order edit for exchanges that support it.
+        Exchanges that support native edit should override _place_edit().
+        """
+        original_price = tracked_order.price
+        original_amount = tracked_order.amount
+
+        # Mark order as pending edit
+        order_update = OrderUpdate(
+            client_order_id=tracked_order.client_order_id,
+            trading_pair=tracked_order.trading_pair,
+            update_timestamp=self.current_timestamp,
+            new_state=OrderState.PENDING_EDIT,
+        )
+        self._order_tracker.process_order_update(order_update)
+
+        try:
+            # Wait for exchange order ID if not available
+            await tracked_order.get_exchange_order_id()
+
+            new_client_order_id, new_exchange_order_id, update_timestamp = await self._place_edit(
+                client_order_id=tracked_order.client_order_id,
+                exchange_order_id=tracked_order.exchange_order_id,
+                trading_pair=tracked_order.trading_pair,
+                new_price=new_price,
+                new_amount=new_amount,
+                **kwargs
+            )
+
+            # Update order with new values
+            order_update = OrderUpdate(
+                client_order_id=new_client_order_id,
+                exchange_order_id=new_exchange_order_id,
+                trading_pair=tracked_order.trading_pair,
+                update_timestamp=update_timestamp,
+                new_state=OrderState.OPEN,
+            )
+            self._order_tracker.process_order_update(order_update)
+
+            # Update tracked order price and amount
+            tracked_order.price = new_price
+            tracked_order.amount = new_amount
+
+            # Emit success event
+            self._emit_order_edited_event(
+                original_order=tracked_order,
+                new_order_id=new_client_order_id,
+                original_price=original_price,
+                original_amount=original_amount,
+                new_price=new_price,
+                new_amount=new_amount,
+            )
+
+            return new_client_order_id
+
+        except Exception as e:
+            # Revert to OPEN state on failure
+            order_update = OrderUpdate(
+                client_order_id=tracked_order.client_order_id,
+                trading_pair=tracked_order.trading_pair,
+                update_timestamp=self.current_timestamp,
+                new_state=OrderState.OPEN,
+            )
+            self._order_tracker.process_order_update(order_update)
+            raise OrderEditError(f"Native edit failed: {e}") from e
+
+    async def _execute_edit_via_cancel_replace(
+        self,
+        tracked_order: InFlightOrder,
+        new_price: Decimal,
+        new_amount: Decimal,
+        **kwargs
+    ) -> str:
+        """
+        Fallback strategy: Cancel existing order and create a new one.
+        Handles balance verification and recovery.
+        """
+        context = PendingEditContext(
+            original_order=tracked_order,
+            new_price=new_price,
+            new_amount=new_amount,
+            cancel_initiated_at=self.current_timestamp,
+        )
+
+        # Calculate expected funds to be released
+        context.expected_released_base, context.expected_released_quote = \
+            self._calculate_order_locked_funds(tracked_order)
+
+        original_price = tracked_order.price
+        original_amount = tracked_order.amount
+
+        # Mark order as pending edit
+        order_update = OrderUpdate(
+            client_order_id=tracked_order.client_order_id,
+            trading_pair=tracked_order.trading_pair,
+            update_timestamp=self.current_timestamp,
+            new_state=OrderState.PENDING_EDIT,
+        )
+        self._order_tracker.process_order_update(order_update)
+
+        try:
+            # Step 1: Cancel with verification
+            await self._cancel_and_verify_for_edit(context)
+
+            # Step 2: Wait for balance to reflect
+            await self._wait_for_balance_update(context)
+
+            # Step 3: Place new order
+            new_order_id = await self._place_replacement_order(context, **kwargs)
+
+            # Emit success event
+            self._emit_order_edited_event(
+                original_order=tracked_order,
+                new_order_id=new_order_id,
+                original_price=original_price,
+                original_amount=original_amount,
+                new_price=new_price,
+                new_amount=new_amount,
+            )
+
+            return new_order_id
+
+        except OrderEditCancelFailed as e:
+            # Rollback: Original order may still be active
+            order_update = OrderUpdate(
+                client_order_id=tracked_order.client_order_id,
+                trading_pair=tracked_order.trading_pair,
+                update_timestamp=self.current_timestamp,
+                new_state=OrderState.OPEN,
+            )
+            self._order_tracker.process_order_update(order_update)
+            raise
+
+        except (OrderEditBalanceTimeout, OrderEditReplacementFailed) as e:
+            # Critical state: Order cancelled but replacement failed
+            self.logger().error(
+                f"CRITICAL: Order {tracked_order.client_order_id} cancelled but replacement failed: {e}. "
+                f"Starting recovery attempt..."
+            )
+            # Start background recovery task
+            safe_ensure_future(self._attempt_edit_recovery(context, e))
+            raise
+
+    def _calculate_order_locked_funds(self, order: InFlightOrder) -> Tuple[Decimal, Decimal]:
+        """Calculate the base and quote amounts locked by an order"""
+        remaining_amount = order.amount - order.executed_amount_base
+        if order.trade_type == TradeType.BUY:
+            # Buy order locks quote currency
+            locked_quote = remaining_amount * order.price if order.price else Decimal("0")
+            return Decimal("0"), locked_quote
+        else:
+            # Sell order locks base currency
+            return remaining_amount, Decimal("0")
+
+    async def _cancel_and_verify_for_edit(
+        self,
+        context: PendingEditContext,
+        timeout_seconds: float = 30.0
+    ) -> None:
+        """Cancel order and wait for exchange confirmation."""
+        order = context.original_order
+
+        try:
+            cancelled = await self._execute_order_cancel_and_process_update(order)
+        except Exception as e:
+            if self._is_order_not_found_during_cancelation_error(e):
+                # Order may have been filled - check status
+                try:
+                    order_update = await self._request_order_status(order)
+                    self._order_tracker.process_order_update(order_update)
+                    if order.is_filled:
+                        raise OrderEditCancelFailed(
+                            f"Cannot edit: Order {order.client_order_id} already filled"
+                        )
+                except Exception:
+                    pass
+            raise OrderEditCancelFailed(f"Cancel failed: {e}")
+
+        if not cancelled:
+            raise OrderEditCancelFailed(
+                f"Exchange did not confirm cancellation for {order.client_order_id}"
+            )
+
+        # For synchronous cancel exchanges, we're done
+        if self.is_cancel_request_in_exchange_synchronous:
+            context.cancel_confirmed = True
+            context.cancel_confirmed_at = self.current_timestamp
+            return
+
+        # For async exchanges, poll until confirmed
+        start_time = self.current_timestamp
+        while (self.current_timestamp - start_time) < timeout_seconds:
+            if order.current_state == OrderState.CANCELED:
+                context.cancel_confirmed = True
+                context.cancel_confirmed_at = self.current_timestamp
+                return
+            await self._sleep(0.5)
+
+        # Check one more time
+        if order.current_state == OrderState.CANCELED:
+            context.cancel_confirmed = True
+            context.cancel_confirmed_at = self.current_timestamp
+            return
+
+        raise OrderEditCancelFailed(
+            f"Timeout waiting for cancel confirmation for {order.client_order_id}"
+        )
+
+    async def _wait_for_balance_update(self, context: PendingEditContext) -> None:
+        """Wait for balance to reflect cancelled order's released funds."""
+        order = context.original_order
+        start_time = self.current_timestamp
+
+        # Determine which asset we need
+        if order.trade_type == TradeType.BUY:
+            required_asset = order.quote_asset
+            required_amount = context.new_price * context.new_amount
+        else:
+            required_asset = order.base_asset
+            required_amount = context.new_amount
+
+        attempt = 0
+        base_delay = context.balance_poll_interval
+
+        while (self.current_timestamp - start_time) < context.max_balance_wait_seconds:
+            # Refresh balances from exchange
+            try:
+                await self._update_all_balances()
+            except Exception as e:
+                self.logger().warning(f"Failed to update balances: {e}")
+
+            available_balance = self.get_available_balance(required_asset)
+
+            if available_balance >= required_amount:
+                self.logger().debug(
+                    f"Balance available for edit: {available_balance} {required_asset} "
+                    f"(need {required_amount})"
+                )
+                return
+
+            # Exponential backoff with jitter
+            attempt += 1
+            delay = min(base_delay * (2 ** attempt), 5.0)  # Cap at 5 seconds
+            delay *= (0.5 + random.random())  # Add jitter
+
+            self.logger().debug(
+                f"Waiting for balance: have {available_balance}, "
+                f"need {required_amount} {required_asset}. "
+                f"Retry in {delay:.1f}s"
+            )
+
+            await self._sleep(delay)
+
+        # Final check
+        available_balance = self.get_available_balance(required_asset)
+        if available_balance >= required_amount:
+            return
+
+        # Timeout - critical error
+        raise OrderEditBalanceTimeout(
+            f"Balance not available after {context.max_balance_wait_seconds}s. "
+            f"Order {order.client_order_id} was cancelled but replacement cannot proceed. "
+            f"Available: {available_balance} {required_asset}, Required: {required_amount}"
+        )
+
+    async def _place_replacement_order(
+        self,
+        context: PendingEditContext,
+        **kwargs
+    ) -> str:
+        """Place the replacement order with retry logic."""
+        order = context.original_order
+
+        for attempt in range(context.max_retries):
+            try:
+                # Generate new order ID
+                new_order_id = get_new_client_order_id(
+                    is_buy=(order.trade_type == TradeType.BUY),
+                    trading_pair=order.trading_pair,
+                    hbot_order_id_prefix=self.client_order_id_prefix,
+                    max_id_len=self.client_order_id_max_length
+                )
+
+                # Create the replacement order
+                await self._create_order(
+                    trade_type=order.trade_type,
+                    order_id=new_order_id,
+                    trading_pair=order.trading_pair,
+                    amount=context.new_amount,
+                    order_type=order.order_type,
+                    price=context.new_price,
+                    **kwargs,
+                )
+
+                return new_order_id
+
+            except Exception as e:
+                self.logger().warning(
+                    f"Failed to place replacement order (attempt {attempt + 1}/{context.max_retries}): {e}"
+                )
+                if attempt < context.max_retries - 1:
+                    # Balance might still be settling
+                    await self._sleep(2.0)
+                    try:
+                        await self._update_all_balances()
+                    except Exception:
+                        pass
+                    continue
+                raise OrderEditReplacementFailed(
+                    f"Could not place replacement order after {context.max_retries} attempts: {e}"
+                )
+
+        raise OrderEditReplacementFailed(
+            f"Could not place replacement order after {context.max_retries} attempts"
+        )
+
+    async def _attempt_edit_recovery(
+        self,
+        context: PendingEditContext,
+        original_error: OrderEditError,
+        max_recovery_attempts: int = 5,
+        recovery_interval: float = 10.0
+    ) -> None:
+        """
+        Background task to attempt recovery from failed edit.
+        Tries to place the replacement order periodically.
+        """
+        order = context.original_order
+
+        for attempt in range(max_recovery_attempts):
+            await self._sleep(recovery_interval)
+
+            try:
+                # Refresh balance
+                await self._update_all_balances()
+
+                # Try to place replacement
+                new_order_id = await self._place_replacement_order(context)
+
+                self.logger().info(
+                    f"Edit recovery successful! Replacement order {new_order_id} "
+                    f"placed for cancelled order {order.client_order_id}"
+                )
+
+                # Emit success event after recovery
+                self._emit_order_edited_event(
+                    original_order=order,
+                    new_order_id=new_order_id,
+                    original_price=order.price,
+                    original_amount=order.amount,
+                    new_price=context.new_price,
+                    new_amount=context.new_amount,
+                )
+                return
+
+            except Exception as e:
+                self.logger().warning(
+                    f"Edit recovery attempt {attempt + 1}/{max_recovery_attempts} failed: {e}"
+                )
+
+        # All recovery attempts failed
+        self.logger().error(
+            f"FAILED TO RECOVER from edit failure for order {order.client_order_id}. "
+            f"Funds may be unallocated. Please check exchange manually."
+        )
+
+    def _emit_order_edited_event(
+        self,
+        original_order: InFlightOrder,
+        new_order_id: str,
+        original_price: Decimal,
+        original_amount: Decimal,
+        new_price: Decimal,
+        new_amount: Decimal,
+    ) -> None:
+        """Emit OrderEdited event"""
+        event = OrderEditedEvent(
+            timestamp=self.current_timestamp,
+            order_id=original_order.client_order_id,
+            trading_pair=original_order.trading_pair,
+            original_price=original_price,
+            new_price=new_price,
+            original_amount=original_amount,
+            new_amount=new_amount,
+            new_order_id=new_order_id if new_order_id != original_order.client_order_id else None,
+            exchange_order_id=original_order.exchange_order_id,
+        )
+        self.trigger_event(MarketEvent.OrderEdited, event)
+
+    def _emit_order_edit_failed_event(
+        self,
+        order: InFlightOrder,
+        error_message: str,
+        recoverable: bool = True
+    ) -> None:
+        """Emit OrderEditFailed event"""
+        event = OrderEditFailedEvent(
+            timestamp=self.current_timestamp,
+            order_id=order.client_order_id,
+            trading_pair=order.trading_pair,
+            error_message=error_message,
+            recoverable=recoverable,
+        )
+        self.trigger_event(MarketEvent.OrderEditFailed, event)
+
+    async def _place_edit(
+        self,
+        client_order_id: str,
+        exchange_order_id: str,
+        trading_pair: str,
+        new_price: Decimal,
+        new_amount: Decimal,
+        **kwargs
+    ) -> Tuple[str, str, float]:
+        """
+        Exchange-specific order edit implementation.
+        Override this method for exchanges that support native order editing.
+
+        :param client_order_id: The client order ID of the order to edit
+        :param exchange_order_id: The exchange order ID of the order to edit
+        :param trading_pair: The trading pair
+        :param new_price: New price for the order
+        :param new_amount: New amount for the order
+        :param kwargs: Additional exchange-specific parameters
+
+        :return: Tuple of (new_client_order_id, new_exchange_order_id, timestamp)
+        """
+        raise NotImplementedError(
+            f"{self.name} does not support native order editing. "
+            f"Set is_edit_order_supported_by_exchange to False to use cancel-replace."
+        )
 
     async def _create_order(self,
                             trade_type: TradeType,

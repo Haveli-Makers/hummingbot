@@ -406,10 +406,6 @@ class CoindcxExchange(ExchangePyBase):
         await super()._status_polling_loop_fetch_updates()
 
     async def _update_trading_fees(self):
-        """
-        Update fees information from the exchange.
-        CoinDCX typically charges 0.1% maker and 0.1% taker fees.
-        """
         pass
 
     async def _user_stream_event_listener(self):
@@ -421,7 +417,7 @@ class CoindcxExchange(ExchangePyBase):
             try:
                 event_type = event_message.get("event", event_message.get("e", ""))
 
-                if event_type in ["order-update", CONSTANTS.ORDER_UPDATE_EVENT_TYPE]:
+                if event_type == CONSTANTS.ORDER_UPDATE_EVENT_TYPE:
                     order_data = event_message.get("data", event_message)
 
                     if isinstance(order_data, list):
@@ -430,7 +426,7 @@ class CoindcxExchange(ExchangePyBase):
                     else:
                         await self._process_order_update(order_data)
 
-                elif event_type in ["trade-update", CONSTANTS.TRADE_UPDATE_EVENT_TYPE]:
+                elif event_type == CONSTANTS.TRADE_UPDATE_EVENT_TYPE:
                     trade_data = event_message.get("data", event_message)
 
                     if isinstance(trade_data, list):
@@ -439,7 +435,7 @@ class CoindcxExchange(ExchangePyBase):
                     else:
                         await self._process_trade_update(trade_data)
 
-                elif event_type in ["balance-update", CONSTANTS.BALANCE_UPDATE_EVENT_TYPE]:
+                elif event_type == CONSTANTS.BALANCE_UPDATE_EVENT_TYPE:
                     balance_data = event_message.get("data", event_message)
 
                     if isinstance(balance_data, list):
@@ -461,8 +457,8 @@ class CoindcxExchange(ExchangePyBase):
         if not isinstance(order_data, dict):
             return
 
-        client_order_id = order_data.get("client_order_id", order_data.get("c", ""))
-        exchange_order_id = str(order_data.get("id", order_data.get("o", "")))
+        client_order_id = order_data.get("client_order_id", "")
+        exchange_order_id = str(order_data.get("id", ""))
 
         tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
         if tracked_order is not None:
@@ -485,12 +481,12 @@ class CoindcxExchange(ExchangePyBase):
         if not isinstance(trade_data, dict):
             return
 
-        client_order_id = trade_data.get("c", trade_data.get("client_order_id", ""))
-        exchange_order_id = str(trade_data.get("o", trade_data.get("order_id", "")))
+        client_order_id = trade_data.get("client_order_id", "")
+        exchange_order_id = str(trade_data.get("order_id", ""))
 
         tracked_order = self._order_tracker.all_fillable_orders.get(client_order_id)
         if tracked_order is not None:
-            fee_amount = Decimal(str(trade_data.get("f", trade_data.get("fee_amount", 0))))
+            fee_amount = Decimal(str(trade_data.get("fee_amount", 0)))
 
             trading_pair = tracked_order.trading_pair
             base, quote = trading_pair.split("-")
@@ -502,11 +498,11 @@ class CoindcxExchange(ExchangePyBase):
                 flat_fees=[TokenAmount(amount=fee_amount, token=fee_token)]
             )
 
-            fill_price = Decimal(str(trade_data.get("p", trade_data.get("price", 0))))
-            fill_amount = Decimal(str(trade_data.get("q", trade_data.get("quantity", 0))))
+            fill_price = Decimal(str(trade_data.get("price", 0)))
+            fill_amount = Decimal(str(trade_data.get("quantity", 0)))
 
             trade_update = TradeUpdate(
-                trade_id=str(trade_data.get("t", trade_data.get("id", ""))),
+                trade_id=str(trade_data.get("id", "")),
                 client_order_id=client_order_id,
                 exchange_order_id=exchange_order_id,
                 trading_pair=tracked_order.trading_pair,
@@ -514,7 +510,7 @@ class CoindcxExchange(ExchangePyBase):
                 fill_base_amount=fill_amount,
                 fill_quote_amount=fill_amount * fill_price,
                 fill_price=fill_price,
-                fill_timestamp=trade_data.get("T", trade_data.get("timestamp", self._time_synchronizer.time() * 1000)) / 1000,
+                fill_timestamp=trade_data.get("timestamp", self._time_synchronizer.time() * 1000) / 1000,
             )
             self._order_tracker.process_trade_update(trade_update)
 
@@ -525,9 +521,9 @@ class CoindcxExchange(ExchangePyBase):
         if not isinstance(balance_data, dict):
             return
 
-        asset_name = balance_data.get("currency", balance_data.get("a", ""))
-        free_balance = Decimal(str(balance_data.get("balance", balance_data.get("f", 0))))
-        locked_balance = Decimal(str(balance_data.get("locked_balance", balance_data.get("l", 0))))
+        asset_name = balance_data.get("currency", "")
+        free_balance = Decimal(str(balance_data.get("balance", 0)))
+        locked_balance = Decimal(str(balance_data.get("locked_balance", 0)))
         total_balance = free_balance + locked_balance
 
         self._account_available_balances[asset_name] = free_balance
@@ -560,34 +556,36 @@ class CoindcxExchange(ExchangePyBase):
                 )
 
                 if trades:
+                    trades_by_order_id = {}
                     for trade in trades:
                         order_id = str(trade.get("order_id", ""))
+                        trades_by_order_id[order_id] = trade
 
-                        for tracked_order in self._order_tracker.all_fillable_orders.values():
-                            if tracked_order.exchange_order_id == order_id:
-                                fee_amount = Decimal(str(trade.get("fee_amount", 0)))
-                                trading_pair = tracked_order.trading_pair
-                                base, quote = trading_pair.split("-")
+                    for tracked_order in self._order_tracker.all_fillable_orders.values():
+                        if tracked_order.exchange_order_id in trades_by_order_id:
+                            trade = trades_by_order_id[tracked_order.exchange_order_id]
+                            fee_amount = Decimal(str(trade.get("fee_amount", 0)))
+                            trading_pair = tracked_order.trading_pair
+                            base, quote = trading_pair.split("-")
 
-                                fee = TradeFeeBase.new_spot_fee(
-                                    fee_schema=self.trade_fee_schema(),
-                                    trade_type=tracked_order.trade_type,
-                                    flat_fees=[TokenAmount(amount=fee_amount, token=quote)]
-                                )
+                            fee = TradeFeeBase.new_spot_fee(
+                                fee_schema=self.trade_fee_schema(),
+                                trade_type=tracked_order.trade_type,
+                                flat_fees=[TokenAmount(amount=fee_amount, token=quote)]
+                            )
 
-                                trade_update = TradeUpdate(
-                                    trade_id=str(trade.get("id", "")),
-                                    client_order_id=tracked_order.client_order_id,
-                                    exchange_order_id=order_id,
-                                    trading_pair=trading_pair,
-                                    fee=fee,
-                                    fill_base_amount=Decimal(str(trade.get("quantity", 0))),
-                                    fill_quote_amount=Decimal(str(trade.get("quantity", 0))) * Decimal(str(trade.get("price", 0))),
-                                    fill_price=Decimal(str(trade.get("price", 0))),
-                                    fill_timestamp=trade.get("timestamp", self._time_synchronizer.time() * 1000) / 1000,
-                                )
-                                self._order_tracker.process_trade_update(trade_update)
-                                break
+                            trade_update = TradeUpdate(
+                                trade_id=str(trade.get("id", "")),
+                                client_order_id=tracked_order.client_order_id,
+                                exchange_order_id=tracked_order.exchange_order_id,
+                                trading_pair=trading_pair,
+                                fee=fee,
+                                fill_base_amount=Decimal(str(trade.get("quantity", 0))),
+                                fill_quote_amount=Decimal(str(trade.get("quantity", 0))) * Decimal(str(trade.get("price", 0))),
+                                fill_price=Decimal(str(trade.get("price", 0))),
+                                fill_timestamp=trade.get("timestamp", self._time_synchronizer.time() * 1000) / 1000,
+                            )
+                            self._order_tracker.process_trade_update(trade_update)
 
             except Exception as e:
                 self.logger().error(f"Error fetching trade history: {e}")

@@ -44,7 +44,15 @@ class CoinDCXAPIUserStreamDataSource(UserStreamTrackerDataSource):
             try:
                 self._client = self._build_client(output)
                 await self._client.connect(CONSTANTS.WSS_URL, transports=["websocket"])
-                await self._client.wait()
+                ping_task = asyncio.create_task(self._ping_task())
+                try:
+                    await self._client.wait()
+                finally:
+                    ping_task.cancel()
+                    try:
+                        await ping_task
+                    except asyncio.CancelledError:
+                        pass
             except asyncio.CancelledError:
                 await self._disconnect()
                 raise
@@ -59,8 +67,7 @@ class CoinDCXAPIUserStreamDataSource(UserStreamTrackerDataSource):
     def _build_client(self, output: asyncio.Queue) -> socketio.AsyncClient:
         client = socketio.AsyncClient(
             logger=False,
-            reconnection=False,
-            ssl_verify=False
+            reconnection=False
         )
         auth_payload = self._auth.generate_ws_auth_payload()
 
@@ -75,15 +82,15 @@ class CoinDCXAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
         @client.on(CONSTANTS.BALANCE_UPDATE_EVENT_TYPE)
         async def on_balance(message):
-            await self._handle_message(message, output)
+            await self._handle_message(message, CONSTANTS.BALANCE_UPDATE_EVENT_TYPE, output)
 
         @client.on(CONSTANTS.ORDER_UPDATE_EVENT_TYPE)
         async def on_order(message):
-            await self._handle_message(message, output)
+            await self._handle_message(message, CONSTANTS.ORDER_UPDATE_EVENT_TYPE, output)
 
         @client.on(CONSTANTS.TRADE_UPDATE_EVENT_TYPE)
         async def on_trade(message):
-            await self._handle_message(message, output)
+            await self._handle_message(message, CONSTANTS.TRADE_UPDATE_EVENT_TYPE, output)
 
         @client.on("error")
         async def on_error(message):
@@ -91,9 +98,25 @@ class CoinDCXAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
         return client
 
-    async def _handle_message(self, message, output: asyncio.Queue):
+    async def _handle_message(self, message, event_type: str, output: asyncio.Queue):
         self._last_recv_time = self._time()
+        if isinstance(message, dict):
+            message["event"] = event_type
         await output.put(message)
+
+    async def _ping_task(self):
+        try:
+            while True:
+                await self._sleep(CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL)
+                if self._client and self._client.connected:
+                    try:
+                        await self._client.emit("ping", {"data": "Ping message"})
+                    except Exception as e:
+                        self.logger().debug(f"Error sending ping: {e}")
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            self.logger().debug(f"Ping task error: {e}")
 
     async def _disconnect(self):
         if self._client is not None:

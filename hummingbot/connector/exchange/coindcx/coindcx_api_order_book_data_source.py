@@ -79,18 +79,17 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
                 self._client = self._build_client(trade_queue, diff_queue)
                 await self._client.connect(CONSTANTS.WSS_URL, transports=["websocket"])
-
-                for trading_pair in self._trading_pairs:
-                    coindcx_pair = hb_pair_to_coindcx_pair(trading_pair, ecode=CONSTANTS.ECODE_COINDCX)
-                    orderbook_channel = f"{coindcx_pair}@orderbook@20"
-                    trades_channel = f"{coindcx_pair}@trades"
-                    await self._client.emit("join", {"channelName": orderbook_channel})
-                    await asyncio.sleep(0.05)
-                    await self._client.emit("join", {"channelName": trades_channel})
-                    await asyncio.sleep(0.05)
-
+                await self._subscribe_channels(self._client)
                 self.logger().info("Subscribed to public order book and trade channels")
-                await self._client.wait()
+                ping_task = asyncio.create_task(self._ping_task())
+                try:
+                    await self._client.wait()
+                finally:
+                    ping_task.cancel()
+                    try:
+                        await ping_task
+                    except asyncio.CancelledError:
+                        pass
             except asyncio.CancelledError:
                 await self._disconnect()
                 raise
@@ -98,7 +97,7 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 self.logger().exception("Unexpected error occurred when listening to order book streams. Retrying in 5 seconds...")
                 await self._disconnect()
                 await asyncio.sleep(5.0)
-            else:
+            finally:
                 await self._disconnect()
                 await asyncio.sleep(1.0)
 
@@ -106,8 +105,7 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         """Build Socket.IO client with event handlers for order book and trades."""
         client = socketio.AsyncClient(
             logger=False,
-            reconnection=False,
-            ssl_verify=False
+            reconnection=False
         )
 
         @client.event
@@ -146,12 +144,18 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 self.logger().debug("CoinDCX order book stream disconnect failed", exc_info=True)
             self._client = None
 
-    async def _subscribe_channels(self, ws):
+    async def _subscribe_channels(self, client: socketio.AsyncClient):
         """
-        Deprecated - subscriptions now handled in listen_for_subscriptions via Socket.IO emit.
-        Kept for compatibility.
+        Subscribes to order book and trade channels for all trading pairs.
         """
-        pass
+        for trading_pair in self._trading_pairs:
+            coindcx_pair = hb_pair_to_coindcx_pair(trading_pair, ecode=CONSTANTS.ECODE_COINDCX)
+            orderbook_channel = f"{coindcx_pair}@orderbook@10"
+            trades_channel = f"{coindcx_pair}@trades"
+            await client.emit("join", {"channelName": orderbook_channel})
+            await asyncio.sleep(0.05)
+            await client.emit("join", {"channelName": trades_channel})
+            await asyncio.sleep(0.05)
 
     async def _connected_websocket_assistant(self):
         """
@@ -207,15 +211,16 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     raw_message, time.time(), {"trading_pair": trading_pair})
                 message_queue.put_nowait(order_book_message)
 
-    def _channel_originating_message(self, event_message: Dict[str, Any]) -> str:
-        """
-        Determines which channel a message originated from based on its content.
-        """
-        channel = ""
-
-        if "p" in event_message and "q" in event_message and "T" in event_message:
-            channel = self._trade_messages_queue_key
-        elif "bids" in event_message or "asks" in event_message:
-            channel = self._diff_messages_queue_key
-
-        return channel
+    async def _ping_task(self):
+        try:
+            while True:
+                await asyncio.sleep(CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL)
+                if self._client and self._client.connected:
+                    try:
+                        await self._client.emit("ping", {"data": "Ping message"})
+                    except Exception as e:
+                        self.logger().debug(f"Error sending ping: {e}")
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            self.logger().debug(f"Ping task error: {e}")

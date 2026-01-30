@@ -34,6 +34,9 @@ ORDER_EDIT_PATH_URL = "/exchange/v1/orders/edit"
 
 WS_HEARTBEAT_TIME_INTERVAL = 30
 
+# Edit Order Rate Limits (CoinDCX Edit Price: 2000 per 60s)
+EDIT_ORDER = "EDIT_ORDER"
+
 # CoinDCX params
 SIDE_BUY = "buy"
 SIDE_SELL = "sell"
@@ -100,6 +103,9 @@ RATE_LIMITS = [
               linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, 5)]),
     RateLimit(limit_id=TRADE_HISTORY_ACCOUNT_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
               linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, 10)]),
+    RateLimit(limit_id=ORDER_EDIT_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, 1),
+                             LinkedLimitWeightPair(EDIT_ORDER, 1)]),
 ]
 
 ORDER_NOT_EXIST_ERROR_CODE = 404

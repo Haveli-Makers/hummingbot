@@ -124,6 +124,14 @@ class CoindcxExchange(ExchangePyBase):
         return True
 
     @property
+    def is_edit_order_supported_by_exchange(self) -> bool:
+        """
+        CoinDCX supports native order editing via the /exchange/v1/orders/edit endpoint.
+        This allows editing the price of an active order.
+        """
+        return True
+
+    @property
     def is_trading_required(self) -> bool:
         return self._trading_required
 
@@ -316,6 +324,83 @@ class CoindcxExchange(ExchangePyBase):
         if cancel_result is not None:
             return True
         return False
+
+    async def _place_edit(
+        self,
+        client_order_id: str,
+        exchange_order_id: str,
+        trading_pair: str,
+        new_price: Decimal,
+        new_amount: Decimal,
+        **kwargs
+    ) -> Tuple[str, str, float]:
+        """
+        CoinDCX native order edit using POST /exchange/v1/orders/edit endpoint.
+        
+        According to CoinDCX API documentation, the edit endpoint allows editing the 
+        price of an active order. Note: CoinDCX does not support editing quantity.
+        
+        :param client_order_id: The client order ID of the order to edit
+        :param exchange_order_id: The exchange order ID of the order to edit
+        :param trading_pair: The trading pair (not used in request but kept for compatibility)
+        :param new_price: New price for the order
+        :param new_amount: New amount for the order (not supported by CoinDCX but kept for compatibility)
+        :return: Tuple of (client_order_id, exchange_order_id, timestamp)
+        """
+        tracked_order = self._order_tracker.fetch_tracked_order(client_order_id)
+        if tracked_order is None:
+            raise ValueError(f"Order {client_order_id} not found")
+        
+        # CoinDCX only supports editing price, not quantity
+        api_params = {
+            "price_per_unit": float(new_price),
+        }
+
+        # Use exchange_order_id if available, otherwise use client_order_id
+        if exchange_order_id:
+            api_params["id"] = exchange_order_id
+        else:
+            api_params["client_order_id"] = client_order_id
+
+        try:
+            result = await self._api_post(
+                path_url=CONSTANTS.ORDER_EDIT_PATH_URL,
+                data=api_params,
+                is_auth_required=True,
+                limit_id=CONSTANTS.ORDER_EDIT_PATH_URL
+            )
+            
+            # CoinDCX returns the updated order details
+            if isinstance(result, dict) and "id" in result:
+                updated_exchange_order_id = str(result.get("id", exchange_order_id))
+                updated_at = result.get("updated_at", self._time_synchronizer.time() * 1000)
+                if isinstance(updated_at, (int, float)):
+                    transact_time = updated_at / 1e3
+                else:
+                    transact_time = self._time_synchronizer.time()
+                
+                return client_order_id, updated_exchange_order_id, transact_time
+            
+            elif isinstance(result, list) and len(result) > 0:
+                # Sometimes CoinDCX returns a list with order data
+                order_data = result[0]
+                updated_exchange_order_id = str(order_data.get("id", exchange_order_id))
+                updated_at = order_data.get("updated_at", self._time_synchronizer.time() * 1000)
+                if isinstance(updated_at, (int, float)):
+                    transact_time = updated_at / 1e3
+                else:
+                    transact_time = self._time_synchronizer.time()
+                
+                return client_order_id, updated_exchange_order_id, transact_time
+            
+            else:
+                # If we get an empty response but no error, assume success
+                transact_time = self._time_synchronizer.time()
+                return client_order_id, exchange_order_id, transact_time
+                
+        except Exception as e:
+            self.logger().error(f"Error during CoinDCX order edit: {e}")
+            raise
 
     async def _update_trading_rules(self):
         """Override to add logging for trading rules update."""

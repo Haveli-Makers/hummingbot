@@ -1,5 +1,5 @@
 """
-Order Edit Example Script for Binance
+Order Edit Example Script for Binance and CoinDCX
 
 This script demonstrates how to use the order editing functionality in Hummingbot.
 It places limit orders and then edits them (adjusts price/amount) based on market conditions.
@@ -7,11 +7,13 @@ It places limit orders and then edits them (adjusts price/amount) based on marke
 Key Features:
 - Places initial limit orders with configurable spreads
 - Monitors orders and edits them when price moves beyond threshold
-- Uses Binance's native cancel-replace API for atomic order editing
+- Uses native order edit APIs for atomic order editing
+  - Binance: Uses cancel-replace API
+  - CoinDCX: Uses edit price API
 - Handles edit events and failures gracefully
 
 Configuration:
-- exchange: The exchange to use (binance or binance_paper_trade)
+- exchange: The exchange to use (binance, binance_paper_trade, coindcx)
 - trading_pair: The trading pair to trade
 - order_amount: Base amount for orders
 - bid_spread: Initial spread below mid price for buy orders
@@ -49,7 +51,7 @@ class OrderEditExampleConfig(BaseClientModel):
     # Exchange and trading pair
     exchange: str = Field(
         default="binance_paper_trade",
-        description="Exchange to use (binance, binance_paper_trade)"
+        description="Exchange to use (binance, binance_paper_trade, coindcx)"
     )
     trading_pair: str = Field(
         default="BTC-USDT",
@@ -123,6 +125,31 @@ class OrderEditExample(ScriptStrategyBase):
     def connector(self) -> ConnectorBase:
         """Get the configured connector."""
         return self.connectors[self.config.exchange]
+
+    def _has_sufficient_balance(self, is_buy: bool, amount: Decimal, price: Decimal) -> bool:
+        """Check if there is enough balance to place the order."""
+        base_asset, quote_asset = self.config.trading_pair.split("-")
+        if is_buy:
+            required_asset = quote_asset
+            required_amount = amount * price
+        else:
+            required_asset = base_asset
+            required_amount = amount
+
+        available_balance = self.connector.get_available_balance(required_asset) or Decimal("0")
+
+        # Add a small buffer for fees/slippage
+        required_amount *= Decimal("1.001")
+
+        if available_balance < required_amount:
+            self.log_with_clock(
+                logging.WARNING,
+                f"Insufficient balance to place {'BUY' if is_buy else 'SELL'} order. "
+                f"Available: {available_balance} {required_asset}, Required: {required_amount} {required_asset}"
+            )
+            return False
+
+        return True
     
     def on_tick(self):
         """Called on each tick of the strategy."""
@@ -179,6 +206,9 @@ class OrderEditExample(ScriptStrategyBase):
         """Place a buy order below the mid price."""
         buy_price = mid_price * (Decimal("1") - self.config.bid_spread)
         buy_price = self.connector.quantize_order_price(self.config.trading_pair, buy_price)
+
+        if not self._has_sufficient_balance(True, self.config.order_amount, buy_price):
+            return None
         
         order_id = self.buy(
             connector_name=self.config.exchange,
@@ -221,6 +251,9 @@ class OrderEditExample(ScriptStrategyBase):
         """Place a sell order above the mid price."""
         sell_price = mid_price * (Decimal("1") + self.config.ask_spread)
         sell_price = self.connector.quantize_order_price(self.config.trading_pair, sell_price)
+
+        if not self._has_sufficient_balance(False, self.config.order_amount, sell_price):
+            return None
         
         order_id = self.sell(
             connector_name=self.config.exchange,
@@ -274,7 +307,7 @@ class OrderEditExample(ScriptStrategyBase):
         """
         Edit an existing order using the connector's edit_order method.
         
-        This uses Binance's native cancel-replace API for atomic order modification.
+        This uses the exchange's native edit order API when supported.
         """
         try:
             # Call the edit_order method on the connector

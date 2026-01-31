@@ -65,8 +65,6 @@ RATE_LIMITS = [
     RateLimit(limit_id=MARKETS_DETAILS_PATH_URL, limit=2000, time_interval=ONE_MINUTE),
     RateLimit(limit_id=ORDER_BOOK_PATH_URL, limit=2000, time_interval=ONE_MINUTE),
     RateLimit(limit_id=TRADE_HISTORY_PATH_URL, limit=2000, time_interval=ONE_MINUTE),
-    RateLimit(limit_id=TICKER_PATH_URL, limit=2000, time_interval=ONE_MINUTE),
-    RateLimit(limit_id=CANDLES_PATH_URL, limit=2000, time_interval=ONE_MINUTE),
 
     RateLimit(limit_id=USER_BALANCES_PATH_URL, limit=2000, time_interval=ONE_MINUTE),
     RateLimit(limit_id=CREATE_ORDER_PATH_URL, limit=2000, time_interval=ONE_MINUTE),

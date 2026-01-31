@@ -415,10 +415,13 @@ class CoindcxExchange(ExchangePyBase):
         """
         async for event_message in self._iter_user_event_queue():
             try:
-                event_type = event_message.get("event", event_message.get("e", ""))
+                event_type = event_message.get("event")
 
                 if event_type == CONSTANTS.ORDER_UPDATE_EVENT_TYPE:
-                    order_data = event_message.get("data", event_message)
+                    if "data" not in event_message:
+                        self.logger().warning(f"Order update event missing 'data' field: {event_message}")
+                        continue
+                    order_data = event_message.get("data")
 
                     if isinstance(order_data, list):
                         for order in order_data:
@@ -427,7 +430,10 @@ class CoindcxExchange(ExchangePyBase):
                         await self._process_order_update(order_data)
 
                 elif event_type == CONSTANTS.TRADE_UPDATE_EVENT_TYPE:
-                    trade_data = event_message.get("data", event_message)
+                    if "data" not in event_message:
+                        self.logger().warning(f"Trade update event missing 'data' field: {event_message}")
+                        continue
+                    trade_data = event_message.get("data")
 
                     if isinstance(trade_data, list):
                         for trade in trade_data:
@@ -436,7 +442,10 @@ class CoindcxExchange(ExchangePyBase):
                         await self._process_trade_update(trade_data)
 
                 elif event_type == CONSTANTS.BALANCE_UPDATE_EVENT_TYPE:
-                    balance_data = event_message.get("data", event_message)
+                    if "data" not in event_message:
+                        self.logger().warning(f"Balance update event missing 'data' field: {event_message}")
+                        continue
+                    balance_data = event_message.get("data")
 
                     if isinstance(balance_data, list):
                         for balance in balance_data:

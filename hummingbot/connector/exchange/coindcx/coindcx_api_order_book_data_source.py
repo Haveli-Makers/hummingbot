@@ -116,12 +116,6 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         async def disconnect():
             self.logger().warning("CoinDCX order book stream disconnected")
 
-        @client.on(CONSTANTS.DEPTH_SNAPSHOT_EVENT_TYPE)
-        async def on_depth_snapshot(message):
-            self.logger().debug(f"Received depth-snapshot: {type(message)}")
-            if isinstance(message, dict) and ("bids" in message or "asks" in message):
-                await self._parse_order_book_diff_message(message, diff_queue)
-
         @client.on(CONSTANTS.DIFF_EVENT_TYPE)
         async def on_depth_update(message):
             self.logger().debug(f"Received depth-update: {type(message)}")

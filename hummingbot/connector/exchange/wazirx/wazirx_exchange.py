@@ -25,7 +25,6 @@ from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFa
 class WazirxExchange(ExchangePyBase):
     """
     WazirX exchange connector (spot).
-    Implementation covering REST trading (place/cancel/get orders), balances, order book snapshots and a polling user-stream fallback.
     """
 
     UPDATE_ORDER_STATUS_MIN_INTERVAL = 10.0
@@ -105,7 +104,11 @@ class WazirxExchange(ExchangePyBase):
         return self._trading_required
 
     def supported_order_types(self):
-        return [OrderType.LIMIT, OrderType.MARKET]
+        return [OrderType.LIMIT, OrderType.LIMIT_MAKER]
+
+    async def get_all_pairs_prices(self) -> List[Dict[str, str]]:
+        pairs_prices = await self._api_get(path_url=CONSTANTS.TICKERS_PATH_URL)
+        return pairs_prices
 
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
         error_msg = str(request_exception)
@@ -150,14 +153,6 @@ class WazirxExchange(ExchangePyBase):
         params: Optional[Dict[str, Any]] = None,
         is_auth_required: bool = False
     ) -> Dict[str, Any]:
-        """
-        Make a request to WazirX API with proper authentication.
-
-        WazirX requires:
-        - Content-Type: application/x-www-form-urlencoded for POST/DELETE
-        - Parameters in body for POST/DELETE, query string for GET
-        - HMAC-SHA256 signature (ORDER SENSITIVE)
-        """
         url = f"{CONSTANTS.REST_URL}{path}"
         params = params or {}
 
@@ -192,7 +187,6 @@ class WazirxExchange(ExchangePyBase):
                     raise ValueError(f"Unsupported HTTP method: {method}")
 
     async def _handle_response(self, response: aiohttp.ClientResponse, method: str, url: str) -> Dict[str, Any]:
-        """Handle API response, raise IOError on error."""
         if response.status >= 400:
             error_text = await response.text()
             raise IOError(f"Error executing request {method} {url}. HTTP status is {response.status}. Error: {error_text}")
@@ -206,7 +200,7 @@ class WazirxExchange(ExchangePyBase):
                  amount: Decimal,
                  price: Decimal = s_decimal_NaN,
                  is_maker: Optional[bool] = None) -> TradeFeeBase:
-        is_maker = order_type is OrderType.LIMIT
+        is_maker = order_type in [OrderType.LIMIT, OrderType.LIMIT_MAKER]
         return DeductedFromReturnsTradeFee(percent=self.estimate_fee_pct(is_maker))
 
     async def _place_order(self,
@@ -218,10 +212,13 @@ class WazirxExchange(ExchangePyBase):
                            price: Decimal,
                            **kwargs) -> Tuple[str, float]:
         symbol = trading_pair.replace("-", "").lower()
+
+        wazirx_order_type = "limit" if order_type in [OrderType.LIMIT, OrderType.LIMIT_MAKER] else order_type.name.lower()
+
         params = {
             "symbol": symbol,
             "side": trade_type.name.lower(),
-            "type": order_type.name.lower(),
+            "type": wazirx_order_type,
             "quantity": f"{amount:f}",
         }
         if order_type.is_limit_type():
@@ -337,15 +334,9 @@ class WazirxExchange(ExchangePyBase):
         return retval
 
     async def _update_trading_fees(self):
-        """
-        Update fees information from the exchange
-        """
         return
 
     async def _user_stream_event_listener(self):
-        """
-        Process events received from the user stream data source.
-        """
         async for event_message in self._iter_user_event_queue():
             try:
                 event_type = event_message.get("event")
@@ -515,10 +506,6 @@ class WazirxExchange(ExchangePyBase):
         self._set_trading_pair_symbol_map(mapping)
 
     async def get_last_traded_prices(self, trading_pairs: List[str], domain: Optional[str] = None) -> Dict[str, float]:
-        """
-        Return a dictionary with trading_pair as key and the current price as value for each trading pair passed as
-        parameter.
-        """
         result = {}
 
         for trading_pair in trading_pairs:

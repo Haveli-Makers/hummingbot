@@ -74,7 +74,7 @@ def get_rate_source(connector_name: str) -> RateSourceBase:
     """
     connector_name_lower = connector_name.lower()
 
-    if connector_name_lower == ("binance"):
+    if connector_name_lower == "binance":
         from hummingbot.core.rate_oracle.sources.binance_rate_source import BinanceRateSource
 
         return BinanceRateSource()
@@ -110,10 +110,6 @@ def get_rate_source(connector_name: str) -> RateSourceBase:
         from hummingbot.core.rate_oracle.sources.dexalot_rate_source import DexalotRateSource
 
         return DexalotRateSource()
-    elif connector_name_lower == "coindcx":
-        from hummingbot.core.rate_oracle.sources.coindcx_rate_source import CoindcxRateSource
-
-        return CoindcxRateSource()
 
     elif connector_name_lower == "wazirx":
         from hummingbot.core.rate_oracle.sources.wazirx_rate_source import WazirxRateSource
@@ -148,7 +144,6 @@ class SpreadCapture(ScriptStrategyBase):
             config = SpreadCaptureConfig()
         super().__init__(connectors, config)
 
-        # Load configuration from the config object
         self.connector_name = config.connector_name
         self.quote_token = config.quote_token
         self.interval_sec = config.interval_sec

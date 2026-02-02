@@ -15,7 +15,7 @@ from hummingbot.logger import HummingbotLogger
 
 
 class WazirxAPIOrderBookDataSource(OrderBookTrackerDataSource):
-    """REST-only order book data source for WazirX. Polls depth snapshots."""
+    """REST-only order book data source for WazirX."""
 
     _logger: Optional[HummingbotLogger] = None
 
@@ -48,9 +48,6 @@ class WazirxAPIOrderBookDataSource(OrderBookTrackerDataSource):
             return {}
 
     async def _request_order_book_snapshot(self, trading_pair: str) -> Dict[str, Any]:
-        """Fetches a single depth snapshot through the shared REST assistant.
-        Avoids dependency on symbol map by deriving the exchange symbol directly.
-        """
         exchange_symbol = trading_pair.replace("-", "").lower()
         params = {"symbol": exchange_symbol, "limit": "100"}
 
@@ -63,7 +60,6 @@ class WazirxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         )
 
     async def _order_book_snapshot(self, trading_pair: str) -> OrderBookMessage:
-        """Builds an OrderBookMessage snapshot from the REST depth response."""
         snapshot = await self._request_order_book_snapshot(trading_pair)
         if not snapshot:
             update_id = int(self._time() * 1e3)
@@ -92,7 +88,6 @@ class WazirxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         return OrderBookMessage(OrderBookMessageType.SNAPSHOT, content=content, timestamp=timestamp)
 
     async def listen_for_subscriptions(self):
-        """Polls REST snapshots and pushes them to the snapshot queue."""
         snapshot_queue = self._message_queue[self._snapshot_messages_queue_key]
         while True:
             try:

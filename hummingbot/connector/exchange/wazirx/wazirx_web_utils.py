@@ -47,7 +47,7 @@ async def get_current_server_time(
     import aiohttp
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(f"{CONSTANTS.REST_URL}{CONSTANTS.SERVER_TIME_PATH_URL}") as response:
+            async with session.get(public_rest_url(CONSTANTS.SERVER_TIME_PATH_URL, domain)) as response:
                 if response.status == 200:
                     data = await response.json()
                     return float(data.get("serverTime", 0))

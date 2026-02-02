@@ -49,11 +49,6 @@ class WazirxAPIUserStreamDataSource(UserStreamTrackerDataSource):
                     await self._process_event_message({"open_orders": data}, self._user_stream_queue)
 
     async def listen_for_user_stream(self, output: asyncio.Queue):
-        """
-        Polling-based user stream implementation for WazirX.
-        Since WazirX doesn't provide websocket user streams in this implementation,
-        we poll for updates periodically.
-        """
         self._user_stream_queue = output
         self._stopping = False
 
@@ -67,8 +62,5 @@ class WazirxAPIUserStreamDataSource(UserStreamTrackerDataSource):
             await asyncio.sleep(self.POLL_INTERVAL)
 
     async def _process_event_message(self, event_message: Dict[str, Any], queue: asyncio.Queue):
-        """
-        Process and enqueue user stream events
-        """
         if len(event_message) > 0:
             queue.put_nowait(event_message)

@@ -2,7 +2,7 @@ import asyncio
 import hashlib
 import hmac
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import aiohttp
 
@@ -15,16 +15,10 @@ from hummingbot.core.web_assistant.connections.data_types import RESTRequest, WS
 class WazirxAuth(AuthBase):
     """
     WazirX authentication.
-
-    WazirX signed endpoints require:
-    - API key in header `X-Api-Key`
-    - HMAC-SHA256 signature computed from URL-encoded parameters
-    - Content-Type: application/x-www-form-urlencoded for POST/DELETE
-    - timestamp in milliseconds
-    - recvWindow for clock skew tolerance
     """
 
     RECV_WINDOW = 60000
+    AUTH_TOKEN_TIMEOUT = 900
 
     def __init__(self, api_key: str, secret_key: str, time_provider: TimeSynchronizer):
         self.api_key = api_key
@@ -33,6 +27,8 @@ class WazirxAuth(AuthBase):
         self._nonce_counter = 0
         self._nonce_lock = asyncio.Lock()
         self._last_timestamp = 0
+        self._auth_key: Optional[str] = None
+        self._auth_key_timestamp: float = 0
 
     async def _get_timestamp(self) -> int:
         async with self._nonce_lock:
@@ -69,11 +65,6 @@ class WazirxAuth(AuthBase):
         return signature
 
     async def add_auth_params(self, params: Dict[str, Any]) -> tuple[Dict[str, Any], str]:
-        """
-        Add authentication parameters (timestamp, recvWindow, signature) to params.
-        Returns (params_with_signature, query_string_for_body).
-        Params are: original_params + recvWindow + timestamp + signature
-        """
         auth_params = dict(params)
         auth_params["recvWindow"] = self.RECV_WINDOW
         auth_params["timestamp"] = await self._get_timestamp()
@@ -86,22 +77,41 @@ class WazirxAuth(AuthBase):
         return auth_params, final_query_string
 
     def get_headers(self) -> Dict[str, str]:
-        """Get headers required for authenticated requests."""
         return {
             "X-Api-Key": self.api_key,
             "Content-Type": "application/x-www-form-urlencoded"
         }
 
     async def rest_authenticate(self, request: RESTRequest) -> RESTRequest:
-        """
-        Note: This method is called by the REST assistant, but for WazirX we handle
-        authentication differently in _wazirx_request() to ensure proper formatting.
-        This is kept for compatibility with the framework.
-        """
         headers = {} if request.headers is None else dict(request.headers)
         headers["X-Api-Key"] = self.api_key
         request.headers = headers
         return request
 
+    async def get_ws_auth_key(self) -> str:
+        current_time = time.time()
+
+        if self._auth_key and (current_time - self._auth_key_timestamp) < self.AUTH_TOKEN_TIMEOUT:
+            return self._auth_key
+
+        url = f"{CONSTANTS.REST_URL}{CONSTANTS.CREATE_AUTH_TOKEN_PATH_URL}"
+
+        params: Dict[str, Any] = {}
+        auth_params, query_string = await self.add_auth_params(params)
+
+        headers = self.get_headers()
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, data=query_string, headers=headers) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    self._auth_key = data.get("auth_key")
+                    self._auth_key_timestamp = current_time
+                    return self._auth_key
+                else:
+                    error_text = await response.text()
+                    raise Exception(f"Failed to get auth token: {response.status} - {error_text}")
+
     async def ws_authenticate(self, request: WSRequest) -> WSRequest:
+        await self.get_ws_auth_key()
         return request

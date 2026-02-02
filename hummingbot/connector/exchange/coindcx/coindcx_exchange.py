@@ -186,6 +186,8 @@ class CoindcxExchange(ExchangePyBase):
         return (
             str(CONSTANTS.ORDER_NOT_EXIST_ERROR_CODE) in exc_str
             or CONSTANTS.ORDER_NOT_EXIST_MESSAGE in exc_str
+            or (str(CONSTANTS.INVALID_REQUEST_ERROR_CODE) in exc_str
+                and CONSTANTS.INVALID_REQUEST_MESSAGE in exc_str)
         )
 
     def _create_web_assistants_factory(self) -> WebAssistantsFactory:

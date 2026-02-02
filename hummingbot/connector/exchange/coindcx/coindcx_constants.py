@@ -80,3 +80,7 @@ ORDER_NOT_EXIST_ERROR_CODE = 404
 ORDER_NOT_EXIST_MESSAGE = "Order not found"
 UNKNOWN_ORDER_ERROR_CODE = 400
 UNKNOWN_ORDER_MESSAGE = "Unknown order"
+
+# CoinDCX returns 422 Invalid Request when trying to cancel an order that is already filled/cancelled
+INVALID_REQUEST_ERROR_CODE = 422
+INVALID_REQUEST_MESSAGE = "Invalid Request"

@@ -14,8 +14,7 @@ if TYPE_CHECKING:
 
 class CoinDCXAPIUserStreamDataSource(UserStreamTrackerDataSource):
     """
-    CoinDCX user stream uses Socket.IO. This data source connects with python-socketio AsyncClient
-    (aiohttp transport) and forwards balance/order/trade updates to the user stream queue.
+    CoinDCX user stream uses Socket.IO.
     """
 
     _logger: Optional[HummingbotLogger] = None
@@ -44,6 +43,7 @@ class CoinDCXAPIUserStreamDataSource(UserStreamTrackerDataSource):
             try:
                 self._client = self._build_client(output)
                 await self._client.connect(CONSTANTS.WSS_URL, transports=["websocket"])
+                self.logger().info("CoinDCX user stream connected successfully")
                 ping_task = asyncio.create_task(self._ping_task())
                 try:
                     await self._client.wait()
@@ -57,7 +57,6 @@ class CoinDCXAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 await self._disconnect()
                 raise
             except Exception:
-                self.logger().exception("CoinDCX user stream error. Reconnecting in 5s...")
                 await self._disconnect()
                 await self._sleep(5.0)
             else:

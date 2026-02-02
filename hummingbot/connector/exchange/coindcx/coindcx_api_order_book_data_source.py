@@ -19,7 +19,6 @@ if TYPE_CHECKING:
 class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
     """
     Data source for CoinDCX order book and trade data.
-    Uses Socket.IO for real-time updates and REST API for snapshots.
     """
 
     def __init__(self,
@@ -44,14 +43,6 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         return await self._connector.get_last_traded_prices(trading_pairs=trading_pairs)
 
     async def _request_order_book_snapshot(self, trading_pair: str) -> Dict[str, Any]:
-        """
-        Retrieves a copy of the full order book from the exchange.
-
-        CoinDCX uses the format: GET /market_data/orderbook?pair=B-BTC_USDT
-
-        :param trading_pair: the trading pair for which the order book will be retrieved
-        :return: the response from the exchange (JSON dictionary)
-        """
         coindcx_pair = hb_pair_to_coindcx_pair(trading_pair, ecode=CONSTANTS.ECODE_COINDCX)
 
         params = {
@@ -152,16 +143,9 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
             await asyncio.sleep(0.05)
 
     async def _connected_websocket_assistant(self):
-        """
-        Deprecated - Socket.IO connection now handled directly in listen_for_subscriptions.
-        Kept for compatibility.
-        """
         pass
 
     async def _order_book_snapshot(self, trading_pair: str) -> OrderBookMessage:
-        """
-        Retrieves and returns the order book snapshot as an OrderBookMessage.
-        """
         snapshot: Dict[str, Any] = await self._request_order_book_snapshot(trading_pair)
         snapshot_timestamp: float = time.time()
         snapshot_msg: OrderBookMessage = CoinDCXOrderBook.snapshot_message_from_exchange(
@@ -172,9 +156,6 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         return snapshot_msg
 
     async def _parse_trade_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
-        """
-        Parses a trade message from CoinDCX Socket.IO and adds it to the message queue.
-        """
         self.logger().debug(f"Received trade message: {raw_message}")
         pair_symbol = raw_message.get("s", "")
         if pair_symbol:
@@ -184,10 +165,6 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
             message_queue.put_nowait(trade_message)
 
     async def _parse_order_book_diff_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
-        """
-        Parses an order book diff message from CoinDCX Socket.IO and adds it to the message queue.
-        """
-        self.logger().debug(f"Received orderbook message: {raw_message}")
         if "bids" in raw_message or "asks" in raw_message:
             trading_pair = None
 

@@ -1,4 +1,5 @@
 import asyncio
+import json
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -425,6 +426,13 @@ class CoindcxExchange(ExchangePyBase):
                         continue
                     order_data = event_message.get("data")
 
+                    if isinstance(order_data, str):
+                        try:
+                            order_data = json.loads(order_data)
+                        except json.JSONDecodeError as e:
+                            self.logger().warning(f"Failed to parse order update data: {e}")
+                            continue
+
                     if isinstance(order_data, list):
                         for order in order_data:
                             await self._process_order_update(order)
@@ -437,6 +445,13 @@ class CoindcxExchange(ExchangePyBase):
                         continue
                     trade_data = event_message.get("data")
 
+                    if isinstance(trade_data, str):
+                        try:
+                            trade_data = json.loads(trade_data)
+                        except json.JSONDecodeError as e:
+                            self.logger().warning(f"Failed to parse trade update data: {e}")
+                            continue
+
                     if isinstance(trade_data, list):
                         for trade in trade_data:
                             await self._process_trade_update(trade)
@@ -448,6 +463,13 @@ class CoindcxExchange(ExchangePyBase):
                         self.logger().warning(f"Balance update event missing 'data' field: {event_message}")
                         continue
                     balance_data = event_message.get("data")
+
+                    if isinstance(balance_data, str):
+                        try:
+                            balance_data = json.loads(balance_data)
+                        except json.JSONDecodeError as e:
+                            self.logger().warning(f"Failed to parse balance update data: {e}")
+                            continue
 
                     if isinstance(balance_data, list):
                         for balance in balance_data:
@@ -532,7 +554,7 @@ class CoindcxExchange(ExchangePyBase):
         if not isinstance(balance_data, dict):
             return
 
-        asset_name = balance_data.get("currency", "")
+        asset_name = balance_data.get("currency_short_name", "") or balance_data.get("currency", "")
         free_balance = Decimal(str(balance_data.get("balance", 0)))
         locked_balance = Decimal(str(balance_data.get("locked_balance", 0)))
         total_balance = free_balance + locked_balance

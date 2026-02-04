@@ -36,9 +36,15 @@ class CoinDCXAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
     @property
     def last_recv_time(self) -> float:
+        """
+        Get the timestamp of the last received message.
+        """
         return self._last_recv_time
 
     async def listen_for_user_stream(self, output: asyncio.Queue):
+        """
+        Connect to CoinDCX user stream and listen for account updates.
+        """
         while True:
             try:
                 self._client = self._build_client(output)
@@ -64,6 +70,9 @@ class CoinDCXAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 await self._sleep(1.0)
 
     def _build_client(self, output: asyncio.Queue) -> socketio.AsyncClient:
+        """
+        Build Socket.IO client with authentication and event handlers.
+        """
         client = socketio.AsyncClient(
             logger=False,
             reconnection=False
@@ -98,12 +107,18 @@ class CoinDCXAPIUserStreamDataSource(UserStreamTrackerDataSource):
         return client
 
     async def _handle_message(self, message, event_type: str, output: asyncio.Queue):
+        """
+        Process and enqueue a message from the user stream.s
+        """
         self._last_recv_time = self._time()
         if isinstance(message, dict):
             message["event"] = event_type
         await output.put(message)
 
     async def _ping_task(self):
+        """
+        Periodically send ping messages to keep the user stream connection alive.
+        """
         try:
             while True:
                 await self._sleep(CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL)
@@ -118,6 +133,9 @@ class CoinDCXAPIUserStreamDataSource(UserStreamTrackerDataSource):
             self.logger().debug(f"Ping task error: {e}")
 
     async def _disconnect(self):
+        """
+        Disconnect the user stream Socket.IO client and clean up resources.
+        """
         if self._client is not None:
             try:
                 await self._client.disconnect()
@@ -126,5 +144,8 @@ class CoinDCXAPIUserStreamDataSource(UserStreamTrackerDataSource):
             self._client = None
 
     async def stop(self):
+        """
+        Stop the user stream data source and disconnect.
+        """
         await self._disconnect()
         await super().stop()

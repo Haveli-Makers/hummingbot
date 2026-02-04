@@ -93,7 +93,9 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 await asyncio.sleep(1.0)
 
     def _build_client(self, trade_queue: asyncio.Queue, diff_queue: asyncio.Queue) -> socketio.AsyncClient:
-        """Build Socket.IO client with event handlers for order book and trades."""
+        """
+        Build Socket.IO client with event handlers for order book and trades.
+        """
         client = socketio.AsyncClient(
             logger=False,
             reconnection=False
@@ -122,6 +124,9 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         return client
 
     async def _disconnect(self):
+        """
+        Disconnect the Socket.IO client and clean up resources.
+        """
         if self._client is not None:
             try:
                 await self._client.disconnect()
@@ -131,7 +136,7 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     async def _subscribe_channels(self, client: socketio.AsyncClient):
         """
-        Subscribes to order book and trade channels for all trading pairs.
+        Subscribe to order book and trade channels for all trading pairs.
         """
         for trading_pair in self._trading_pairs:
             coindcx_pair = hb_pair_to_coindcx_pair(trading_pair, ecode=CONSTANTS.ECODE_COINDCX)
@@ -143,9 +148,16 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
             await asyncio.sleep(0.05)
 
     async def _connected_websocket_assistant(self):
+        """
+        Placeholder for websocket assistant connection.
+        CoinDCX uses Socket.IO instead of traditional WebSocket.
+        """
         pass
 
     async def _order_book_snapshot(self, trading_pair: str) -> OrderBookMessage:
+        """
+        Fetch and create an order book snapshot message for the trading pair.
+        """
         snapshot: Dict[str, Any] = await self._request_order_book_snapshot(trading_pair)
         snapshot_timestamp: float = time.time()
         snapshot_msg: OrderBookMessage = CoinDCXOrderBook.snapshot_message_from_exchange(
@@ -156,6 +168,9 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         return snapshot_msg
 
     async def _parse_trade_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
+        """
+        Parse and enqueue a trade message from the exchange.
+        """
         self.logger().debug(f"Received trade message: {raw_message}")
         pair_symbol = raw_message.get("s", "")
         if pair_symbol:
@@ -165,6 +180,9 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
             message_queue.put_nowait(trade_message)
 
     async def _parse_order_book_diff_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
+        """
+        Parse and enqueue an order book differential update message.
+        """
         if "bids" in raw_message or "asks" in raw_message:
             trading_pair = None
 
@@ -183,6 +201,9 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 message_queue.put_nowait(order_book_message)
 
     async def _ping_task(self):
+        """
+        Periodically send ping messages to keep the WebSocket connection alive.
+        """
         try:
             while True:
                 await asyncio.sleep(CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL)

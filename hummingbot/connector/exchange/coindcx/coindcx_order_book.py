@@ -18,6 +18,9 @@ class CoinDCXOrderBook(OrderBook):
             timestamp: float,
             metadata: Optional[Dict] = None
     ) -> OrderBookMessage:
+        """
+        Convert a CoinDCX order book snapshot into an OrderBookMessage.
+        """
         if metadata is None:
             metadata = {}
 
@@ -52,6 +55,9 @@ class CoinDCXOrderBook(OrderBook):
             timestamp: float,
             metadata: Optional[Dict] = None
     ) -> OrderBookMessage:
+        """
+        Convert a CoinDCX order book differential update into an OrderBookMessage.
+        """
         if metadata is None:
             metadata = {}
 
@@ -85,6 +91,9 @@ class CoinDCXOrderBook(OrderBook):
             msg: Dict,
             metadata: Optional[Dict] = None
     ) -> OrderBookMessage:
+        """
+        Convert a CoinDCX trade message into an OrderBookMessage.
+        """
         if metadata is None:
             metadata = {}
 

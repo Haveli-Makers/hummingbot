@@ -17,6 +17,15 @@ DEFAULT_FEES = TradeFeeSchema(
 
 
 def is_exchange_information_valid(exchange_info: Dict[str, Any]) -> bool:
+    """
+    Validate if exchange market information is valid and active.
+
+    Args:
+        exchange_info: Market information dictionary from CoinDCX
+
+    Returns:
+        True if the market is active and has valid parameters, False otherwise
+    """
     status = exchange_info.get("status", "")
     if status.lower() != "active":
         return False
@@ -60,10 +69,29 @@ def coindcx_pair_to_hb_pair(coindcx_pair: str) -> str:
 
 
 def hb_pair_to_coindcx_symbol(hb_pair: str) -> str:
+    """
+    Convert Hummingbot trading pair format to CoinDCX symbol format.
+
+    Args:
+        hb_pair: Trading pair in Hummingbot format (e.g., "BTC-USDT")
+
+    Returns:
+        Symbol in CoinDCX format (e.g., "BTCUSDT")
+    """
     return hb_pair.replace("-", "")
 
 
 def hb_pair_to_coindcx_pair(hb_pair: str, ecode: str = "B") -> str:
+    """
+    Convert Hummingbot trading pair format to CoinDCX pair format with exchange code.
+
+    Args:
+        hb_pair: Trading pair in Hummingbot format (e.g., "BTC-USDT")
+        ecode: Exchange code prefix (e.g., "B" for main exchange)
+
+    Returns:
+        Pair in CoinDCX format (e.g., "B-BTC_USDT")
+    """
     return f"{ecode}-{hb_pair.replace('-', '_')}"
 
 

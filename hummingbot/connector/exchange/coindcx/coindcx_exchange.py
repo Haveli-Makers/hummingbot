@@ -79,6 +79,9 @@ class CoindcxExchange(ExchangePyBase):
 
     @property
     def authenticator(self):
+        """
+        Get the authenticator instance for CoinDCX API.
+        """
         return CoinDCXAuth(
             api_key=self.api_key,
             secret_key=self.secret_key,
@@ -86,46 +89,79 @@ class CoindcxExchange(ExchangePyBase):
 
     @property
     def name(self) -> str:
+        """
+        Get the name of this connector.
+        """
         return "coindcx"
 
     @property
     def rate_limits_rules(self):
+        """
+        Get the rate limit rules for CoinDCX API.
+        """
         return CONSTANTS.RATE_LIMITS
 
     @property
     def domain(self):
+        """
+        Get the domain for this connector.
+        """
         return self._domain
 
     @property
     def client_order_id_max_length(self):
+        """
+        Get the maximum length for client order IDs.
+        """
         return CONSTANTS.MAX_ORDER_ID_LEN
 
     @property
     def client_order_id_prefix(self):
+        """
+        Get the prefix for client order IDs.
+        """
         return CONSTANTS.HBOT_ORDER_ID_PREFIX
 
     @property
     def trading_rules_request_path(self):
+        """
+        Get the API path for trading rules request.
+        """
         return CONSTANTS.MARKETS_DETAILS_PATH_URL
 
     @property
     def trading_pairs_request_path(self):
+        """
+        Get the API path for trading pairs request.
+        """
         return CONSTANTS.MARKETS_DETAILS_PATH_URL
 
     @property
     def check_network_request_path(self):
+        """
+        Get the API path for checking network connectivity.
+        """
         return CONSTANTS.MARKETS_PATH_URL
 
     @property
     def trading_pairs(self):
+        """
+        Get the list of trading pairs for this connector.
+        """
         return self._trading_pairs
 
     @property
     def is_cancel_request_in_exchange_synchronous(self) -> bool:
+        """
+        Check if cancel requests are synchronous on this exchange.
+        """
         return True
 
     @property
     def is_trading_required(self) -> bool:
+        """
+        Check if trading functionality is required for this connector.
+        """
         return self._trading_required
 
     @property
@@ -144,6 +180,9 @@ class CoindcxExchange(ExchangePyBase):
         return sd
 
     def supported_order_types(self):
+        """
+        Get the list of order types supported by this connector.
+        """
         return [OrderType.LIMIT, OrderType.LIMIT_MAKER, OrderType.MARKET]
 
     async def start_network(self):
@@ -192,6 +231,9 @@ class CoindcxExchange(ExchangePyBase):
         )
 
     def _create_web_assistants_factory(self) -> WebAssistantsFactory:
+        """
+        Create a web assistants factory for making API requests.
+        """
         return web_utils.build_api_factory(
             throttler=self._throttler,
             time_synchronizer=self._time_synchronizer,
@@ -199,6 +241,9 @@ class CoindcxExchange(ExchangePyBase):
             auth=self._auth)
 
     def _create_order_book_data_source(self) -> OrderBookTrackerDataSource:
+        """
+        Create an order book data source for tracking order book updates.
+        """
         return CoinDCXAPIOrderBookDataSource(
             trading_pairs=self._trading_pairs,
             connector=self,
@@ -206,6 +251,9 @@ class CoindcxExchange(ExchangePyBase):
             api_factory=self._web_assistants_factory)
 
     def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
+        """
+        Create a user stream data source for tracking account updates.
+        """
         return CoinDCXAPIUserStreamDataSource(
             auth=self._auth,
             trading_pairs=self._trading_pairs,
@@ -222,6 +270,9 @@ class CoindcxExchange(ExchangePyBase):
                  amount: Decimal,
                  price: Decimal = s_decimal_NaN,
                  is_maker: Optional[bool] = None) -> TradeFeeBase:
+        """
+        Calculate the trading fee for an order.
+        """
         is_maker = order_type is OrderType.LIMIT_MAKER
         return DeductedFromReturnsTradeFee(percent=self.estimate_fee_pct(is_maker))
 
@@ -352,8 +403,6 @@ class CoindcxExchange(ExchangePyBase):
         trading_pair_rules = exchange_info_dict if isinstance(exchange_info_dict, list) else [exchange_info_dict]
         retval = []
 
-        # is_list = isinstance(exchange_info_dict, list)
-
         for rule in filter(coindcx_utils.is_exchange_information_valid, trading_pair_rules):
             try:
                 symbol = rule.get("symbol", rule.get("coindcx_name", ""))
@@ -405,10 +454,16 @@ class CoindcxExchange(ExchangePyBase):
         return retval
 
     async def _status_polling_loop_fetch_updates(self):
+        """
+        Fetch account and order updates during status polling loop.
+        """
         await self._update_order_fills_from_trades()
         await super()._status_polling_loop_fetch_updates()
 
     async def _update_trading_fees(self):
+        """
+        Update trading fees from the exchange.
+        """
         pass
 
     async def _user_stream_event_listener(self):

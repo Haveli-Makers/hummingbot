@@ -14,13 +14,19 @@ from hummingbot.core.web_assistant.connections.data_types import RESTRequest, WS
 
 class WazirxAuth(AuthBase):
     """
-    WazirX authentication.
+    WazirX authentication handler for API requests.
+
+    Handles HMAC-SHA256 signature generation and timestamp synchronization
+    for authenticated API calls to the WazirX exchange.
     """
 
     RECV_WINDOW = 60000
     AUTH_TOKEN_TIMEOUT = 900
 
     def __init__(self, api_key: str, secret_key: str, time_provider: TimeSynchronizer):
+        """
+        Initialize the WazirX authentication handler.
+        """
         self.api_key = api_key
         self.secret_key = secret_key
         self.time_provider = time_provider

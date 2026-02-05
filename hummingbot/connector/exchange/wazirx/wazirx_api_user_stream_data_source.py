@@ -9,12 +9,17 @@ from hummingbot.core.data_type.user_stream_tracker_data_source import UserStream
 
 
 class WazirxAPIUserStreamDataSource(UserStreamTrackerDataSource):
-    """User stream data source for WazirX. """
+    """
+    User stream data source for WazirX exchange using REST API polling.
+    """
 
     POLL_INTERVAL = 5.0
 
     def __init__(self, auth: Any, trading_pairs: Optional[List[str]] = None, connector: Optional[ExchangePyBase] = None,
                  api_factory=None, domain: str = CONSTANTS.DEFAULT_DOMAIN):
+        """
+        Initialize the user stream data source.
+        """
         super().__init__()
         self._auth = auth
         self._trading_pairs = trading_pairs
@@ -24,10 +29,16 @@ class WazirxAPIUserStreamDataSource(UserStreamTrackerDataSource):
         self._stopping = False
 
     async def start(self):
+        """
+        Start the user stream polling task.
+        """
         self._stopping = False
         self._task = asyncio.ensure_future(self._poll_user_updates())
 
     async def stop(self):
+        """
+        Stop the user stream polling task.
+        """
         self._stopping = True
         if hasattr(self, "_task"):
             self._task.cancel()

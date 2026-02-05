@@ -16,7 +16,20 @@ DEFAULT_FEES = TradeFeeSchema(
 
 
 def wazirx_pair_to_hb_pair(symbol: str) -> str:
-    """Convert WazirX symbol like 'btcinr' or 'btcusdt' to Hummingbot format 'BTC-INR' or 'BTC-USDT'.
+    """
+    Convert WazirX symbol format to Hummingbot trading pair format.
+
+    Args:
+        symbol: WazirX symbol (e.g., "btcinr", "btcusdt")
+
+    Returns:
+        Hummingbot trading pair format (e.g., "BTC-INR", "BTC-USDT")
+
+    Examples:
+        >>> wazirx_pair_to_hb_pair("btcinr")
+        'BTC-INR'
+        >>> wazirx_pair_to_hb_pair("btcusdt")
+        'BTC-USDT'
     """
     s = symbol.upper()
     if "_" in s:
@@ -33,12 +46,30 @@ def wazirx_pair_to_hb_pair(symbol: str) -> str:
 
 
 def hb_pair_to_wazirx_symbol(hb_pair: str) -> str:
+    """
+    Convert Hummingbot trading pair format to WazirX symbol format.
+
+    Args:
+        hb_pair: Hummingbot trading pair (e.g., "BTC-INR")
+
+    Returns:
+        WazirX symbol format (e.g., "BTCINR")
+
+    Examples:
+        >>> hb_pair_to_wazirx_symbol("BTC-INR")
+        'BTCINR'
+        >>> hb_pair_to_wazirx_symbol("ETH-USDT")
+        'ETHUSDT'
+    """
     return hb_pair.replace("-", "").upper()
 
 
 class WazirxConfigMap(BaseConnectorConfigMap):
     """
     Configuration map for WazirX connector.
+
+    Defines the required configuration parameters for connecting to the
+    WazirX exchange, including API credentials.
     """
     connector: str = "wazirx"
     wazirx_api_key: SecretStr = Field(

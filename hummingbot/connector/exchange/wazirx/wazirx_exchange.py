@@ -24,7 +24,7 @@ from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFa
 
 class WazirxExchange(ExchangePyBase):
     """
-    WazirX exchange connector (spot).
+    WazirX exchange connector for spot trading.
     """
 
     UPDATE_ORDER_STATUS_MIN_INTERVAL = 10.0
@@ -40,6 +40,9 @@ class WazirxExchange(ExchangePyBase):
                  trading_required: bool = True,
                  domain: str = CONSTANTS.DEFAULT_DOMAIN,
                  ):
+        """
+        Initialize the WazirX exchange connector.
+        """
         self.api_key = wazirx_api_key
         self.secret_key = wazirx_api_secret
         self._domain = domain
@@ -153,6 +156,9 @@ class WazirxExchange(ExchangePyBase):
         params: Optional[Dict[str, Any]] = None,
         is_auth_required: bool = False
     ) -> Dict[str, Any]:
+        """
+        Make an authenticated or unauthenticated request to the WazirX API.
+        """
         url = f"{CONSTANTS.REST_URL}{path}"
         params = params or {}
 
@@ -211,6 +217,9 @@ class WazirxExchange(ExchangePyBase):
                            order_type: OrderType,
                            price: Decimal,
                            **kwargs) -> Tuple[str, float]:
+        """
+        Place an order on the WazirX exchange.
+        """
         symbol = trading_pair.replace("-", "").lower()
 
         wazirx_order_type = "limit" if order_type in [OrderType.LIMIT, OrderType.LIMIT_MAKER] else order_type.name.lower()

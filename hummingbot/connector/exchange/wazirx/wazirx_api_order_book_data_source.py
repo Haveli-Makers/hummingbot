@@ -15,7 +15,9 @@ from hummingbot.logger import HummingbotLogger
 
 
 class WazirxAPIOrderBookDataSource(OrderBookTrackerDataSource):
-    """REST-only order book data source for WazirX."""
+    """
+    REST-only order book data source for WazirX exchange.
+    """
 
     _logger: Optional[HummingbotLogger] = None
 
@@ -25,6 +27,9 @@ class WazirxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                  domain: str = CONSTANTS.DEFAULT_DOMAIN,
                  api_factory: Optional[WebAssistantsFactory] = None,
                  snapshot_poll_interval: float = 5.0):
+        """
+        Initialize the order book data source.
+        """
         super().__init__(trading_pairs or [])
         self._trading_pairs = trading_pairs or []
         self._connector = connector
@@ -33,6 +38,9 @@ class WazirxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._snapshot_poll_interval = snapshot_poll_interval
 
     async def get_snapshot(self, trading_pair: str) -> Dict[str, Any]:
+        """
+        Get an order book snapshot for a trading pair.
+        """
         symbol = trading_pair.replace("-", "").lower()
         url = f"{CONSTANTS.REST_URL}{CONSTANTS.DEPTH_PATH_URL}?symbol={symbol}"
         async with aiohttp.ClientSession() as session:
@@ -42,6 +50,9 @@ class WazirxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 return await resp.json()
 
     async def get_last_traded_prices(self, trading_pairs: List[str], domain: Optional[str] = None) -> Dict[str, float]:
+        """
+        Get last traded prices for multiple trading pairs.
+        """
         try:
             return await self._connector.get_last_traded_prices(trading_pairs=trading_pairs)
         except Exception:
@@ -88,6 +99,9 @@ class WazirxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         return OrderBookMessage(OrderBookMessageType.SNAPSHOT, content=content, timestamp=timestamp)
 
     async def listen_for_subscriptions(self):
+        """
+        Listen for order book subscription updates.
+        """
         snapshot_queue = self._message_queue[self._snapshot_messages_queue_key]
         while True:
             try:

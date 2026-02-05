@@ -9,14 +9,23 @@ from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFa
 
 
 def public_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
+    """
+    Build a public REST API URL for WazirX.
+    """
     return CONSTANTS.REST_URL + path_url
 
 
 def private_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
+    """
+    Build a private REST API URL for WazirX.
+    """
     return CONSTANTS.REST_URL + path_url
 
 
 def create_throttler() -> AsyncThrottler:
+    """
+    Create an async throttler with WazirX rate limits.
+    """
     return AsyncThrottler(CONSTANTS.RATE_LIMITS)
 
 
@@ -27,6 +36,9 @@ def build_api_factory(
         time_provider: Optional[Callable] = None,
         auth: Optional[AuthBase] = None,
 ) -> WebAssistantsFactory:
+    """
+    Build a web assistants factory for WazirX API interactions.
+    """
     throttler = throttler or create_throttler()
     time_synchronizer = time_synchronizer or TimeSynchronizer()
     time_provider = time_provider or (lambda: get_current_server_time())
@@ -44,6 +56,9 @@ async def get_current_server_time(
         throttler: Optional[AsyncThrottler] = None,
         domain: str = CONSTANTS.DEFAULT_DOMAIN,
 ) -> float:
+    """
+    Get the current server time from WazirX API.
+    """
     import aiohttp
     try:
         async with aiohttp.ClientSession() as session:

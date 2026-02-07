@@ -293,7 +293,7 @@ class MarketsRecorder:
             return
 
         with self._sql_manager.get_new_session() as session:
-            timestamp = self.db_timestamp
+            timestamp = self.db_timestamp / 1000
             for data in market_data_list:
                 best_bid = data['best_bid']
                 best_ask = data['best_ask']

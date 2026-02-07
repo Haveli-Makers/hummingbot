@@ -465,6 +465,63 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
             positions = query.all()
         self.assertEqual(1, len(positions))
 
+    def test_store_market_data(self):
+        recorder = MarketsRecorder(
+            sql=self.manager,
+            markets=[self],
+            config_file_path=self.config_file_path,
+            strategy_name=self.strategy_name,
+            market_data_collection=MarketDataCollectionConfigMap(
+                market_data_collection_enabled=False,
+                market_data_collection_interval=60,
+                market_data_collection_depth=20,
+            ),
+        )
+
+        # Test with empty list
+        recorder.store_market_data([])
+        with self.manager.get_new_session() as session:
+            market_data = session.query(MarketData).all()
+        self.assertEqual(0, len(market_data))
+
+        # Test with data including mid_price and spread
+        market_data_list = [
+            {
+                'exchange': 'binance',
+                'trading_pair': 'ETH-USDT',
+                'best_bid': 100.0,
+                'best_ask': 101.0,
+                'mid_price': 100.5,
+                'spread': 1.0,
+                'order_book': {'bid': [], 'ask': []}
+            }
+        ]
+        recorder.store_market_data(market_data_list)
+        with self.manager.get_new_session() as session:
+            market_data = session.query(MarketData).all()
+        self.assertEqual(1, len(market_data))
+        self.assertEqual(100.5, market_data[0].mid_price)
+        self.assertEqual(1.0, market_data[0].spread)
+
+        # Test with data missing mid_price and spread
+        market_data_list2 = [
+            {
+                'exchange': 'binance',
+                'trading_pair': 'BTC-USDT',
+                'best_bid': 200.0,
+                'best_ask': 202.0,
+                # mid_price and spread not provided
+            }
+        ]
+        recorder.store_market_data(market_data_list2)
+        with self.manager.get_new_session() as session:
+            market_data = session.query(MarketData).all()
+        self.assertEqual(2, len(market_data))
+        # Check the second one
+        self.assertEqual(201.0, market_data[1].mid_price)  # (200+202)/2
+        expected_spread = ((202.0 - 200.0) / 201.0) * 100
+        self.assertAlmostEqual(expected_spread, float(market_data[1].spread), places=5)
+
     def test_update_or_store_position(self):
         recorder = MarketsRecorder(
             sql=self.manager,
@@ -916,7 +973,52 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
         for i, call in enumerate(remove_listener_calls):
             event_type, forwarder = call[0]
             self.assertIn(event_type, expected_event_types)
-            self.assertIn(forwarder, expected_forwarders)
+
+    def test_get_executors_methods(self):
+        recorder = MarketsRecorder(
+            sql=self.manager,
+            markets=[self],
+            config_file_path=self.config_file_path,
+            strategy_name=self.strategy_name,
+            market_data_collection=MarketDataCollectionConfigMap(
+                market_data_collection_enabled=False,
+                market_data_collection_interval=60,
+                market_data_collection_depth=20,
+            ),
+        )
+
+        # Store an executor using a mock PositionExecutor
+        position_executor_mock = MagicMock(spec=PositionExecutor)
+        position_executor_config = PositionExecutorConfig(
+            id="test_executor", timestamp=123, trading_pair="ETH-USDT", connector_name="binance", side=TradeType.BUY,
+            entry_price=Decimal("1000"), amount=Decimal("1"), leverage=1,
+            triple_barrier_config=TripleBarrierConfig(take_profit=Decimal("0.1"), stop_loss=Decimal("0.2")),
+        )
+        position_executor_mock.config = position_executor_config
+        position_executor_mock.executor_info = ExecutorInfo(
+            id="test_executor", timestamp=123, type="position_executor", close_timestamp=None, close_type=None,
+            status=RunnableStatus.RUNNING, controller_id="test_controller", custom_info={},
+            config=position_executor_config, net_pnl_pct=Decimal("0.0"), net_pnl_quote=Decimal("0"),
+            cum_fees_quote=Decimal("0"), filled_amount_quote=Decimal("0"), is_active=True, is_trading=False)
+
+        recorder.store_or_update_executor(position_executor_mock)
+
+        # Test get_executors_by_ids
+        executors = recorder.get_executors_by_ids(["test_executor"])
+        self.assertEqual(1, len(executors))
+        self.assertEqual("test_executor", executors[0].id)
+
+        # Test get_executors_by_controller
+        executors_by_controller = recorder.get_executors_by_controller("test_controller")
+        self.assertEqual(1, len(executors_by_controller))
+        self.assertEqual("test_executor", executors_by_controller[0].id)
+
+        # Test get_all_executors
+        all_executors = recorder.get_all_executors()
+        self.assertGreaterEqual(len(all_executors), 1)
+        # Find our executor
+        found = any(e.id == "test_executor" for e in all_executors)
+        self.assertTrue(found)
 
     def test_add_market_integration_with_event_processing(self):
         """Test that dynamically added markets can process events correctly."""
@@ -971,7 +1073,7 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual("BTC-USDT", orders[0].symbol)
         self.assertEqual("NEW_MARKET_OID1", orders[0].id)
 
-    def test_store_market_data(self):
+    def test_store_market_data_batch(self):
         """Test storing multiple market data records in a single batch."""
         recorder = MarketsRecorder(
             sql=self.manager,

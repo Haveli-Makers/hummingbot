@@ -19,18 +19,7 @@ class CoinDCXOrderBook(OrderBook):
             metadata: Optional[Dict] = None
     ) -> OrderBookMessage:
         """
-        Converts a CoinDCX order book snapshot to an OrderBookMessage.
-
-        CoinDCX snapshot format:
-        {
-            "bids": {"price1": "quantity1", "price2": "quantity2", ...},
-            "asks": {"price1": "quantity1", "price2": "quantity2", ...}
-        }
-
-        :param msg: the order book snapshot message from CoinDCX
-        :param timestamp: the timestamp of the message
-        :param metadata: additional metadata (should include 'trading_pair')
-        :return: an OrderBookMessage object
+        Convert a CoinDCX order book snapshot into an OrderBookMessage.
         """
         if metadata is None:
             metadata = {}
@@ -67,20 +56,7 @@ class CoinDCXOrderBook(OrderBook):
             metadata: Optional[Dict] = None
     ) -> OrderBookMessage:
         """
-        Converts a CoinDCX order book diff (update) to an OrderBookMessage.
-
-        CoinDCX depth-update format:
-        {
-            "ts": timestamp,
-            "vs": version,
-            "asks": {"price1": "quantity1", ...},
-            "bids": {"price1": "quantity1", ...}
-        }
-
-        :param msg: the order book diff message from CoinDCX
-        :param timestamp: the timestamp of the message
-        :param metadata: additional metadata (should include 'trading_pair')
-        :return: an OrderBookMessage object
+        Convert a CoinDCX order book differential update into an OrderBookMessage.
         """
         if metadata is None:
             metadata = {}
@@ -116,21 +92,7 @@ class CoinDCXOrderBook(OrderBook):
             metadata: Optional[Dict] = None
     ) -> OrderBookMessage:
         """
-        Converts a CoinDCX trade message to an OrderBookMessage.
-
-        CoinDCX new-trade format:
-        {
-            "T": "timestamp",
-            "p": "price",
-            "q": "quantity",
-            "m": 0 or 1 (is_maker),
-            "s": "pair",
-            "pr": "spot"
-        }
-
-        :param msg: the trade message from CoinDCX
-        :param metadata: additional metadata (should include 'trading_pair')
-        :return: an OrderBookMessage object
+        Convert a CoinDCX trade message into an OrderBookMessage.
         """
         if metadata is None:
             metadata = {}

@@ -1,4 +1,5 @@
 import asyncio
+import json
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -78,6 +79,9 @@ class CoindcxExchange(ExchangePyBase):
 
     @property
     def authenticator(self):
+        """
+        Get the authenticator instance for CoinDCX API.
+        """
         return CoinDCXAuth(
             api_key=self.api_key,
             secret_key=self.secret_key,
@@ -85,54 +89,79 @@ class CoindcxExchange(ExchangePyBase):
 
     @property
     def name(self) -> str:
+        """
+        Get the name of this connector.
+        """
         return "coindcx"
 
     @property
     def rate_limits_rules(self):
+        """
+        Get the rate limit rules for CoinDCX API.
+        """
         return CONSTANTS.RATE_LIMITS
 
     @property
     def domain(self):
+        """
+        Get the domain for this connector.
+        """
         return self._domain
 
     @property
     def client_order_id_max_length(self):
+        """
+        Get the maximum length for client order IDs.
+        """
         return CONSTANTS.MAX_ORDER_ID_LEN
 
     @property
     def client_order_id_prefix(self):
+        """
+        Get the prefix for client order IDs.
+        """
         return CONSTANTS.HBOT_ORDER_ID_PREFIX
 
     @property
     def trading_rules_request_path(self):
+        """
+        Get the API path for trading rules request.
+        """
         return CONSTANTS.MARKETS_DETAILS_PATH_URL
 
     @property
     def trading_pairs_request_path(self):
+        """
+        Get the API path for trading pairs request.
+        """
         return CONSTANTS.MARKETS_DETAILS_PATH_URL
 
     @property
     def check_network_request_path(self):
+        """
+        Get the API path for checking network connectivity.
+        """
         return CONSTANTS.MARKETS_PATH_URL
 
     @property
     def trading_pairs(self):
+        """
+        Get the list of trading pairs for this connector.
+        """
         return self._trading_pairs
 
     @property
     def is_cancel_request_in_exchange_synchronous(self) -> bool:
-        return True
-
-    @property
-    def is_edit_order_supported_by_exchange(self) -> bool:
         """
-        CoinDCX supports native order editing via the /exchange/v1/orders/edit endpoint.
-        This allows editing the price of an active order.
+        Check if cancel requests are synchronous on this exchange.
         """
         return True
 
     @property
     def is_trading_required(self) -> bool:
+        """
+        Check if trading functionality is required for this connector.
+        """
         return self._trading_required
 
     @property
@@ -151,6 +180,9 @@ class CoindcxExchange(ExchangePyBase):
         return sd
 
     def supported_order_types(self):
+        """
+        Get the list of order types supported by this connector.
+        """
         return [OrderType.LIMIT, OrderType.LIMIT_MAKER, OrderType.MARKET]
 
     async def start_network(self):
@@ -194,9 +226,14 @@ class CoindcxExchange(ExchangePyBase):
         return (
             str(CONSTANTS.ORDER_NOT_EXIST_ERROR_CODE) in exc_str
             or CONSTANTS.ORDER_NOT_EXIST_MESSAGE in exc_str
+            or (str(CONSTANTS.INVALID_REQUEST_ERROR_CODE) in exc_str
+                and CONSTANTS.INVALID_REQUEST_MESSAGE in exc_str)
         )
 
     def _create_web_assistants_factory(self) -> WebAssistantsFactory:
+        """
+        Create a web assistants factory for making API requests.
+        """
         return web_utils.build_api_factory(
             throttler=self._throttler,
             time_synchronizer=self._time_synchronizer,
@@ -204,6 +241,9 @@ class CoindcxExchange(ExchangePyBase):
             auth=self._auth)
 
     def _create_order_book_data_source(self) -> OrderBookTrackerDataSource:
+        """
+        Create an order book data source for tracking order book updates.
+        """
         return CoinDCXAPIOrderBookDataSource(
             trading_pairs=self._trading_pairs,
             connector=self,
@@ -211,6 +251,9 @@ class CoindcxExchange(ExchangePyBase):
             api_factory=self._web_assistants_factory)
 
     def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
+        """
+        Create a user stream data source for tracking account updates.
+        """
         return CoinDCXAPIUserStreamDataSource(
             auth=self._auth,
             trading_pairs=self._trading_pairs,
@@ -227,6 +270,9 @@ class CoindcxExchange(ExchangePyBase):
                  amount: Decimal,
                  price: Decimal = s_decimal_NaN,
                  is_maker: Optional[bool] = None) -> TradeFeeBase:
+        """
+        Calculate the trading fee for an order.
+        """
         is_maker = order_type is OrderType.LIMIT_MAKER
         return DeductedFromReturnsTradeFee(percent=self.estimate_fee_pct(is_maker))
 
@@ -325,83 +371,6 @@ class CoindcxExchange(ExchangePyBase):
             return True
         return False
 
-    async def _place_edit(
-        self,
-        client_order_id: str,
-        exchange_order_id: str,
-        trading_pair: str,
-        new_price: Decimal,
-        new_amount: Decimal,
-        **kwargs
-    ) -> Tuple[str, str, float]:
-        """
-        CoinDCX native order edit using POST /exchange/v1/orders/edit endpoint.
-        
-        According to CoinDCX API documentation, the edit endpoint allows editing the 
-        price of an active order. Note: CoinDCX does not support editing quantity.
-        
-        :param client_order_id: The client order ID of the order to edit
-        :param exchange_order_id: The exchange order ID of the order to edit
-        :param trading_pair: The trading pair (not used in request but kept for compatibility)
-        :param new_price: New price for the order
-        :param new_amount: New amount for the order (not supported by CoinDCX but kept for compatibility)
-        :return: Tuple of (client_order_id, exchange_order_id, timestamp)
-        """
-        tracked_order = self._order_tracker.fetch_tracked_order(client_order_id)
-        if tracked_order is None:
-            raise ValueError(f"Order {client_order_id} not found")
-        
-        # CoinDCX only supports editing price, not quantity
-        api_params = {
-            "price_per_unit": float(new_price),
-        }
-
-        # Use exchange_order_id if available, otherwise use client_order_id
-        if exchange_order_id:
-            api_params["id"] = exchange_order_id
-        else:
-            api_params["client_order_id"] = client_order_id
-
-        try:
-            result = await self._api_post(
-                path_url=CONSTANTS.ORDER_EDIT_PATH_URL,
-                data=api_params,
-                is_auth_required=True,
-                limit_id=CONSTANTS.ORDER_EDIT_PATH_URL
-            )
-            
-            # CoinDCX returns the updated order details
-            if isinstance(result, dict) and "id" in result:
-                updated_exchange_order_id = str(result.get("id", exchange_order_id))
-                updated_at = result.get("updated_at", self._time_synchronizer.time() * 1000)
-                if isinstance(updated_at, (int, float)):
-                    transact_time = updated_at / 1e3
-                else:
-                    transact_time = self._time_synchronizer.time()
-                
-                return client_order_id, updated_exchange_order_id, transact_time
-            
-            elif isinstance(result, list) and len(result) > 0:
-                # Sometimes CoinDCX returns a list with order data
-                order_data = result[0]
-                updated_exchange_order_id = str(order_data.get("id", exchange_order_id))
-                updated_at = order_data.get("updated_at", self._time_synchronizer.time() * 1000)
-                if isinstance(updated_at, (int, float)):
-                    transact_time = updated_at / 1e3
-                else:
-                    transact_time = self._time_synchronizer.time()
-                
-                return client_order_id, updated_exchange_order_id, transact_time
-            
-            else:
-                # If we get an empty response but no error, assume success
-                transact_time = self._time_synchronizer.time()
-                return client_order_id, exchange_order_id, transact_time
-                
-        except Exception as e:
-            self.logger().error(f"Error during CoinDCX order edit: {e}")
-            raise
-
     async def _update_trading_rules(self):
         """Override to add logging for trading rules update."""
         exchange_info = await self._make_trading_rules_request()
@@ -433,8 +402,6 @@ class CoindcxExchange(ExchangePyBase):
         """
         trading_pair_rules = exchange_info_dict if isinstance(exchange_info_dict, list) else [exchange_info_dict]
         retval = []
-
-        # is_list = isinstance(exchange_info_dict, list)
 
         for rule in filter(coindcx_utils.is_exchange_information_valid, trading_pair_rules):
             try:
@@ -487,13 +454,15 @@ class CoindcxExchange(ExchangePyBase):
         return retval
 
     async def _status_polling_loop_fetch_updates(self):
+        """
+        Fetch account and order updates during status polling loop.
+        """
         await self._update_order_fills_from_trades()
         await super()._status_polling_loop_fetch_updates()
 
     async def _update_trading_fees(self):
         """
-        Update fees information from the exchange.
-        CoinDCX typically charges 0.1% maker and 0.1% taker fees.
+        Update trading fees from the exchange.
         """
         pass
 
@@ -504,10 +473,20 @@ class CoindcxExchange(ExchangePyBase):
         """
         async for event_message in self._iter_user_event_queue():
             try:
-                event_type = event_message.get("event", event_message.get("e", ""))
+                event_type = event_message.get("event")
 
-                if event_type in ["order-update", CONSTANTS.ORDER_UPDATE_EVENT_TYPE]:
-                    order_data = event_message.get("data", event_message)
+                if event_type == CONSTANTS.ORDER_UPDATE_EVENT_TYPE:
+                    if "data" not in event_message:
+                        self.logger().warning(f"Order update event missing 'data' field: {event_message}")
+                        continue
+                    order_data = event_message.get("data")
+
+                    if isinstance(order_data, str):
+                        try:
+                            order_data = json.loads(order_data)
+                        except json.JSONDecodeError as e:
+                            self.logger().warning(f"Failed to parse order update data: {e}")
+                            continue
 
                     if isinstance(order_data, list):
                         for order in order_data:
@@ -515,8 +494,18 @@ class CoindcxExchange(ExchangePyBase):
                     else:
                         await self._process_order_update(order_data)
 
-                elif event_type in ["trade-update", CONSTANTS.TRADE_UPDATE_EVENT_TYPE]:
-                    trade_data = event_message.get("data", event_message)
+                elif event_type == CONSTANTS.TRADE_UPDATE_EVENT_TYPE:
+                    if "data" not in event_message:
+                        self.logger().warning(f"Trade update event missing 'data' field: {event_message}")
+                        continue
+                    trade_data = event_message.get("data")
+
+                    if isinstance(trade_data, str):
+                        try:
+                            trade_data = json.loads(trade_data)
+                        except json.JSONDecodeError as e:
+                            self.logger().warning(f"Failed to parse trade update data: {e}")
+                            continue
 
                     if isinstance(trade_data, list):
                         for trade in trade_data:
@@ -524,8 +513,18 @@ class CoindcxExchange(ExchangePyBase):
                     else:
                         await self._process_trade_update(trade_data)
 
-                elif event_type in ["balance-update", CONSTANTS.BALANCE_UPDATE_EVENT_TYPE]:
-                    balance_data = event_message.get("data", event_message)
+                elif event_type == CONSTANTS.BALANCE_UPDATE_EVENT_TYPE:
+                    if "data" not in event_message:
+                        self.logger().warning(f"Balance update event missing 'data' field: {event_message}")
+                        continue
+                    balance_data = event_message.get("data")
+
+                    if isinstance(balance_data, str):
+                        try:
+                            balance_data = json.loads(balance_data)
+                        except json.JSONDecodeError as e:
+                            self.logger().warning(f"Failed to parse balance update data: {e}")
+                            continue
 
                     if isinstance(balance_data, list):
                         for balance in balance_data:
@@ -546,8 +545,8 @@ class CoindcxExchange(ExchangePyBase):
         if not isinstance(order_data, dict):
             return
 
-        client_order_id = order_data.get("client_order_id", order_data.get("c", ""))
-        exchange_order_id = str(order_data.get("id", order_data.get("o", "")))
+        client_order_id = order_data.get("client_order_id", "")
+        exchange_order_id = str(order_data.get("id", ""))
 
         tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
         if tracked_order is not None:
@@ -570,12 +569,12 @@ class CoindcxExchange(ExchangePyBase):
         if not isinstance(trade_data, dict):
             return
 
-        client_order_id = trade_data.get("c", trade_data.get("client_order_id", ""))
-        exchange_order_id = str(trade_data.get("o", trade_data.get("order_id", "")))
+        client_order_id = trade_data.get("client_order_id", "")
+        exchange_order_id = str(trade_data.get("order_id", ""))
 
         tracked_order = self._order_tracker.all_fillable_orders.get(client_order_id)
         if tracked_order is not None:
-            fee_amount = Decimal(str(trade_data.get("f", trade_data.get("fee_amount", 0))))
+            fee_amount = Decimal(str(trade_data.get("fee_amount", 0)))
 
             trading_pair = tracked_order.trading_pair
             base, quote = trading_pair.split("-")
@@ -587,11 +586,11 @@ class CoindcxExchange(ExchangePyBase):
                 flat_fees=[TokenAmount(amount=fee_amount, token=fee_token)]
             )
 
-            fill_price = Decimal(str(trade_data.get("p", trade_data.get("price", 0))))
-            fill_amount = Decimal(str(trade_data.get("q", trade_data.get("quantity", 0))))
+            fill_price = Decimal(str(trade_data.get("price", 0)))
+            fill_amount = Decimal(str(trade_data.get("quantity", 0)))
 
             trade_update = TradeUpdate(
-                trade_id=str(trade_data.get("t", trade_data.get("id", ""))),
+                trade_id=str(trade_data.get("id", "")),
                 client_order_id=client_order_id,
                 exchange_order_id=exchange_order_id,
                 trading_pair=tracked_order.trading_pair,
@@ -599,7 +598,7 @@ class CoindcxExchange(ExchangePyBase):
                 fill_base_amount=fill_amount,
                 fill_quote_amount=fill_amount * fill_price,
                 fill_price=fill_price,
-                fill_timestamp=trade_data.get("T", trade_data.get("timestamp", self._time_synchronizer.time() * 1000)) / 1000,
+                fill_timestamp=trade_data.get("timestamp", self._time_synchronizer.time() * 1000) / 1000,
             )
             self._order_tracker.process_trade_update(trade_update)
 
@@ -610,9 +609,9 @@ class CoindcxExchange(ExchangePyBase):
         if not isinstance(balance_data, dict):
             return
 
-        asset_name = balance_data.get("currency", balance_data.get("a", ""))
-        free_balance = Decimal(str(balance_data.get("balance", balance_data.get("f", 0))))
-        locked_balance = Decimal(str(balance_data.get("locked_balance", balance_data.get("l", 0))))
+        asset_name = balance_data.get("currency_short_name", "") or balance_data.get("currency", "")
+        free_balance = Decimal(str(balance_data.get("balance", 0)))
+        locked_balance = Decimal(str(balance_data.get("locked_balance", 0)))
         total_balance = free_balance + locked_balance
 
         self._account_available_balances[asset_name] = free_balance
@@ -645,34 +644,36 @@ class CoindcxExchange(ExchangePyBase):
                 )
 
                 if trades:
+                    trades_by_order_id = {}
                     for trade in trades:
                         order_id = str(trade.get("order_id", ""))
+                        trades_by_order_id[order_id] = trade
 
-                        for tracked_order in self._order_tracker.all_fillable_orders.values():
-                            if tracked_order.exchange_order_id == order_id:
-                                fee_amount = Decimal(str(trade.get("fee_amount", 0)))
-                                trading_pair = tracked_order.trading_pair
-                                base, quote = trading_pair.split("-")
+                    for tracked_order in self._order_tracker.all_fillable_orders.values():
+                        if tracked_order.exchange_order_id in trades_by_order_id:
+                            trade = trades_by_order_id[tracked_order.exchange_order_id]
+                            fee_amount = Decimal(str(trade.get("fee_amount", 0)))
+                            trading_pair = tracked_order.trading_pair
+                            base, quote = trading_pair.split("-")
 
-                                fee = TradeFeeBase.new_spot_fee(
-                                    fee_schema=self.trade_fee_schema(),
-                                    trade_type=tracked_order.trade_type,
-                                    flat_fees=[TokenAmount(amount=fee_amount, token=quote)]
-                                )
+                            fee = TradeFeeBase.new_spot_fee(
+                                fee_schema=self.trade_fee_schema(),
+                                trade_type=tracked_order.trade_type,
+                                flat_fees=[TokenAmount(amount=fee_amount, token=quote)]
+                            )
 
-                                trade_update = TradeUpdate(
-                                    trade_id=str(trade.get("id", "")),
-                                    client_order_id=tracked_order.client_order_id,
-                                    exchange_order_id=order_id,
-                                    trading_pair=trading_pair,
-                                    fee=fee,
-                                    fill_base_amount=Decimal(str(trade.get("quantity", 0))),
-                                    fill_quote_amount=Decimal(str(trade.get("quantity", 0))) * Decimal(str(trade.get("price", 0))),
-                                    fill_price=Decimal(str(trade.get("price", 0))),
-                                    fill_timestamp=trade.get("timestamp", self._time_synchronizer.time() * 1000) / 1000,
-                                )
-                                self._order_tracker.process_trade_update(trade_update)
-                                break
+                            trade_update = TradeUpdate(
+                                trade_id=str(trade.get("id", "")),
+                                client_order_id=tracked_order.client_order_id,
+                                exchange_order_id=tracked_order.exchange_order_id,
+                                trading_pair=trading_pair,
+                                fee=fee,
+                                fill_base_amount=Decimal(str(trade.get("quantity", 0))),
+                                fill_quote_amount=Decimal(str(trade.get("quantity", 0))) * Decimal(str(trade.get("price", 0))),
+                                fill_price=Decimal(str(trade.get("price", 0))),
+                                fill_timestamp=trade.get("timestamp", self._time_synchronizer.time() * 1000) / 1000,
+                            )
+                            self._order_tracker.process_trade_update(trade_update)
 
             except Exception as e:
                 self.logger().error(f"Error fetching trade history: {e}")

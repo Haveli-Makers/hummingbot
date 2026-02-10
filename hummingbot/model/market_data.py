@@ -1,9 +1,8 @@
 import inspect
 
-from sqlalchemy import JSON, Column, Index, PrimaryKeyConstraint, Text
+from sqlalchemy import JSON, Column, Index, PrimaryKeyConstraint, Text, BigInteger, Float, Numeric
 
 from hummingbot.model import HummingbotBase
-from hummingbot.model.decimal_type_decorator import SqliteDecimal
 
 
 class MarketData(HummingbotBase):
@@ -15,13 +14,13 @@ class MarketData(HummingbotBase):
         Index("idx_market_data_exchange", "exchange"),
     )
 
-    timestamp = Column(SqliteDecimal(6), nullable=False)
+    timestamp = Column(BigInteger, nullable=False)
     exchange = Column(Text, nullable=False)
     trading_pair = Column(Text, nullable=False)
-    mid_price = Column(SqliteDecimal(6), nullable=False)
-    best_bid = Column(SqliteDecimal(6), nullable=False)
-    best_ask = Column(SqliteDecimal(6), nullable=False)
-    spread = Column(SqliteDecimal(6), nullable=True)
+    mid_price = Column(Float, nullable=False)
+    best_bid = Column(Float, nullable=False)
+    best_ask = Column(Float, nullable=False)
+    spread = Column(Numeric(5, 2), nullable=True)
     order_book = Column(JSON)
 
     def __repr__(self) -> str:

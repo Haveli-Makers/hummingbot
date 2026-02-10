@@ -18,12 +18,13 @@ DEFAULT_FEES = TradeFeeSchema(
 
 def is_exchange_information_valid(exchange_info: Dict[str, Any]) -> bool:
     """
-    Verifies if a trading pair is enabled to operate with based on its exchange information.
-    CoinDCX uses 'status' field to indicate if a market is active.
-    Also validates that critical fields have valid values.
+    Validate if exchange market information is valid and active.
 
-    :param exchange_info: the exchange information for a trading pair
-    :return: True if the trading pair is enabled and has valid data, False otherwise
+    Args:
+        exchange_info: Market information dictionary from CoinDCX
+
+    Returns:
+        True if the market is active and has valid parameters, False otherwise
     """
     status = exchange_info.get("status", "")
     if status.lower() != "active":
@@ -69,25 +70,27 @@ def coindcx_pair_to_hb_pair(coindcx_pair: str) -> str:
 
 def hb_pair_to_coindcx_symbol(hb_pair: str) -> str:
     """
-    Converts Hummingbot trading pair format to CoinDCX symbol format.
-    Hummingbot uses format like "BTC-USDT"
-    CoinDCX symbol format is like "BTCUSDT"
+    Convert Hummingbot trading pair format to CoinDCX symbol format.
 
-    :param hb_pair: Trading pair in Hummingbot format
-    :return: Trading pair in CoinDCX symbol format
+    Args:
+        hb_pair: Trading pair in Hummingbot format (e.g., "BTC-USDT")
+
+    Returns:
+        Symbol in CoinDCX format (e.g., "BTCUSDT")
     """
     return hb_pair.replace("-", "")
 
 
 def hb_pair_to_coindcx_pair(hb_pair: str, ecode: str = "B") -> str:
     """
-    Converts Hummingbot trading pair format to CoinDCX pair format (used in sockets).
-    Hummingbot uses format like "BTC-USDT"
-    CoinDCX pair format is like "B-BTC_USDT"
+    Convert Hummingbot trading pair format to CoinDCX pair format with exchange code.
 
-    :param hb_pair: Trading pair in Hummingbot format
-    :param ecode: Exchange code (B for Binance markets, I for CoinDCX INR markets)
-    :return: Trading pair in CoinDCX pair format
+    Args:
+        hb_pair: Trading pair in Hummingbot format (e.g., "BTC-USDT")
+        ecode: Exchange code prefix (e.g., "B" for main exchange)
+
+    Returns:
+        Pair in CoinDCX format (e.g., "B-BTC_USDT")
     """
     return f"{ecode}-{hb_pair.replace('-', '_')}"
 

@@ -1,329 +1,207 @@
 """
-Order Edit Example Script for Binance and CoinDCX
-
-This script demonstrates how to use the order editing functionality in Hummingbot.
-It places limit orders and then edits them (adjusts price/amount) based on market conditions.
-
-Key Features:
-- Places initial limit orders with configurable spreads
-- Monitors orders and edits them when price moves beyond threshold
-- Uses native order edit APIs for atomic order editing
-  - Binance: Uses cancel-replace API
-  - CoinDCX: Uses edit price API
-- Handles edit events and failures gracefully
-
-Configuration:
-- exchange: The exchange to use (binance, binance_paper_trade, coindcx)
-- trading_pair: The trading pair to trade
-- order_amount: Base amount for orders
-- bid_spread: Initial spread below mid price for buy orders
-- ask_spread: Initial spread above mid price for sell orders
-- edit_threshold: Price movement threshold to trigger order edit (as decimal, e.g., 0.002 = 0.2%)
-- refresh_time: Time between order status checks (seconds)
-
-Author: Hummingbot Team
+Configuration (set in conf/scripts/conf_order_edit_example_<exchange>.yml):
+- exchange: coindcx, wazirx, etc.
+- trading_pair: e.g. USDT-INR
+- order_amount: base amount for the order
+- bid_spread: initial spread below mid price (0.002 = 0.2%)
+- edit_price: the new price to set when editing the order
+- edit_after_seconds: seconds to wait before editing the order
 """
 
 import logging
 import os
 from decimal import Decimal
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 from pydantic import Field
 
 from hummingbot.client.config.config_data_types import BaseClientModel
 from hummingbot.connector.connector_base import ConnectorBase
-from hummingbot.core.data_type.common import OrderType, PriceType, TradeType
+from hummingbot.core.data_type.common import OrderType, PriceType
 from hummingbot.core.data_type.limit_order import LimitOrder
-from hummingbot.core.event.events import (
-    OrderCancelledEvent,
-    OrderEditedEvent,
-    OrderEditFailedEvent,
-    OrderFilledEvent,
-)
+from hummingbot.core.event.events import OrderCancelledEvent, OrderEditedEvent, OrderEditFailedEvent, OrderFilledEvent
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 
 
 class OrderEditExampleConfig(BaseClientModel):
     """Configuration for the Order Edit Example script."""
     script_file_name: str = os.path.basename(__file__)
-    
-    # Exchange and trading pair
+
     exchange: str = Field(
-        default="binance_paper_trade",
-        description="Exchange to use (binance, binance_paper_trade, coindcx)"
+        default="coindcx",
+        description="Exchange to use (coindcx, wazirx, etc.)"
     )
     trading_pair: str = Field(
-        default="BTC-USDT",
+        default="USDT-INR",
         description="Trading pair to trade"
     )
-    
-    # Order parameters
+
     order_amount: Decimal = Field(
-        default=Decimal("0.001"),
-        description="Amount for each order"
+        default=Decimal("1.2"),
+        description="Amount for the BUY order"
     )
     bid_spread: Decimal = Field(
         default=Decimal("0.002"),
-        description="Spread below mid price for buy orders (0.002 = 0.2%)"
+        description="Spread below mid price for initial BUY order (0.002 = 0.2%)"
     )
-    ask_spread: Decimal = Field(
-        default=Decimal("0.002"),
-        description="Spread above mid price for sell orders (0.002 = 0.2%)"
+
+    edit_price: Decimal = Field(
+        default=Decimal("0"),
+        description="Target price to edit the order to. Set 0 to skip editing."
     )
-    
-    # Edit parameters
-    edit_threshold: Decimal = Field(
-        default=Decimal("0.001"),
-        description="Price movement threshold to trigger order edit (0.001 = 0.1%)"
+    edit_after_seconds: int = Field(
+        default=15,
+        description="Seconds to wait after placing order before editing its price"
     )
+
     refresh_time: int = Field(
         default=10,
-        description="Time between order checks (seconds)"
+        description="Time between order status checks (seconds)"
     )
-    force_edit_after_seconds: int = Field(
-        default=15,
-        description="If no edit triggered naturally, force one after this many seconds"
-    )
-    
-    # Strategy behavior
-    max_orders_per_side: int = Field(
-        default=1,
-        description="Maximum number of orders per side"
+    post_edit_cooldown_seconds: int = Field(
+        default=10,
+        description="Seconds to wait after an edit before placing new orders"
     )
 
 
 class OrderEditExample(ScriptStrategyBase):
     """
-    A script that demonstrates order editing functionality.
-    
+    A script that places a BUY order and edits its price.
+
     The script:
-    1. Places buy and sell limit orders at configured spreads
-    2. Monitors mid price and edits orders when price moves beyond threshold
-    3. Uses native Binance cancel-replace for efficient order editing
+    1. Places a BUY limit order at bid_spread % below mid price
+    2. After edit_after_seconds, edits the order to edit_price
+    3. Uses native edit if supported, otherwise cancel-and-replace
     """
-    
-    # Tracking variables
+
     _last_check_timestamp: float = 0
-    _order_prices: Dict[str, Decimal] = {}  # client_order_id -> original price
-    _last_mid_price: Optional[Decimal] = None
-    _force_edit_start_ts: Optional[float] = None
-    
+    _order_placed_ts: Optional[float] = None
+    _order_client_id: Optional[str] = None
+    _order_price: Optional[Decimal] = None
+    _edit_done: bool = False
+    _post_edit_cooldown_until: Optional[float] = None
+
     @classmethod
     def init_markets(cls, config: OrderEditExampleConfig):
         cls.markets = {config.exchange: {config.trading_pair}}
-    
+
     def __init__(self, connectors: Dict[str, ConnectorBase], config: OrderEditExampleConfig):
         super().__init__(connectors)
         self.config = config
-        self._order_prices = {}
-        self._last_mid_price = None
         self._last_check_timestamp = 0
-        self._force_edit_start_ts = None
-    
+        self._order_placed_ts = None
+        self._order_client_id = None
+        self._order_price = None
+        self._edit_done = False
+        self._post_edit_cooldown_until = None
+
     @property
     def connector(self) -> ConnectorBase:
         """Get the configured connector."""
         return self.connectors[self.config.exchange]
 
-    def _has_sufficient_balance(self, is_buy: bool, amount: Decimal, price: Decimal) -> bool:
-        """Check if there is enough balance to place the order."""
-        base_asset, quote_asset = self.config.trading_pair.split("-")
-        if is_buy:
-            required_asset = quote_asset
-            required_amount = amount * price
-        else:
-            required_asset = base_asset
-            required_amount = amount
-
-        available_balance = self.connector.get_available_balance(required_asset) or Decimal("0")
-
-        # Add a small buffer for fees/slippage
-        required_amount *= Decimal("1.001")
-
-        if available_balance < required_amount:
-            self.log_with_clock(
-                logging.WARNING,
-                f"Insufficient balance to place {'BUY' if is_buy else 'SELL'} order. "
-                f"Available: {available_balance} {required_asset}, Required: {required_amount} {required_asset}"
-            )
-            return False
-
-        return True
-    
     def on_tick(self):
         """Called on each tick of the strategy."""
-        
-        # Check if it's time to evaluate orders
         if self.current_timestamp - self._last_check_timestamp < self.config.refresh_time:
             return
-        
+
         self._last_check_timestamp = self.current_timestamp
-        
-        # Get current mid price
+
         mid_price = self.connector.get_price_by_type(
-            self.config.trading_pair, 
-            PriceType.MidPrice
+            self.config.trading_pair,
+            PriceType.MidPrice,
         )
-        
         if mid_price is None or mid_price <= 0:
             self.logger().warning("Could not get valid mid price")
             return
-        
-        # Get active orders
+
+        in_cooldown = (
+            self._post_edit_cooldown_until is not None
+            and self.current_timestamp < self._post_edit_cooldown_until
+        )
+
         active_orders = self.get_active_orders(connector_name=self.config.exchange)
         buy_orders = [o for o in active_orders if o.is_buy]
-        sell_orders = [o for o in active_orders if not o.is_buy]
-        
-        # Place new orders if needed
-        if len(buy_orders) < self.config.max_orders_per_side:
-            self._place_buy_order(mid_price)
-        
-        if len(sell_orders) < self.config.max_orders_per_side:
-            self._place_sell_order(mid_price)
-        
-        # Check if we need to edit existing orders
-        if self._last_mid_price is not None:
-            price_change = abs(mid_price - self._last_mid_price) / self._last_mid_price
-            
-            if price_change >= self.config.edit_threshold:
-                self.logger().info(
-                    f"Price moved {price_change:.4%} (threshold: {self.config.edit_threshold:.4%}). "
-                    f"Editing orders..."
-                )
-                self._edit_orders_for_new_price(mid_price, active_orders)
-        
-        self._last_mid_price = mid_price
-        if self._force_edit_start_ts is None:
-            self._force_edit_start_ts = self.current_timestamp
 
-        # Force a one-time edit if no natural trigger occurs (to validate edit flow quickly)
-        if self.current_timestamp - self._force_edit_start_ts >= self.config.force_edit_after_seconds:
-            self._force_edit_start_ts = float('inf')  # disable further forced edits
-            self._force_edit_any_order(active_orders)
-    
+        if not buy_orders and self._order_client_id is None and not in_cooldown:
+            self._place_buy_order(mid_price)
+            return
+
+        if (
+            not self._edit_done
+            and self._order_placed_ts is not None
+            and self.current_timestamp - self._order_placed_ts >= self.config.edit_after_seconds
+            and self.config.edit_price > 0
+            and buy_orders
+        ):
+            order = buy_orders[0]
+            self._do_edit(order, self.config.edit_price)
+
     def _place_buy_order(self, mid_price: Decimal) -> Optional[str]:
-        """Place a buy order below the mid price."""
+        """Place a BUY order at bid_spread % below mid price."""
         buy_price = mid_price * (Decimal("1") - self.config.bid_spread)
         buy_price = self.connector.quantize_order_price(self.config.trading_pair, buy_price)
 
-        if not self._has_sufficient_balance(True, self.config.order_amount, buy_price):
+        base_asset, quote_asset = self.config.trading_pair.split("-")
+        available = self.connector.get_available_balance(quote_asset) or Decimal("0")
+        required = self.config.order_amount * buy_price
+        if available < required:
+            self.log_with_clock(
+                logging.WARNING,
+                f"Insufficient {quote_asset} balance. Available: {available}, Required: {required}",
+            )
             return None
-        
+
         order_id = self.buy(
             connector_name=self.config.exchange,
             trading_pair=self.config.trading_pair,
             amount=self.config.order_amount,
             order_type=OrderType.LIMIT,
-            price=buy_price
+            price=buy_price,
         )
-        
+
         if order_id:
-            self._order_prices[order_id] = buy_price
+            self._order_client_id = order_id
+            self._order_price = buy_price
+            self._order_placed_ts = self.current_timestamp
+            self._edit_done = False
             self.log_with_clock(
                 logging.INFO,
-                f"Placed BUY order {order_id} at {buy_price}"
+                f"Placed BUY order {order_id} at {buy_price} "
+                f"(mid: {mid_price}, spread: {self.config.bid_spread:.4%})",
             )
-        
+            if self.config.edit_price > 0:
+                self.log_with_clock(
+                    logging.INFO,
+                    f"Will edit price to {self.config.edit_price} after {self.config.edit_after_seconds}s",
+                )
         return order_id
 
-    def _force_edit_any_order(self, active_orders: List[LimitOrder]):
-        """Force a small edit on the first active order to validate edit events."""
-        if not active_orders:
-            return
-        order = active_orders[0]
-        # Nudge price by 0.1% in the same direction
-        delta = Decimal("0.001")
-        if order.is_buy:
-            new_price = order.price * (Decimal("1") + delta)
-        else:
-            new_price = order.price * (Decimal("1") - delta)
+    def _do_edit(self, order: LimitOrder, new_price: Decimal):
+        """Edit the order price using the connector's edit_order.
 
+        For exchanges with native edit (e.g. CoinDCX), this calls the exchange's
+        edit endpoint directly. For exchanges without native edit (e.g. WazirX),
+        the connector automatically uses cancel-and-replace strategy.
+        """
         new_price = self.connector.quantize_order_price(self.config.trading_pair, new_price)
 
         self.log_with_clock(
             logging.INFO,
-            f"Forced edit for quick validation on order {order.client_order_id}: {order.price} -> {new_price}"
+            f"Editing BUY order {order.client_order_id}: "
+            f"{order.price} -> {new_price} (amount unchanged: {order.quantity})",
         )
-        self._edit_order(order, new_price, order.quantity)
-    
-    def _place_sell_order(self, mid_price: Decimal) -> Optional[str]:
-        """Place a sell order above the mid price."""
-        sell_price = mid_price * (Decimal("1") + self.config.ask_spread)
-        sell_price = self.connector.quantize_order_price(self.config.trading_pair, sell_price)
-
-        if not self._has_sufficient_balance(False, self.config.order_amount, sell_price):
-            return None
-        
-        order_id = self.sell(
-            connector_name=self.config.exchange,
-            trading_pair=self.config.trading_pair,
-            amount=self.config.order_amount,
-            order_type=OrderType.LIMIT,
-            price=sell_price
-        )
-        
-        if order_id:
-            self._order_prices[order_id] = sell_price
-            self.log_with_clock(
-                logging.INFO,
-                f"Placed SELL order {order_id} at {sell_price}"
-            )
-        
-        return order_id
-    
-    def _edit_orders_for_new_price(self, mid_price: Decimal, active_orders: List[LimitOrder]):
-        """Edit orders to adjust to new mid price."""
-        
-        for order in active_orders:
-            if order.is_buy:
-                new_price = mid_price * (Decimal("1") - self.config.bid_spread)
-            else:
-                new_price = mid_price * (Decimal("1") + self.config.ask_spread)
-            
-            new_price = self.connector.quantize_order_price(
-                self.config.trading_pair, 
-                new_price
-            )
-            
-            # Get original price
-            original_price = self._order_prices.get(order.client_order_id, order.price)
-            
-            # Only edit if price changed significantly
-            price_diff = abs(new_price - original_price) / original_price
-            if price_diff < Decimal("0.0001"):  # Less than 0.01% change
-                continue
-            
-            self.log_with_clock(
-                logging.INFO,
-                f"Editing {'BUY' if order.is_buy else 'SELL'} order {order.client_order_id}: "
-                f"{original_price} -> {new_price}"
-            )
-            
-            # Use the edit_order method
-            self._edit_order(order, new_price, order.quantity)
-    
-    def _edit_order(self, order: LimitOrder, new_price: Decimal, new_amount: Decimal):
-        """
-        Edit an existing order using the connector's edit_order method.
-        
-        This uses the exchange's native edit order API when supported.
-        """
         try:
-            # Call the edit_order method on the connector
             self.connector.edit_order(
                 client_order_id=order.client_order_id,
                 trading_pair=order.trading_pair,
                 new_price=new_price,
-                new_amount=new_amount
+                new_amount=order.quantity,
             )
-            
-            # Update our tracking
-            self._order_prices[order.client_order_id] = new_price
-            
+            self._edit_done = True
         except Exception as e:
             self.logger().error(f"Failed to edit order {order.client_order_id}: {e}")
-    
+
     def did_fill_order(self, event: OrderFilledEvent):
         """Called when an order is filled."""
         msg = (
@@ -332,68 +210,66 @@ class OrderEditExample(ScriptStrategyBase):
         )
         self.log_with_clock(logging.INFO, msg)
         self.notify_hb_app_with_timestamp(msg)
-        
-        # Clean up tracking
-        if event.order_id in self._order_prices:
-            del self._order_prices[event.order_id]
-    
+        self._reset_tracking()
+
     def did_cancel_order(self, event: OrderCancelledEvent):
         """Called when an order is cancelled."""
-        self.log_with_clock(
-            logging.INFO,
-            f"Order cancelled: {event.order_id}"
-        )
-        
-        # Clean up tracking
-        if event.order_id in self._order_prices:
-            del self._order_prices[event.order_id]
-    
+        self.log_with_clock(logging.INFO, f"Order cancelled: {event.order_id}")
+        if event.order_id == self._order_client_id and self._edit_done:
+            pass
+        elif event.order_id == self._order_client_id:
+            self._reset_tracking()
+
     def did_edit_order(self, event: OrderEditedEvent):
         """Called when an order is successfully edited."""
         msg = (
-            f"Order edited: {event.order_id} "
+            f"Order edited successfully: {event.order_id} "
             f"Price: {event.original_price:.2f} -> {event.new_price:.2f}, "
             f"Amount: {event.original_amount:.6f} -> {event.new_amount:.6f}"
         )
         self.log_with_clock(logging.INFO, msg)
         self.notify_hb_app_with_timestamp(msg)
-        
-        # Update tracking with new price
+
         if event.new_order_id:
-            # Cancel-replace: new order ID was created
-            if event.order_id in self._order_prices:
-                del self._order_prices[event.order_id]
-            self._order_prices[event.new_order_id] = event.new_price
-        else:
-            # Native edit: same order ID
-            self._order_prices[event.order_id] = event.new_price
-    
+            self._order_client_id = event.new_order_id
+        self._order_price = event.new_price
+        self._edit_done = True
+        self._post_edit_cooldown_until = (
+            self.current_timestamp + self.config.post_edit_cooldown_seconds
+        )
+
     def did_fail_order_edit(self, event: OrderEditFailedEvent):
         """Called when an order edit fails."""
-        msg = (
-            f"Order edit FAILED: {event.order_id} - {event.error_message}"
-        )
+        msg = f"Order edit FAILED: {event.order_id} - {event.error_message}"
         if not event.recoverable:
             msg += " (CRITICAL: Order was cancelled but replacement failed!)"
-        
+            self._reset_tracking()
         self.log_with_clock(logging.ERROR, msg)
         self.notify_hb_app_with_timestamp(msg)
-    
+
+    def _reset_tracking(self):
+        """Reset order tracking so a new order can be placed."""
+        self._order_client_id = None
+        self._order_price = None
+        self._order_placed_ts = None
+        self._edit_done = False
+
     def format_status(self) -> str:
         """Return formatted status for the HB client."""
         lines = []
         lines.append(f"\n  Exchange: {self.config.exchange}")
         lines.append(f"  Trading Pair: {self.config.trading_pair}")
-        
-        # Current price
+
         mid_price = self.connector.get_price_by_type(
-            self.config.trading_pair, 
-            PriceType.MidPrice
+            self.config.trading_pair,
+            PriceType.MidPrice,
         )
         if mid_price:
             lines.append(f"  Mid Price: {mid_price:.2f}")
-        
-        # Active orders
+
+        lines.append(f"  Edit Price Target: {self.config.edit_price}")
+        lines.append(f"  Edit Done: {self._edit_done}")
+
         active_orders = self.get_active_orders(connector_name=self.config.exchange)
         if active_orders:
             lines.append(f"\n  Active Orders ({len(active_orders)}):")
@@ -405,11 +281,13 @@ class OrderEditExample(ScriptStrategyBase):
                 )
         else:
             lines.append("\n  No active orders")
-        
-        # Edit threshold info
-        if self._last_mid_price and mid_price:
-            price_change = abs(mid_price - self._last_mid_price) / self._last_mid_price
-            lines.append(f"\n  Price change since last edit: {price_change:.4%}")
-            lines.append(f"  Edit threshold: {self.config.edit_threshold:.4%}")
-        
+
+        if self._order_placed_ts and not self._edit_done and self.config.edit_price > 0:
+            remaining = max(
+                0,
+                self.config.edit_after_seconds
+                - (self.current_timestamp - self._order_placed_ts),
+            )
+            lines.append(f"\n  Edit in: {remaining:.0f}s")
+
         return "\n".join(lines)

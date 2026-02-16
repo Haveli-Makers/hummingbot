@@ -39,7 +39,6 @@ from hummingbot.exceptions import (
     OrderEditCancelFailed,
     OrderEditError,
     OrderEditReplacementFailed,
-    OrderNotEditableError,
 )
 from hummingbot.logger import HummingbotLogger
 
@@ -414,8 +413,6 @@ class ExchangePyBase(ExchangeBase, ABC):
         failed_cancellations = [CancellationResult(oid, False) for oid in order_id_set]
         return successful_cancellations + failed_cancellations
 
-    # === Order Editing ===
-
     @property
     def is_edit_order_supported_by_exchange(self) -> bool:
         """
@@ -473,18 +470,15 @@ class ExchangePyBase(ExchangeBase, ABC):
             self.logger().warning(f"Order {client_order_id} not found for editing")
             return None
 
-        # Validate order is editable
         if not self._is_order_editable(tracked_order):
             error_msg = f"Order {client_order_id} cannot be edited (current state: {tracked_order.current_state})"
             self.logger().warning(error_msg)
             self._emit_order_edit_failed_event(tracked_order, error_msg, recoverable=True)
             return None
 
-        # Use original values if not provided
         final_price = new_price if new_price is not None else tracked_order.price
         final_amount = new_amount if new_amount is not None else tracked_order.amount
 
-        # Quantize the values
         final_price = self.quantize_order_price(trading_pair, final_price)
         final_amount = self.quantize_order_amount(trading_pair, final_amount)
 
@@ -518,7 +512,7 @@ class ExchangePyBase(ExchangeBase, ABC):
         editable_states = {
             OrderState.OPEN,
             OrderState.PARTIALLY_FILLED,
-            OrderState.PENDING_CREATE,  # May need exchange confirmation
+            OrderState.PENDING_CREATE,
         }
         return order.current_state in editable_states
 
@@ -531,12 +525,10 @@ class ExchangePyBase(ExchangeBase, ABC):
     ) -> str:
         """
         Execute native order edit for exchanges that support it.
-        Exchanges that support native edit should override _place_edit().
         """
         original_price = tracked_order.price
         original_amount = tracked_order.amount
 
-        # Mark order as pending edit
         order_update = OrderUpdate(
             client_order_id=tracked_order.client_order_id,
             trading_pair=tracked_order.trading_pair,
@@ -546,7 +538,6 @@ class ExchangePyBase(ExchangeBase, ABC):
         self._order_tracker.process_order_update(order_update)
 
         try:
-            # Wait for exchange order ID if not available
             await tracked_order.get_exchange_order_id()
 
             new_client_order_id, new_exchange_order_id, update_timestamp = await self._place_edit(
@@ -558,7 +549,6 @@ class ExchangePyBase(ExchangeBase, ABC):
                 **kwargs
             )
 
-            # Update order with new values
             order_update = OrderUpdate(
                 client_order_id=new_client_order_id,
                 exchange_order_id=new_exchange_order_id,
@@ -568,11 +558,9 @@ class ExchangePyBase(ExchangeBase, ABC):
             )
             self._order_tracker.process_order_update(order_update)
 
-            # Update tracked order price and amount
             tracked_order.price = new_price
             tracked_order.amount = new_amount
 
-            # Emit success event
             self._emit_order_edited_event(
                 original_order=tracked_order,
                 new_order_id=new_client_order_id,
@@ -585,7 +573,6 @@ class ExchangePyBase(ExchangeBase, ABC):
             return new_client_order_id
 
         except Exception as e:
-            # Revert to OPEN state on failure
             order_update = OrderUpdate(
                 client_order_id=tracked_order.client_order_id,
                 trading_pair=tracked_order.trading_pair,
@@ -613,14 +600,12 @@ class ExchangePyBase(ExchangeBase, ABC):
             cancel_initiated_at=self.current_timestamp,
         )
 
-        # Calculate expected funds to be released
         context.expected_released_base, context.expected_released_quote = \
             self._calculate_order_locked_funds(tracked_order)
 
         original_price = tracked_order.price
         original_amount = tracked_order.amount
 
-        # Mark order as pending edit
         order_update = OrderUpdate(
             client_order_id=tracked_order.client_order_id,
             trading_pair=tracked_order.trading_pair,
@@ -630,16 +615,12 @@ class ExchangePyBase(ExchangeBase, ABC):
         self._order_tracker.process_order_update(order_update)
 
         try:
-            # Step 1: Cancel with verification
             await self._cancel_and_verify_for_edit(context)
 
-            # Step 2: Wait for balance to reflect
             await self._wait_for_balance_update(context)
 
-            # Step 3: Place new order
             new_order_id = await self._place_replacement_order(context, **kwargs)
 
-            # Emit success event
             self._emit_order_edited_event(
                 original_order=tracked_order,
                 new_order_id=new_order_id,
@@ -651,8 +632,7 @@ class ExchangePyBase(ExchangeBase, ABC):
 
             return new_order_id
 
-        except OrderEditCancelFailed as e:
-            # Rollback: Original order may still be active
+        except OrderEditCancelFailed:
             order_update = OrderUpdate(
                 client_order_id=tracked_order.client_order_id,
                 trading_pair=tracked_order.trading_pair,
@@ -663,12 +643,10 @@ class ExchangePyBase(ExchangeBase, ABC):
             raise
 
         except (OrderEditBalanceTimeout, OrderEditReplacementFailed) as e:
-            # Critical state: Order cancelled but replacement failed
             self.logger().error(
                 f"CRITICAL: Order {tracked_order.client_order_id} cancelled but replacement failed: {e}. "
                 f"Starting recovery attempt..."
             )
-            # Start background recovery task
             safe_ensure_future(self._attempt_edit_recovery(context, e))
             raise
 
@@ -676,11 +654,9 @@ class ExchangePyBase(ExchangeBase, ABC):
         """Calculate the base and quote amounts locked by an order"""
         remaining_amount = order.amount - order.executed_amount_base
         if order.trade_type == TradeType.BUY:
-            # Buy order locks quote currency
             locked_quote = remaining_amount * order.price if order.price else Decimal("0")
             return Decimal("0"), locked_quote
         else:
-            # Sell order locks base currency
             return remaining_amount, Decimal("0")
 
     async def _cancel_and_verify_for_edit(
@@ -695,7 +671,6 @@ class ExchangePyBase(ExchangeBase, ABC):
             cancelled = await self._execute_order_cancel_and_process_update(order)
         except Exception as e:
             if self._is_order_not_found_during_cancelation_error(e):
-                # Order may have been filled - check status
                 try:
                     order_update = await self._request_order_status(order)
                     self._order_tracker.process_order_update(order_update)
@@ -712,13 +687,11 @@ class ExchangePyBase(ExchangeBase, ABC):
                 f"Exchange did not confirm cancellation for {order.client_order_id}"
             )
 
-        # For synchronous cancel exchanges, we're done
         if self.is_cancel_request_in_exchange_synchronous:
             context.cancel_confirmed = True
             context.cancel_confirmed_at = self.current_timestamp
             return
 
-        # For async exchanges, poll until confirmed
         start_time = self.current_timestamp
         while (self.current_timestamp - start_time) < timeout_seconds:
             if order.current_state == OrderState.CANCELED:
@@ -727,7 +700,6 @@ class ExchangePyBase(ExchangeBase, ABC):
                 return
             await self._sleep(0.5)
 
-        # Check one more time
         if order.current_state == OrderState.CANCELED:
             context.cancel_confirmed = True
             context.cancel_confirmed_at = self.current_timestamp
@@ -742,7 +714,6 @@ class ExchangePyBase(ExchangeBase, ABC):
         order = context.original_order
         start_time = self.current_timestamp
 
-        # Determine which asset we need
         if order.trade_type == TradeType.BUY:
             required_asset = order.quote_asset
             required_amount = context.new_price * context.new_amount
@@ -754,7 +725,6 @@ class ExchangePyBase(ExchangeBase, ABC):
         base_delay = context.balance_poll_interval
 
         while (self.current_timestamp - start_time) < context.max_balance_wait_seconds:
-            # Refresh balances from exchange
             try:
                 await self._update_all_balances()
             except Exception as e:
@@ -769,10 +739,9 @@ class ExchangePyBase(ExchangeBase, ABC):
                 )
                 return
 
-            # Exponential backoff with jitter
             attempt += 1
-            delay = min(base_delay * (2 ** attempt), 5.0)  # Cap at 5 seconds
-            delay *= (0.5 + random.random())  # Add jitter
+            delay = min(base_delay * (2 ** attempt), 5.0)
+            delay *= (0.5 + random.random())
 
             self.logger().debug(
                 f"Waiting for balance: have {available_balance}, "
@@ -782,12 +751,10 @@ class ExchangePyBase(ExchangeBase, ABC):
 
             await self._sleep(delay)
 
-        # Final check
         available_balance = self.get_available_balance(required_asset)
         if available_balance >= required_amount:
             return
 
-        # Timeout - critical error
         raise OrderEditBalanceTimeout(
             f"Balance not available after {context.max_balance_wait_seconds}s. "
             f"Order {order.client_order_id} was cancelled but replacement cannot proceed. "
@@ -804,7 +771,6 @@ class ExchangePyBase(ExchangeBase, ABC):
 
         for attempt in range(context.max_retries):
             try:
-                # Generate new order ID
                 new_order_id = get_new_client_order_id(
                     is_buy=(order.trade_type == TradeType.BUY),
                     trading_pair=order.trading_pair,
@@ -812,7 +778,6 @@ class ExchangePyBase(ExchangeBase, ABC):
                     max_id_len=self.client_order_id_max_length
                 )
 
-                # Create the replacement order
                 await self._create_order(
                     trade_type=order.trade_type,
                     order_id=new_order_id,
@@ -830,7 +795,6 @@ class ExchangePyBase(ExchangeBase, ABC):
                     f"Failed to place replacement order (attempt {attempt + 1}/{context.max_retries}): {e}"
                 )
                 if attempt < context.max_retries - 1:
-                    # Balance might still be settling
                     await self._sleep(2.0)
                     try:
                         await self._update_all_balances()
@@ -862,10 +826,7 @@ class ExchangePyBase(ExchangeBase, ABC):
             await self._sleep(recovery_interval)
 
             try:
-                # Refresh balance
                 await self._update_all_balances()
-
-                # Try to place replacement
                 new_order_id = await self._place_replacement_order(context)
 
                 self.logger().info(
@@ -873,7 +834,6 @@ class ExchangePyBase(ExchangeBase, ABC):
                     f"placed for cancelled order {order.client_order_id}"
                 )
 
-                # Emit success event after recovery
                 self._emit_order_edited_event(
                     original_order=order,
                     new_order_id=new_order_id,
@@ -889,7 +849,6 @@ class ExchangePyBase(ExchangeBase, ABC):
                     f"Edit recovery attempt {attempt + 1}/{max_recovery_attempts} failed: {e}"
                 )
 
-        # All recovery attempts failed
         self.logger().error(
             f"FAILED TO RECOVER from edit failure for order {order.client_order_id}. "
             f"Funds may be unallocated. Please check exchange manually."
@@ -1103,8 +1062,6 @@ class ExchangePyBase(ExchangeBase, ABC):
         except asyncio.CancelledError:
             raise
         except asyncio.TimeoutError:
-            # some exchanges do not allow cancels with the client/user order id
-            # so log a warning and wait for the creation of the order to complete
             self.logger().warning(
                 f"Failed to cancel the order {order.client_order_id} because it does not have an exchange order id yet"
             )

@@ -34,8 +34,6 @@ class InvalidController(HummingbotBaseException):
     """
 
 
-# === Order Edit Exceptions ===
-
 class OrderEditError(HummingbotBaseException):
     """Base exception for order edit operations"""
     pass

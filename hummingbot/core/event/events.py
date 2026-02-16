@@ -27,7 +27,6 @@ class MarketEvent(Enum):
     SellOrderCreated = 201
     FundingPaymentCompleted = 202
     FundingInfo = 203
-    # Order Edit Events
     OrderEdited = 210
     OrderEditFailed = 211
     RangePositionLiquidityAdded = 300
@@ -132,7 +131,7 @@ class OrderEditedEvent:
     new_price: Decimal
     original_amount: Decimal
     new_amount: Decimal
-    new_order_id: Optional[str] = None  # New order ID if cancel-replace was used
+    new_order_id: Optional[str] = None
     exchange_order_id: Optional[str] = None
 
 
@@ -143,7 +142,7 @@ class OrderEditFailedEvent:
     order_id: str
     trading_pair: str
     error_message: str
-    recoverable: bool = True  # False if order was cancelled but replacement failed
+    recoverable: bool = True
 
 
 @dataclass

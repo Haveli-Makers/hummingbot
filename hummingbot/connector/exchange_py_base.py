@@ -1062,6 +1062,8 @@ class ExchangePyBase(ExchangeBase, ABC):
         except asyncio.CancelledError:
             raise
         except asyncio.TimeoutError:
+            # some exchanges do not allow cancels with the client/user order id
+            # so log a warning and wait for the creation of the order to complete
             self.logger().warning(
                 f"Failed to cancel the order {order.client_order_id} because it does not have an exchange order id yet"
             )

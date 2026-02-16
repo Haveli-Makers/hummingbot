@@ -34,8 +34,7 @@ class OrderState(Enum):
     APPROVED = 8
     CREATED = 9
     COMPLETED = 10
-    # Order Edit States
-    PENDING_EDIT = 11  # Edit request submitted, waiting for confirmation
+    PENDING_EDIT = 11
 
 
 class OrderUpdate(NamedTuple):

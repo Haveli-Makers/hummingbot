@@ -121,7 +121,6 @@ class OrderExpiredEvent(NamedTuple):
 
 
 @dataclass
-@dataclass
 class OrderEditedEvent:
     """Event emitted when an order is successfully edited (via native edit or cancel-replace)"""
     timestamp: float

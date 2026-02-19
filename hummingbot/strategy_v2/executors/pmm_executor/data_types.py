@@ -1,0 +1,127 @@
+from decimal import Decimal
+from enum import Enum
+from typing import List, Literal, Optional
+
+from pydantic import BaseModel, ConfigDict, model_validator
+
+from hummingbot.core.data_type.common import OrderType
+from hummingbot.strategy_v2.executors.data_types import ExecutorConfigBase
+from hummingbot.strategy_v2.models.executors import TrackedOrder
+
+
+class PMMExecutorConfig(ExecutorConfigBase):
+    """
+    Configuration for the Pure Market Making Executor.
+
+    Places symmetric buy and sell orders at specified percentage distances from a fair price.
+    When any order fills, it is automatically re-placed at the same price level.
+
+    Example:
+        fair_price = 100
+        spread_percentages = [0.01, 0.02, 0.03, 0.05]  # 1%, 2%, 3%, 5%
+        order_amounts_quote = [200, 200, 800, 800]
+
+        Sell orders placed at: 101, 102, 103, 105
+        Buy orders placed at:  99,  98,  97,  95
+    """
+    type: Literal["pmm_executor"] = "pmm_executor"
+    connector_name: str
+    trading_pair: str
+
+    # Levels configuration
+    spread_percentages: List[Decimal]  # e.g., [0.01, 0.02, 0.03, 0.05] for 1%, 2%, 3%, 5%
+    order_amounts_quote: List[Decimal]  # quote amount per level, must match length of spread_percentages
+
+    # Fair price: if None, uses mid price at initialization
+    fair_price: Optional[Decimal] = None
+
+    # Execution
+    order_type: OrderType = OrderType.LIMIT
+    order_frequency: int = 0  # minimum seconds between order placement batches
+    max_orders_per_batch: Optional[int] = None
+    safe_extra_spread: Decimal = Decimal("0.0001")
+    min_order_amount_quote: Decimal = Decimal("100")
+
+    # Risk Management
+    stop_loss: Optional[Decimal] = None  # stop loss percentage on total PnL (e.g., 0.05 = 5%)
+    time_limit: Optional[int] = None  # time limit in seconds
+    leverage: int = 20
+    level_id: Optional[str] = None
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    @model_validator(mode="after")
+    def validate_levels(self):
+        if len(self.spread_percentages) != len(self.order_amounts_quote):
+            raise ValueError("spread_percentages and order_amounts_quote must have the same length")
+        if any(s <= 0 for s in self.spread_percentages):
+            raise ValueError("All spread_percentages must be positive")
+        if any(a <= 0 for a in self.order_amounts_quote):
+            raise ValueError("All order_amounts_quote must be positive")
+        return self
+
+
+class PMMOrderState(Enum):
+    """State of an individual order (buy or sell) within a PMM level."""
+    NOT_ACTIVE = "NOT_ACTIVE"
+    ORDER_PLACED = "ORDER_PLACED"
+    ORDER_FILLED = "ORDER_FILLED"
+
+
+class PMMLevel(BaseModel):
+    """
+    Represents a single PMM level with independent buy and sell orders.
+
+    Each level is defined by a spread percentage from the fair price and an order amount.
+    When a buy fills, a sell is placed at that level (and vice versa), creating a grid
+    that alternates sides on each fill.
+
+    pending_side tracks which side to place next:
+      - "buy"  → place a buy order (initial state, or after a sell fills)
+      - "sell" → place a sell order (after a buy fills)
+      - "both" → place both buy and sell (if sufficient balance on both sides)
+    """
+    id: str
+    spread_pct: Decimal
+    amount_quote: Decimal
+    buy_order: Optional[TrackedOrder] = None
+    sell_order: Optional[TrackedOrder] = None
+    pending_side: str = "buy"  # "buy", "sell", or "both"
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    @property
+    def buy_state(self) -> PMMOrderState:
+        if self.buy_order is None:
+            return PMMOrderState.NOT_ACTIVE
+        elif self.buy_order.is_filled:
+            return PMMOrderState.ORDER_FILLED
+        else:
+            return PMMOrderState.ORDER_PLACED
+
+    @property
+    def sell_state(self) -> PMMOrderState:
+        if self.sell_order is None:
+            return PMMOrderState.NOT_ACTIVE
+        elif self.sell_order.is_filled:
+            return PMMOrderState.ORDER_FILLED
+        else:
+            return PMMOrderState.ORDER_PLACED
+
+    def get_buy_price(self, fair_price: Decimal) -> Decimal:
+        """Calculate buy order price: fair_price * (1 - spread_pct)"""
+        return fair_price * (1 - self.spread_pct)
+
+    def get_sell_price(self, fair_price: Decimal) -> Decimal:
+        """Calculate sell order price: fair_price * (1 + spread_pct)"""
+        return fair_price * (1 + self.spread_pct)
+
+    def reset_buy_order(self):
+        self.buy_order = None
+
+    def reset_sell_order(self):
+        self.sell_order = None
+
+    def reset_level(self):
+        self.buy_order = None
+        self.sell_order = None
+        self.pending_side = "buy"

@@ -15,36 +15,24 @@ class PMMExecutorConfig(ExecutorConfigBase):
 
     Places symmetric buy and sell orders at specified percentage distances from a fair price.
     When any order fills, it is automatically re-placed at the same price level.
-
-    Example:
-        fair_price = 100
-        spread_percentages = [0.01, 0.02, 0.03, 0.05]  # 1%, 2%, 3%, 5%
-        order_amounts_quote = [200, 200, 800, 800]
-
-        Sell orders placed at: 101, 102, 103, 105
-        Buy orders placed at:  99,  98,  97,  95
     """
     type: Literal["pmm_executor"] = "pmm_executor"
     connector_name: str
     trading_pair: str
 
-    # Levels configuration
-    spread_percentages: List[Decimal]  # e.g., [0.01, 0.02, 0.03, 0.05] for 1%, 2%, 3%, 5%
-    order_amounts_quote: List[Decimal]  # quote amount per level, must match length of spread_percentages
-
-    # Fair price: if None, uses mid price at initialization
+    spread_percentages: List[Decimal]  
+    order_amounts_quote: List[Decimal]  
     fair_price: Optional[Decimal] = None
 
-    # Execution
+
     order_type: OrderType = OrderType.LIMIT
-    order_frequency: int = 0  # minimum seconds between order placement batches
+    order_frequency: int = 0  
     max_orders_per_batch: Optional[int] = None
     safe_extra_spread: Decimal = Decimal("0.0001")
     min_order_amount_quote: Decimal = Decimal("100")
 
-    # Risk Management
-    stop_loss: Optional[Decimal] = None  # stop loss percentage on total PnL (e.g., 0.05 = 5%)
-    time_limit: Optional[int] = None  # time limit in seconds
+    stop_loss: Optional[Decimal] = None  
+    time_limit: Optional[int] = None  
     leverage: int = 20
     level_id: Optional[str] = None
 
@@ -86,7 +74,7 @@ class PMMLevel(BaseModel):
     amount_quote: Decimal
     buy_order: Optional[TrackedOrder] = None
     sell_order: Optional[TrackedOrder] = None
-    pending_side: str = "buy"  # "buy", "sell", or "both"
+    pending_side: str = "both"  # "buy", "sell", or "both"
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     @property
@@ -124,4 +112,4 @@ class PMMLevel(BaseModel):
     def reset_level(self):
         self.buy_order = None
         self.sell_order = None
-        self.pending_side = "buy"
+        self.pending_side = "both"

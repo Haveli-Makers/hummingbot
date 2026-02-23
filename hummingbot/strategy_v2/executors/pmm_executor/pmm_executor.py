@@ -28,13 +28,7 @@ class PMMExecutor(ExecutorBase):
     Pure Market Making Executor.
 
     Places symmetric buy and sell limit orders at specified percentage distances from a fair price.
-    When any order fills, it is automatically re-placed at the same price level.
-
-    Example with fair_price=100 and spreads=[1%, 2%, 3%, 5%]:
-        Sell orders at: 101, 102, 103, 105
-        Buy orders at:  99,  98,  97,  95
-
-    If the sell order at 101 fills, a new sell order is placed at 101.
+    When any order fills, it is automatically re-places at the same price level.
     """
     _logger = None
 
@@ -60,7 +54,6 @@ class PMMExecutor(ExecutorBase):
 
         self.trading_rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
 
-        # Set fair price: use config value or current mid price
         if self.config.fair_price is not None:
             self.fair_price = self.config.fair_price
         else:
@@ -68,21 +61,17 @@ class PMMExecutor(ExecutorBase):
 
         self.mid_price = self.fair_price
 
-        # Generate PMM levels
         self.pmm_levels = self._generate_levels()
 
-        # Order tracking
         self._filled_orders: List[dict] = []
         self._failed_orders: List[str] = []
         self._canceled_orders: List[str] = []
         self._close_order: Optional[TrackedOrder] = None
 
-        # Per-level failure tracking: level_id -> (failure_count, last_failure_timestamp)
         self._level_failures: Dict[str, tuple] = {}
         self._max_level_failures = 5
-        self._level_failure_cooldown = 60  # seconds between retries after failure
+        self._level_failure_cooldown = 60  
 
-        # Metrics
         self.total_buy_quote = Decimal("0")
         self.total_sell_quote = Decimal("0")
         self.total_fees_quote = Decimal("0")
@@ -126,7 +115,7 @@ class PMMExecutor(ExecutorBase):
     async def validate_sufficient_balance(self):
         """Validate that there is enough balance to place orders on both sides."""
         mid_price = self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.MidPrice)
-        # Check balance for the largest side
+
         total_amount_quote = sum(self.config.order_amounts_quote)
         total_amount_base = total_amount_quote / mid_price
         if self.is_perpetual:
@@ -213,66 +202,71 @@ class PMMExecutor(ExecutorBase):
 
     def process_filled_orders(self):
         """
-        Detect filled orders, record them, and switch the level to the opposite side.
+        Detect filled orders, record them, and switch the level to place both buy and sell.
 
-        Grid alternation logic:
-          - Buy fills  → pending_side = "sell" (place a sell at this level's spread)
-          - Sell fills → pending_side = "buy"  (place a buy  at this level's spread)
+        When any order fills at a level, both a new buy and sell are placed at that level's
+        spread percentage from fair price (subject to available balance).
         """
         for level in self.pmm_levels:
-            # Check buy orders
-            if level.buy_state == PMMOrderState.ORDER_FILLED:
-                if (level.buy_order and level.buy_order.order
-                        and level.buy_order.order.completely_filled_event.is_set()):
+            if level.buy_state == PMMOrderState.ORDER_FILLED and level.buy_order:
+                if level.buy_order.order:
                     order_json = level.buy_order.order.to_json()
-                    # Guard against missing fill data (fill updates may not arrive on time)
-                    if Decimal(order_json.get("executed_amount_base", "0")) == Decimal("0"):
-                        self.logger().warning(
-                            f"PMM buy filled but amounts are 0 for level={level.id} "
-                            f"(fill data arrived late). Using order amount for tracking."
-                        )
-                        buy_price = level.get_buy_price(self.fair_price)
-                        amount_base = level.amount_quote / buy_price
-                        order_json["executed_amount_base"] = str(amount_base)
-                        order_json["executed_amount_quote"] = str(level.amount_quote)
-                        if "cumulative_fee_paid_quote" not in order_json or order_json["cumulative_fee_paid_quote"] == "0":
-                            order_json["cumulative_fee_paid_quote"] = "0"
-                    self._filled_orders.append(order_json)
-                    self.logger().info(
-                        f"PMM buy filled | level={level.id} "
-                        f"spread={float(level.spread_pct)*100:.2f}% "
-                        f"price={level.buy_order.average_executed_price} | "
-                        f"Switching to SELL at {level.get_sell_price(self.fair_price):.4f}"
-                    )
-                    level.reset_buy_order()
-                    level.pending_side = "sell"  # Next: place a sell at this level
+                else:
+                    order_json = {"trade_type": "BUY"}
 
-            # Check sell orders
-            if level.sell_state == PMMOrderState.ORDER_FILLED:
-                if (level.sell_order and level.sell_order.order
-                        and level.sell_order.order.completely_filled_event.is_set()):
-                    order_json = level.sell_order.order.to_json()
-                    # Guard against missing fill data
-                    if Decimal(order_json.get("executed_amount_base", "0")) == Decimal("0"):
-                        self.logger().warning(
-                            f"PMM sell filled but amounts are 0 for level={level.id} "
-                            f"(fill data arrived late). Using order amount for tracking."
-                        )
-                        sell_price = level.get_sell_price(self.fair_price)
-                        amount_base = level.amount_quote / sell_price
-                        order_json["executed_amount_base"] = str(amount_base)
-                        order_json["executed_amount_quote"] = str(level.amount_quote)
-                        if "cumulative_fee_paid_quote" not in order_json or order_json["cumulative_fee_paid_quote"] == "0":
-                            order_json["cumulative_fee_paid_quote"] = "0"
-                    self._filled_orders.append(order_json)
-                    self.logger().info(
-                        f"PMM sell filled | level={level.id} "
-                        f"spread={float(level.spread_pct)*100:.2f}% "
-                        f"price={level.sell_order.average_executed_price} | "
-                        f"Switching to BUY at {level.get_buy_price(self.fair_price):.4f}"
+                if Decimal(order_json.get("executed_amount_base", "0")) == Decimal("0"):
+                    self.logger().warning(
+                        f"PMM buy filled but amounts are 0 for level={level.id} "
+                        f"(fill data arrived late). Using order amount for tracking."
                     )
-                    level.reset_sell_order()
-                    level.pending_side = "buy"  # Next: place a buy at this level
+                    buy_price = level.get_buy_price(self.fair_price)
+                    amount_base = level.amount_quote / buy_price
+                    order_json["executed_amount_base"] = str(amount_base)
+                    order_json["executed_amount_quote"] = str(level.amount_quote)
+                    order_json.setdefault("trade_type", "BUY")
+                if "cumulative_fee_paid_quote" not in order_json or order_json["cumulative_fee_paid_quote"] == "0":
+                    order_json["cumulative_fee_paid_quote"] = "0"
+
+                self._filled_orders.append(order_json)
+                self.logger().info(
+                    f"PMM buy filled | level={level.id} "
+                    f"spread={float(level.spread_pct)*100:.2f}% "
+                    f"price={level.buy_order.average_executed_price} | "
+                    f"Re-placing BUY at {level.get_buy_price(self.fair_price):.4f} "
+                    f"and SELL at {level.get_sell_price(self.fair_price):.4f}"
+                )
+                level.reset_buy_order()
+                level.pending_side = "both" 
+
+            if level.sell_state == PMMOrderState.ORDER_FILLED and level.sell_order:
+                if level.sell_order.order:
+                    order_json = level.sell_order.order.to_json()
+                else:
+                    order_json = {"trade_type": "SELL"}
+
+                if Decimal(order_json.get("executed_amount_base", "0")) == Decimal("0"):
+                    self.logger().warning(
+                        f"PMM sell filled but amounts are 0 for level={level.id} "
+                        f"(fill data arrived late). Using order amount for tracking."
+                    )
+                    sell_price = level.get_sell_price(self.fair_price)
+                    amount_base = level.amount_quote / sell_price
+                    order_json["executed_amount_base"] = str(amount_base)
+                    order_json["executed_amount_quote"] = str(level.amount_quote)
+                    order_json.setdefault("trade_type", "SELL")
+                if "cumulative_fee_paid_quote" not in order_json or order_json["cumulative_fee_paid_quote"] == "0":
+                    order_json["cumulative_fee_paid_quote"] = "0"
+
+                self._filled_orders.append(order_json)
+                self.logger().info(
+                    f"PMM sell filled | level={level.id} "
+                    f"spread={float(level.spread_pct)*100:.2f}% "
+                    f"price={level.sell_order.average_executed_price} | "
+                    f"Re-placing BUY at {level.get_buy_price(self.fair_price):.4f} "
+                    f"and SELL at {level.get_sell_price(self.fair_price):.4f}"
+                )
+                level.reset_sell_order()
+                level.pending_side = "both"  
 
     # ─── Order Management ────────────────────────────────────────────────
 
@@ -285,7 +279,6 @@ class PMMExecutor(ExecutorBase):
             elapsed = self._strategy.current_timestamp - last_ts
             if elapsed < self._level_failure_cooldown:
                 return True
-            # Cooldown expired — reset counter
             self._level_failures[level_id] = (0, 0)
         return False
 
@@ -343,16 +336,14 @@ class PMMExecutor(ExecutorBase):
         buy_price = level.get_buy_price(self.fair_price)
         amount_base = level.amount_quote / buy_price
 
-        # If buy price is at or above the best bid, adjust to avoid crossing
         best_bid = self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.BestBid)
         if buy_price >= best_bid:
             buy_price = best_bid * (1 - self.config.safe_extra_spread)
 
-        # Check minimum notional before placing
         min_notional = max(self.config.min_order_amount_quote, self.trading_rules.min_notional_size)
         notional = amount_base * buy_price
         if notional < min_notional:
-            self.logger().warning(
+            self.logger().debug(
                 f"PMM: Skipping buy L{level.id} — notional {notional:.2f} < min {min_notional:.2f}"
             )
             self._record_level_failure(f"{level.id}_buy")
@@ -367,10 +358,9 @@ class PMMExecutor(ExecutorBase):
         if adjusted:
             order_candidate = adjusted[0]
 
-        # Re-check notional after budget adjustment
         adjusted_notional = order_candidate.amount * order_candidate.price
         if order_candidate.amount <= Decimal("0") or adjusted_notional < min_notional:
-            self.logger().info(
+            self.logger().debug(
                 f"PMM: Skipping buy L{level.id} — adjusted notional {adjusted_notional:.2f} < min {min_notional:.2f} "
                 f"(insufficient quote balance to place buy order)"
             )
@@ -396,16 +386,14 @@ class PMMExecutor(ExecutorBase):
         sell_price = level.get_sell_price(self.fair_price)
         amount_base = level.amount_quote / sell_price
 
-        # If sell price is at or below the best ask, adjust to avoid crossing
         best_ask = self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.BestAsk)
         if sell_price <= best_ask:
             sell_price = best_ask * (1 + self.config.safe_extra_spread)
 
-        # Check minimum notional before placing
         min_notional = max(self.config.min_order_amount_quote, self.trading_rules.min_notional_size)
         notional = amount_base * sell_price
         if notional < min_notional:
-            self.logger().warning(
+            self.logger().debug(
                 f"PMM: Skipping sell L{level.id} — notional {notional:.2f} < min {min_notional:.2f}"
             )
             self._record_level_failure(f"{level.id}_sell")
@@ -420,10 +408,9 @@ class PMMExecutor(ExecutorBase):
         if adjusted:
             order_candidate = adjusted[0]
 
-        # Re-check notional after budget adjustment
         adjusted_notional = order_candidate.amount * order_candidate.price
         if order_candidate.amount <= Decimal("0") or adjusted_notional < min_notional:
-            self.logger().info(
+            self.logger().debug(
                 f"PMM: Skipping sell L{level.id} — adjusted notional {adjusted_notional:.2f} < min {min_notional:.2f} "
                 f"(insufficient base balance to place sell order — need {amount_base:.4f} {self.config.trading_pair.split('-')[0]})"
             )
@@ -497,47 +484,23 @@ class PMMExecutor(ExecutorBase):
         """
         Handle the shutdown process:
         1. Cancel all remaining open orders
-        2. Close any net inventory with a market order
-        3. Stop the executor once everything is settled
+        2. Stop the executor 
         """
         self.close_timestamp = self._strategy.current_timestamp
 
-        # Check if all orders are canceled/completed
         active_orders = [
             order for level in self.pmm_levels
             for order in [level.buy_order, level.sell_order]
             if order is not None and not order.is_done and not order.is_filled
         ]
 
-        if len(active_orders) == 0 and self._close_order is None:
-            # All open orders are done; handle remaining net inventory
-            if abs(self.net_inventory_base) >= self.trading_rules.min_order_size:
-                close_side = TradeType.SELL if self.net_inventory_base > 0 else TradeType.BUY
-                order_id = self.place_order(
-                    connector_name=self.config.connector_name,
-                    trading_pair=self.config.trading_pair,
-                    order_type=OrderType.MARKET,
-                    amount=abs(self.net_inventory_base),
-                    side=close_side,
-                    position_action=PositionAction.CLOSE if self.is_perpetual else PositionAction.NIL,
-                )
-                self._close_order = TrackedOrder(order_id=order_id)
-                self.logger().info(
-                    f"PMM: Placing close order to unwind {self.net_inventory_base} inventory"
-                )
-            else:
-                # No significant inventory to close
-                self.update_realized_pnl_metrics()
-                self.stop()
-        elif self._close_order and self._close_order.is_done:
-            # Close order completed
-            if self._close_order.order:
-                self._filled_orders.append(self._close_order.order.to_json())
-            self._close_order = None
+        if len(active_orders) == 0:
             self.update_realized_pnl_metrics()
+            self.logger().info(
+                f"PMM: Shutdown complete | net inventory: {self.net_inventory_base} base"
+            )
             self.stop()
         else:
-            # Still have active orders — cancel them
             self.cancel_all_orders()
             self._current_retries += 1
 
@@ -597,12 +560,10 @@ class PMMExecutor(ExecutorBase):
         self.net_inventory_base = buy_amount_base - sell_amount_base
         self.net_inventory_quote = self.net_inventory_base * self.mid_price
 
-        # Realized PnL = sell proceeds - buy cost - fees
         self.realized_pnl_quote = (
             self.total_sell_quote - self.total_buy_quote - self.total_fees_quote
         )
 
-        # Unrealized PnL from net inventory (mark-to-market)
         if buy_amount_base > 0 and self.net_inventory_base > 0:
             avg_buy_price = self.total_buy_quote / buy_amount_base
             self.unrealized_pnl_quote = self.net_inventory_base * (self.mid_price - avg_buy_price)

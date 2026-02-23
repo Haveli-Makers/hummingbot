@@ -20,19 +20,18 @@ class PMMExecutorConfig(ExecutorConfigBase):
     connector_name: str
     trading_pair: str
 
-    spread_percentages: List[Decimal]  
-    order_amounts_quote: List[Decimal]  
+    spread_percentages: List[Decimal]
+    order_amounts_quote: List[Decimal]
     fair_price: Optional[Decimal] = None
 
-
     order_type: OrderType = OrderType.LIMIT
-    order_frequency: int = 0  
+    order_frequency: int = 0
     max_orders_per_batch: Optional[int] = None
     safe_extra_spread: Decimal = Decimal("0.0001")
     min_order_amount_quote: Decimal = Decimal("100")
 
-    stop_loss: Optional[Decimal] = None  
-    time_limit: Optional[int] = None  
+    stop_loss: Optional[Decimal] = None
+    time_limit: Optional[int] = None
     leverage: int = 20
     level_id: Optional[str] = None
 

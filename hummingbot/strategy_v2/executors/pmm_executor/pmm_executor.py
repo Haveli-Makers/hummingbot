@@ -4,7 +4,7 @@ from decimal import Decimal
 from typing import Dict, List, Optional, Union
 
 from hummingbot.connector.connector_base import ConnectorBase
-from hummingbot.core.data_type.common import OrderType, PositionAction, PriceType, TradeType
+from hummingbot.core.data_type.common import PositionAction, PriceType, TradeType
 from hummingbot.core.data_type.order_candidate import OrderCandidate, PerpetualOrderCandidate
 from hummingbot.core.event.events import (
     BuyOrderCompletedEvent,
@@ -70,7 +70,7 @@ class PMMExecutor(ExecutorBase):
 
         self._level_failures: Dict[str, tuple] = {}
         self._max_level_failures = 5
-        self._level_failure_cooldown = 60  
+        self._level_failure_cooldown = 60
 
         self.total_buy_quote = Decimal("0")
         self.total_sell_quote = Decimal("0")
@@ -105,10 +105,10 @@ class PMMExecutor(ExecutorBase):
             )
         self.logger().info(
             f"Created {len(levels)} PMM levels | "
-            f"spreads: {[f'{float(s)*100:.2f}%' for s in self.config.spread_percentages]} | "
+            f"spreads: {[f'{float(s) * 100:.2f}%' for s in self.config.spread_percentages]} | "
             f"fair price: {self.fair_price} | "
-            f"buy prices: {[float(l.get_buy_price(self.fair_price)) for l in levels]} | "
-            f"sell prices: {[float(l.get_sell_price(self.fair_price)) for l in levels]}"
+            f"buy prices: {[float(lv.get_buy_price(self.fair_price)) for lv in levels]} | "
+            f"sell prices: {[float(lv.get_sell_price(self.fair_price)) for lv in levels]}"
         )
         return levels
 
@@ -230,13 +230,13 @@ class PMMExecutor(ExecutorBase):
                 self._filled_orders.append(order_json)
                 self.logger().info(
                     f"PMM buy filled | level={level.id} "
-                    f"spread={float(level.spread_pct)*100:.2f}% "
+                    f"spread={float(level.spread_pct) * 100:.2f}% "
                     f"price={level.buy_order.average_executed_price} | "
                     f"Re-placing BUY at {level.get_buy_price(self.fair_price):.4f} "
                     f"and SELL at {level.get_sell_price(self.fair_price):.4f}"
                 )
                 level.reset_buy_order()
-                level.pending_side = "both" 
+                level.pending_side = "both"
 
             if level.sell_state == PMMOrderState.ORDER_FILLED and level.sell_order:
                 if level.sell_order.order:
@@ -260,13 +260,13 @@ class PMMExecutor(ExecutorBase):
                 self._filled_orders.append(order_json)
                 self.logger().info(
                     f"PMM sell filled | level={level.id} "
-                    f"spread={float(level.spread_pct)*100:.2f}% "
+                    f"spread={float(level.spread_pct) * 100:.2f}% "
                     f"price={level.sell_order.average_executed_price} | "
                     f"Re-placing BUY at {level.get_buy_price(self.fair_price):.4f} "
                     f"and SELL at {level.get_sell_price(self.fair_price):.4f}"
                 )
                 level.reset_sell_order()
-                level.pending_side = "both"  
+                level.pending_side = "both"
 
     # ─── Order Management ────────────────────────────────────────────────
 
@@ -484,7 +484,7 @@ class PMMExecutor(ExecutorBase):
         """
         Handle the shutdown process:
         1. Cancel all remaining open orders
-        2. Stop the executor 
+        2. Stop the executor
         """
         self.close_timestamp = self._strategy.current_timestamp
 

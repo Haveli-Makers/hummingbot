@@ -175,51 +175,51 @@ class SymmetricGrid(ControllerBase):
         fair_price = self.config.reference_price if self.config.reference_price else mid_price
 
         box_width = 114
-        status.append("┌" + "─" * box_width + "┐")
-        header = f"│ Symmetric Grid - {self.config.connector_name} {self.config.trading_pair}"
-        header += " " * (box_width - len(header) + 1) + "│"
+        status.append("+" + "-" * box_width + "+")
+        header = f"| Symmetric Grid - {self.config.connector_name} {self.config.trading_pair}"
+        header += " " * (box_width - len(header) + 1) + "|"
         status.append(header)
 
-        info_line = (f"│ Mid Price: {mid_price:.4f} │ Fair Price: {fair_price:.4f} │ "
-                     f"Levels: {len(self.config.spreads)} │ "
+        info_line = (f"| Mid Price: {mid_price:.4f} | Fair Price: {fair_price:.4f} | "
+                     f"Levels: {len(self.config.spreads)} | "
                      f"Budget: {self.config.total_amount_quote:.2f}")
-        info_line += " " * (box_width - len(info_line) + 1) + "│"
+        info_line += " " * (box_width - len(info_line) + 1) + "|"
         status.append(info_line)
 
         # Show spread levels with buy/sell prices
         for i, (spread, amount) in enumerate(zip(self.config.spreads, self.config.amounts_quote)):
             buy_price = fair_price * (1 - spread)
             sell_price = fair_price * (1 + spread)
-            level_line = (f"│  L{i}: spread={float(spread)*100:.2f}% │ "
-                          f"Buy: {buy_price:.4f} │ Sell: {sell_price:.4f} │ Amount: {amount:.2f}")
-            level_line += " " * (box_width - len(level_line) + 1) + "│"
+            level_line = (f"|  L{i}: spread={float(spread) * 100:.2f}% | "
+                          f"Buy: {buy_price:.4f} | Sell: {sell_price:.4f} | Amount: {amount:.2f}")
+            level_line += " " * (box_width - len(level_line) + 1) + "|"
             status.append(level_line)
 
-        status.append("├" + "─" * box_width + "┤")
+        status.append("+" + "-" * box_width + "+")
 
         # Active executor info
         for executor in self.active_executors():
             ci = executor.custom_info
-            perf_line = (f"│ PnL: R={ci.get('realized_pnl_quote', 0):.4f} U={ci.get('unrealized_pnl_quote', 0):.4f} │ "
-                         f"Fees: {ci.get('total_fees_quote', 0):.4f} │ "
-                         f"Inventory: {ci.get('net_inventory_base', 0):.6f} │ "
+            perf_line = (f"| PnL: R={ci.get('realized_pnl_quote', 0):.4f} U={ci.get('unrealized_pnl_quote', 0):.4f} | "
+                         f"Fees: {ci.get('total_fees_quote', 0):.4f} | "
+                         f"Inventory: {ci.get('net_inventory_base', 0):.6f} | "
                          f"Fills: {len(ci.get('filled_orders', []))}")
-            perf_line += " " * (box_width - len(perf_line) + 1) + "│"
+            perf_line += " " * (box_width - len(perf_line) + 1) + "|"
             status.append(perf_line)
 
             # Show per-level states
             for level_info in ci.get("levels", []):
-                lev_line = (f"│  {level_info['id']}: spread={level_info['spread_pct']*100:.2f}% │ "
-                            f"Buy@{level_info['buy_price']:.4f} [{level_info['buy_state']}] │ "
-                            f"Sell@{level_info['sell_price']:.4f} [{level_info['sell_state']}] │ "
+                lev_line = (f"|  {level_info['id']}: spread={level_info['spread_pct'] * 100:.2f}% | "
+                            f"Buy@{level_info['buy_price']:.4f} [{level_info['buy_state']}] | "
+                            f"Sell@{level_info['sell_price']:.4f} [{level_info['sell_state']}] | "
                             f"Next: {level_info.get('pending_side', '?')}")
-                lev_line += " " * (box_width - len(lev_line) + 1) + "│"
+                lev_line += " " * (box_width - len(lev_line) + 1) + "|"
                 status.append(lev_line)
 
         if len(self.active_executors()) == 0:
-            no_exec = "│ No active executor — will create on next tick"
-            no_exec += " " * (box_width - len(no_exec) + 1) + "│"
+            no_exec = "| No active executor - will create on next tick"
+            no_exec += " " * (box_width - len(no_exec) + 1) + "|"
             status.append(no_exec)
 
-        status.append("└" + "─" * box_width + "┘")
+        status.append("+" + "-" * box_width + "+")
         return status

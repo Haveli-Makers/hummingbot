@@ -227,6 +227,37 @@ class TradeFeeBase(ABC):
                 fee_amount += flat_fee.amount * conversion_rate
         return fee_amount
 
+    def total_deduction_in_quote(
+            self,
+            trading_pair: str,
+            price: Decimal,
+            order_amount: Decimal,
+            tds_amount: Decimal = S_DECIMAL_0,
+            exchange: Optional["ExchangeBase"] = None,
+            rate_source: Optional["RateOracle"] = None
+    ) -> Decimal:
+        """
+        Returns total deduction (exchange fee + TDS) in quote currency.
+
+        :param trading_pair: The trading pair for the order
+        :param price: The fill price
+        :param order_amount: The fill amount in base currency
+        :param tds_amount: TDS amount in quote currency (0 for buys)
+        :param exchange: Optional exchange instance for rate lookups
+        :param rate_source: Optional rate oracle for rate lookups
+        :return: Total deduction in quote currency
+        """
+        _, quote = split_hb_trading_pair(trading_pair)
+        fee_in_quote = self.fee_amount_in_token(
+            trading_pair=trading_pair,
+            price=price,
+            order_amount=order_amount,
+            token=quote,
+            exchange=exchange,
+            rate_source=rate_source,
+        )
+        return fee_in_quote + tds_amount
+
     def _are_tokens_interchangeable(self, first_token: str, second_token: str):
         interchangeable_tokens = [
             {"WETH", "ETH"},

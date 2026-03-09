@@ -27,19 +27,19 @@ class IndiaCryptoTaxConfig:
 @dataclass
 class TDSResult:
     """TDS deduction details for a single sell trade."""
-    sell_value_quote: Decimal       
-    tds_rate: Decimal               
-    tds_amount_quote: Decimal       
+    sell_value_quote: Decimal
+    tds_rate: Decimal
+    tds_amount_quote: Decimal
 
 
 @dataclass
 class ProfitTaxResult:
     """Profit tax calculation result for a buy-sell pair."""
-    profit_after_fees: Decimal      
-    tax_rate: Decimal               
-    tax_liability: Decimal          
-    tds_already_paid: Decimal       
-    additional_tax_due: Decimal     
+    profit_after_fees: Decimal
+    tax_rate: Decimal
+    tax_liability: Decimal
+    tds_already_paid: Decimal
+    additional_tax_due: Decimal
 
 
 def calculate_tds(sell_value_quote: Decimal,

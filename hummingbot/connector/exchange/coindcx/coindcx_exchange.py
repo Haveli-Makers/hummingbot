@@ -637,7 +637,7 @@ class CoindcxExchange(ExchangePyBase):
                         fee_amount=fee_amount,
                         quote=quote,
                     )
-                return  
+                return
 
             except asyncio.CancelledError:
                 raise

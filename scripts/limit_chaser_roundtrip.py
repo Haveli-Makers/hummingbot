@@ -114,7 +114,7 @@ class LimitChaserRoundTripScript(ScriptStrategyBase):
         super().__init__(connectors, config)
         self.config = config
         self._executor: Optional[OrderExecutor] = None
-        self._leg: int = 0          
+        self._leg: int = 0
         self._leg1_done: bool = False
         self._leg2_done: bool = False
         self._leg1_close_ts: float = 0.0
@@ -218,7 +218,7 @@ class LimitChaserRoundTripScript(ScriptStrategyBase):
             if self.current_timestamp - self._leg1_close_ts >= self.config.delay_between_legs:
                 self._leg = 2
                 if not self._start_leg(self._sides[1]):
-                    self._leg = 1  
+                    self._leg = 1
             return
 
         # --- Leg 2 filled → done ---

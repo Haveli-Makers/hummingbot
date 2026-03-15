@@ -15,10 +15,6 @@ class CoindcxRateSource(RateSourceBase):
     Fetches ticker data directly from CoinDCX public API.
     """
 
-    def __init__(self):
-        super().__init__()
-        self._coindcx_exchange: Optional["CoindcxExchange"] = None
-
     @property
     def name(self) -> str:
         return "coindcx"
@@ -35,7 +31,7 @@ class CoindcxRateSource(RateSourceBase):
         results: Dict[str, Decimal] = {}
 
         tasks = [
-            self._get_coindcx_prices(exchange=self._coindcx_exchange, quote_token=quote_token),
+            self._get_coindcx_prices(exchange=self._exchange, quote_token=quote_token),
         ]
         task_results = await safe_gather(*tasks, return_exceptions=True)
         for task_result in task_results:
@@ -62,7 +58,7 @@ class CoindcxRateSource(RateSourceBase):
         results: Dict[str, Dict[str, Decimal]] = {}
 
         tasks = [
-            self._get_coindcx_bid_ask_prices(exchange=self._coindcx_exchange, quote_token=quote_token),
+            self._get_coindcx_bid_ask_prices(exchange=self._exchange, quote_token=quote_token),
         ]
         task_results = await safe_gather(*tasks, return_exceptions=True)
         for task_result in task_results:
@@ -76,10 +72,6 @@ class CoindcxRateSource(RateSourceBase):
                 results.update(task_result)
 
         return results
-
-    def _ensure_exchanges(self):
-        if self._coindcx_exchange is None:
-            self._coindcx_exchange = self._build_coindcx_connector_without_private_keys()
 
     @staticmethod
     async def _get_coindcx_prices(exchange: 'CoindcxExchange', quote_token: str = None) -> Dict[str, Decimal]:
@@ -159,8 +151,7 @@ class CoindcxRateSource(RateSourceBase):
 
         return results
 
-    @staticmethod
-    def _build_coindcx_connector_without_private_keys() -> 'CoindcxExchange':
+    def _build_exchange(self) -> 'CoindcxExchange':
         from hummingbot.connector.exchange.coindcx.coindcx_exchange import CoindcxExchange
 
         return CoindcxExchange(

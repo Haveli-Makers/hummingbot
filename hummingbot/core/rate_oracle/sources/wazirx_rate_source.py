@@ -15,10 +15,6 @@ class WazirxRateSource(RateSourceBase):
     Rate source for WazirX exchange.
     """
 
-    def __init__(self):
-        super().__init__()
-        self._wazirx_exchange: Optional["WazirxExchange"] = None
-
     @property
     def name(self) -> str:
         return "wazirx"
@@ -26,18 +22,14 @@ class WazirxRateSource(RateSourceBase):
     @async_ttl_cache(ttl=30, maxsize=1)
     async def get_prices(self, quote_token: Optional[str] = None) -> Dict[str, Decimal]:
         self._ensure_exchanges()
-        results = await self._get_wazirx_prices(exchange=self._wazirx_exchange, quote_token=quote_token)
+        results = await self._get_wazirx_prices(exchange=self._exchange, quote_token=quote_token)
         return results
 
     @async_ttl_cache(ttl=30, maxsize=1)
     async def get_bid_ask_prices(self, quote_token: Optional[str] = None) -> Dict[str, Dict[str, Decimal]]:
         self._ensure_exchanges()
-        results = await self._get_wazirx_bid_ask_prices(exchange=self._wazirx_exchange, quote_token=quote_token)
+        results = await self._get_wazirx_bid_ask_prices(exchange=self._exchange, quote_token=quote_token)
         return results
-
-    def _ensure_exchanges(self):
-        if self._wazirx_exchange is None:
-            self._wazirx_exchange = self._build_wazirx_connector_without_private_keys()
 
     @staticmethod
     async def _get_wazirx_prices(exchange: "WazirxExchange", quote_token: Optional[str] = None) -> Dict[str, Decimal]:
@@ -118,8 +110,7 @@ class WazirxRateSource(RateSourceBase):
 
         return results
 
-    @staticmethod
-    def _build_wazirx_connector_without_private_keys() -> "WazirxExchange":
+    def _build_exchange(self) -> "WazirxExchange":
         from hummingbot.connector.exchange.wazirx.wazirx_exchange import WazirxExchange
 
         return WazirxExchange(

@@ -11,10 +11,6 @@ if TYPE_CHECKING:
 
 
 class BinanceRateSource(RateSourceBase):
-    def __init__(self):
-        super().__init__()
-        self._binance_exchange: Optional[BinanceExchange] = None  # delayed because of circular reference
-
     @property
     def name(self) -> str:
         return "binance"
@@ -24,7 +20,7 @@ class BinanceRateSource(RateSourceBase):
         self._ensure_exchanges()
         results = {}
         tasks = [
-            self._get_binance_prices(exchange=self._binance_exchange),
+            self._get_binance_prices(exchange=self._exchange),
         ]
         task_results = await safe_gather(*tasks, return_exceptions=True)
         for task_result in task_results:
@@ -49,7 +45,7 @@ class BinanceRateSource(RateSourceBase):
         self._ensure_exchanges()
         results = {}
         tasks = [
-            self._get_binance_bid_ask_prices(exchange=self._binance_exchange, quote_token=quote_token),
+            self._get_binance_bid_ask_prices(exchange=self._exchange, quote_token=quote_token),
         ]
         task_results = await safe_gather(*tasks, return_exceptions=True)
         for task_result in task_results:
@@ -62,10 +58,6 @@ class BinanceRateSource(RateSourceBase):
             else:
                 results.update(task_result)
         return results
-
-    def _ensure_exchanges(self):
-        if self._binance_exchange is None:
-            self._binance_exchange = self._build_binance_connector_without_private_keys(domain="com")
 
     @staticmethod
     async def _get_binance_prices(exchange: 'BinanceExchange', quote_token: str = None) -> Dict[str, Decimal]:
@@ -128,8 +120,7 @@ class BinanceRateSource(RateSourceBase):
 
         return results
 
-    @staticmethod
-    def _build_binance_connector_without_private_keys(domain: str) -> 'BinanceExchange':
+    def _build_exchange(self) -> 'BinanceExchange':
         from hummingbot.connector.exchange.binance.binance_exchange import BinanceExchange
 
         return BinanceExchange(
@@ -137,5 +128,5 @@ class BinanceRateSource(RateSourceBase):
             binance_api_secret="",
             trading_pairs=[],
             trading_required=False,
-            domain=domain,
+            domain="com",
         )

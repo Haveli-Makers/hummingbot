@@ -13,7 +13,6 @@ if TYPE_CHECKING:
 class CubeRateSource(RateSourceBase):
     def __init__(self):
         super().__init__()
-        self._cube_exchange: Optional[CubeExchange] = None  # delayed because of circular reference
         self._cube_staging_exchange: Optional[CubeExchange] = None  # delayed because of circular reference
 
     @property
@@ -25,7 +24,7 @@ class CubeRateSource(RateSourceBase):
         self._ensure_exchanges()
         results = {}
         tasks = [
-            self._get_cube_prices(exchange=self._cube_exchange),
+            self._get_cube_prices(exchange=self._exchange),
             self._get_cube_prices(exchange=self._cube_staging_exchange),
         ]
         task_results = await safe_gather(*tasks, return_exceptions=True)
@@ -51,7 +50,7 @@ class CubeRateSource(RateSourceBase):
         self._ensure_exchanges()
         results = {}
         tasks = [
-            self._get_cube_bid_ask_prices(exchange=self._cube_exchange, quote_token=quote_token),
+            self._get_cube_bid_ask_prices(exchange=self._exchange, quote_token=quote_token),
             self._get_cube_bid_ask_prices(exchange=self._cube_staging_exchange, quote_token=quote_token),
         ]
         task_results = await safe_gather(*tasks, return_exceptions=True)
@@ -66,9 +65,12 @@ class CubeRateSource(RateSourceBase):
                 results.update(task_result)
         return results
 
+    def _build_exchange(self) -> 'CubeExchange':
+        return self._build_cube_connector_without_private_keys(domain="live")
+
     def _ensure_exchanges(self):
-        if self._cube_exchange is None:
-            self._cube_exchange = self._build_cube_connector_without_private_keys(domain="live")
+        if self._exchange is None:
+            self._exchange = self._build_exchange()
             self._cube_staging_exchange = self._build_cube_connector_without_private_keys(domain="staging")
 
     @staticmethod

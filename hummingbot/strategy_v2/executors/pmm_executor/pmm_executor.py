@@ -54,11 +54,7 @@ class PMMExecutor(ExecutorBase):
 
         self.trading_rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
 
-        if self.config.fair_price is not None:
-            self.fair_price = self.config.fair_price
-        else:
-            self.fair_price = self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.MidPrice)
-
+        self.fair_price = self.get_fair_price()
         self.mid_price = self.fair_price
 
         self.pmm_levels = self._generate_levels()
@@ -86,6 +82,12 @@ class PMMExecutor(ExecutorBase):
         self.max_order_creation_timestamp = 0
         self._current_retries = 0
         self._max_retries = max_retries
+
+    def get_fair_price(self) -> Decimal:
+        """Calculate the fair price based on config: use explicit fair_price if set, otherwise fetch by fair_price_type."""
+        if self.config.fair_price is not None:
+            return self.config.fair_price
+        return self.get_price(self.config.connector_name, self.config.trading_pair, self.config.fair_price_type)
 
     @property
     def is_perpetual(self) -> bool:
@@ -141,6 +143,7 @@ class PMMExecutor(ExecutorBase):
         if adjusted[0].amount == Decimal("0"):
             self.close_type = CloseType.INSUFFICIENT_BALANCE
             self.logger().error("Not enough budget to open PMM positions.")
+            # TODO: Send notification to user about insufficient balance
             self.stop()
 
     @property
@@ -166,7 +169,7 @@ class PMMExecutor(ExecutorBase):
     # ─── Control Loop ────────────────────────────────────────────────────
 
     async def control_task(self):
-        """Main control loop: update metrics, process fills, manage orders or shutdown."""
+        """Main control loop: update metrics, refresh fair price, process fills, manage orders or shutdown."""
         self.update_metrics()
         self.process_filled_orders()
 
@@ -175,6 +178,8 @@ class PMMExecutor(ExecutorBase):
                 self.cancel_all_orders()
                 self._status = RunnableStatus.SHUTTING_DOWN
                 return
+            if self.config.fair_price is None:
+                self.refresh_orders_on_price_change()
             self.manage_orders()
         elif self.status == RunnableStatus.SHUTTING_DOWN:
             await self.control_shutdown_process()
@@ -267,6 +272,47 @@ class PMMExecutor(ExecutorBase):
                 )
                 level.reset_sell_order()
                 level.pending_side = "both"
+
+    # ─── Fair Price Refresh ────────────────────────────────────────────
+
+    def refresh_orders_on_price_change(self):
+        """Recalculate fair price and cancel+replace orders level-by-level if price moved beyond tolerance."""
+        new_fair_price = self.get_fair_price()
+        if self.fair_price == Decimal("0"):
+            self.fair_price = new_fair_price
+            return
+
+        price_change_pct = abs(new_fair_price - self.fair_price) / self.fair_price
+        if price_change_pct <= self.config.price_refresh_tolerance:
+            return
+
+        self.logger().info(
+            f"PMM: Fair price changed {self.fair_price} → {new_fair_price} "
+            f"({float(price_change_pct) * 100:.4f}% > {float(self.config.price_refresh_tolerance) * 100:.4f}% tolerance). "
+            f"Refreshing orders level-by-level."
+        )
+        self.fair_price = new_fair_price
+
+        for level in self.pmm_levels:
+            if level.buy_order and level.buy_state == PMMOrderState.ORDER_PLACED:
+                self._strategy.cancel(
+                    connector_name=self.config.connector_name,
+                    trading_pair=self.config.trading_pair,
+                    order_id=level.buy_order.order_id,
+                )
+                self.logger().debug(f"PMM: Canceling stale buy order {level.buy_order.order_id} for level {level.id}")
+                level.reset_buy_order()
+                self._place_buy_order(level)
+
+            if level.sell_order and level.sell_state == PMMOrderState.ORDER_PLACED:
+                self._strategy.cancel(
+                    connector_name=self.config.connector_name,
+                    trading_pair=self.config.trading_pair,
+                    order_id=level.sell_order.order_id,
+                )
+                self.logger().debug(f"PMM: Canceling stale sell order {level.sell_order.order_id} for level {level.id}")
+                level.reset_sell_order()
+                self._place_sell_order(level)
 
     # ─── Order Management ────────────────────────────────────────────────
 

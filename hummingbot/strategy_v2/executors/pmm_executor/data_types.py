@@ -4,7 +4,7 @@ from typing import List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
-from hummingbot.core.data_type.common import OrderType
+from hummingbot.core.data_type.common import OrderType, PriceType
 from hummingbot.strategy_v2.executors.data_types import ExecutorConfigBase
 from hummingbot.strategy_v2.models.executors import TrackedOrder
 
@@ -23,12 +23,14 @@ class PMMExecutorConfig(ExecutorConfigBase):
     spread_percentages: List[Decimal]
     order_amounts_quote: List[Decimal]
     fair_price: Optional[Decimal] = None
+    fair_price_type: PriceType = PriceType.MidPrice
 
     order_type: OrderType = OrderType.LIMIT
     order_frequency: int = 0
     max_orders_per_batch: Optional[int] = None
     safe_extra_spread: Decimal = Decimal("0.0001")
     min_order_amount_quote: Decimal = Decimal("100")
+    price_refresh_tolerance: Decimal = Decimal("0.001")
 
     stop_loss: Optional[Decimal] = None
     time_limit: Optional[int] = None

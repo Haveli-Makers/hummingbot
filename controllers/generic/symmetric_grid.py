@@ -32,10 +32,8 @@ class SymmetricGridConfig(ControllerConfigBase):
     controller_name: str = "symmetric_grid"
     candles_config: List[CandlesConfig] = []
 
-    # Account configuration
     leverage: int = 1
 
-    # Connector & pair
     connector_name: str = Field(
         default="coindcx",
         json_schema_extra={"prompt_on_new": True, "prompt": "Enter the connector name (e.g., coindcx):"}
@@ -45,39 +43,34 @@ class SymmetricGridConfig(ControllerConfigBase):
         json_schema_extra={"prompt_on_new": True, "prompt": "Enter the trading pair (e.g., USDT-INR):"}
     )
 
-    # Total budget (informational, actual per-level amounts are in amounts_quote)
     total_amount_quote: Decimal = Field(
         default=Decimal("240"),
         json_schema_extra={"prompt_on_new": True, "is_updatable": True}
     )
 
-    # Optional fixed reference price; None = use current mid price
     reference_price: Optional[Decimal] = Field(
         default=None,
         json_schema_extra={"prompt_on_new": True, "is_updatable": True,
-                           "prompt": "Enter a fixed reference price, or leave blank for mid price:"}
+                           "prompt": "Enter a fixed reference price, or leave blank for mid price:"}  
     )
 
-    # Spread percentages from fair price for each level
     spreads: List[Decimal] = Field(
         default=[Decimal("0.01"), Decimal("0.02"), Decimal("0.03"), Decimal("0.05")],
         json_schema_extra={"prompt_on_new": True, "is_updatable": True,
                            "prompt": "Enter comma-separated spread percentages (e.g., 0.01,0.02,0.03,0.05):"}
     )
 
-    # Quote amounts per level  (must match length of spreads)
     amounts_quote: List[Decimal] = Field(
         default=[Decimal("200"), Decimal("800"), Decimal("200"), Decimal("800")],
         json_schema_extra={"prompt_on_new": True, "is_updatable": True,
                            "prompt": "Enter comma-separated amounts in quote per level (e.g., 200,800,200,800):"}
     )
 
-    # Order type settings
     open_order_type: OrderType = Field(default=OrderType.LIMIT_MAKER)
     take_profit_order_type: OrderType = Field(default=OrderType.LIMIT)
 
     # When true, each level's take-profit spread equals its own spread percentage
-    take_profit_matches_spread: bool = Field(default=True, json_schema_extra={"is_updatable": True})
+    take_profit_matches_spread: bool = Field(default=True, json_schema_extra={"is_updatable": True}) 
 
     # Fallback take profit if take_profit_matches_spread is False
     global_take_profit: Optional[Decimal] = Field(default=Decimal("0.01"), json_schema_extra={"is_updatable": True})
@@ -144,18 +137,12 @@ class SymmetricGrid(ControllerBase):
         if len(self.active_executors()) > 0:
             return []
 
-        mid_price = self.market_data_provider.get_price_by_type(
-            self.config.connector_name, self.config.trading_pair, PriceType.MidPrice)
-
-        fair_price = self.config.reference_price if self.config.reference_price else mid_price
-
         return [CreateExecutorAction(
             controller_id=self.config.id,
             executor_config=PMMExecutorConfig(
                 timestamp=self.market_data_provider.time(),
                 connector_name=self.config.connector_name,
                 trading_pair=self.config.trading_pair,
-                fair_price=fair_price,
                 spread_percentages=list(self.config.spreads),
                 order_amounts_quote=list(self.config.amounts_quote),
                 order_type=self.config.open_order_type,
@@ -186,7 +173,6 @@ class SymmetricGrid(ControllerBase):
         info_line += " " * (box_width - len(info_line) + 1) + "|"
         status.append(info_line)
 
-        # Show spread levels with buy/sell prices
         for i, (spread, amount) in enumerate(zip(self.config.spreads, self.config.amounts_quote)):
             buy_price = fair_price * (1 - spread)
             sell_price = fair_price * (1 + spread)
@@ -197,7 +183,6 @@ class SymmetricGrid(ControllerBase):
 
         status.append("+" + "-" * box_width + "+")
 
-        # Active executor info
         for executor in self.active_executors():
             ci = executor.custom_info
             perf_line = (f"| PnL: R={ci.get('realized_pnl_quote', 0):.4f} U={ci.get('unrealized_pnl_quote', 0):.4f} | "
@@ -207,7 +192,6 @@ class SymmetricGrid(ControllerBase):
             perf_line += " " * (box_width - len(perf_line) + 1) + "|"
             status.append(perf_line)
 
-            # Show per-level states
             for level_info in ci.get("levels", []):
                 lev_line = (f"|  {level_info['id']}: spread={level_info['spread_pct'] * 100:.2f}% | "
                             f"Buy@{level_info['buy_price']:.4f} [{level_info['buy_state']}] | "

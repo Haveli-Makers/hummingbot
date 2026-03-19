@@ -67,6 +67,7 @@ class PMMExecutor(ExecutorBase):
         self._level_failures: Dict[str, tuple] = {}
         self._max_level_failures = 5
         self._level_failure_cooldown = 60
+        self._level_insufficient_funds: Dict[str, bool] = {} 
 
         self.total_buy_quote = Decimal("0")
         self.total_sell_quote = Decimal("0")
@@ -82,6 +83,10 @@ class PMMExecutor(ExecutorBase):
         self.max_order_creation_timestamp = 0
         self._current_retries = 0
         self._max_retries = max_retries
+        self._last_refresh_timestamp: float = 0
+        self._refresh_cooldown: float = 1.5  
+        self._refresh_pending_levels: List[int] = [] 
+        self._refresh_canceling_level: Optional[int] = None  
 
     def get_fair_price(self) -> Decimal:
         """Calculate the fair price based on config: use explicit fair_price if set, otherwise fetch by fair_price_type."""
@@ -115,13 +120,14 @@ class PMMExecutor(ExecutorBase):
         return levels
 
     async def validate_sufficient_balance(self):
-        """Validate that there is enough balance to place orders on both sides."""
+        """Validate that there is enough balance to place orders on both sides (buy and sell)."""
         mid_price = self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.MidPrice)
 
         total_amount_quote = sum(self.config.order_amounts_quote)
         total_amount_base = total_amount_quote / mid_price
+
         if self.is_perpetual:
-            order_candidate = PerpetualOrderCandidate(
+            buy_candidate = PerpetualOrderCandidate(
                 trading_pair=self.config.trading_pair,
                 is_maker=self.config.order_type.is_limit_type(),
                 order_type=self.config.order_type,
@@ -131,7 +137,7 @@ class PMMExecutor(ExecutorBase):
                 leverage=Decimal(self.config.leverage),
             )
         else:
-            order_candidate = OrderCandidate(
+            buy_candidate = OrderCandidate(
                 trading_pair=self.config.trading_pair,
                 is_maker=self.config.order_type.is_limit_type(),
                 order_type=self.config.order_type,
@@ -139,12 +145,29 @@ class PMMExecutor(ExecutorBase):
                 amount=total_amount_base,
                 price=mid_price,
             )
-        adjusted = self.adjust_order_candidates(self.config.connector_name, [order_candidate])
-        if adjusted[0].amount == Decimal("0"):
+        adjusted_buy = self.adjust_order_candidates(self.config.connector_name, [buy_candidate])
+        if adjusted_buy[0].amount == Decimal("0"):
             self.close_type = CloseType.INSUFFICIENT_BALANCE
-            self.logger().error("Not enough budget to open PMM positions.")
-            # TODO: Send notification to user about insufficient balance
+            self.logger().error("Not enough quote balance to open PMM buy positions.")
             self.stop()
+            return
+
+        if not self.is_perpetual:
+            sell_candidate = OrderCandidate(
+                trading_pair=self.config.trading_pair,
+                is_maker=self.config.order_type.is_limit_type(),
+                order_type=self.config.order_type,
+                order_side=TradeType.SELL,
+                amount=total_amount_base,
+                price=mid_price,
+            )
+            adjusted_sell = self.adjust_order_candidates(self.config.connector_name, [sell_candidate])
+            if adjusted_sell[0].amount == Decimal("0"):
+                self.logger().warning(
+                    f"Not enough base balance for all sell levels. "
+                    f"Need ~{total_amount_base:.4f} {self.config.trading_pair.split('-')[0]} "
+                    f"but have less. Sells will be placed only up to available balance."
+                )
 
     @property
     def end_time(self) -> Optional[float]:
@@ -242,6 +265,9 @@ class PMMExecutor(ExecutorBase):
                 )
                 level.reset_buy_order()
                 level.pending_side = "both"
+                for key in list(self._level_insufficient_funds):
+                    if key.endswith("_sell"):
+                        del self._level_insufficient_funds[key]
 
             if level.sell_state == PMMOrderState.ORDER_FILLED and level.sell_order:
                 if level.sell_order.order:
@@ -272,52 +298,103 @@ class PMMExecutor(ExecutorBase):
                 )
                 level.reset_sell_order()
                 level.pending_side = "both"
+                for key in list(self._level_insufficient_funds):
+                    if key.endswith("_buy"):
+                        del self._level_insufficient_funds[key]
 
     # ─── Fair Price Refresh ────────────────────────────────────────────
 
     def refresh_orders_on_price_change(self):
-        """Recalculate fair price and cancel+replace orders level-by-level if price moved beyond tolerance."""
+        """Staggered refresh: cancel and replace ONE level per tick to minimize downtime.
+
+        When price moves beyond tolerance, all levels are queued for refresh. Each tick
+        cancels the next pending level. When the cancel confirms (via process_order_canceled_event),
+        the level is reset to NOT_ACTIVE, and manage_orders() places the replacement immediately.
+        """
+        if self._refresh_pending_levels or self._refresh_canceling_level is not None:
+            self._cancel_next_pending_level()
+            return
+
         new_fair_price = self.get_fair_price()
         if self.fair_price == Decimal("0"):
             self.fair_price = new_fair_price
             return
 
         price_change_pct = abs(new_fair_price - self.fair_price) / self.fair_price
+        self.logger().debug(
+            f"PMM: Price check | stored={self.fair_price:.4f} | current={new_fair_price:.4f} | "
+            f"change={float(price_change_pct) * 100:.4f}% | tolerance={float(self.config.price_refresh_tolerance) * 100:.4f}%"
+        )
         if price_change_pct <= self.config.price_refresh_tolerance:
+            return
+
+        now = self._strategy.current_timestamp
+        if now - self._last_refresh_timestamp < self._refresh_cooldown:
             return
 
         self.logger().info(
             f"PMM: Fair price changed {self.fair_price} → {new_fair_price} "
             f"({float(price_change_pct) * 100:.4f}% > {float(self.config.price_refresh_tolerance) * 100:.4f}% tolerance). "
-            f"Refreshing orders level-by-level."
+            f"Starting staggered refresh."
         )
         self.fair_price = new_fair_price
+        self._last_refresh_timestamp = now
 
         for level in self.pmm_levels:
-            if level.buy_order and level.buy_state == PMMOrderState.ORDER_PLACED:
-                self._strategy.cancel(
-                    connector_name=self.config.connector_name,
-                    trading_pair=self.config.trading_pair,
-                    order_id=level.buy_order.order_id,
-                )
-                self.logger().debug(f"PMM: Canceling stale buy order {level.buy_order.order_id} for level {level.id}")
-                level.reset_buy_order()
-                self._place_buy_order(level)
+            self.logger().info(
+                f"PMM: Level {level.id} new prices | "
+                f"buy: {level.get_buy_price(self.fair_price):.4f} | "
+                f"sell: {level.get_sell_price(self.fair_price):.4f}"
+            )
 
-            if level.sell_order and level.sell_state == PMMOrderState.ORDER_PLACED:
-                self._strategy.cancel(
-                    connector_name=self.config.connector_name,
-                    trading_pair=self.config.trading_pair,
-                    order_id=level.sell_order.order_id,
-                )
-                self.logger().debug(f"PMM: Canceling stale sell order {level.sell_order.order_id} for level {level.id}")
-                level.reset_sell_order()
-                self._place_sell_order(level)
+        self._refresh_pending_levels = [
+            i for i, level in enumerate(self.pmm_levels)
+            if (level.buy_order and level.buy_state == PMMOrderState.ORDER_PLACED)
+            or (level.sell_order and level.sell_state == PMMOrderState.ORDER_PLACED)
+        ]
+        self._refresh_canceling_level = None
+        self._cancel_next_pending_level()
+
+    def _cancel_next_pending_level(self):
+        """Cancel orders for the next level in the refresh queue."""
+        if self._refresh_canceling_level is not None:
+            idx = self._refresh_canceling_level
+            level = self.pmm_levels[idx]
+            buy_done = level.buy_state != PMMOrderState.ORDER_PLACED
+            sell_done = level.sell_state != PMMOrderState.ORDER_PLACED
+            if not (buy_done and sell_done):
+                return 
+
+        if not self._refresh_pending_levels:
+            self._refresh_canceling_level = None
+            return
+
+        idx = self._refresh_pending_levels.pop(0)
+        self._refresh_canceling_level = idx
+        level = self.pmm_levels[idx]
+
+        if level.buy_order and level.buy_state == PMMOrderState.ORDER_PLACED:
+            self._strategy.cancel(
+                connector_name=self.config.connector_name,
+                trading_pair=self.config.trading_pair,
+                order_id=level.buy_order.order_id,
+            )
+            self.logger().debug(f"PMM: Refresh canceling buy for {level.id}")
+
+        if level.sell_order and level.sell_state == PMMOrderState.ORDER_PLACED:
+            self._strategy.cancel(
+                connector_name=self.config.connector_name,
+                trading_pair=self.config.trading_pair,
+                order_id=level.sell_order.order_id,
+            )
+            self.logger().debug(f"PMM: Refresh canceling sell for {level.id}")
 
     # ─── Order Management ────────────────────────────────────────────────
 
     def _is_level_on_cooldown(self, level_id: str) -> bool:
-        """Check if a level is in failure cooldown (too many recent failures)."""
+        """Check if a level is in failure cooldown or permanently disabled due to insufficient funds."""
+        if self._level_insufficient_funds.get(level_id, False):
+            return True
         if level_id not in self._level_failures:
             return False
         count, last_ts = self._level_failures[level_id]
@@ -348,9 +425,16 @@ class PMMExecutor(ExecutorBase):
         orders_placed = 0
         max_batch = self.config.max_orders_per_batch or (len(self.pmm_levels) * 2)
 
-        for level in self.pmm_levels:
+        refreshing_indices = set(self._refresh_pending_levels)
+        if self._refresh_canceling_level is not None:
+            refreshing_indices.add(self._refresh_canceling_level)
+
+        for i, level in enumerate(self.pmm_levels):
             if orders_placed >= max_batch:
                 break
+
+            if i in refreshing_indices:
+                continue
 
             should_place_buy = (
                 level.pending_side in ("buy", "both")
@@ -423,8 +507,10 @@ class PMMExecutor(ExecutorBase):
             position_action=PositionAction.OPEN if self.is_perpetual else PositionAction.NIL,
         )
         level.buy_order = TrackedOrder(order_id=order_id)
-        self.logger().debug(
-            f"PMM: Placed buy order {order_id} at {buy_price:.6f} for level {level.id}"
+        self.logger().info(
+            f"PMM: Placed BUY order {order_id} | level={level.id} | "
+            f"price={order_candidate.price:.4f} | amount={order_candidate.amount:.4f} | "
+            f"fair_price={self.fair_price:.4f} | spread={float(level.spread_pct) * 100:.2f}%"
         )
 
     def _place_sell_order(self, level: PMMLevel):
@@ -473,8 +559,10 @@ class PMMExecutor(ExecutorBase):
             position_action=PositionAction.OPEN if self.is_perpetual else PositionAction.NIL,
         )
         level.sell_order = TrackedOrder(order_id=order_id)
-        self.logger().debug(
-            f"PMM: Placed sell order {order_id} at {sell_price:.6f} for level {level.id}"
+        self.logger().info(
+            f"PMM: Placed SELL order {order_id} | level={level.id} | "
+            f"price={order_candidate.price:.4f} | amount={order_candidate.amount:.4f} | "
+            f"fair_price={self.fair_price:.4f} | spread={float(level.spread_pct) * 100:.2f}%"
         )
 
     def _create_order_candidate(self, side: TradeType, amount: Decimal, price: Decimal):
@@ -724,35 +812,70 @@ class PMMExecutor(ExecutorBase):
         self.update_tracked_orders_with_order_id(event.order_id)
 
     def process_order_canceled_event(self, _, market: ConnectorBase, event: OrderCancelledEvent):
-        for level in self.pmm_levels:
+        for i, level in enumerate(self.pmm_levels):
             if level.buy_order and event.order_id == level.buy_order.order_id:
                 self._canceled_orders.append(level.buy_order.order_id)
                 saved_side = level.pending_side
                 level.reset_buy_order()
-                level.pending_side = saved_side  # preserve: re-place same side
+                level.pending_side = saved_side  
             if level.sell_order and event.order_id == level.sell_order.order_id:
                 self._canceled_orders.append(level.sell_order.order_id)
                 saved_side = level.pending_side
                 level.reset_sell_order()
-                level.pending_side = saved_side  # preserve: re-place same side
+                level.pending_side = saved_side  
+
+            if i == self._refresh_canceling_level:
+                buy_done = level.buy_state != PMMOrderState.ORDER_PLACED
+                sell_done = level.sell_state != PMMOrderState.ORDER_PLACED
+                if buy_done and sell_done:
+                    self.logger().info(f"PMM: Refresh cancel confirmed for {level.id}, placing replacements.")
+                    if level.pending_side in ("buy", "both") and not self._is_level_on_cooldown(f"{level.id}_buy"):
+                        self._place_buy_order(level)
+                    if level.pending_side in ("sell", "both") and not self._is_level_on_cooldown(f"{level.id}_sell"):
+                        self._place_sell_order(level)
+                    self._refresh_canceling_level = None
+                    self._cancel_next_pending_level()
+
         if self._close_order and event.order_id == self._close_order.order_id:
             self._canceled_orders.append(self._close_order.order_id)
             self._close_order = None
 
+    def _is_insufficient_funds_error(self, event: MarketOrderFailureEvent) -> bool:
+        """Check if the failure is due to insufficient funds."""
+        if event.error_message:
+            msg = event.error_message.lower()
+            return "insufficient funds" in msg or "insufficient balance" in msg
+        return False
+
     def process_order_failed_event(self, _, market, event: MarketOrderFailureEvent):
+        is_balance_error = self._is_insufficient_funds_error(event)
         for level in self.pmm_levels:
             if level.buy_order and event.order_id == level.buy_order.order_id:
                 self._failed_orders.append(level.buy_order.order_id)
-                self._record_level_failure(f"{level.id}_buy")
+                level_key = f"{level.id}_buy"
+                self._record_level_failure(level_key)
+                if is_balance_error:
+                    self._level_insufficient_funds[level_key] = True
+                    self.logger().warning(
+                        f"PMM: Disabling buy for level {level.id} — insufficient funds. "
+                        f"Will re-enable when a sell fills and releases balance."
+                    )
                 saved_side = level.pending_side
                 level.reset_buy_order()
-                level.pending_side = saved_side  # preserve: retry same side
+                level.pending_side = saved_side
             if level.sell_order and event.order_id == level.sell_order.order_id:
                 self._failed_orders.append(level.sell_order.order_id)
-                self._record_level_failure(f"{level.id}_sell")
+                level_key = f"{level.id}_sell"
+                self._record_level_failure(level_key)
+                if is_balance_error:
+                    self._level_insufficient_funds[level_key] = True
+                    self.logger().warning(
+                        f"PMM: Disabling sell for level {level.id} — insufficient funds. "
+                        f"Will re-enable when a buy fills and creates inventory."
+                    )
                 saved_side = level.pending_side
                 level.reset_sell_order()
-                level.pending_side = saved_side  # preserve: retry same side
+                level.pending_side = saved_side
         if self._close_order and event.order_id == self._close_order.order_id:
             self._failed_orders.append(self._close_order.order_id)
             self._close_order = None

@@ -67,7 +67,7 @@ class PMMExecutor(ExecutorBase):
         self._level_failures: Dict[str, tuple] = {}
         self._max_level_failures = 5
         self._level_failure_cooldown = 60
-        self._level_insufficient_funds: Dict[str, bool] = {} 
+        self._level_insufficient_funds: Dict[str, bool] = {}
 
         self.total_buy_quote = Decimal("0")
         self.total_sell_quote = Decimal("0")
@@ -84,9 +84,9 @@ class PMMExecutor(ExecutorBase):
         self._current_retries = 0
         self._max_retries = max_retries
         self._last_refresh_timestamp: float = 0
-        self._refresh_cooldown: float = 1.5  
-        self._refresh_pending_levels: List[int] = [] 
-        self._refresh_canceling_level: Optional[int] = None  
+        self._refresh_cooldown: float = 1.5
+        self._refresh_pending_levels: List[int] = []
+        self._refresh_canceling_level: Optional[int] = None
 
     def get_fair_price(self) -> Decimal:
         """Calculate the fair price based on config: use explicit fair_price if set, otherwise fetch by fair_price_type."""
@@ -363,7 +363,7 @@ class PMMExecutor(ExecutorBase):
             buy_done = level.buy_state != PMMOrderState.ORDER_PLACED
             sell_done = level.sell_state != PMMOrderState.ORDER_PLACED
             if not (buy_done and sell_done):
-                return 
+                return
 
         if not self._refresh_pending_levels:
             self._refresh_canceling_level = None
@@ -817,12 +817,12 @@ class PMMExecutor(ExecutorBase):
                 self._canceled_orders.append(level.buy_order.order_id)
                 saved_side = level.pending_side
                 level.reset_buy_order()
-                level.pending_side = saved_side  
+                level.pending_side = saved_side
             if level.sell_order and event.order_id == level.sell_order.order_id:
                 self._canceled_orders.append(level.sell_order.order_id)
                 saved_side = level.pending_side
                 level.reset_sell_order()
-                level.pending_side = saved_side  
+                level.pending_side = saved_side
 
             if i == self._refresh_canceling_level:
                 buy_done = level.buy_state != PMMOrderState.ORDER_PLACED

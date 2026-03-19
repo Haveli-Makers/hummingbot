@@ -30,7 +30,7 @@ class PMMExecutorConfig(ExecutorConfigBase):
     max_orders_per_batch: Optional[int] = None
     safe_extra_spread: Decimal = Decimal("0.0001")
     min_order_amount_quote: Decimal = Decimal("100")
-    price_refresh_tolerance: Decimal = Decimal("0.0005") 
+    price_refresh_tolerance: Decimal = Decimal("0.0005")
 
     stop_loss: Optional[Decimal] = None
     time_limit: Optional[int] = None

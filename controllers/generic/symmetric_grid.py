@@ -51,7 +51,7 @@ class SymmetricGridConfig(ControllerConfigBase):
     reference_price: Optional[Decimal] = Field(
         default=None,
         json_schema_extra={"prompt_on_new": True, "is_updatable": True,
-                           "prompt": "Enter a fixed reference price, or leave blank for mid price:"}  
+                           "prompt": "Enter a fixed reference price, or leave blank for mid price:"}
     )
 
     spreads: List[Decimal] = Field(
@@ -70,7 +70,7 @@ class SymmetricGridConfig(ControllerConfigBase):
     take_profit_order_type: OrderType = Field(default=OrderType.LIMIT)
 
     # When true, each level's take-profit spread equals its own spread percentage
-    take_profit_matches_spread: bool = Field(default=True, json_schema_extra={"is_updatable": True}) 
+    take_profit_matches_spread: bool = Field(default=True, json_schema_extra={"is_updatable": True})
 
     # Fallback take profit if take_profit_matches_spread is False
     global_take_profit: Optional[Decimal] = Field(default=Decimal("0.01"), json_schema_extra={"is_updatable": True})

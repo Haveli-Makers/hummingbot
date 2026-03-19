@@ -94,8 +94,7 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 await self._disconnect()
                 await asyncio.sleep(1.0)
 
-    def _build_client(self, trade_queue: asyncio.Queue, diff_queue: asyncio.Queue,
-                       snapshot_queue: asyncio.Queue) -> socketio.AsyncClient:
+    def _build_client(self, trade_queue: asyncio.Queue, diff_queue: asyncio.Queue, snapshot_queue: asyncio.Queue) -> socketio.AsyncClient:
         """
         Build Socket.IO client with event handlers for order book and trades.
         """

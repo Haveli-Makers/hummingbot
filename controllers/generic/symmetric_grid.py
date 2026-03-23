@@ -149,6 +149,7 @@ class SymmetricGrid(ControllerBase):
                 stop_loss=self.config.stop_loss,
                 time_limit=self.config.time_limit,
                 leverage=self.config.leverage,
+                fair_price=self.config.reference_price,
             )
         )]
 

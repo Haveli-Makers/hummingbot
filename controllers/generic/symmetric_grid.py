@@ -7,7 +7,7 @@ from hummingbot.core.data_type.common import MarketDict, OrderType, PriceType
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase, ControllerConfigBase
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair
-from hummingbot.strategy_v2.executors.pmm_executor.data_types import PMMExecutorConfig
+from hummingbot.strategy_v2.executors.symmetric_grid_executor.data_types import SymmetricGridExecutorConfig
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction
 from hummingbot.strategy_v2.models.executors_info import ExecutorInfo
 
@@ -43,11 +43,6 @@ class SymmetricGridConfig(ControllerConfigBase):
         json_schema_extra={"prompt_on_new": True, "prompt": "Enter the trading pair (e.g., USDT-INR):"}
     )
 
-    total_amount_quote: Decimal = Field(
-        default=Decimal("240"),
-        json_schema_extra={"prompt_on_new": True, "is_updatable": True}
-    )
-
     reference_price: Optional[Decimal] = Field(
         default=None,
         json_schema_extra={"prompt_on_new": True, "is_updatable": True,
@@ -67,17 +62,15 @@ class SymmetricGridConfig(ControllerConfigBase):
     )
 
     open_order_type: OrderType = Field(default=OrderType.LIMIT_MAKER)
-    take_profit_order_type: OrderType = Field(default=OrderType.LIMIT)
-
-    # When true, each level's take-profit spread equals its own spread percentage
-    take_profit_matches_spread: bool = Field(default=True, json_schema_extra={"is_updatable": True})
-
-    # Fallback take profit if take_profit_matches_spread is False
-    global_take_profit: Optional[Decimal] = Field(default=Decimal("0.01"), json_schema_extra={"is_updatable": True})
 
     # Risk management
     stop_loss: Optional[Decimal] = Field(default=None, json_schema_extra={"is_updatable": True})
     time_limit: Optional[int] = Field(default=None, json_schema_extra={"is_updatable": True})
+    price_refresh_tolerance: Decimal = Field(
+        default=Decimal("0.0005"),
+        json_schema_extra={"is_updatable": True,
+                           "prompt": "Price refresh tolerance as a fraction (e.g. 0.0005 = 0.05%):"}
+    )
 
     @field_validator('spreads', mode='before')
     @classmethod
@@ -93,7 +86,7 @@ class SymmetricGridConfig(ControllerConfigBase):
             return [Decimal(x.strip()) for x in v.split(',')]
         return [Decimal(str(x)) for x in v]
 
-    @field_validator('open_order_type', 'take_profit_order_type', mode="before")
+    @field_validator('open_order_type', mode="before")
     @classmethod
     def validate_order_type(cls, v) -> OrderType:
         if isinstance(v, OrderType):
@@ -111,7 +104,7 @@ class SymmetricGridConfig(ControllerConfigBase):
 
 class SymmetricGrid(ControllerBase):
     """
-    Symmetric Grid controller that uses PMMExecutor to place symmetric buy and sell
+    Symmetric Grid controller that uses SymmetricGridExecutor to place symmetric buy and sell
     orders around a fair price. Orders that fill are automatically re-placed.
     """
 
@@ -139,16 +132,18 @@ class SymmetricGrid(ControllerBase):
 
         return [CreateExecutorAction(
             controller_id=self.config.id,
-            executor_config=PMMExecutorConfig(
+            executor_config=SymmetricGridExecutorConfig(
                 timestamp=self.market_data_provider.time(),
                 connector_name=self.config.connector_name,
                 trading_pair=self.config.trading_pair,
                 spread_percentages=list(self.config.spreads),
                 order_amounts_quote=list(self.config.amounts_quote),
+                fair_price=self.config.reference_price,
                 order_type=self.config.open_order_type,
                 stop_loss=self.config.stop_loss,
                 time_limit=self.config.time_limit,
                 leverage=self.config.leverage,
+                price_refresh_tolerance=self.config.price_refresh_tolerance,
             )
         )]
 
@@ -169,7 +164,7 @@ class SymmetricGrid(ControllerBase):
 
         info_line = (f"| Mid Price: {mid_price:.4f} | Fair Price: {fair_price:.4f} | "
                      f"Levels: {len(self.config.spreads)} | "
-                     f"Budget: {self.config.total_amount_quote:.2f}")
+                     f"Budget: {sum(self.config.amounts_quote):.2f}")
         info_line += " " * (box_width - len(info_line) + 1) + "|"
         status.append(info_line)
 

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -15,6 +16,9 @@ from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFa
 
 if TYPE_CHECKING:
     from hummingbot.connector.exchange.coindcx.coindcx_exchange import CoinDCXExchange
+
+
+logger = logging.getLogger(__name__)
 
 
 class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
@@ -122,6 +126,8 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     except (json.JSONDecodeError, TypeError):
                         return
                 if isinstance(data, dict) and ("bids" in data or "asks" in data):
+                    if "channel" in message and "channel" not in data:
+                        data["channel"] = message["channel"]
                     if len(self._trading_pairs) == 1:
                         data["s"] = hb_pair_to_coindcx_symbol(self._trading_pairs[0])
                     snapshot_queue.put_nowait(data)
@@ -136,6 +142,8 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     except (json.JSONDecodeError, TypeError):
                         return
                 if isinstance(data, dict) and ("bids" in data or "asks" in data):
+                    if "channel" in message and "channel" not in data:
+                        data["channel"] = message["channel"]
                     if len(self._trading_pairs) == 1:
                         data["s"] = hb_pair_to_coindcx_symbol(self._trading_pairs[0])
                     diff_queue.put_nowait(data)
@@ -150,6 +158,8 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     except (json.JSONDecodeError, TypeError):
                         return
                 if isinstance(data, dict) and "p" in data and "q" in data:
+                    if "channel" in message and "channel" not in data:
+                        data["channel"] = message["channel"]
                     if len(self._trading_pairs) == 1:
                         data["s"] = hb_pair_to_coindcx_symbol(self._trading_pairs[0])
                     trade_queue.put_nowait(data)
@@ -186,6 +196,14 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         CoinDCX uses Socket.IO instead of traditional WebSocket.
         """
         pass
+
+    def _channel_originating_message(self, event_message: Dict[str, Any]) -> str:
+        """Route a raw event dict to the correct queue key (trade vs diff)."""
+        if "p" in event_message and "q" in event_message:
+            return self._trade_messages_queue_key
+        if "bids" in event_message or "asks" in event_message:
+            return self._diff_messages_queue_key
+        return ""
 
     async def _order_book_snapshot(self, trading_pair: str) -> OrderBookMessage:
         """

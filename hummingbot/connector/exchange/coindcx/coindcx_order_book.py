@@ -1,8 +1,39 @@
-from typing import Dict, Optional
+import logging
+from typing import Dict, List, Optional
 
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.order_book import OrderBook
 from hummingbot.core.data_type.order_book_message import OrderBookMessage, OrderBookMessageType
+
+logger = logging.getLogger(__name__)
+
+
+def _parse_price_levels(raw) -> List[List[float]]:
+    """Parse CoinDCX bid/ask data into [[price, amount], ...] regardless of format.
+
+    Handles:
+      - dict  {"95.55": "10", ...}         (REST API format)
+      - list of lists  [["95.55", "10"]]    (possible Socket.IO format)
+      - list of dicts  [{"p": "95.55", "q": "10"}]
+    """
+    levels: List[List[float]] = []
+    if isinstance(raw, dict):
+        for price, amount in raw.items():
+            levels.append([float(price), float(amount)])
+    elif isinstance(raw, (list, tuple)):
+        for item in raw:
+            if isinstance(item, dict):
+                # {"p": ..., "q": ...} or {"price": ..., "qty": ...}
+                p = item.get("p") or item.get("price") or item.get("rate", 0)
+                q = item.get("q") or item.get("qty") or item.get("amount") or item.get("vol", 0)
+                levels.append([float(p), float(q)])
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                levels.append([float(item[0]), float(item[1])])
+            else:
+                logger.warning(f"CoinDCX: unrecognised price-level format: {item!r}")
+    else:
+        logger.warning(f"CoinDCX: unexpected bids/asks type: {type(raw).__name__}")
+    return levels
 
 
 class CoinDCXOrderBook(OrderBook):
@@ -24,20 +55,15 @@ class CoinDCXOrderBook(OrderBook):
         if metadata is None:
             metadata = {}
 
-        bids = []
-        asks = []
+        bids = _parse_price_levels(msg.get("bids", {}))
+        asks = _parse_price_levels(msg.get("asks", {}))
 
-        if "bids" in msg:
-            for price, amount in msg["bids"].items():
-                bids.append([float(price), float(amount)])
-
-        if "asks" in msg:
-            for price, amount in msg["asks"].items():
-                asks.append([float(price), float(amount)])
-
+        # Use vs sequence number if available; fallback to 0 so that diffs
+        # (which carry a small vs) are never falsely rejected by the
+        # staleness check (snapshot_uid > diff.update_id).
         content = {
             "trading_pair": metadata.get("trading_pair"),
-            "update_id": msg.get("vs", int(timestamp * 1000)),
+            "update_id": msg.get("vs", 0),
             "bids": bids,
             "asks": asks
         }
@@ -61,20 +87,12 @@ class CoinDCXOrderBook(OrderBook):
         if metadata is None:
             metadata = {}
 
-        bids = []
-        asks = []
-
-        if "bids" in msg:
-            for price, amount in msg["bids"].items():
-                bids.append([float(price), float(amount)])
-
-        if "asks" in msg:
-            for price, amount in msg["asks"].items():
-                asks.append([float(price), float(amount)])
+        bids = _parse_price_levels(msg.get("bids", {}))
+        asks = _parse_price_levels(msg.get("asks", {}))
 
         content = {
             "trading_pair": metadata.get("trading_pair"),
-            "update_id": msg.get("vs", int(timestamp * 1000)),
+            "update_id": msg.get("vs", 0),
             "bids": bids,
             "asks": asks
         }

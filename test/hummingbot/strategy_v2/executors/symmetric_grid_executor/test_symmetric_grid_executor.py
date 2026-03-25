@@ -4,19 +4,16 @@ from unittest.mock import MagicMock, PropertyMock, patch
 
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
-from hummingbot.core.data_type.common import OrderType, PriceType, TradeType
+from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, TradeUpdate
-from hummingbot.core.data_type.order_candidate import OrderCandidate
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount
-from hummingbot.core.event.events import (
-    BuyOrderCreatedEvent,
-    MarketOrderFailureEvent,
-    OrderCancelledEvent,
-    OrderFilledEvent,
-    SellOrderCreatedEvent,
-)
+from hummingbot.core.event.events import MarketOrderFailureEvent, OrderCancelledEvent
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
-from hummingbot.strategy_v2.executors.symmetric_grid_executor.data_types import SymmetricGridExecutorConfig, SymmetricGridLevel, SymmetricGridOrderState
+from hummingbot.strategy_v2.executors.symmetric_grid_executor.data_types import (
+    SymmetricGridExecutorConfig,
+    SymmetricGridLevel,
+    SymmetricGridOrderState,
+)
 from hummingbot.strategy_v2.executors.symmetric_grid_executor.symmetric_grid_executor import SymmetricGridExecutor
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
@@ -290,7 +287,7 @@ class TestSymmetricGridExecutor(IsolatedAsyncioWrapperTestCase):
         executor._filled_orders = [
             {"trade_type": "BUY", "executed_amount_base": "10", "executed_amount_quote": "495", "cumulative_fee_paid_quote": "0"},
         ]
-        executor.mid_price = Decimal("55") 
+        executor.mid_price = Decimal("55")
         executor.update_realized_pnl_metrics()
 
         self.assertEqual(executor.unrealized_pnl_quote, Decimal("55"))
@@ -342,7 +339,7 @@ class TestSymmetricGridExecutor(IsolatedAsyncioWrapperTestCase):
         executor = self._make_executor(price_refresh_tolerance=Decimal("0.001"))
         self._set_executor_running(executor)
         executor.fair_price = Decimal("100")
-        executor._last_refresh_timestamp = 999_999.5  
+        executor._last_refresh_timestamp = 999_999.5
 
         with patch.object(SymmetricGridExecutor, "get_fair_price", return_value=Decimal("102")):
             executor.refresh_orders_on_price_change()
@@ -513,7 +510,7 @@ class TestSymmetricGridExecutor(IsolatedAsyncioWrapperTestCase):
         executor._filled_orders = [
             {"trade_type": "BUY", "executed_amount_base": "10", "executed_amount_quote": "1000", "cumulative_fee_paid_quote": "0"},
         ]
-        executor.mid_price = Decimal("90")  
+        executor.mid_price = Decimal("90")
         executor.update_realized_pnl_metrics()
 
         self.assertTrue(executor.stop_loss_condition())

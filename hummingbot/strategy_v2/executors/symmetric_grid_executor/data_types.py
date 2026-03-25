@@ -93,7 +93,7 @@ class SymmetricGridLevel(BaseModel):
     amount_quote: Decimal
     buy_order: Optional[TrackedOrder] = None
     sell_order: Optional[TrackedOrder] = None
-    pending_side: str = "both"  
+    pending_side: str = "both"
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     @property

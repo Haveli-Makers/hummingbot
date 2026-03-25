@@ -18,7 +18,12 @@ from hummingbot.core.event.events import (
 from hummingbot.logger import HummingbotLogger
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
-from hummingbot.strategy_v2.executors.symmetric_grid_executor.data_types import FairPriceType, SymmetricGridExecutorConfig, SymmetricGridLevel, SymmetricGridOrderState
+from hummingbot.strategy_v2.executors.symmetric_grid_executor.data_types import (
+    FairPriceType,
+    SymmetricGridExecutorConfig,
+    SymmetricGridLevel,
+    SymmetricGridOrderState,
+)
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
 
@@ -86,7 +91,7 @@ class SymmetricGridExecutor(ExecutorBase):
         self._max_retries = max_retries
         self._last_refresh_timestamp: float = 0
         self._refresh_cooldown: float = 1.5
-        self._refresh_pending_levels: set = set() 
+        self._refresh_pending_levels: set = set()
         self._refresh_cancel_sent_ts: float = 0
         self._refresh_cancel_timeout: float = 10.0
         self._last_price_log_timestamp: float = 0
@@ -180,10 +185,7 @@ class SymmetricGridExecutor(ExecutorBase):
             )
             adjusted_sell = self.adjust_order_candidates(self.config.connector_name, [sell_candidate])
             if adjusted_sell[0].amount == Decimal("0"):
-                self.logger().warning(
-                f"[#{self._seq()}] Not enough base balance for all sell levels. "
-                f"Need ~{total_amount_base:.4f} {self.config.trading_pair.split('-')[0]}."
-            )
+                self.logger().warning(f"[#{self._seq()}] Not enough base balance for all sell levels. "f"Need ~{total_amount_base:.4f} {self.config.trading_pair.split('-')[0]}.")
 
     @property
     def end_time(self) -> Optional[float]:

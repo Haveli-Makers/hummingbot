@@ -23,7 +23,6 @@ def _parse_price_levels(raw) -> List[List[float]]:
     elif isinstance(raw, (list, tuple)):
         for item in raw:
             if isinstance(item, dict):
-                # {"p": ..., "q": ...} or {"price": ..., "qty": ...}
                 p = item.get("p") or item.get("price") or item.get("rate", 0)
                 q = item.get("q") or item.get("qty") or item.get("amount") or item.get("vol", 0)
                 levels.append([float(p), float(q)])
@@ -58,9 +57,6 @@ class CoinDCXOrderBook(OrderBook):
         bids = _parse_price_levels(msg.get("bids", {}))
         asks = _parse_price_levels(msg.get("asks", {}))
 
-        # Use vs sequence number if available; fallback to 0 so that diffs
-        # (which carry a small vs) are never falsely rejected by the
-        # staleness check (snapshot_uid > diff.update_id).
         content = {
             "trading_pair": metadata.get("trading_pair"),
             "update_id": msg.get("vs", 0),

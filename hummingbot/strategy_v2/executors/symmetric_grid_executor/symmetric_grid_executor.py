@@ -73,9 +73,9 @@ class SymmetricGridExecutor(ExecutorBase):
         self._level_failures: Dict[str, tuple] = {}
         self._max_level_failures = 5
         self._level_failure_cooldown = 60
-        self._level_insufficient_funds: Dict[str, float] = {}  
-        self._sell_base_pending: Dict[str, Decimal] = {} 
-        self._refresh_completed_levels: set = set() 
+        self._level_insufficient_funds: Dict[str, float] = {}
+        self._sell_base_pending: Dict[str, Decimal] = {}
+        self._refresh_completed_levels: set = set()
 
         self.total_buy_quote = Decimal("0")
         self.total_sell_quote = Decimal("0")
@@ -98,7 +98,7 @@ class SymmetricGridExecutor(ExecutorBase):
         self._refresh_cancel_timeout: float = 10.0
         self._last_price_log_timestamp: float = 0
         self._price_log_interval: float = 30.0
-        self._insufficient_funds_cooldown: float = 5.0  
+        self._insufficient_funds_cooldown: float = 5.0
 
     def _get_mid_price(self) -> Decimal:
         """Fetch the mid price from the connector."""

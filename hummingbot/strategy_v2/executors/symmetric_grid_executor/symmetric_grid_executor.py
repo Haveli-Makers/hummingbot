@@ -73,7 +73,9 @@ class SymmetricGridExecutor(ExecutorBase):
         self._level_failures: Dict[str, tuple] = {}
         self._max_level_failures = 5
         self._level_failure_cooldown = 60
-        self._level_insufficient_funds: Dict[str, bool] = {}
+        self._level_insufficient_funds: Dict[str, float] = {}  
+        self._sell_base_pending: Dict[str, Decimal] = {} 
+        self._refresh_completed_levels: set = set() 
 
         self.total_buy_quote = Decimal("0")
         self.total_sell_quote = Decimal("0")
@@ -96,6 +98,7 @@ class SymmetricGridExecutor(ExecutorBase):
         self._refresh_cancel_timeout: float = 10.0
         self._last_price_log_timestamp: float = 0
         self._price_log_interval: float = 30.0
+        self._insufficient_funds_cooldown: float = 5.0  
 
     def _get_mid_price(self) -> Decimal:
         """Fetch the mid price from the connector."""
@@ -336,6 +339,7 @@ class SymmetricGridExecutor(ExecutorBase):
                         )
                         level.reset_level()
                     self._refresh_pending_levels.clear()
+                    self._refresh_completed_levels.clear()
                     self._refresh_cancel_sent_ts = 0
             return
 
@@ -398,9 +402,13 @@ class SymmetricGridExecutor(ExecutorBase):
     # ─── Order Management ────────────────────────────────────────────────
 
     def _is_level_on_cooldown(self, level_id: str) -> bool:
-        """Check if a level is in failure cooldown or permanently disabled due to insufficient funds."""
+        """Check if a level is in failure cooldown (including insufficient-funds cooldown)."""
         if self._level_insufficient_funds.get(level_id, False):
-            return True
+            ts = self._level_insufficient_funds[level_id]
+            if self._strategy.current_timestamp - ts < self._insufficient_funds_cooldown:
+                return True
+            del self._level_insufficient_funds[level_id]
+            return False
         if level_id not in self._level_failures:
             return False
         count, last_ts = self._level_failures[level_id]
@@ -516,10 +524,24 @@ class SymmetricGridExecutor(ExecutorBase):
             f"qty={order_candidate.amount:.4f} | fair={self.fair_price:.4f} | spread={float(level.spread_pct) * 100:.2f}%"
         )
 
+    def _get_pending_sell_base(self) -> Decimal:
+        """Return total base amount committed to sell orders not yet confirmed by the exchange."""
+        return sum(self._sell_base_pending.values(), Decimal("0"))
+
     def _place_sell_order(self, level: SymmetricGridLevel):
         """Place a sell order for the given level at fair_price * (1 + spread_pct)."""
         sell_price = level.get_sell_price(self.fair_price)
         amount_base = level.amount_quote / sell_price
+
+        base_asset = self.config.trading_pair.split("-")[0]
+        available_base = self.get_available_balance(self.config.connector_name, base_asset)
+        effective_available = available_base - self._get_pending_sell_base()
+        if effective_available < amount_base:
+            self.logger().info(
+                f"SymGrid: Skipping sell {level.id} — effective available base "
+                f"{effective_available:.4f} < needed {amount_base:.4f} {base_asset}"
+            )
+            return
 
         best_ask = self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.BestAsk)
         if sell_price <= best_ask:
@@ -562,6 +584,7 @@ class SymmetricGridExecutor(ExecutorBase):
             position_action=PositionAction.OPEN if self.is_perpetual else PositionAction.NIL,
         )
         level.sell_order = TrackedOrder(order_id=order_id)
+        self._sell_base_pending[order_id] = order_candidate.amount
         self.logger().info(
             f"[#{self._seq()}] SELL {level.id} | price={order_candidate.price:.4f} | "
             f"qty={order_candidate.amount:.4f} | fair={self.fair_price:.4f} | spread={float(level.spread_pct) * 100:.2f}%"
@@ -806,6 +829,7 @@ class SymmetricGridExecutor(ExecutorBase):
 
     def process_order_created_event(self, _, market, event: Union[BuyOrderCreatedEvent, SellOrderCreatedEvent]):
         self.update_tracked_orders_with_order_id(event.order_id)
+        self._sell_base_pending.pop(event.order_id, None)
 
     def process_order_filled_event(self, _, market, event: OrderFilledEvent):
         self.update_tracked_orders_with_order_id(event.order_id)
@@ -814,6 +838,7 @@ class SymmetricGridExecutor(ExecutorBase):
         self.update_tracked_orders_with_order_id(event.order_id)
 
     def process_order_canceled_event(self, _, market: ConnectorBase, event: OrderCancelledEvent):
+        self._sell_base_pending.pop(event.order_id, None)
         for i, level in enumerate(self.grid_levels):
             if level.buy_order and event.order_id == level.buy_order.order_id:
                 self._canceled_orders.append(level.buy_order.order_id)
@@ -830,23 +855,37 @@ class SymmetricGridExecutor(ExecutorBase):
                 buy_done = level.buy_state != SymmetricGridOrderState.ORDER_PLACED
                 sell_done = level.sell_state != SymmetricGridOrderState.ORDER_PLACED
                 if buy_done and sell_done:
-                    self._refresh_pending_levels.discard(i)
-                    if level.pending_side in ("buy", "both") and not self._is_level_on_cooldown(f"{level.id}_buy"):
-                        self._place_buy_order(level)
-                    if level.pending_side in ("sell", "both") and not self._is_level_on_cooldown(f"{level.id}_sell"):
-                        self._place_sell_order(level)
-                    self.logger().info(
-                        f"[#{self._seq()}] Refreshed {level.id} | "
-                        f"buy={level.get_buy_price(self.fair_price):.4f} | "
-                        f"sell={level.get_sell_price(self.fair_price):.4f} | "
-                        f"remaining={len(self._refresh_pending_levels)}"
-                    )
-                    if not self._refresh_pending_levels:
-                        self._refresh_cancel_sent_ts = 0
+                    self._refresh_completed_levels.add(i)
+
+        if self._refresh_pending_levels and self._refresh_completed_levels >= self._refresh_pending_levels:
+            self._place_refresh_batch()
 
         if self._close_order and event.order_id == self._close_order.order_id:
             self._canceled_orders.append(self._close_order.order_id)
             self._close_order = None
+
+    def _place_refresh_batch(self):
+        """Place orders for all refreshed levels in one batch, with balance-aware sell allocation."""
+        levels_to_refresh = sorted(self._refresh_completed_levels)
+        self._level_insufficient_funds.clear()
+        self._sell_base_pending.clear()
+
+        for i in levels_to_refresh:
+            level = self.grid_levels[i]
+            if level.pending_side in ("buy", "both") and not self._is_level_on_cooldown(f"{level.id}_buy"):
+                self._place_buy_order(level)
+            if level.pending_side in ("sell", "both") and not self._is_level_on_cooldown(f"{level.id}_sell"):
+                self._place_sell_order(level)
+            self.logger().info(
+                f"[#{self._seq()}] Refreshed {level.id} | "
+                f"buy={level.get_buy_price(self.fair_price):.4f} | "
+                f"sell={level.get_sell_price(self.fair_price):.4f} | "
+                f"remaining={len(levels_to_refresh) - levels_to_refresh.index(i) - 1}"
+            )
+
+        self._refresh_pending_levels.clear()
+        self._refresh_completed_levels.clear()
+        self._refresh_cancel_sent_ts = 0
 
     def _is_insufficient_funds_error(self, event: MarketOrderFailureEvent) -> bool:
         """Check if the failure is due to insufficient funds."""
@@ -857,16 +896,17 @@ class SymmetricGridExecutor(ExecutorBase):
 
     def process_order_failed_event(self, _, market, event: MarketOrderFailureEvent):
         is_balance_error = self._is_insufficient_funds_error(event)
+        self._sell_base_pending.pop(event.order_id, None)
         for level in self.grid_levels:
             if level.buy_order and event.order_id == level.buy_order.order_id:
                 self._failed_orders.append(level.buy_order.order_id)
                 level_key = f"{level.id}_buy"
                 self._record_level_failure(level_key)
                 if is_balance_error:
-                    self._level_insufficient_funds[level_key] = True
+                    self._level_insufficient_funds[level_key] = self._strategy.current_timestamp
                     self.logger().warning(
-                        f"SymGrid: Disabling buy for level {level.id} — insufficient funds. "
-                        f"Will re-enable when a sell fills and releases balance."
+                        f"SymGrid: Cooling down buy for level {level.id} — insufficient funds. "
+                        f"Will retry in {self._insufficient_funds_cooldown:.0f}s."
                     )
                 saved_side = level.pending_side
                 level.reset_buy_order()
@@ -876,10 +916,10 @@ class SymmetricGridExecutor(ExecutorBase):
                 level_key = f"{level.id}_sell"
                 self._record_level_failure(level_key)
                 if is_balance_error:
-                    self._level_insufficient_funds[level_key] = True
+                    self._level_insufficient_funds[level_key] = self._strategy.current_timestamp
                     self.logger().warning(
-                        f"SymGrid: Disabling sell for level {level.id} — insufficient funds. "
-                        f"Will re-enable when a buy fills and creates inventory."
+                        f"SymGrid: Cooling down sell for level {level.id} — insufficient funds. "
+                        f"Will retry in {self._insufficient_funds_cooldown:.0f}s."
                     )
                 saved_side = level.pending_side
                 level.reset_sell_order()

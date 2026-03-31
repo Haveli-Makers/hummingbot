@@ -42,6 +42,7 @@ class TestSymmetricGridExecutor(IsolatedAsyncioWrapperTestCase):
         trading_rule = TradingRule(trading_pair="ETH-USDT", min_notional_size=Decimal("1"))
         type(connector).trading_rules = PropertyMock(return_value={"ETH-USDT": trading_rule})
         connector.budget_checker.adjust_candidates.side_effect = lambda c: c
+        connector.get_available_balance.return_value = Decimal("10000")
         connector._order_tracker = MagicMock()
         connector._order_tracker.fetch_order.return_value = None
 
@@ -411,7 +412,7 @@ class TestSymmetricGridExecutor(IsolatedAsyncioWrapperTestCase):
         executor = self._make_executor()
         self._set_executor_running(executor)
 
-        executor._level_insufficient_funds["L0_sell"] = True
+        executor._level_insufficient_funds["L0_sell"] = self.strategy.current_timestamp
 
         self.assertTrue(executor._is_level_on_cooldown("L0_sell"))
 
@@ -437,7 +438,7 @@ class TestSymmetricGridExecutor(IsolatedAsyncioWrapperTestCase):
         )
         executor.process_order_failed_event(None, MagicMock(), event)
 
-        self.assertTrue(executor._level_insufficient_funds.get("L0_buy", False))
+        self.assertIn("L0_buy", executor._level_insufficient_funds)
         self.assertIsNone(executor.grid_levels[0].buy_order)
         self.assertIn(buy_order_id, executor._failed_orders)
 
@@ -460,7 +461,7 @@ class TestSymmetricGridExecutor(IsolatedAsyncioWrapperTestCase):
         )
         executor.process_order_failed_event(None, MagicMock(), event)
 
-        self.assertFalse(executor._level_insufficient_funds.get("L0_sell", False))
+        self.assertNotIn("L0_sell", executor._level_insufficient_funds)
         self.assertIsNone(executor.grid_levels[0].sell_order)
         self.assertIn(sell_order_id, executor._failed_orders)
 

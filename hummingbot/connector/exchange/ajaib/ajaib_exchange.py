@@ -5,11 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from bidict import bidict
 
 from hummingbot.connector.constants import s_decimal_NaN
-from hummingbot.connector.exchange.ajaib import (
-    ajaib_constants as CONSTANTS,
-    ajaib_utils,
-    ajaib_web_utils as web_utils,
-)
+from hummingbot.connector.exchange.ajaib import ajaib_constants as CONSTANTS, ajaib_utils, ajaib_web_utils as web_utils
 from hummingbot.connector.exchange.ajaib.ajaib_api_order_book_data_source import AjaibAPIOrderBookDataSource
 from hummingbot.connector.exchange.ajaib.ajaib_api_user_stream_data_source import AjaibAPIUserStreamDataSource
 from hummingbot.connector.exchange.ajaib.ajaib_auth import AjaibAuth
@@ -21,7 +17,6 @@ from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
-from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
 
@@ -147,16 +142,12 @@ class AjaibExchange(ExchangePyBase):
             is_auth_required=True,
         )
         symbols = [s["symbol"] for s in exchange_info.get("symbols", [])
-                    if s.get("isSpotTradingAllowed", False)]
+                   if s.get("isSpotTradingAllowed", False)]
 
         results = []
         for symbol in symbols:
             try:
-                depth = await self._api_get(
-                    path_url=CONSTANTS.DEPTH_PATH_URL,
-                    params={"symbol": symbol, "limit": 1},
-                    is_auth_required=True,
-                )
+                depth = await self._api_get(path_url=CONSTANTS.DEPTH_PATH_URL, params={"symbol": symbol, "limit": 1}, is_auth_required=True)
                 bids = depth.get("bids", [])
                 asks = depth.get("asks", [])
                 results.append({
@@ -514,7 +505,7 @@ class AjaibExchange(ExchangePyBase):
                 is_auth_required=True)
 
             if klines and len(klines) > 0:
-                return float(klines[0][4]) 
+                return float(klines[0][4])
             return 0.0
         except Exception as e:
             self.logger().error(f"Error getting last traded price: {e}")

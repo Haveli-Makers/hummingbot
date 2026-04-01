@@ -1,7 +1,7 @@
 from hummingbot.core.api_throttler.data_types import RateLimit
 from hummingbot.core.data_type.in_flight_order import OrderState
 
-DEFAULT_DOMAIN = "api.kripto.ajaib.co.id"
+DEFAULT_DOMAIN = "testnet.api.crypto.ajaib.co.id"
 
 BASE_URL = "https://{0}"
 
@@ -11,14 +11,12 @@ MAX_ORDER_ID_LEN = 36
 REST_URL = "https://api.kripto.ajaib.co.id"
 WSS_URL = "wss://stream.kripto.ajaib.co.id"
 
-# Market Info endpoints
 SERVER_TIME_PATH_URL = "/v1/time"
 EXCHANGE_INFO_PATH_URL = "/v1/exchange-info"
 KLINES_PATH_URL = "/v1/klines"
 TICKER_BOOK_PATH_URL = "/v1/ticker/bookTicker"
 DEPTH_PATH_URL = "/v1/depth"
 
-# Spot Trading endpoints
 CREATE_ORDER_PATH_URL = "/v1/order"
 ORDER_STATUS_PATH_URL = "/v1/order"
 CANCEL_ORDER_PATH_URL = "/v1/order"
@@ -27,8 +25,7 @@ CANCEL_ALL_ORDERS_PATH_URL = "/v1/order/all"
 TRADES_PATH_URL = "/v1/trades"
 ALL_ORDERS_PATH_URL = "/v1/order/all"
 
-# Wallet endpoints
-PORTFOLIO_PATH_URL = "/v1/portfolio"
+ACCOUNT_PATH_URL = "/v1/account"
 
 WS_HEARTBEAT_TIME_INTERVAL = 30
 
@@ -65,7 +62,7 @@ RATE_LIMITS = [
     RateLimit(limit_id=CANCEL_ALL_ORDERS_PATH_URL, limit=30, time_interval=ONE_MINUTE),
     RateLimit(limit_id=TRADES_PATH_URL, limit=1200, time_interval=ONE_MINUTE),
     RateLimit(limit_id=ALL_ORDERS_PATH_URL, limit=1200, time_interval=ONE_MINUTE),
-    RateLimit(limit_id=PORTFOLIO_PATH_URL, limit=1200, time_interval=ONE_MINUTE),
+    RateLimit(limit_id=ACCOUNT_PATH_URL, limit=1200, time_interval=ONE_MINUTE),
 ]
 
 ORDER_NOT_EXIST_ERROR_CODE = 404

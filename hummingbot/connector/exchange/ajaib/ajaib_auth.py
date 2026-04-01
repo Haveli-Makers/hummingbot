@@ -23,25 +23,17 @@ class AjaibAuth(AuthBase):
         self._load_private_key()
 
     def _load_private_key(self):
-        """
-        Load the Ed25519 private key. The secret_key can be either:
-        - A path to a PEM file
-        - The PEM content directly
-        """
         if not self._secret_key:
             return
 
         try:
             from cryptography.hazmat.primitives.serialization import load_pem_private_key
-
             pem_data = self._secret_key
-            # Check if it's a file path
             if not pem_data.startswith("-----"):
                 try:
                     with open(pem_data, 'rb') as f:
                         pem_data = f.read()
                 except (FileNotFoundError, OSError):
-                    # Treat as raw key content
                     pem_data = pem_data.encode('utf-8')
             else:
                 pem_data = pem_data.encode('utf-8')
@@ -60,14 +52,14 @@ class AjaibAuth(AuthBase):
         timestamp = int(time.time() * 1000)
 
         if request.method in (RESTMethod.GET, RESTMethod.DELETE):
+            headers.pop("Content-Type", None)
             params = dict(request.params) if request.params else {}
             params["timestamp"] = timestamp
-            payload = urlencode(sorted(params.items()))
+            payload = urlencode(list(params.items()))
             signature = self._sign(payload)
             params["signature"] = signature
             request.params = params
         else:
-            # POST/PUT: parameters go in the body
             if request.data:
                 if isinstance(request.data, dict):
                     data = request.data.copy()
@@ -76,7 +68,7 @@ class AjaibAuth(AuthBase):
             else:
                 data = {}
             data["timestamp"] = timestamp
-            payload = urlencode(sorted(data.items()))
+            payload = urlencode(list(data.items()))
             signature = self._sign(payload)
             data["signature"] = signature
             request.data = data

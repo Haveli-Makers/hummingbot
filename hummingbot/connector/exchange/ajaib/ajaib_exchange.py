@@ -28,7 +28,6 @@ from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFa
 class AjaibExchange(ExchangePyBase):
     """
     Ajaib exchange connector implementation.
-    Supports spot trading on Ajaib (Binance-compatible API with Ed25519 auth).
     """
 
     UPDATE_ORDER_STATUS_MIN_INTERVAL = 10.0
@@ -137,17 +136,40 @@ class AjaibExchange(ExchangePyBase):
 
     async def get_all_pairs_prices(self) -> List[Dict[str, str]]:
         """
-        Fetches book ticker data (best bid/ask) for all symbols.
-        Uses the Binance-compatible /v1/ticker/bookTicker endpoint.
+        Fetches best bid/ask for all symbols by querying /v1/depth for each.
         """
         if not self._keys_configured:
             self.logger().warning("Ajaib API keys not configured. Cannot fetch prices.")
             return []
-        pairs_prices = await self._api_get(
-            path_url=CONSTANTS.TICKER_BOOK_PATH_URL,
+
+        exchange_info = await self._api_get(
+            path_url=CONSTANTS.EXCHANGE_INFO_PATH_URL,
             is_auth_required=True,
         )
-        return pairs_prices
+        symbols = [s["symbol"] for s in exchange_info.get("symbols", [])
+                    if s.get("isSpotTradingAllowed", False)]
+
+        results = []
+        for symbol in symbols:
+            try:
+                depth = await self._api_get(
+                    path_url=CONSTANTS.DEPTH_PATH_URL,
+                    params={"symbol": symbol, "limit": 1},
+                    is_auth_required=True,
+                )
+                bids = depth.get("bids", [])
+                asks = depth.get("asks", [])
+                results.append({
+                    "symbol": symbol,
+                    "bidPrice": bids[0][0] if bids else "0",
+                    "bidQty": bids[0][1] if bids else "0",
+                    "askPrice": asks[0][0] if asks else "0",
+                    "askQty": asks[0][1] if asks else "0",
+                })
+            except Exception as e:
+                self.logger().debug(f"Failed to fetch depth for {symbol}: {e}")
+
+        return results
 
     async def _make_trading_pairs_request(self) -> Any:
         if not self._keys_configured:
@@ -333,7 +355,6 @@ class AjaibExchange(ExchangePyBase):
                         )
                         self._order_tracker.process_order_update(order_update=order_update)
 
-                        # Check for fills
                         fill_qty = Decimal(str(event_message.get("l", "0")))
                         if fill_qty > 0:
                             fill_price = Decimal(str(event_message.get("L", "0")))
@@ -433,7 +454,7 @@ class AjaibExchange(ExchangePyBase):
         remote_asset_names = set()
 
         account_info = await self._api_get(
-            path_url=CONSTANTS.PORTFOLIO_PATH_URL,
+            path_url=CONSTANTS.ACCOUNT_PATH_URL,
             is_auth_required=True)
 
         balances = account_info.get("balances", []) if isinstance(account_info, dict) else []
@@ -493,8 +514,7 @@ class AjaibExchange(ExchangePyBase):
                 is_auth_required=True)
 
             if klines and len(klines) > 0:
-                # Kline format: [open_time, open, high, low, close, volume, close_time]
-                return float(klines[0][4])  # close price
+                return float(klines[0][4]) 
             return 0.0
         except Exception as e:
             self.logger().error(f"Error getting last traded price: {e}")

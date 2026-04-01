@@ -13,9 +13,6 @@ class AjaibRateSource(RateSourceBase):
     """
     Rate source for Ajaib exchange.
     Fetches ticker data from the Ajaib API.
-
-    NOTE: Ajaib requires Ed25519 authentication for all endpoints.
-    API keys must be configured in conf/connectors/ajaib.yml for this to work.
     """
 
     def __init__(self):
@@ -76,12 +73,6 @@ class AjaibRateSource(RateSourceBase):
     async def _get_ajaib_prices(exchange: 'AjaibExchange', quote_token: str = None) -> Dict[str, Decimal]:
         """
         Fetches mid prices from Ajaib bookTicker response.
-
-        Expected response format (Binance-compatible):
-        [
-            {"symbol": "BTC_USDT", "bidPrice": "50000.00", "bidQty": "1.0", "askPrice": "50001.00", "askQty": "0.5"},
-            ...
-        ]
         """
         results: Dict[str, Decimal] = {}
         if exchange is None:
@@ -140,46 +131,42 @@ class AjaibRateSource(RateSourceBase):
                 if quote != quote_token:
                     continue
 
-            bid_price = pair_price.get("bidPrice")
-            ask_price = pair_price.get("askPrice")
-            if bid_price is not None and ask_price is not None:
-                try:
-                    bid = Decimal(str(bid_price))
-                    ask = Decimal(str(ask_price))
-                    if bid > 0 and ask > 0 and bid <= ask:
-                        mid = (bid + ask) / Decimal("2")
-                        spread = ask - bid
-                        spread_pct = (spread / mid) * Decimal("100") if mid > 0 else Decimal("0")
-                        results[trading_pair] = {
-                            "bid": bid,
-                            "ask": ask,
-                            "mid": mid,
-                            "spread": spread_pct,
-                        }
-                except Exception:
-                    continue
+            bid_price = pair_price.get("bidPrice", "0")
+            ask_price = pair_price.get("askPrice", "0")
+            try:
+                bid = Decimal(str(bid_price))
+                ask = Decimal(str(ask_price))
+                mid = (bid + ask) / Decimal("2") if (bid + ask) > 0 else Decimal("0")
+                spread = ask - bid if ask >= bid else Decimal("0")
+                spread_pct = (spread / mid) * Decimal("100") if mid > 0 else Decimal("0")
+                results[trading_pair] = {
+                    "bid": bid,
+                    "ask": ask,
+                    "mid": mid,
+                    "spread": spread_pct,
+                }
+            except Exception:
+                continue
 
         return results
 
     @staticmethod
     def _build_ajaib_connector() -> 'AjaibExchange':
         """
-        Build an Ajaib exchange connector with API keys from config.
-        Ajaib requires Ed25519 authentication for all endpoints, so keys must be configured.
+        Build an Ajaib exchange connector with API keys from saved config.
+        Ajaib requires Ed25519 authentication for all endpoints.
         """
-        from pydantic import SecretStr
-
         from hummingbot.connector.exchange.ajaib.ajaib_exchange import AjaibExchange
 
         api_key = ""
         api_secret = ""
 
         try:
-            from hummingbot.client.settings import AllConnectorSettings
-            connector_config = AllConnectorSettings.get_connector_config_keys("ajaib")
-            if connector_config is not None:
-                api_key = getattr(connector_config, "ajaib_api_key", SecretStr("")).get_secret_value()
-                api_secret = getattr(connector_config, "ajaib_api_secret", SecretStr("")).get_secret_value()
+            from hummingbot.client.config.security import Security
+            keys = Security.api_keys("ajaib")
+            if keys:
+                api_key = keys.get("ajaib_api_key", "")
+                api_secret = keys.get("ajaib_api_secret", "")
         except Exception:
             pass
 

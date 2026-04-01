@@ -37,8 +37,6 @@ class AjaibAPIUserStreamDataSource(UserStreamTrackerDataSource):
     async def listen_for_user_stream(self, output: asyncio.Queue):
         """
         Ajaib user data stream uses WebSocket for execution reports.
-        For now, this is a placeholder - the user stream will be implemented
-        when full trading support is added.
         """
         while True:
             try:

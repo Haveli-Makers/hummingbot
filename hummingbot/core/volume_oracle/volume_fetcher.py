@@ -19,7 +19,7 @@ EXCHANGE_CONFIGS: Dict[str, Dict] = {
     "coindcx": {
         "url": "https://api.coindcx.com/exchange/ticker",
         "pair_format": lambda base, quote: f"{base}{quote}",
-        "param_key": None,  
+        "param_key": None,
         "volume_field": "volume",
         "quote_volume_field": None,
         "symbol_field": "market",
@@ -33,7 +33,7 @@ EXCHANGE_CONFIGS: Dict[str, Dict] = {
         "quote_volume_field": "volCcy24h",
         "symbol_field": "instId",
         "last_price_field": "last",
-        "response_wrapper": "data", 
+        "response_wrapper": "data",
     },
     "wazirx": {
         "url": "https://api.wazirx.com/sapi/v1/ticker/24hr",
@@ -62,9 +62,9 @@ EXCHANGE_CONFIGS: Dict[str, Dict] = {
         "quote_volume_field": "turnover24h",
         "symbol_field": "symbol",
         "last_price_field": "lastPrice",
-        "response_wrapper": "result", 
-        "list_field": "list", 
-        "extra_params": {"category": "spot"}, 
+        "response_wrapper": "result",
+        "list_field": "list",
+        "extra_params": {"category": "spot"},
     },
 }
 
@@ -166,6 +166,7 @@ class VolumeFetcher:
                     return item
 
         return None
+
 
 async def get_24h_volume(
     exchange: str,

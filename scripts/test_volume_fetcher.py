@@ -1,10 +1,10 @@
 import asyncio
-import sys
 import os
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import sys
 
 from hummingbot.core.volume_oracle.volume_oracle import VolumeOracle
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
 async def main():

@@ -2,8 +2,8 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Dict
 
 from hummingbot.connector.exchange.bybit import bybit_constants as CONSTANTS
-from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.volume_oracle.sources.volume_source_base import VolumeSourceBase
+from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 
 if TYPE_CHECKING:
     from hummingbot.connector.exchange.bybit.bybit_exchange import BybitExchange

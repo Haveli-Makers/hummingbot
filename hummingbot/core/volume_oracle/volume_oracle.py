@@ -6,7 +6,9 @@ from hummingbot.core.volume_oracle.sources.ascend_ex_volume_source import Ascend
 from hummingbot.core.volume_oracle.sources.binance_us_volume_source import BinanceUSVolumeSource
 from hummingbot.core.volume_oracle.sources.binance_volume_source import BinanceVolumeSource
 from hummingbot.core.volume_oracle.sources.bybit_volume_source import BybitVolumeSource
-from hummingbot.core.volume_oracle.sources.coinbase_advanced_trade_volume_source import CoinbaseAdvancedTradeVolumeSource
+from hummingbot.core.volume_oracle.sources.coinbase_advanced_trade_volume_source import (
+    CoinbaseAdvancedTradeVolumeSource,
+)
 from hummingbot.core.volume_oracle.sources.coindcx_volume_source import CoindcxVolumeSource
 from hummingbot.core.volume_oracle.sources.cube_volume_source import CubeVolumeSource
 from hummingbot.core.volume_oracle.sources.derive_volume_source import DeriveVolumeSource

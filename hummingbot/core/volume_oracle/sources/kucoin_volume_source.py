@@ -1,7 +1,6 @@
 from decimal import Decimal
 from typing import TYPE_CHECKING, Dict
 
-from hummingbot.connector.exchange.kucoin import kucoin_constants as CONSTANTS
 from hummingbot.core.volume_oracle.sources.volume_source_base import VolumeSourceBase
 
 if TYPE_CHECKING:
@@ -19,9 +18,7 @@ class KucoinVolumeSource(VolumeSourceBase):
         symbol = f"{base}-{quote}"
         self._ensure_exchange()
 
-        resp = await self._exchange._api_get(
-            path_url=CONSTANTS.ALL_TICKERS_PATH_URL,
-        )
+        resp = await self._exchange.get_all_pairs_prices()
 
         tickers = resp.get("data", {}).get("ticker", [])
         ticker = None

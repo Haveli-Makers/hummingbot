@@ -1,7 +1,6 @@
 from decimal import Decimal
 from typing import TYPE_CHECKING, Dict
 
-from hummingbot.connector.exchange.hyperliquid import hyperliquid_constants as CONSTANTS
 from hummingbot.core.volume_oracle.sources.volume_source_base import VolumeSourceBase
 
 if TYPE_CHECKING:
@@ -18,10 +17,7 @@ class HyperliquidVolumeSource(VolumeSourceBase):
         base, quote = self._parse_trading_pair(trading_pair)
         self._ensure_exchange()
 
-        response = await self._exchange._api_post(
-            path_url=CONSTANTS.TICKER_PRICE_CHANGE_URL,
-            data={"type": CONSTANTS.ASSET_CONTEXT_TYPE},
-        )
+        response = await self._exchange.get_24h_volume_ticker()
 
         meta = response[0]
         contexts = response[1]

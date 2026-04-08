@@ -255,6 +255,12 @@ class OkxExchange(ExchangePyBase):
         last_traded_prices = {ticker["instId"]: float(ticker["last"]) for ticker in resp_json["data"] if ticker["last"]}
         return last_traded_prices
 
+    async def get_24h_volume_ticker(self, inst_id: str) -> Dict[str, Any]:
+        return await self._api_get(
+            path_url=CONSTANTS.OKX_TICKER_PATH,
+            params={"instId": inst_id},
+        )
+
     async def _get_last_traded_price(self, trading_pair: str) -> float:
         params = {"instId": await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)}
 

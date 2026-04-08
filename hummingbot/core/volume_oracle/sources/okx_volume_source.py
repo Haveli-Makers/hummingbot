@@ -1,7 +1,6 @@
 from decimal import Decimal
 from typing import TYPE_CHECKING, Dict
 
-from hummingbot.connector.exchange.okx import okx_constants as CONSTANTS
 from hummingbot.core.volume_oracle.sources.volume_source_base import VolumeSourceBase
 
 if TYPE_CHECKING:
@@ -19,10 +18,7 @@ class OkxVolumeSource(VolumeSourceBase):
         inst_id = f"{base}-{quote}"
         self._ensure_exchange()
 
-        resp = await self._exchange._api_get(
-            path_url=CONSTANTS.OKX_TICKER_PATH,
-            params={"instId": inst_id},
-        )
+        resp = await self._exchange.get_24h_volume_ticker(inst_id)
 
         tickers = resp.get("data", [])
         if not tickers:

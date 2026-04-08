@@ -1,7 +1,6 @@
 from decimal import Decimal
 from typing import TYPE_CHECKING, Dict
 
-from hummingbot.connector.exchange.derive import derive_constants as CONSTANTS
 from hummingbot.core.volume_oracle.sources.volume_source_base import VolumeSourceBase
 
 if TYPE_CHECKING:
@@ -19,10 +18,7 @@ class DeriveVolumeSource(VolumeSourceBase):
         instrument_name = f"{base}-{quote}"
         self._ensure_exchange()
 
-        resp = await self._exchange._api_post(
-            path_url=CONSTANTS.TICKER_PRICE_CHANGE_PATH_URL,
-            data={"instrument_name": instrument_name},
-        )
+        resp = await self._exchange.get_24h_volume_ticker(instrument_name)
 
         ticker = resp.get("result")
         if ticker is None:

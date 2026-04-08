@@ -1,7 +1,6 @@
 from decimal import Decimal
 from typing import TYPE_CHECKING, Dict
 
-from hummingbot.connector.exchange.cube import cube_constants as CONSTANTS
 from hummingbot.core.volume_oracle.sources.volume_source_base import VolumeSourceBase
 
 if TYPE_CHECKING:
@@ -19,11 +18,8 @@ class CubeVolumeSource(VolumeSourceBase):
         ticker_id = f"{base}{quote}".upper()
         self._ensure_exchange()
 
-        resp = await self._exchange._api_get(
-            path_url=CONSTANTS.TICKER_BOOK_PATH_URL,
-        )
+        tickers = await self._exchange.get_all_pairs_prices()
 
-        tickers = resp.get("result", [])
         ticker = None
         for item in tickers:
             if isinstance(item, dict) and item.get("ticker_id", "").upper() == ticker_id:

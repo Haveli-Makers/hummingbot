@@ -1,9 +1,7 @@
 from decimal import Decimal
 from typing import TYPE_CHECKING, Dict
 
-from hummingbot.connector.exchange.gate_io import gate_io_constants as CONSTANTS
 from hummingbot.core.volume_oracle.sources.volume_source_base import VolumeSourceBase
-from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 
 if TYPE_CHECKING:
     from hummingbot.connector.exchange.gate_io.gate_io_exchange import GateIoExchange
@@ -20,11 +18,7 @@ class GateIoVolumeSource(VolumeSourceBase):
         currency_pair = f"{base}_{quote}"
         self._ensure_exchange()
 
-        resp = await self._exchange._api_request(
-            method=RESTMethod.GET,
-            path_url=CONSTANTS.TICKER_PATH_URL,
-            params={"currency_pair": currency_pair},
-        )
+        resp = await self._exchange.get_24h_volume_ticker(currency_pair)
 
         if not resp:
             raise ValueError(f"Trading pair {trading_pair} ({currency_pair}) not found on {self.name}")

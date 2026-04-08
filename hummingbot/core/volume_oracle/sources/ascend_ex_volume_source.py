@@ -1,9 +1,7 @@
 from decimal import Decimal
 from typing import TYPE_CHECKING, Dict
 
-from hummingbot.connector.exchange.ascend_ex import ascend_ex_constants as CONSTANTS
 from hummingbot.core.volume_oracle.sources.volume_source_base import VolumeSourceBase
-from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 
 if TYPE_CHECKING:
     from hummingbot.connector.exchange.ascend_ex.ascend_ex_exchange import AscendExExchange
@@ -20,11 +18,7 @@ class AscendExVolumeSource(VolumeSourceBase):
         symbol = f"{base}/{quote}"
         self._ensure_exchange()
 
-        resp = await self._exchange._api_request(
-            method=RESTMethod.GET,
-            path_url=CONSTANTS.TICKER_PATH_URL,
-            params={"symbol": symbol},
-        )
+        resp = await self._exchange.get_24h_volume_ticker(symbol)
 
         ticker = resp.get("data")
         if ticker is None:

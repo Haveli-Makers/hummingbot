@@ -1,7 +1,6 @@
 from decimal import Decimal
 from typing import TYPE_CHECKING, Dict
 
-from hummingbot.connector.exchange.coindcx import coindcx_constants as CONSTANTS
 from hummingbot.core.volume_oracle.sources.volume_source_base import VolumeSourceBase
 
 if TYPE_CHECKING:
@@ -19,9 +18,7 @@ class CoindcxVolumeSource(VolumeSourceBase):
         exchange_symbol = f"{base}{quote}"
         self._ensure_exchange()
 
-        data = await self._exchange._api_get(
-            path_url=CONSTANTS.TICKER_PATH_URL,
-        )
+        data = await self._exchange.get_all_pairs_prices()
 
         ticker = None
         for item in data:

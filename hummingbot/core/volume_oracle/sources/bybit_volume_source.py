@@ -1,9 +1,7 @@
 from decimal import Decimal
 from typing import TYPE_CHECKING, Dict
 
-from hummingbot.connector.exchange.bybit import bybit_constants as CONSTANTS
 from hummingbot.core.volume_oracle.sources.volume_source_base import VolumeSourceBase
-from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 
 if TYPE_CHECKING:
     from hummingbot.connector.exchange.bybit.bybit_exchange import BybitExchange
@@ -20,14 +18,7 @@ class BybitVolumeSource(VolumeSourceBase):
         symbol = f"{base}{quote}"
         self._ensure_exchange()
 
-        resp = await self._exchange._api_request(
-            method=RESTMethod.GET,
-            path_url=CONSTANTS.LAST_TRADED_PRICE_PATH,
-            params={
-                "category": CONSTANTS.TRADE_CATEGORY,
-                "symbol": symbol,
-            },
-        )
+        resp = await self._exchange.get_24h_volume_ticker(symbol)
 
         tickers = resp.get("result", {}).get("list", [])
         if not tickers:

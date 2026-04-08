@@ -1,7 +1,6 @@
 from decimal import Decimal
 from typing import TYPE_CHECKING, Dict
 
-from hummingbot.connector.exchange.binance import binance_constants as CONSTANTS
 from hummingbot.core.volume_oracle.sources.volume_source_base import VolumeSourceBase
 
 if TYPE_CHECKING:
@@ -19,10 +18,7 @@ class BinanceUSVolumeSource(VolumeSourceBase):
         symbol = f"{base}{quote}"
         self._ensure_exchange()
 
-        ticker = await self._exchange._api_get(
-            path_url=CONSTANTS.TICKER_PRICE_CHANGE_PATH_URL,
-            params={"symbol": symbol},
-        )
+        ticker = await self._exchange.get_24h_volume_ticker(symbol)
 
         result = {
             "exchange": self.name,

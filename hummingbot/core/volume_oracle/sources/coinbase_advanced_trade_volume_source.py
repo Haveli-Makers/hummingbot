@@ -1,7 +1,6 @@
 from decimal import Decimal
 from typing import TYPE_CHECKING, Dict
 
-from hummingbot.connector.exchange.coinbase_advanced_trade import coinbase_advanced_trade_constants as CONSTANTS
 from hummingbot.core.volume_oracle.sources.volume_source_base import VolumeSourceBase
 
 if TYPE_CHECKING:
@@ -21,13 +20,7 @@ class CoinbaseAdvancedTradeVolumeSource(VolumeSourceBase):
         product_id = f"{base}-{quote}"
         self._ensure_exchange()
 
-        path_url, limit_id = CONSTANTS.get_ticker_endpoint(use_auth_for_public_endpoints=False)
-        resp = await self._exchange._api_get(
-            path_url=path_url.format(product_id=product_id),
-            params={"limit": 1},
-            limit_id=limit_id,
-            is_auth_required=False,
-        )
+        resp = await self._exchange.get_24h_volume_ticker(product_id)
 
         trades = resp.get("trades", [])
         if not trades:

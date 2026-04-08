@@ -130,6 +130,12 @@ class AscendExExchange(ExchangePyBase):
         pairs_prices["data"] = spot_valid_token_entries
         return pairs_prices
 
+    async def get_24h_volume_ticker(self, symbol: str) -> Dict[str, Any]:
+        return await self._api_get(
+            path_url=CONSTANTS.TICKER_PATH_URL,
+            params={"symbol": symbol},
+        )
+
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
         # API documentation does not clarify the error message for timestamp related problems
         return False

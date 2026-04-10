@@ -149,6 +149,12 @@ class DeriveExchange(ExchangePyBase):
             res.append(data)
         return res
 
+    async def get_24h_volume_ticker(self, instrument_name: str) -> Dict[str, Any]:
+        return await self._api_post(
+            path_url=CONSTANTS.TICKER_PRICE_CHANGE_PATH_URL,
+            data={"instrument_name": instrument_name},
+        )
+
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
         return False
 

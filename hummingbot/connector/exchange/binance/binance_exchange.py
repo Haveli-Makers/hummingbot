@@ -118,6 +118,12 @@ class BinanceExchange(ExchangePyBase):
         pairs_prices = await self._api_get(path_url=CONSTANTS.TICKER_BOOK_PATH_URL)
         return pairs_prices
 
+    async def get_24h_volume_ticker(self, symbol: str) -> Dict[str, str]:
+        return await self._api_get(
+            path_url=CONSTANTS.TICKER_PRICE_CHANGE_PATH_URL,
+            params={"symbol": symbol},
+        )
+
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
         error_description = str(request_exception)
         is_time_synchronizer_related = ("-1021" in error_description

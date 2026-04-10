@@ -813,6 +813,15 @@ class CoinbaseAdvancedTradeExchange(ExchangePyBase):
             )):
                 yield {p.get("product_id"): p.get("price")}
 
+    async def get_24h_volume_ticker(self, product_id: str) -> Dict[str, Any]:
+        path_url, limit_id = constants.get_ticker_endpoint(use_auth_for_public_endpoints=False)
+        return await self._api_get(
+            path_url=path_url.format(product_id=product_id),
+            params={"limit": 1},
+            limit_id=limit_id,
+            is_auth_required=False,
+        )
+
     async def get_exchange_rates(self, quote_token: str) -> Dict[str, str] | None:
         """
         Fetches the prices of all symbols in the exchange with a default quote of USD

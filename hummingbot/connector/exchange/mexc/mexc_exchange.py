@@ -114,6 +114,13 @@ class MexcExchange(ExchangePyBase):
         pairs_prices = await self._api_get(path_url=CONSTANTS.TICKER_BOOK_PATH_URL, headers={"Content-Type": "application/json"})
         return pairs_prices
 
+    async def get_24h_volume_ticker(self, symbol: str) -> Dict[str, str]:
+        return await self._api_get(
+            path_url=CONSTANTS.TICKER_PRICE_CHANGE_PATH_URL,
+            params={"symbol": symbol},
+            headers={"Content-Type": "application/json"},
+        )
+
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
         return str(CONSTANTS.TIMESTAMP_RELATED_ERROR_CODE) in str(
             request_exception

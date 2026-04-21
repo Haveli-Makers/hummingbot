@@ -1,5 +1,5 @@
 from decimal import Decimal
-from typing import TYPE_CHECKING, Dict
+from typing import TYPE_CHECKING, Any, Dict
 
 from hummingbot.core.volume_oracle.sources.volume_source_base import VolumeSourceBase
 
@@ -13,26 +13,34 @@ class BybitVolumeSource(VolumeSourceBase):
     def name(self) -> str:
         return "bybit"
 
-    async def get_24h_volume(self, trading_pair: str) -> Dict[str, Decimal]:
-        base, quote = self._parse_trading_pair(trading_pair)
-        symbol = f"{base}{quote}"
+    async def get_all_24h_volumes(self) -> Dict[str, Dict[str, Decimal]]:
         self._ensure_exchange()
+        resp = await self._exchange.get_all_24h_volume_tickers()
 
-        resp = await self._exchange.get_24h_volume_ticker(symbol)
+        result: Dict[str, Dict[str, Decimal]] = {}
+        for item in resp.get("result", {}).get("list", []):
+            if not isinstance(item, dict):
+                continue
 
-        tickers = resp.get("result", {}).get("list", [])
-        if not tickers:
-            raise ValueError(f"Trading pair {trading_pair} ({symbol}) not found on {self.name}")
+            symbol = str(item.get("symbol", "")).upper()
+            if not symbol:
+                continue
 
-        ticker = tickers[0]
+            try:
+                result[symbol] = self._normalize_ticker(item)
+            except (KeyError, ValueError):
+                continue
+
+        return result
+
+    def _normalize_ticker(self, ticker: Dict[str, Any]) -> Dict[str, Decimal]:
         result = {
             "exchange": self.name,
-            "trading_pair": trading_pair,
-            "symbol": ticker.get("symbol", symbol),
+            "symbol": str(ticker["symbol"]).upper(),
             "base_volume": Decimal(str(ticker["volume24h"])),
             "last_price": Decimal(str(ticker["lastPrice"])),
         }
-        if ticker.get("turnover24h"):
+        if ticker.get("turnover24h") is not None:
             result["quote_volume"] = Decimal(str(ticker["turnover24h"]))
         return result
 

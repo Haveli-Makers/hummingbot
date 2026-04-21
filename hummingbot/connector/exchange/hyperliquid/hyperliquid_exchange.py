@@ -136,7 +136,7 @@ class HyperliquidExchange(ExchangePyBase):
             res.append(result)
         return res
 
-    async def get_24h_volume_ticker(self) -> list:
+    async def get_all_24h_volume_tickers(self) -> list:
         return await self._api_post(
             path_url=CONSTANTS.TICKER_PRICE_CHANGE_URL,
             data={"type": CONSTANTS.ASSET_CONTEXT_TYPE},

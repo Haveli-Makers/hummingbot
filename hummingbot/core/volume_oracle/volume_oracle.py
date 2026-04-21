@@ -75,14 +75,8 @@ class VolumeOracle:
     def source(self, new_source: VolumeSourceBase):
         self._source = new_source
 
-    async def get_24h_volume(self, trading_pair: str) -> Dict[str, Decimal]:
-        return await self._source.get_24h_volume(trading_pair)
-
     async def get_all_24h_volumes(self) -> Dict[str, Dict[str, Decimal]]:
-        getter = getattr(self._source, "get_all_24h_volumes", None)
-        if callable(getter):
-            return await getter()
-        raise NotImplementedError(f"Bulk volume retrieval is not supported for source '{self._source.name}'.")
+        return await self._source.get_all_24h_volumes()
 
     async def close(self):
         await self._source.close()

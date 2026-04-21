@@ -31,12 +31,12 @@ class VolumeSourceBase(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def get_24h_volume(self, trading_pair: str) -> Dict[str, Decimal]:
+    async def get_all_24h_volumes(self) -> Dict[str, Dict[str, Decimal]]:
         """
-        Fetch 24h volume for a trading pair.
+        Fetch 24h volumes for all trading pairs available on the source exchange.
 
-        :param trading_pair: Trading pair in HB format e.g. "BTC-USDT"
-        :return: exchange, trading_pair, symbol, base_volume, last_price, and optionally quote_volume
+        :return: a symbol-keyed mapping containing exchange, symbol, base_volume, last_price,
+                 and optionally quote_volume for each trading pair.
         """
         ...
 

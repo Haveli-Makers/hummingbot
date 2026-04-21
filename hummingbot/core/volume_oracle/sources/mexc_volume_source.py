@@ -1,5 +1,5 @@
 from decimal import Decimal
-from typing import TYPE_CHECKING, Dict
+from typing import TYPE_CHECKING, Any, Dict
 
 from hummingbot.core.volume_oracle.sources.volume_source_base import VolumeSourceBase
 
@@ -13,21 +13,31 @@ class MexcVolumeSource(VolumeSourceBase):
     def name(self) -> str:
         return "mexc"
 
-    async def get_24h_volume(self, trading_pair: str) -> Dict[str, Decimal]:
-        base, quote = self._parse_trading_pair(trading_pair)
-        symbol = f"{base}{quote}"
+    async def get_all_24h_volumes(self) -> Dict[str, Dict[str, Decimal]]:
         self._ensure_exchange()
+        data = await self._exchange.get_all_24h_volume_tickers()
 
-        ticker = await self._exchange.get_24h_volume_ticker(symbol)
+        result: Dict[str, Dict[str, Decimal]] = {}
+        for item in data:
+            if not isinstance(item, dict):
+                continue
 
+            symbol = str(item.get("symbol", "")).upper()
+            if not symbol:
+                continue
+
+            result[symbol] = self._normalize_ticker(item)
+
+        return result
+
+    def _normalize_ticker(self, ticker: Dict[str, Any]) -> Dict[str, Decimal]:
         result = {
             "exchange": self.name,
-            "trading_pair": trading_pair,
-            "symbol": ticker["symbol"],
+            "symbol": str(ticker["symbol"]).upper(),
             "base_volume": Decimal(str(ticker["volume"])),
             "last_price": Decimal(str(ticker["lastPrice"])),
         }
-        if ticker.get("quoteVolume"):
+        if ticker.get("quoteVolume") is not None:
             result["quote_volume"] = Decimal(str(ticker["quoteVolume"]))
         return result
 

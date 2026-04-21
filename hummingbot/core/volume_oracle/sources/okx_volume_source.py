@@ -1,5 +1,5 @@
 from decimal import Decimal
-from typing import TYPE_CHECKING, Dict
+from typing import TYPE_CHECKING, Any, Dict
 
 from hummingbot.core.volume_oracle.sources.volume_source_base import VolumeSourceBase
 
@@ -13,26 +13,35 @@ class OkxVolumeSource(VolumeSourceBase):
     def name(self) -> str:
         return "okx"
 
-    async def get_24h_volume(self, trading_pair: str) -> Dict[str, Decimal]:
-        base, quote = self._parse_trading_pair(trading_pair)
-        inst_id = f"{base}-{quote}"
+    async def get_all_24h_volumes(self) -> Dict[str, Dict[str, Decimal]]:
         self._ensure_exchange()
+        resp = await self._exchange.get_all_pairs_prices()
 
-        resp = await self._exchange.get_24h_volume_ticker(inst_id)
+        result: Dict[str, Dict[str, Decimal]] = {}
+        for item in resp.get("data", []):
+            if not isinstance(item, dict):
+                continue
 
-        tickers = resp.get("data", [])
-        if not tickers:
-            raise ValueError(f"Trading pair {trading_pair} ({inst_id}) not found on {self.name}")
+            symbol = str(item.get("instId", "")).upper()
+            if not symbol:
+                continue
 
-        ticker = tickers[0]
+            try:
+                result[symbol] = self._normalize_ticker(ticker=item)
+            except (KeyError, ValueError):
+                continue
+
+        return result
+
+    def _normalize_ticker(self, ticker: Dict[str, Any]) -> Dict[str, Decimal]:
+        symbol = str(ticker.get("instId", "")).upper()
         result = {
             "exchange": self.name,
-            "trading_pair": trading_pair,
-            "symbol": ticker.get("instId", inst_id),
+            "symbol": symbol,
             "base_volume": Decimal(str(ticker["vol24h"])),
             "last_price": Decimal(str(ticker["last"])),
         }
-        if ticker.get("volCcy24h"):
+        if ticker.get("volCcy24h") is not None:
             result["quote_volume"] = Decimal(str(ticker["volCcy24h"]))
         return result
 

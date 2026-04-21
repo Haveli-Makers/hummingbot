@@ -105,11 +105,8 @@ class GateIoExchange(ExchangePyBase):
     def supported_order_types(self):
         return [OrderType.LIMIT, OrderType.MARKET, OrderType.LIMIT_MAKER]
 
-    async def get_24h_volume_ticker(self, currency_pair: str) -> list:
-        return await self._api_get(
-            path_url=CONSTANTS.TICKER_PATH_URL,
-            params={"currency_pair": currency_pair},
-        )
+    async def get_all_24h_volume_tickers(self) -> list:
+        return await self._api_get(path_url=CONSTANTS.TICKER_PATH_URL)
 
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
         return CONSTANTS.ERR_LABEL_TIME_RELATED_ERROR in str(request_exception)

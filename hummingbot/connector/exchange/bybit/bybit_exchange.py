@@ -116,12 +116,11 @@ class BybitExchange(ExchangePyBase):
     def supported_order_types(self):
         return [OrderType.MARKET, OrderType.LIMIT, OrderType.LIMIT_MAKER]
 
-    async def get_24h_volume_ticker(self, symbol: str, category: str = None) -> Dict[str, Any]:
+    async def get_all_24h_volume_tickers(self, category: str = None) -> Dict[str, Any]:
         return await self._api_get(
             path_url=CONSTANTS.LAST_TRADED_PRICE_PATH,
             params={
                 "category": category or CONSTANTS.TRADE_CATEGORY,
-                "symbol": symbol,
             },
         )
 

@@ -114,10 +114,9 @@ class MexcExchange(ExchangePyBase):
         pairs_prices = await self._api_get(path_url=CONSTANTS.TICKER_BOOK_PATH_URL, headers={"Content-Type": "application/json"})
         return pairs_prices
 
-    async def get_24h_volume_ticker(self, symbol: str) -> Dict[str, str]:
+    async def get_all_24h_volume_tickers(self) -> List[Dict[str, str]]:
         return await self._api_get(
             path_url=CONSTANTS.TICKER_PRICE_CHANGE_PATH_URL,
-            params={"symbol": symbol},
             headers={"Content-Type": "application/json"},
         )
 

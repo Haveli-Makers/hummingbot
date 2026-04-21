@@ -149,11 +149,18 @@ class DeriveExchange(ExchangePyBase):
             res.append(data)
         return res
 
-    async def get_24h_volume_ticker(self, instrument_name: str) -> Dict[str, Any]:
-        return await self._api_post(
-            path_url=CONSTANTS.TICKER_PRICE_CHANGE_PATH_URL,
-            data={"instrument_name": instrument_name},
-        )
+    async def get_all_24h_volume_tickers(self) -> List[Dict[str, Any]]:
+        if len(self._instrument_ticker) == 0:
+            await self._make_trading_rules_request()
+
+        tasks = [
+            self._api_post(
+                path_url=CONSTANTS.TICKER_PRICE_CHANGE_PATH_URL,
+                data={"instrument_name": token["instrument_name"]},
+            )
+            for token in self._instrument_ticker
+        ]
+        return await safe_gather(*tasks, return_exceptions=True)
 
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
         return False

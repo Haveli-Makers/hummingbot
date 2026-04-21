@@ -813,14 +813,20 @@ class CoinbaseAdvancedTradeExchange(ExchangePyBase):
             )):
                 yield {p.get("product_id"): p.get("price")}
 
-    async def get_24h_volume_ticker(self, product_id: str) -> Dict[str, Any]:
-        path_url, limit_id = constants.get_ticker_endpoint(use_auth_for_public_endpoints=False)
-        return await self._api_get(
-            path_url=path_url.format(product_id=product_id),
-            params={"limit": 1},
-            limit_id=limit_id,
-            is_auth_required=False,
-        )
+    async def get_all_24h_volume_tickers(self) -> List[Dict[str, Any]]:
+        products: List[Dict[str, Any]] = await self._api_get(
+            path_url=constants.get_products_endpoint(self._use_auth_for_public_endpoints),
+            is_auth_required=True)
+        return [
+            p for p in products
+            if all((
+                p.get("product_type", None) == "SPOT",
+                p.get("trading_disabled", None) is False,
+                p.get("is_disabled", None) is False,
+                p.get("cancel_only", None) is False,
+                p.get("auction_mode", None) is False,
+            ))
+        ]
 
     async def get_exchange_rates(self, quote_token: str) -> Dict[str, str] | None:
         """

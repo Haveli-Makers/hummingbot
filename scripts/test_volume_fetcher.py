@@ -9,21 +9,29 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 async def main():
     exchange = sys.argv[1] if len(sys.argv) > 1 else "binance"
-    pair = sys.argv[2] if len(sys.argv) > 2 else "BTC-USDT"
+    symbol_filter = sys.argv[2].upper() if len(sys.argv) > 2 else ""
 
     source = VolumeOracle.source_for_exchange(exchange)
     oracle = VolumeOracle(source=source)
 
-    print(f"Fetching 24h volume for {pair} on {oracle.source.name}...")
+    print(f"Fetching bulk 24h volumes on {oracle.source.name}...")
     try:
-        result = await oracle.get_24h_volume(pair)
-        print(f"\n  Exchange     : {result['exchange']}")
-        print(f"  Pair         : {result['trading_pair']}")
-        print(f"  Symbol       : {result['symbol']}")
-        print(f"  Base Volume  : {result['base_volume']}")
-        if "quote_volume" in result:
-            print(f"  Quote Volume : {result['quote_volume']}")
-        print(f"  Last Price   : {result['last_price']}")
+        results = await oracle.get_all_24h_volumes()
+        print(f"Found {len(results)} symbols")
+
+        if symbol_filter:
+            filtered = {key: value for key, value in results.items() if key.upper() == symbol_filter}
+            if not filtered:
+                raise ValueError(f"Symbol {symbol_filter} not found on {oracle.source.name}")
+            results = filtered
+
+        for symbol, result in results.items():
+            print(f"\n  Symbol       : {symbol}")
+            print(f"  Exchange     : {result['exchange']}")
+            print(f"  Base Volume  : {result['base_volume']}")
+            if "quote_volume" in result:
+                print(f"  Quote Volume : {result['quote_volume']}")
+            print(f"  Last Price   : {result['last_price']}")
     except Exception as e:
         print(f"Error: {e}")
     finally:

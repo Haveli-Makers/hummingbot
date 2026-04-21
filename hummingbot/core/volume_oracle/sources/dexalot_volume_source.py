@@ -1,4 +1,4 @@
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any, Dict
 
 from hummingbot.core.volume_oracle.sources.volume_source_base import VolumeSourceBase
@@ -28,18 +28,21 @@ class DexalotVolumeSource(VolumeSourceBase):
 
             try:
                 result[symbol] = self._normalize_ticker(ticker=item)
-            except (KeyError, ValueError):
+            except (KeyError, ValueError, InvalidOperation):
                 continue
 
         return result
 
     def _normalize_ticker(self, ticker: Dict[str, Any]) -> Dict[str, Decimal]:
         symbol = str(ticker.get("pair", "")).upper()
+        last_price_raw = ticker.get("close") or ticker.get("last") or ticker.get("high")
+        if last_price_raw is None:
+            raise ValueError(f"Missing last_price for {symbol}")
         result = {
             "exchange": self.name,
             "symbol": symbol,
-            "last_price": Decimal(str(ticker.get("last", ticker.get("high", "0")))),
-            "base_volume": Decimal(str(ticker.get("volume", "0"))),
+            "last_price": Decimal(str(last_price_raw)),
+            "base_volume": Decimal(str(ticker.get("volume") or "0")),
         }
         if ticker.get("quote_volume") is not None:
             result["quote_volume"] = Decimal(str(ticker["quote_volume"]))

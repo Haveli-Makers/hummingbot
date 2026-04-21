@@ -1,4 +1,4 @@
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any, Dict
 
 from hummingbot.core.volume_oracle.sources.volume_source_base import VolumeSourceBase
@@ -28,18 +28,21 @@ class CubeVolumeSource(VolumeSourceBase):
 
             try:
                 result[symbol] = self._normalize_ticker(ticker=item)
-            except (KeyError, ValueError):
+            except (KeyError, ValueError, InvalidOperation):
                 continue
 
         return result
 
     def _normalize_ticker(self, ticker: Dict[str, Any]) -> Dict[str, Decimal]:
         symbol = str(ticker.get("ticker_id", "")).upper()
+        last_price = ticker.get("last_price")
+        if last_price is None:
+            raise ValueError(f"Missing last_price for {symbol}")
         result = {
             "exchange": self.name,
             "symbol": symbol,
-            "last_price": Decimal(str(ticker["last_price"])),
-            "base_volume": Decimal(str(ticker.get("base_volume", ticker.get("volume", "0")))),
+            "last_price": Decimal(str(last_price)),
+            "base_volume": Decimal(str(ticker.get("base_volume") if ticker.get("base_volume") is not None else ticker.get("volume", 0))),
         }
         if ticker.get("quote_volume") is not None:
             result["quote_volume"] = Decimal(str(ticker["quote_volume"]))

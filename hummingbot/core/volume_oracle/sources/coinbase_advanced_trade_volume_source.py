@@ -1,4 +1,4 @@
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any, Dict
 
 from hummingbot.core.volume_oracle.sources.volume_source_base import VolumeSourceBase
@@ -28,19 +28,27 @@ class CoinbaseAdvancedTradeVolumeSource(VolumeSourceBase):
             if not symbol:
                 continue
 
-            result[symbol] = self._normalize_ticker(item)
+            try:
+                result[symbol] = self._normalize_ticker(item)
+            except (KeyError, ValueError, InvalidOperation):
+                continue
 
         return result
+
+    @staticmethod
+    def _safe_decimal(value, default: str = "0") -> Decimal:
+        v = str(value).strip() if value is not None else ""
+        return Decimal(v) if v else Decimal(default)
 
     def _normalize_ticker(self, ticker: Dict[str, Any]) -> Dict[str, Decimal]:
         result = {
             "exchange": self.name,
             "symbol": str(ticker["product_id"]).upper(),
-            "last_price": Decimal(str(ticker.get("price", "0"))),
-            "base_volume": Decimal(str(ticker.get("volume_24h", "0"))),
+            "last_price": self._safe_decimal(ticker.get("price")),
+            "base_volume": self._safe_decimal(ticker.get("volume_24h")),
         }
         if ticker.get("quote_volume_24h") is not None:
-            result["quote_volume"] = Decimal(str(ticker["quote_volume_24h"]))
+            result["quote_volume"] = self._safe_decimal(ticker["quote_volume_24h"])
         return result
 
     def _build_exchange(self) -> "CoinbaseAdvancedTradeExchange":

@@ -1,4 +1,4 @@
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any, Dict
 
 from hummingbot.core.volume_oracle.sources.volume_source_base import VolumeSourceBase
@@ -29,16 +29,19 @@ class HyperliquidVolumeSource(VolumeSourceBase):
 
             try:
                 result[symbol] = self._normalize_ticker(symbol=symbol, context=ctx)
-            except (KeyError, ValueError):
+            except (KeyError, ValueError, InvalidOperation):
                 continue
 
         return result
 
     def _normalize_ticker(self, symbol: str, context: Dict[str, Any]) -> Dict[str, Decimal]:
+        mid_px = context.get("midPx")
+        if mid_px is None:
+            raise ValueError(f"Missing midPx for {symbol}")
         result = {
             "exchange": self.name,
             "symbol": symbol,
-            "last_price": Decimal(str(context["midPx"])),
+            "last_price": Decimal(str(mid_px)),
             "base_volume": Decimal(str(context.get("dayNtlVlm", "0"))),
         }
         return result

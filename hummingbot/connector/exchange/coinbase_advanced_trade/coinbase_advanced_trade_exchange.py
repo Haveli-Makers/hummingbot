@@ -814,9 +814,10 @@ class CoinbaseAdvancedTradeExchange(ExchangePyBase):
                 yield {p.get("product_id"): p.get("price")}
 
     async def get_all_24h_volume_tickers(self) -> List[Dict[str, Any]]:
-        products: List[Dict[str, Any]] = await self._api_get(
+        response: Dict[str, Any] = await self._api_get(
             path_url=constants.get_products_endpoint(self._use_auth_for_public_endpoints),
             is_auth_required=True)
+        products: List[Dict[str, Any]] = response.get("products", [])
         return [
             p for p in products
             if all((

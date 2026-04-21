@@ -17,20 +17,40 @@ class HyperliquidVolumeSource(VolumeSourceBase):
         self._ensure_exchange()
         response = await self._exchange.get_all_24h_volume_tickers()
 
-        contexts = response[1]
         result: Dict[str, Dict[str, Decimal]] = {}
-        for ctx in contexts:
-            if not isinstance(ctx, dict):
-                continue
 
-            symbol = str(ctx.get("coin", "")).upper()
-            if not symbol:
-                continue
+        # Perps: response['perps'] = [{universe: [{name, ...}]}, [ctx, ...]]
+        perps_data = response.get("perps", [])
+        if len(perps_data) == 2:
+            perps_universe = perps_data[0].get("universe", [])
+            perps_contexts = perps_data[1]
+            for i, ctx in enumerate(perps_contexts):
+                if not isinstance(ctx, dict):
+                    continue
+                name = perps_universe[i].get("name", "") if i < len(perps_universe) else ""
+                if not name:
+                    continue
+                symbol = name.upper() + "-USD"
+                try:
+                    result[symbol] = self._normalize_ticker(symbol=symbol, context=ctx)
+                except (KeyError, ValueError, InvalidOperation):
+                    continue
 
-            try:
-                result[symbol] = self._normalize_ticker(symbol=symbol, context=ctx)
-            except (KeyError, ValueError, InvalidOperation):
-                continue
+        # Spot: response['spot'] = [{universe: [{name, ...}]}, [ctx, ...]]
+        spot_data = response.get("spot", [])
+        if len(spot_data) == 2:
+            spot_contexts = spot_data[1]
+            for ctx in spot_contexts:
+                if not isinstance(ctx, dict):
+                    continue
+                raw_symbol = str(ctx.get("coin", ""))
+                if not raw_symbol or raw_symbol.startswith("@"):
+                    continue
+                symbol = raw_symbol.replace("/", "-").upper()
+                try:
+                    result[symbol] = self._normalize_ticker(symbol=symbol, context=ctx)
+                except (KeyError, ValueError, InvalidOperation):
+                    continue
 
         return result
 

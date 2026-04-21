@@ -324,3 +324,32 @@ class PerformanceMetrics:
 
         self.total_pnl = self.trade_pnl - self.fee_in_quote
         self.return_pct = self.divide(self.total_pnl, self.hold_value)
+
+    def calculate_total_tds(self, trades: List[Any], tds_rate: Decimal = Decimal("0.01")) -> Decimal:
+        """
+        Calculate total TDS paid across all sell trades.
+        TDS = sell_value × tds_rate for each sell trade.
+
+        :param trades: List of TradeFill or Trade objects
+        :param tds_rate: TDS rate (default 1%)
+        :return: Total TDS in quote currency
+        """
+        total_tds = s_decimal_0
+        for trade in trades:
+            trade_type = trade.trade_type if isinstance(trade.trade_type, str) else trade.trade_type.name
+            if trade_type.upper() == TradeType.SELL.name.upper():
+                sell_value = Decimal(str(trade.amount)) * Decimal(str(trade.price))
+                total_tds += sell_value * tds_rate
+        return total_tds
+
+    def estimate_profit_tax(self, tax_rate: Decimal = Decimal("0.30")) -> Decimal:
+        """
+        Estimate 30% income tax on net profit for reporting.
+        Tax is only applicable when total_pnl > 0.
+
+        :param tax_rate: Profit tax rate (default 30%)
+        :return: Estimated tax liability in quote currency
+        """
+        if self.total_pnl > s_decimal_0:
+            return self.total_pnl * tax_rate
+        return s_decimal_0

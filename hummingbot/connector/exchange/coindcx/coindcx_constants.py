@@ -85,3 +85,7 @@ UNKNOWN_ORDER_MESSAGE = "Unknown order"
 # CoinDCX returns 422 Invalid Request when trying to cancel an order that is already filled/cancelled
 INVALID_REQUEST_ERROR_CODE = 422
 INVALID_REQUEST_MESSAGE = "Invalid Request"
+
+# India Crypto Tax rates
+TDS_RATE = "0.01"            # 1% TDS on sell value
+PROFIT_TAX_RATE = "0.30"     # 30% flat tax on crypto profits

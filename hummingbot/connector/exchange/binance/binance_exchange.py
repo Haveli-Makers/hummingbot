@@ -133,8 +133,12 @@ class BinanceExchange(ExchangePyBase):
                     results.append(resp)
                 elif isinstance(resp, list):
                     results.extend(resp)
-            except Exception:
-                self.logger().warning(f"Skipping {tp}: symbol not found on {self.name}")
+            except IOError as e:
+                err = str(e)
+                if "HTTP status is 400" in err or "HTTP status is 404" in err:
+                    self.logger().warning(f"Skipping {tp}: symbol not found on {self.name}")
+                else:
+                    raise
         return results
 
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):

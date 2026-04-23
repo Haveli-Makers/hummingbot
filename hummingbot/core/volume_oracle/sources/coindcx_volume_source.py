@@ -31,13 +31,6 @@ class CoindcxVolumeSource(VolumeSourceBase):
             except (KeyError, ValueError):
                 continue
 
-        if trading_pairs:
-            filter_symbols = {tp.replace("-", "").upper() for tp in trading_pairs}
-            for tp in filter_symbols:
-                if tp not in result:
-                    self.logger().warning(f"Skipping {tp}: symbol not found on {self.name}")
-            result = {k: v for k, v in result.items() if k in filter_symbols}
-
         return result
 
     def _normalize_ticker(self, ticker: Dict[str, Any]) -> Dict[str, Decimal]:

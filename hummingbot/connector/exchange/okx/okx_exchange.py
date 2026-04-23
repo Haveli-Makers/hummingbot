@@ -271,8 +271,12 @@ class OkxExchange(ExchangePyBase):
                     params={"instId": inst_id},
                 )
                 all_data.extend(resp.get("data", []))
-            except Exception:
-                self.logger().warning(f"Skipping {tp}: symbol not found on {self.name}")
+            except IOError as e:
+                err = str(e)
+                if "HTTP status is 400" in err or "HTTP status is 404" in err:
+                    self.logger().warning(f"Skipping {tp}: symbol not found on {self.name}")
+                else:
+                    raise
         return {"data": all_data}
 
     async def get_all_24h_volume_tickers(self, trading_pairs: Optional[List[str]] = None) -> Dict[str, Any]:

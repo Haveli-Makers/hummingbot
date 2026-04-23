@@ -814,11 +814,22 @@ class CoinbaseAdvancedTradeExchange(ExchangePyBase):
                 yield {p.get("product_id"): p.get("price")}
 
     async def get_all_24h_volume_tickers(self, trading_pairs: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        base_path = constants.get_products_endpoint(self._use_auth_for_public_endpoints)
+        params: Dict[str, Any] = {}
+        if trading_pairs:
+            params["product_ids"] = trading_pairs
         response: Dict[str, Any] = await self._api_get(
-            path_url=constants.get_products_endpoint(self._use_auth_for_public_endpoints),
+            path_url=base_path,
+            params=params,
             is_auth_required=True)
         products: List[Dict[str, Any]] = response.get("products", [])
-        active_products = [
+        if trading_pairs:
+            found_ids = {p.get("product_id", "").upper() for p in products}
+            for tp in trading_pairs:
+                if tp.upper() not in found_ids:
+                    self.logger().warning(f"Skipping {tp}: symbol not found on {self.name}")
+            return products
+        return [
             p for p in products
             if all((
                 p.get("product_type", None) == "SPOT",
@@ -828,10 +839,6 @@ class CoinbaseAdvancedTradeExchange(ExchangePyBase):
                 p.get("auction_mode", None) is False,
             ))
         ]
-        if trading_pairs:
-            filter_ids = {tp.upper() for tp in trading_pairs}
-            active_products = [p for p in active_products if p.get("product_id", "").upper() in filter_ids]
-        return active_products
 
     async def get_exchange_rates(self, quote_token: str) -> Dict[str, str] | None:
         """

@@ -132,8 +132,12 @@ class BybitExchange(ExchangePyBase):
                     params={"category": category or CONSTANTS.TRADE_CATEGORY, "symbol": symbol},
                 )
                 all_items.extend(resp.get("result", {}).get("list", []))
-            except Exception:
-                self.logger().warning(f"Skipping {tp}: symbol not found on {self.name}")
+            except IOError as e:
+                err = str(e)
+                if "HTTP status is 400" in err or "HTTP status is 404" in err:
+                    self.logger().warning(f"Skipping {tp}: symbol not found on {self.name}")
+                else:
+                    raise
         return {"result": {"list": all_items}}
 
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):

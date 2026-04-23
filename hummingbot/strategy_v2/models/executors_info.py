@@ -10,12 +10,13 @@ from hummingbot.strategy_v2.executors.dca_executor.data_types import DCAExecutor
 from hummingbot.strategy_v2.executors.grid_executor.data_types import GridExecutorConfig
 from hummingbot.strategy_v2.executors.order_executor.data_types import OrderExecutorConfig
 from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig
+from hummingbot.strategy_v2.executors.symmetric_grid_executor.data_types import SymmetricGridExecutorConfig
 from hummingbot.strategy_v2.executors.twap_executor.data_types import TWAPExecutorConfig
 from hummingbot.strategy_v2.executors.xemm_executor.data_types import XEMMExecutorConfig
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executors import CloseType
 
-AnyExecutorConfig = Union[PositionExecutorConfig, DCAExecutorConfig, GridExecutorConfig, XEMMExecutorConfig, ArbitrageExecutorConfig, OrderExecutorConfig, TWAPExecutorConfig, BestPriceExecutorConfig]
+AnyExecutorConfig = Union[PositionExecutorConfig, DCAExecutorConfig, GridExecutorConfig, XEMMExecutorConfig, ArbitrageExecutorConfig, OrderExecutorConfig, TWAPExecutorConfig, BestPriceExecutorConfig, SymmetricGridExecutorConfig]
 
 
 class ExecutorInfo(BaseModel):

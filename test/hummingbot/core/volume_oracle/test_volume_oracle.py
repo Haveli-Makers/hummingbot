@@ -1,7 +1,6 @@
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from typing import Dict, List, Optional
-from unittest.mock import AsyncMock, patch
 
 from hummingbot.core.volume_oracle.sources.binance_volume_source import BinanceVolumeSource
 from hummingbot.core.volume_oracle.sources.volume_source_base import VolumeSourceBase

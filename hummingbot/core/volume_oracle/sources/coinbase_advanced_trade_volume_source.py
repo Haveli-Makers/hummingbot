@@ -1,5 +1,5 @@
 from decimal import Decimal, InvalidOperation
-from typing import TYPE_CHECKING, Any, Dict
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from hummingbot.core.volume_oracle.sources.volume_source_base import VolumeSourceBase
 
@@ -15,9 +15,9 @@ class CoinbaseAdvancedTradeVolumeSource(VolumeSourceBase):
     def name(self) -> str:
         return "coinbase_advanced_trade"
 
-    async def get_all_24h_volumes(self) -> Dict[str, Dict[str, Decimal]]:
+    async def get_all_24h_volumes(self, trading_pairs: Optional[List[str]] = None) -> Dict[str, Dict[str, Decimal]]:
         self._ensure_exchange()
-        data = await self._exchange.get_all_24h_volume_tickers()
+        data = await self._exchange.get_all_24h_volume_tickers(trading_pairs)
 
         result: Dict[str, Dict[str, Decimal]] = {}
         for item in data:

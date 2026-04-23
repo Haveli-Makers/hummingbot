@@ -1,6 +1,6 @@
 import logging
 from decimal import Decimal
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from hummingbot.core.volume_oracle.sources.ascend_ex_volume_source import AscendExVolumeSource
 from hummingbot.core.volume_oracle.sources.binance_us_volume_source import BinanceUSVolumeSource
@@ -75,8 +75,8 @@ class VolumeOracle:
     def source(self, new_source: VolumeSourceBase):
         self._source = new_source
 
-    async def get_all_24h_volumes(self) -> Dict[str, Dict[str, Decimal]]:
-        return await self._source.get_all_24h_volumes()
+    async def get_all_24h_volumes(self, trading_pairs: Optional[List[str]] = None) -> Dict[str, Dict[str, Decimal]]:
+        return await self._source.get_all_24h_volumes(trading_pairs)
 
     async def close(self):
         await self._source.close()

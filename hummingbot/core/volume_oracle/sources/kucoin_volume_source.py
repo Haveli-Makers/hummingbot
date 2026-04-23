@@ -1,5 +1,5 @@
-from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Dict
+from decimal import Decimal, InvalidOperation
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from hummingbot.core.volume_oracle.sources.volume_source_base import VolumeSourceBase
 
@@ -13,9 +13,9 @@ class KucoinVolumeSource(VolumeSourceBase):
     def name(self) -> str:
         return "kucoin"
 
-    async def get_all_24h_volumes(self) -> Dict[str, Dict[str, Decimal]]:
+    async def get_all_24h_volumes(self, trading_pairs: Optional[List[str]] = None) -> Dict[str, Dict[str, Decimal]]:
         self._ensure_exchange()
-        resp = await self._exchange.get_all_pairs_prices()
+        resp = await self._exchange.get_all_24h_volume_tickers(trading_pairs)
 
         result: Dict[str, Dict[str, Decimal]] = {}
         for item in resp.get("data", {}).get("ticker", []):
@@ -28,21 +28,33 @@ class KucoinVolumeSource(VolumeSourceBase):
 
             try:
                 result[symbol] = self._normalize_ticker(ticker=item)
-            except (KeyError, ValueError):
+            except (KeyError, ValueError, InvalidOperation):
                 continue
+
+        if trading_pairs:
+            filter_symbols = {tp.upper() for tp in trading_pairs}
+            for tp in filter_symbols:
+                if tp not in result:
+                    self.logger().warning(f"Skipping {tp}: symbol not found on {self.name}")
+            result = {k: v for k, v in result.items() if k in filter_symbols}
 
         return result
 
     def _normalize_ticker(self, ticker: Dict[str, Any]) -> Dict[str, Decimal]:
         symbol = str(ticker.get("symbol", "")).upper()
+        vol = ticker.get("vol")
+        last = ticker.get("last")
+        if vol is None or last is None:
+            raise ValueError(f"Missing vol or last for {symbol}")
         result = {
             "exchange": self.name,
             "symbol": symbol,
-            "base_volume": Decimal(str(ticker["vol"])),
-            "last_price": Decimal(str(ticker["last"])),
+            "base_volume": Decimal(str(vol)),
+            "last_price": Decimal(str(last)),
         }
-        if ticker.get("volValue") is not None:
-            result["quote_volume"] = Decimal(str(ticker["volValue"]))
+        vol_value = ticker.get("volValue")
+        if vol_value is not None:
+            result["quote_volume"] = Decimal(str(vol_value))
         return result
 
     def _build_exchange(self) -> "KucoinExchange":

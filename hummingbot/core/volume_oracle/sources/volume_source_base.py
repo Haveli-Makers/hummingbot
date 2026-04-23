@@ -1,7 +1,7 @@
 import logging
 from abc import ABC, abstractmethod
 from decimal import Decimal
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from hummingbot.logger import HummingbotLogger
 
@@ -31,10 +31,12 @@ class VolumeSourceBase(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def get_all_24h_volumes(self) -> Dict[str, Dict[str, Decimal]]:
+    async def get_all_24h_volumes(self, trading_pairs: Optional[List[str]] = None) -> Dict[str, Dict[str, Decimal]]:
         """
-        Fetch 24h volumes for all trading pairs available on the source exchange.
+        Fetch 24h volumes for trading pairs on the source exchange.
 
+        :param trading_pairs: Optional list of trading pairs in HB format (e.g. ["BTC-USDT"]).
+                              If None or empty, fetches volumes for all available trading pairs.
         :return: a symbol-keyed mapping containing exchange, symbol, base_volume, last_price,
                  and optionally quote_volume for each trading pair.
         """

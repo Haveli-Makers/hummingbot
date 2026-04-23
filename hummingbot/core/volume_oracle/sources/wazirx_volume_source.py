@@ -1,5 +1,5 @@
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Dict
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from hummingbot.core.volume_oracle.sources.volume_source_base import VolumeSourceBase
 
@@ -13,14 +13,14 @@ class WazirxVolumeSource(VolumeSourceBase):
     def name(self) -> str:
         return "wazirx"
 
-    async def get_all_24h_volumes(self) -> Dict[str, Dict[str, Decimal]]:
+    async def get_all_24h_volumes(self, trading_pairs: Optional[List[str]] = None) -> Dict[str, Dict[str, Decimal]]:
         """
         Fetch 24h volume for all trading pairs in a single request.
 
         :return: A symbol-keyed mapping with exchange, symbol, base_volume, last_price and optional quote_volume.
         """
         self._ensure_exchange()
-        data = await self._exchange.get_all_pairs_prices()
+        data = await self._exchange.get_all_24h_volume_tickers(trading_pairs)
 
         result: Dict[str, Dict[str, Decimal]] = {}
         for item in data:

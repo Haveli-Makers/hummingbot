@@ -165,6 +165,9 @@ class DexalotExchange(ExchangePyBase):
                 await ws.disconnect()
                 return price_list
 
+    async def get_all_24h_volume_tickers(self, trading_pairs: Optional[List[str]] = None) -> List[Dict[str, str]]:
+        return await self.get_all_pairs_prices()
+
     def _format_evmamount_to_amount(self, trading_pair, base_evm_amount: Decimal, quote_evm_amount: Decimal) -> Tuple:
 
         base_evmdecimals = self._evm_params[trading_pair].get("base_evmdecimals")

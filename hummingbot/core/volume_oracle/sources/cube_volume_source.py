@@ -1,5 +1,5 @@
 from decimal import Decimal, InvalidOperation
-from typing import TYPE_CHECKING, Any, Dict
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from hummingbot.core.volume_oracle.sources.volume_source_base import VolumeSourceBase
 
@@ -13,9 +13,9 @@ class CubeVolumeSource(VolumeSourceBase):
     def name(self) -> str:
         return "cube"
 
-    async def get_all_24h_volumes(self) -> Dict[str, Dict[str, Decimal]]:
+    async def get_all_24h_volumes(self, trading_pairs: Optional[List[str]] = None) -> Dict[str, Dict[str, Decimal]]:
         self._ensure_exchange()
-        tickers = await self._exchange.get_all_pairs_prices()
+        tickers = await self._exchange.get_all_24h_volume_tickers(trading_pairs)
 
         result: Dict[str, Dict[str, Decimal]] = {}
         for item in tickers:
@@ -30,6 +30,13 @@ class CubeVolumeSource(VolumeSourceBase):
                 result[symbol] = self._normalize_ticker(ticker=item)
             except (KeyError, ValueError, InvalidOperation):
                 continue
+
+        if trading_pairs:
+            filter_symbols = {tp.upper() for tp in trading_pairs}
+            for tp in filter_symbols:
+                if tp not in result:
+                    self.logger().warning(f"Skipping {tp}: symbol not found on {self.name}")
+            result = {k: v for k, v in result.items() if k in filter_symbols}
 
         return result
 

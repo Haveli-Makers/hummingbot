@@ -114,6 +114,9 @@ class KucoinExchange(ExchangePyBase):
         pairs_prices = await self._api_get(path_url=CONSTANTS.ALL_TICKERS_PATH_URL)
         return pairs_prices
 
+    async def get_all_24h_volume_tickers(self, trading_pairs: Optional[List[str]] = None) -> List[Dict[str, str]]:
+        return await self.get_all_pairs_prices()
+
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
         error_description = str(request_exception)
         return CONSTANTS.RET_CODE_AUTH_TIMESTAMP_ERROR in error_description and CONSTANTS.RET_MSG_AUTH_TIMESTAMP_ERROR in error_description

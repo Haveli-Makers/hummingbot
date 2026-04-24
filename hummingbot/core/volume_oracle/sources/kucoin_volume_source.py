@@ -12,6 +12,14 @@ class KucoinVolumeSource(VolumeSourceBase):
     @property
     def name(self) -> str:
         return "kucoin"
+    
+    def _safe_decimal(self, value):
+        try:
+            if value in (None, "", "NaN", "N/A", "--"):
+                return Decimal("0")
+            return Decimal(str(value))
+        except (InvalidOperation, ValueError, TypeError):
+            return Decimal("0")
 
     async def get_all_24h_volumes(self, trading_pairs: Optional[List[str]] = None) -> Dict[str, Dict[str, Decimal]]:
         self._ensure_exchange()
@@ -42,12 +50,12 @@ class KucoinVolumeSource(VolumeSourceBase):
         result = {
             "exchange": self.name,
             "symbol": symbol,
-            "base_volume": Decimal(str(vol)),
-            "last_price": Decimal(str(last)),
+            "base_volume": self._safe_decimal(vol),
+            "last_price": self._safe_decimal(last),
         }
         vol_value = ticker.get("volValue")
         if vol_value is not None:
-            result["quote_volume"] = Decimal(str(vol_value))
+            result["quote_volume"] = self._safe_decimal(vol_value)
         return result
 
     def _build_exchange(self) -> "KucoinExchange":

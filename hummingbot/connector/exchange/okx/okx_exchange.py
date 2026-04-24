@@ -270,7 +270,11 @@ class OkxExchange(ExchangePyBase):
                     path_url=CONSTANTS.OKX_TICKER_PATH,
                     params={"instId": inst_id},
                 )
-                all_data.extend(resp.get("data", []))
+                ticker_data = resp.get("data", [])
+                if not ticker_data:
+                    self.logger().warning(f"Skipping {tp}: symbol not found on {self.name}")
+                else:
+                    all_data.extend(ticker_data)
             except IOError as e:
                 err = str(e)
                 if "HTTP status is 400" in err or "HTTP status is 404" in err:

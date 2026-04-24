@@ -36,8 +36,7 @@ class KucoinVolumeSource(VolumeSourceBase):
 
             try:
                 result[symbol] = self._normalize_ticker(ticker=item)
-            except Exception as e:
-                print(f"Bad ticker data for {symbol}: {item} | Error: {e}")
+            except (KeyError, ValueError):
                 continue
 
         return result
@@ -46,8 +45,6 @@ class KucoinVolumeSource(VolumeSourceBase):
         symbol = str(ticker.get("symbol", "")).upper()
         vol = ticker.get("vol")
         last = ticker.get("last")
-        if vol is None or last is None:
-            raise ValueError(f"Missing vol or last for {symbol}")
         result = {
             "exchange": self.name,
             "symbol": symbol,

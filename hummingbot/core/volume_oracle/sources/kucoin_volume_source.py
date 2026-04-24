@@ -12,7 +12,7 @@ class KucoinVolumeSource(VolumeSourceBase):
     @property
     def name(self) -> str:
         return "kucoin"
-    
+
     def _safe_decimal(self, value):
         try:
             if value in (None, "", "NaN", "N/A", "--"):
@@ -36,7 +36,8 @@ class KucoinVolumeSource(VolumeSourceBase):
 
             try:
                 result[symbol] = self._normalize_ticker(ticker=item)
-            except (KeyError, ValueError, InvalidOperation):
+            except Exception as e:
+                print(f"Bad ticker data for {symbol}: {item} | Error: {e}")
                 continue
 
         return result

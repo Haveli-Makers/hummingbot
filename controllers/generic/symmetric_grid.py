@@ -4,7 +4,6 @@ from typing import List, Optional
 from pydantic import Field, field_validator
 
 from hummingbot.core.data_type.common import MarketDict, OrderType, PriceType
-from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase, ControllerConfigBase
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair
 from hummingbot.strategy_v2.executors.symmetric_grid_executor.data_types import SymmetricGridExecutorConfig
@@ -30,7 +29,6 @@ class SymmetricGridConfig(ControllerConfigBase):
     """
     controller_type: str = "generic"
     controller_name: str = "symmetric_grid"
-    candles_config: List[CandlesConfig] = []
 
     leverage: int = 1
 
@@ -67,7 +65,7 @@ class SymmetricGridConfig(ControllerConfigBase):
     stop_loss: Optional[Decimal] = Field(default=None, json_schema_extra={"is_updatable": True})
     time_limit: Optional[int] = Field(default=None, json_schema_extra={"is_updatable": True})
     price_refresh_tolerance: Decimal = Field(
-        default=Decimal("0.0005"),
+        default=Decimal("0.0000"),
         json_schema_extra={"is_updatable": True,
                            "prompt": "Price refresh tolerance as a fraction (e.g. 0.0005 = 0.05%):"}
     )
@@ -123,10 +121,6 @@ class SymmetricGrid(ControllerBase):
         return [e for e in self.executors_info if e.is_active]
 
     def determine_executor_actions(self) -> List[ExecutorAction]:
-        """
-        If no PMM executor is currently active, create one.
-        The PMM executor handles order placement, fill detection, and re-placement internally.
-        """
         if len(self.active_executors()) > 0:
             return []
 

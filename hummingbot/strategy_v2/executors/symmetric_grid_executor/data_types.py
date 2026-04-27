@@ -2,7 +2,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict
 
 from hummingbot.core.data_type.common import OrderType
 from hummingbot.strategy_v2.executors.data_types import ExecutorConfigBase
@@ -13,8 +13,6 @@ class FairPriceType(Enum):
     """Price type used to determine the fair price for the symmetric grid."""
     MidPrice = "MidPrice"
 
-
-_FAIR_PRICE_TYPE_INT_MIGRATIONS = {1: "MidPrice"}
 
 
 class SymmetricGridExecutorConfig(ExecutorConfigBase):
@@ -43,29 +41,10 @@ class SymmetricGridExecutorConfig(ExecutorConfigBase):
     stop_loss: Optional[Decimal] = None
     time_limit: Optional[int] = None
     leverage: int = 20
-    level_id: Optional[str] = None
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    @field_validator("fair_price_type", mode="before")
-    @classmethod
-    def _migrate_fair_price_type(cls, v):
-        """Accept legacy PriceType int values (e.g. 1 → 'MidPrice') from old DB records."""
-        if isinstance(v, int):
-            return _FAIR_PRICE_TYPE_INT_MIGRATIONS.get(v, v)
-        return v
 
-    @model_validator(mode="after")
-    def validate_levels(self):
-        if len(self.spread_percentages) != len(self.order_amounts_quote):
-            raise ValueError("spread_percentages and order_amounts_quote must have the same length")
-        if any(s <= 0 for s in self.spread_percentages):
-            raise ValueError("All spread_percentages must be positive")
-        if any(s >= 1 for s in self.spread_percentages):
-            raise ValueError("All spread_percentages must be less than 1.0 (100%)")
-        if any(a <= 0 for a in self.order_amounts_quote):
-            raise ValueError("All order_amounts_quote must be positive")
-        return self
 
 
 class SymmetricGridOrderState(Enum):

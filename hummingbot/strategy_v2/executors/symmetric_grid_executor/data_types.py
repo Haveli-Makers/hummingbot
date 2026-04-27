@@ -2,7 +2,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 from hummingbot.core.data_type.common import OrderType
 from hummingbot.strategy_v2.executors.data_types import ExecutorConfigBase
@@ -42,6 +42,18 @@ class SymmetricGridExecutorConfig(ExecutorConfigBase):
     leverage: int = 20
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    @model_validator(mode="after")
+    def validate_levels(self):
+        if len(self.spread_percentages) != len(self.order_amounts_quote):
+            raise ValueError("spread_percentages and order_amounts_quote must have the same length")
+        if any(s <= 0 for s in self.spread_percentages):
+            raise ValueError("All spread_percentages must be positive")
+        if any(s >= 1 for s in self.spread_percentages):
+            raise ValueError("All spread_percentages must be less than 1.0 (100%)")
+        if any(a <= 0 for a in self.order_amounts_quote):
+            raise ValueError("All order_amounts_quote must be positive")
+        return self
 
 
 class SymmetricGridOrderState(Enum):

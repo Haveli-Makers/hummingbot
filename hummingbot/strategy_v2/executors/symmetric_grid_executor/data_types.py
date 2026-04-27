@@ -14,7 +14,6 @@ class FairPriceType(Enum):
     MidPrice = "MidPrice"
 
 
-
 class SymmetricGridExecutorConfig(ExecutorConfigBase):
     """
     Configuration for the Symmetric Grid Executor.
@@ -43,8 +42,6 @@ class SymmetricGridExecutorConfig(ExecutorConfigBase):
     leverage: int = 20
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
-
-
 
 
 class SymmetricGridOrderState(Enum):

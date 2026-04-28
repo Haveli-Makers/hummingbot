@@ -13,6 +13,7 @@ class FairPriceType(Enum):
     """Price type used to determine the fair price for the symmetric grid."""
     MidPrice = "MidPrice"
 
+
 class SymmetricGridExecutorConfig(ExecutorConfigBase):
     """
     Configuration for the Symmetric Grid Executor.

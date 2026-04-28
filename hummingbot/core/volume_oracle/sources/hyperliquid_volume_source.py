@@ -1,5 +1,5 @@
-from decimal import Decimal
-from typing import TYPE_CHECKING, Dict
+from decimal import Decimal, InvalidOperation
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from hummingbot.core.volume_oracle.sources.volume_source_base import VolumeSourceBase
 
@@ -13,46 +13,63 @@ class HyperliquidVolumeSource(VolumeSourceBase):
     def name(self) -> str:
         return "hyperliquid"
 
-    async def get_24h_volume(self, trading_pair: str) -> Dict[str, Decimal]:
-        base, quote = self._parse_trading_pair(trading_pair)
+    async def get_all_24h_volumes(self, trading_pairs: Optional[List[str]] = None) -> Dict[str, Dict[str, Decimal]]:
         self._ensure_exchange()
+        response = await self._exchange.get_all_24h_volume_tickers()
 
-        response = await self._exchange.get_24h_volume_ticker()
+        result: Dict[str, Dict[str, Decimal]] = {}
 
-        meta = response[0]
-        contexts = response[1]
-        meta_tokens = meta.get("tokens", [])
-        universe = meta.get("universe", [])
+        # Perps: response['perps'] = [{universe: [{name, ...}]}, [ctx, ...]]
+        perps_data = response.get("perps", [])
+        if len(perps_data) == 2:
+            perps_universe = perps_data[0].get("universe", [])
+            perps_contexts = perps_data[1]
+            for i, ctx in enumerate(perps_contexts):
+                if not isinstance(ctx, dict):
+                    continue
+                name = perps_universe[i].get("name", "") if i < len(perps_universe) else ""
+                if not name:
+                    continue
+                symbol = name.upper() + "-USD"
+                try:
+                    result[symbol] = self._normalize_ticker(symbol=symbol, context=ctx)
+                except (KeyError, ValueError, InvalidOperation):
+                    continue
 
-        coin_to_context = {}
-        for ctx in contexts:
-            coin_to_context[ctx.get("coin", "")] = ctx
+        # Spot: response['spot'] = [{universe: [{name, ...}]}, [ctx, ...]]
+        spot_data = response.get("spot", [])
+        if len(spot_data) == 2:
+            spot_contexts = spot_data[1]
+            for ctx in spot_contexts:
+                if not isinstance(ctx, dict):
+                    continue
+                raw_symbol = str(ctx.get("coin", ""))
+                if not raw_symbol or raw_symbol.startswith("@"):
+                    continue
+                symbol = raw_symbol.replace("/", "-").upper()
+                try:
+                    result[symbol] = self._normalize_ticker(symbol=symbol, context=ctx)
+                except (KeyError, ValueError, InvalidOperation):
+                    continue
 
-        target_coin = None
-        for entry in universe:
-            token_indices = entry.get("tokens", [])
-            if len(token_indices) >= 2:
-                base_idx, quote_idx = token_indices[0], token_indices[1]
-                if base_idx < len(meta_tokens) and quote_idx < len(meta_tokens):
-                    base_name = meta_tokens[base_idx].get("name", "").upper()
-                    quote_name = meta_tokens[quote_idx].get("name", "").upper()
-                    if base_name == base.upper() and quote_name == quote.upper():
-                        target_coin = entry.get("name")
-                        break
+        if trading_pairs:
+            filter_symbols = {tp.upper() for tp in trading_pairs}
+            for tp in filter_symbols:
+                if tp not in result:
+                    self.logger().warning(f"Skipping {tp}: symbol not found on {self.name}")
+            result = {k: v for k, v in result.items() if k in filter_symbols}
 
-        if target_coin is None:
-            raise ValueError(f"Trading pair {trading_pair} not found on {self.name}")
+        return result
 
-        ctx = coin_to_context.get(target_coin)
-        if ctx is None:
-            raise ValueError(f"No market data for {trading_pair} ({target_coin}) on {self.name}")
-
+    def _normalize_ticker(self, symbol: str, context: Dict[str, Any]) -> Dict[str, Decimal]:
+        mid_px = context.get("midPx")
+        if mid_px is None:
+            raise ValueError(f"Missing midPx for {symbol}")
         result = {
             "exchange": self.name,
-            "trading_pair": trading_pair,
-            "symbol": target_coin,
-            "last_price": Decimal(str(ctx["midPx"])),
-            "base_volume": Decimal(str(ctx.get("dayNtlVlm", "0"))),
+            "symbol": symbol,
+            "last_price": Decimal(str(mid_px)),
+            "base_volume": Decimal(str(context.get("dayNtlVlm", "0"))),
         }
         return result
 

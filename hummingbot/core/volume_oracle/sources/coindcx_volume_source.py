@@ -1,5 +1,5 @@
 from decimal import Decimal
-from typing import TYPE_CHECKING, Dict
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from hummingbot.core.volume_oracle.sources.volume_source_base import VolumeSourceBase
 
@@ -13,26 +13,31 @@ class CoindcxVolumeSource(VolumeSourceBase):
     def name(self) -> str:
         return "coindcx"
 
-    async def get_24h_volume(self, trading_pair: str) -> Dict[str, Decimal]:
-        base, quote = self._parse_trading_pair(trading_pair)
-        exchange_symbol = f"{base}{quote}"
+    async def get_all_24h_volumes(self, trading_pairs: Optional[List[str]] = None) -> Dict[str, Dict[str, Decimal]]:
         self._ensure_exchange()
+        data = await self._exchange.get_all_24h_volume_tickers(trading_pairs)
 
-        data = await self._exchange.get_all_pairs_prices()
-
-        ticker = None
+        result: Dict[str, Dict[str, Decimal]] = {}
         for item in data:
-            if isinstance(item, dict) and item.get("market", "").upper() == exchange_symbol.upper():
-                ticker = item
-                break
+            if not isinstance(item, dict):
+                continue
 
-        if ticker is None:
-            raise ValueError(f"Trading pair {trading_pair} ({exchange_symbol}) not found on {self.name}")
+            symbol = str(item.get("market", "")).upper()
+            if not symbol:
+                continue
 
+            try:
+                result[symbol] = self._normalize_ticker(ticker=item)
+            except (KeyError, ValueError):
+                continue
+
+        return result
+
+    def _normalize_ticker(self, ticker: Dict[str, Any]) -> Dict[str, Decimal]:
+        symbol = str(ticker.get("market", "")).upper()
         result = {
             "exchange": self.name,
-            "trading_pair": trading_pair,
-            "symbol": ticker.get("market", exchange_symbol),
+            "symbol": symbol,
             "base_volume": Decimal(str(ticker["volume"])),
             "last_price": Decimal(str(ticker["last_price"])),
         }

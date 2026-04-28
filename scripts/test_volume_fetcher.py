@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import sys
 
@@ -6,24 +7,33 @@ from hummingbot.core.volume_oracle.volume_oracle import VolumeOracle
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+logging.basicConfig(level=logging.WARNING, format="%(name)s - %(levelname)s - %(message)s")
+
 
 async def main():
     exchange = sys.argv[1] if len(sys.argv) > 1 else "binance"
-    pair = sys.argv[2] if len(sys.argv) > 2 else "BTC-USDT"
+    raw_pairs = [a.upper() for a in sys.argv[2:]] if len(sys.argv) > 2 else []
+    trading_pairs = raw_pairs if raw_pairs and raw_pairs != ["ALL"] else None
 
     source = VolumeOracle.source_for_exchange(exchange)
     oracle = VolumeOracle(source=source)
 
-    print(f"Fetching 24h volume for {pair} on {oracle.source.name}...")
+    filter_desc = f" for {trading_pairs}" if trading_pairs else " (all pairs)"
+    print(f"Fetching 24h volumes on {oracle.source.name}{filter_desc}...")
     try:
-        result = await oracle.get_24h_volume(pair)
-        print(f"\n  Exchange     : {result['exchange']}")
-        print(f"  Pair         : {result['trading_pair']}")
-        print(f"  Symbol       : {result['symbol']}")
-        print(f"  Base Volume  : {result['base_volume']}")
-        if "quote_volume" in result:
-            print(f"  Quote Volume : {result['quote_volume']}")
-        print(f"  Last Price   : {result['last_price']}")
+        results = await oracle.get_all_24h_volumes(trading_pairs=trading_pairs)
+        print(f"Found {len(results)} symbols")
+
+        if trading_pairs and not results:
+            raise ValueError(f"No results for {trading_pairs} on {oracle.source.name}")
+
+        for symbol, result in results.items():
+            print(f"\n  Symbol       : {symbol}")
+            print(f"  Exchange     : {result['exchange']}")
+            print(f"  Base Volume  : {result['base_volume']}")
+            if "quote_volume" in result:
+                print(f"  Quote Volume : {result['quote_volume']}")
+            print(f"  Last Price   : {result['last_price']}")
     except Exception as e:
         print(f"Error: {e}")
     finally:

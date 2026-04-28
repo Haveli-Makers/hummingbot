@@ -1,5 +1,5 @@
-from decimal import Decimal
-from typing import TYPE_CHECKING, Dict
+from decimal import Decimal, InvalidOperation
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from hummingbot.core.volume_oracle.sources.volume_source_base import VolumeSourceBase
 
@@ -15,27 +15,40 @@ class CoinbaseAdvancedTradeVolumeSource(VolumeSourceBase):
     def name(self) -> str:
         return "coinbase_advanced_trade"
 
-    async def get_24h_volume(self, trading_pair: str) -> Dict[str, Decimal]:
-        base, quote = self._parse_trading_pair(trading_pair)
-        product_id = f"{base}-{quote}"
+    async def get_all_24h_volumes(self, trading_pairs: Optional[List[str]] = None) -> Dict[str, Dict[str, Decimal]]:
         self._ensure_exchange()
+        data = await self._exchange.get_all_24h_volume_tickers(trading_pairs)
 
-        resp = await self._exchange.get_24h_volume_ticker(product_id)
+        result: Dict[str, Dict[str, Decimal]] = {}
+        for item in data:
+            if not isinstance(item, dict):
+                continue
 
-        trades = resp.get("trades", [])
-        if not trades:
-            raise ValueError(f"Trading pair {trading_pair} ({product_id}) not found on {self.name}")
+            symbol = str(item.get("product_id", "")).upper()
+            if not symbol:
+                continue
 
-        last_price = Decimal(str(trades[0]["price"]))
+            try:
+                result[symbol] = self._normalize_ticker(item)
+            except (KeyError, ValueError, InvalidOperation):
+                continue
+
+        return result
+
+    @staticmethod
+    def _safe_decimal(value, default: str = "0") -> Decimal:
+        v = str(value).strip() if value is not None else ""
+        return Decimal(v) if v else Decimal(default)
+
+    def _normalize_ticker(self, ticker: Dict[str, Any]) -> Dict[str, Decimal]:
         result = {
             "exchange": self.name,
-            "trading_pair": trading_pair,
-            "symbol": product_id,
-            "last_price": last_price,
-            "base_volume": Decimal(str(resp.get("volume", "0"))),
+            "symbol": str(ticker["product_id"]).upper(),
+            "last_price": self._safe_decimal(ticker.get("price")),
+            "base_volume": self._safe_decimal(ticker.get("volume_24h")),
         }
-        if resp.get("quote_volume"):
-            result["quote_volume"] = Decimal(str(resp["quote_volume"]))
+        if ticker.get("quote_volume_24h") is not None:
+            result["quote_volume"] = self._safe_decimal(ticker["quote_volume_24h"])
         return result
 
     def _build_exchange(self) -> "CoinbaseAdvancedTradeExchange":

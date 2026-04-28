@@ -1,5 +1,5 @@
 from decimal import Decimal
-from typing import TYPE_CHECKING, Dict
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from hummingbot.core.volume_oracle.sources.volume_source_base import VolumeSourceBase
 
@@ -13,25 +13,35 @@ class DeriveVolumeSource(VolumeSourceBase):
     def name(self) -> str:
         return "derive"
 
-    async def get_24h_volume(self, trading_pair: str) -> Dict[str, Decimal]:
-        base, quote = self._parse_trading_pair(trading_pair)
-        instrument_name = f"{base}-{quote}"
+    async def get_all_24h_volumes(self, trading_pairs: Optional[List[str]] = None) -> Dict[str, Dict[str, Decimal]]:
         self._ensure_exchange()
+        data = await self._exchange.get_all_24h_volume_tickers(trading_pairs)
 
-        resp = await self._exchange.get_24h_volume_ticker(instrument_name)
+        result: Dict[str, Dict[str, Decimal]] = {}
+        for item in data:
+            if not isinstance(item, dict):
+                continue
 
-        ticker = resp.get("result")
-        if ticker is None:
-            raise ValueError(f"Trading pair {trading_pair} ({instrument_name}) not found on {self.name}")
+            ticker = item.get("result")
+            if not isinstance(ticker, dict):
+                continue
 
+            symbol = str(ticker.get("instrument_name", "")).upper()
+            if not symbol:
+                continue
+
+            result[symbol] = self._normalize_ticker(ticker)
+
+        return result
+
+    def _normalize_ticker(self, ticker: Dict[str, Any]) -> Dict[str, Decimal]:
         result = {
             "exchange": self.name,
-            "trading_pair": trading_pair,
-            "symbol": ticker.get("instrument_name", instrument_name),
+            "symbol": str(ticker["instrument_name"]).upper(),
             "last_price": Decimal(str(ticker.get("mark_price", ticker.get("best_bid_price", "0")))),
             "base_volume": Decimal(str(ticker.get("amount_24h", ticker.get("volume_24h", "0")))),
         }
-        if ticker.get("quote_volume_24h"):
+        if ticker.get("quote_volume_24h") is not None:
             result["quote_volume"] = Decimal(str(ticker["quote_volume_24h"]))
         return result
 

@@ -1,5 +1,5 @@
 from decimal import Decimal
-from typing import TYPE_CHECKING, Dict
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from hummingbot.core.volume_oracle.sources.volume_source_base import VolumeSourceBase
 
@@ -13,31 +13,31 @@ class AscendExVolumeSource(VolumeSourceBase):
     def name(self) -> str:
         return "ascend_ex"
 
-    async def get_24h_volume(self, trading_pair: str) -> Dict[str, Decimal]:
-        base, quote = self._parse_trading_pair(trading_pair)
-        symbol = f"{base}/{quote}"
+    async def get_all_24h_volumes(self, trading_pairs: Optional[List[str]] = None) -> Dict[str, Dict[str, Decimal]]:
         self._ensure_exchange()
+        resp = await self._exchange.get_all_24h_volume_tickers(trading_pairs)
 
-        resp = await self._exchange.get_24h_volume_ticker(symbol)
+        result: Dict[str, Dict[str, Decimal]] = {}
+        for item in resp.get("data", []):
+            if not isinstance(item, dict):
+                continue
 
-        ticker = resp.get("data")
-        if ticker is None:
-            raise ValueError(f"Trading pair {trading_pair} ({symbol}) not found on {self.name}")
+            symbol = str(item.get("symbol", "")).upper()
+            if not symbol:
+                continue
 
-        if isinstance(ticker, list):
-            match = None
-            for item in ticker:
-                if item.get("symbol", "").upper() == symbol.upper():
-                    match = item
-                    break
-            if match is None:
-                raise ValueError(f"Trading pair {trading_pair} ({symbol}) not found on {self.name}")
-            ticker = match
+            try:
+                result[symbol] = self._normalize_ticker(ticker=item)
+            except (KeyError, ValueError):
+                continue
 
+        return result
+
+    def _normalize_ticker(self, ticker: Dict[str, Any]) -> Dict[str, Decimal]:
+        symbol = str(ticker.get("symbol", "")).upper()
         result = {
             "exchange": self.name,
-            "trading_pair": trading_pair,
-            "symbol": ticker.get("symbol", symbol),
+            "symbol": symbol,
             "base_volume": Decimal(str(ticker["volume"])),
             "last_price": Decimal(str(ticker["close"])),
         }

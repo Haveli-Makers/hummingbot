@@ -1,5 +1,5 @@
-from decimal import Decimal
-from typing import TYPE_CHECKING, Dict
+from decimal import Decimal, InvalidOperation
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from hummingbot.core.volume_oracle.sources.volume_source_base import VolumeSourceBase
 
@@ -13,32 +13,47 @@ class KucoinVolumeSource(VolumeSourceBase):
     def name(self) -> str:
         return "kucoin"
 
-    async def get_24h_volume(self, trading_pair: str) -> Dict[str, Decimal]:
-        base, quote = self._parse_trading_pair(trading_pair)
-        symbol = f"{base}-{quote}"
+    def _safe_decimal(self, value):
+        try:
+            if value in (None, "", "NaN", "N/A", "--"):
+                return Decimal("0")
+            return Decimal(str(value))
+        except (InvalidOperation, ValueError, TypeError):
+            return Decimal("0")
+
+    async def get_all_24h_volumes(self, trading_pairs: Optional[List[str]] = None) -> Dict[str, Dict[str, Decimal]]:
         self._ensure_exchange()
+        resp = await self._exchange.get_all_24h_volume_tickers(trading_pairs)
 
-        resp = await self._exchange.get_all_pairs_prices()
+        result: Dict[str, Dict[str, Decimal]] = {}
+        for item in resp.get("data", {}).get("ticker", []):
+            if not isinstance(item, dict):
+                continue
 
-        tickers = resp.get("data", {}).get("ticker", [])
-        ticker = None
-        for item in tickers:
-            if item.get("symbol", "").upper() == symbol.upper():
-                ticker = item
-                break
+            symbol = str(item.get("symbol", "")).upper()
+            if not symbol:
+                continue
 
-        if ticker is None:
-            raise ValueError(f"Trading pair {trading_pair} ({symbol}) not found on {self.name}")
+            try:
+                result[symbol] = self._normalize_ticker(ticker=item)
+            except (KeyError, ValueError):
+                continue
 
+        return result
+
+    def _normalize_ticker(self, ticker: Dict[str, Any]) -> Dict[str, Decimal]:
+        symbol = str(ticker.get("symbol", "")).upper()
+        vol = ticker.get("vol")
+        last = ticker.get("last")
         result = {
             "exchange": self.name,
-            "trading_pair": trading_pair,
-            "symbol": ticker.get("symbol", symbol),
-            "base_volume": Decimal(str(ticker["vol"])),
-            "last_price": Decimal(str(ticker["last"])),
+            "symbol": symbol,
+            "base_volume": self._safe_decimal(vol),
+            "last_price": self._safe_decimal(last),
         }
-        if ticker.get("volValue"):
-            result["quote_volume"] = Decimal(str(ticker["volValue"]))
+        vol_value = ticker.get("volValue")
+        if vol_value is not None:
+            result["quote_volume"] = self._safe_decimal(vol_value)
         return result
 
     def _build_exchange(self) -> "KucoinExchange":

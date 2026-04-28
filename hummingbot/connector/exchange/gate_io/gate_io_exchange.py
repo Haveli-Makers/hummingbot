@@ -105,11 +105,27 @@ class GateIoExchange(ExchangePyBase):
     def supported_order_types(self):
         return [OrderType.LIMIT, OrderType.MARKET, OrderType.LIMIT_MAKER]
 
-    async def get_24h_volume_ticker(self, currency_pair: str) -> list:
-        return await self._api_get(
-            path_url=CONSTANTS.TICKER_PATH_URL,
-            params={"currency_pair": currency_pair},
-        )
+    async def get_all_24h_volume_tickers(self, trading_pairs: Optional[List[str]] = None) -> list:
+        if not trading_pairs:
+            return await self._api_get(path_url=CONSTANTS.TICKER_PATH_URL)
+        results = []
+        for tp in trading_pairs:
+            base, quote = tp.split("-", 1)
+            currency_pair = f"{base}_{quote}"
+            try:
+                resp = await self._api_get(
+                    path_url=CONSTANTS.TICKER_PATH_URL,
+                    params={"currency_pair": currency_pair},
+                )
+                if isinstance(resp, list):
+                    results.extend(resp)
+            except IOError as e:
+                err = str(e)
+                if "HTTP status is 400" in err or "HTTP status is 404" in err:
+                    self.logger().warning(f"Skipping {tp}: symbol not found on {self.name}")
+                else:
+                    raise
+        return results
 
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
         return CONSTANTS.ERR_LABEL_TIME_RELATED_ERROR in str(request_exception)

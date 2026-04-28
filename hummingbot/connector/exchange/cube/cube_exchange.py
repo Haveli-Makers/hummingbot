@@ -126,6 +126,17 @@ class CubeExchange(ExchangePyBase):
         pairs_prices = await self._api_get(path_url=CONSTANTS.TICKER_BOOK_PATH_URL)
         return pairs_prices.get("result", [])
 
+    async def get_all_24h_volume_tickers(self, trading_pairs: Optional[List[str]] = None) -> List[Dict[str, str]]:
+        all_tickers = await self.get_all_pairs_prices()
+        if not trading_pairs:
+            return all_tickers
+        filter_symbols = {tp.replace("-", "").upper() for tp in trading_pairs}
+        found = {item.get("ticker_id", "").upper() for item in all_tickers if isinstance(item, dict)}
+        for sym in filter_symbols:
+            if sym not in found:
+                self.logger().warning(f"Skipping {sym}: symbol not found on {self.name}")
+        return [item for item in all_tickers if isinstance(item, dict) and item.get("ticker_id", "").upper() in filter_symbols]
+
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
         # API documentation does not clarify the error message for timestamp related problems
         return False

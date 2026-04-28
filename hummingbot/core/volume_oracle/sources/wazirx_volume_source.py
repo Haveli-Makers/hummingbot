@@ -1,5 +1,5 @@
 from decimal import Decimal
-from typing import TYPE_CHECKING, Dict
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from hummingbot.core.volume_oracle.sources.volume_source_base import VolumeSourceBase
 
@@ -13,31 +13,43 @@ class WazirxVolumeSource(VolumeSourceBase):
     def name(self) -> str:
         return "wazirx"
 
-    async def get_24h_volume(self, trading_pair: str) -> Dict[str, Decimal]:
-        base, quote = self._parse_trading_pair(trading_pair)
-        symbol = f"{base}{quote}".lower()
+    async def get_all_24h_volumes(self, trading_pairs: Optional[List[str]] = None) -> Dict[str, Dict[str, Decimal]]:
+        """
+        Fetch 24h volume for all trading pairs in a single request.
+
+        :return: A symbol-keyed mapping with exchange, symbol, base_volume, last_price and optional quote_volume.
+        """
         self._ensure_exchange()
+        data = await self._exchange.get_all_24h_volume_tickers(trading_pairs)
 
-        data = await self._exchange.get_all_pairs_prices()
-
-        ticker = None
+        result: Dict[str, Dict[str, Decimal]] = {}
         for item in data:
-            if isinstance(item, dict) and item.get("symbol", "").lower() == symbol:
-                ticker = item
-                break
+            if not isinstance(item, dict):
+                continue
 
-        if ticker is None:
-            raise ValueError(f"Trading pair {trading_pair} ({symbol}) not found on {self.name}")
+            symbol = str(item.get("symbol", "")).lower()
+            if not symbol:
+                continue
 
+            try:
+                result[symbol] = self._normalize_ticker(ticker=item)
+            except (KeyError, ValueError):
+                # Skip malformed ticker entries but keep the bulk response available.
+                continue
+
+        return result
+
+    def _normalize_ticker(self, ticker: Dict[str, Any]) -> Dict[str, Decimal]:
+        symbol = str(ticker.get("symbol", "")).lower()
         result = {
             "exchange": self.name,
-            "trading_pair": trading_pair,
-            "symbol": ticker.get("symbol", symbol),
+            "symbol": symbol,
             "base_volume": Decimal(str(ticker["volume"])),
             "last_price": Decimal(str(ticker["lastPrice"])),
         }
-        if ticker.get("quoteVolume"):
+        if ticker.get("quoteVolume") is not None:
             result["quote_volume"] = Decimal(str(ticker["quoteVolume"]))
+
         return result
 
     def _build_exchange(self) -> "WazirxExchange":

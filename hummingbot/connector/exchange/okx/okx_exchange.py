@@ -255,11 +255,36 @@ class OkxExchange(ExchangePyBase):
         last_traded_prices = {ticker["instId"]: float(ticker["last"]) for ticker in resp_json["data"] if ticker["last"]}
         return last_traded_prices
 
-    async def get_24h_volume_ticker(self, inst_id: str) -> Dict[str, Any]:
-        return await self._api_get(
-            path_url=CONSTANTS.OKX_TICKER_PATH,
-            params={"instId": inst_id},
-        )
+    async def get_all_pairs_prices(self, trading_pairs: Optional[List[str]] = None) -> Dict[str, Any]:
+        if not trading_pairs:
+            return await self._api_get(
+                path_url=CONSTANTS.OKX_TICKERS_PATH,
+                params={"instType": "SPOT"},
+            )
+        all_data = []
+        for tp in trading_pairs:
+            base, quote = tp.split("-", 1)
+            inst_id = f"{base}-{quote}"
+            try:
+                resp = await self._api_get(
+                    path_url=CONSTANTS.OKX_TICKER_PATH,
+                    params={"instId": inst_id},
+                )
+                ticker_data = resp.get("data", [])
+                if not ticker_data:
+                    self.logger().warning(f"Skipping {tp}: symbol not found on {self.name}")
+                else:
+                    all_data.extend(ticker_data)
+            except IOError as e:
+                err = str(e)
+                if "HTTP status is 400" in err or "HTTP status is 404" in err:
+                    self.logger().warning(f"Skipping {tp}: symbol not found on {self.name}")
+                else:
+                    raise
+        return {"data": all_data}
+
+    async def get_all_24h_volume_tickers(self, trading_pairs: Optional[List[str]] = None) -> Dict[str, Any]:
+        return await self.get_all_pairs_prices(trading_pairs)
 
     async def _get_last_traded_price(self, trading_pair: str) -> float:
         params = {"instId": await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)}

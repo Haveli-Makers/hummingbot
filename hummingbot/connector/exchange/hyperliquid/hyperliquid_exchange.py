@@ -136,11 +136,16 @@ class HyperliquidExchange(ExchangePyBase):
             res.append(result)
         return res
 
-    async def get_24h_volume_ticker(self) -> list:
-        return await self._api_post(
+    async def get_all_24h_volume_tickers(self) -> dict:
+        spot = await self._api_post(
             path_url=CONSTANTS.TICKER_PRICE_CHANGE_URL,
             data={"type": CONSTANTS.ASSET_CONTEXT_TYPE},
         )
+        perps = await self._api_post(
+            path_url=CONSTANTS.TICKER_PRICE_CHANGE_URL,
+            data={"type": "metaAndAssetCtxs"},
+        )
+        return {"spot": spot, "perps": perps}
 
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
         return False

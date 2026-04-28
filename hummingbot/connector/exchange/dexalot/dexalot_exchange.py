@@ -165,6 +165,17 @@ class DexalotExchange(ExchangePyBase):
                 await ws.disconnect()
                 return price_list
 
+    async def get_all_24h_volume_tickers(self, trading_pairs: Optional[List[str]] = None) -> List[Dict[str, str]]:
+        all_tickers = await self.get_all_pairs_prices()
+        if not trading_pairs:
+            return all_tickers
+        filter_symbols = {tp.replace("-", "/").upper() for tp in trading_pairs}
+        found = {item.get("pair", "").upper() for item in all_tickers if isinstance(item, dict)}
+        for sym in filter_symbols:
+            if sym not in found:
+                self.logger().warning(f"Skipping {sym}: symbol not found on {self.name}")
+        return [item for item in all_tickers if isinstance(item, dict) and item.get("pair", "").upper() in filter_symbols]
+
     def _format_evmamount_to_amount(self, trading_pair, base_evm_amount: Decimal, quote_evm_amount: Decimal) -> Tuple:
 
         base_evmdecimals = self._evm_params[trading_pair].get("base_evmdecimals")

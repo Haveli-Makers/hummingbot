@@ -106,9 +106,10 @@ class GridV2ExecutorConfig(ControllerConfigBase):
     )
     max_open_orders: int = Field(
         default=8,
+        gt=0,
         json_schema_extra={
             "prompt_on_new": True,
-            "prompt": "Enter the maximum number of open grid orders: ",
+            "prompt": "Enter the default max orders per grid creation batch: ",
             "is_updatable": True,
         }
     )
@@ -126,6 +127,15 @@ class GridV2ExecutorConfig(ControllerConfigBase):
         json_schema_extra={
             "prompt_on_new": True,
             "prompt": "Enter the best-price executor price diff as a decimal (e.g., 0): ",
+            "is_updatable": True,
+        }
+    )
+    safe_extra_spread: Decimal = Field(
+        default=Decimal("0.0001"),
+        ge=Decimal("0"),
+        json_schema_extra={
+            "prompt_on_new": True,
+            "prompt": "Enter the extra spread used to avoid crossing the book (e.g., 0.0001): ",
             "is_updatable": True,
         }
     )
@@ -147,9 +157,10 @@ class GridV2ExecutorConfig(ControllerConfigBase):
     )
     max_orders_per_batch: Optional[int] = Field(
         default=None,
+        gt=0,
         json_schema_extra={
             "prompt_on_new": True,
-            "prompt": "Enter max orders per batch, or leave blank for all levels: ",
+            "prompt": "Enter max orders per batch, or leave blank to use default max orders per batch: ",
             "is_updatable": True,
         }
     )
@@ -295,7 +306,8 @@ class GridV2Executor(ControllerBase):
                 fair_price=None,
                 order_type=self.config.open_order_type,
                 order_frequency=self.config.order_frequency,
-                max_orders_per_batch=self.config.max_orders_per_batch,
+                max_orders_per_batch=self.config.max_orders_per_batch or self.config.max_open_orders,
+                safe_extra_spread=self.config.safe_extra_spread,
                 min_order_amount_quote=self.config.min_order_amount_quote,
                 price_refresh_tolerance=self.config.price_refresh_tolerance,
                 stop_loss=self.config.stop_loss,
@@ -481,7 +493,7 @@ class GridV2Executor(ControllerBase):
             width,
         ))
         status.append(self._box_line(
-            f"Levels: {len(self.config.spreads)} | Max Orders: {self.config.max_open_orders} | "
+            f"Levels: {len(self.config.spreads)} | Batch Orders: {self.config.max_orders_per_batch or self.config.max_open_orders} | "
             f"Order Type: {self.config.open_order_type.name}",
             f"Leverage: {self.config.leverage}x",
             width,

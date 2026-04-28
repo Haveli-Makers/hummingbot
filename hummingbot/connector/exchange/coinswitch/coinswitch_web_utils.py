@@ -79,8 +79,9 @@ class CoinswitchWebUtils:
         return asyncio.wait_for(coroutine, timeout=timeout_seconds)
 
     @staticmethod
-    def get_rest_assistant(client_config_map) -> Any:
-        return WebAssistantsFactory(client_config_map=client_config_map)
+    async def get_rest_assistant(client_config_map) -> Any:
+        api_factory = build_api_factory()
+        return await api_factory.get_rest_assistant()
 
     @staticmethod
     def get_ws_path_for_client(domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
@@ -88,10 +89,15 @@ class CoinswitchWebUtils:
 
     @staticmethod
     def parse_trading_pair(trading_pair: str) -> tuple:
-        parts = trading_pair.split("-")
-        if len(parts) != 2:
-            parts = trading_pair.split("/")
-        return parts[0], parts[1]
+        if not trading_pair:
+            raise ValueError(f"Cannot parse empty trading pair.")
+        for sep in ("-", "/"):
+            parts = trading_pair.split(sep)
+            if len(parts) == 2 and parts[0] and parts[1]:
+                return parts[0], parts[1]
+        raise ValueError(
+            f"Cannot parse trading pair '{trading_pair}': expected 'BASE-QUOTE' or 'BASE/QUOTE' format."
+        )
 
     @staticmethod
     def format_trading_pair(base: str, quote: str) -> str:

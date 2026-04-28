@@ -82,8 +82,8 @@ class CoinswitchUtils:
         Convert string to Decimal safely.
         """
         try:
-            return Decimal(s)
-        except (ValueError):
+            return Decimal(str(s))
+        except Exception:
             return Decimal(0)
 
     @staticmethod
@@ -145,9 +145,9 @@ class CoinswitchUtils:
         return {
             "symbol": depth_response.get("symbol", "").upper(),
             "timestamp": depth_response.get("timestamp"),
-            "bids": [[CoinswitchUtils.str_to_decimal(bid[0]), CoinswitchUtils.str_to_decimal(bid[1])]
+            "bids": [[CoinswitchUtils.str_to_decimal(str(bid[0])), CoinswitchUtils.str_to_decimal(str(bid[1]))]
                      for bid in depth_response.get("bids", [])],
-            "asks": [[CoinswitchUtils.str_to_decimal(ask[0]), CoinswitchUtils.str_to_decimal(ask[1])]
+            "asks": [[CoinswitchUtils.str_to_decimal(str(ask[0])), CoinswitchUtils.str_to_decimal(str(ask[1]))]
                      for ask in depth_response.get("asks", [])],
         }
 

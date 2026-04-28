@@ -13,6 +13,20 @@ class CoinswitchAuth(AuthBase):
     """
 
     def __init__(self, api_key: str, secret_key: str, time_provider):
+        # Allow empty credentials for connectors used only for public (unauthenticated) requests.
+        if api_key or secret_key:
+            try:
+                secret_key_bytes = bytes.fromhex(secret_key)
+            except ValueError:
+                raise ValueError(
+                    "CoinSwitch API secret must be a hex-encoded Ed25519 private key. "
+                    "Ensure the secret key contains only hexadecimal characters."
+                )
+            if len(secret_key_bytes) != 32:
+                raise ValueError(
+                    f"CoinSwitch API secret must be a 32-byte (64 hex character) Ed25519 private key, "
+                    f"got {len(secret_key_bytes)} bytes ({len(secret_key)} hex characters)."
+                )
         self.api_key = api_key
         self.secret_key = secret_key
         self._time_provider = time_provider

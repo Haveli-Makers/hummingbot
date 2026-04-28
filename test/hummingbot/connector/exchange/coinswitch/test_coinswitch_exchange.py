@@ -19,9 +19,8 @@ class CoinswitchExchangeTests(unittest.TestCase):
             from hummingbot.connector.exchange.coinswitch.coinswitch_exchange import CoinswitchExchange
 
             exchange = CoinswitchExchange(
-                client_config_map=MagicMock(),
                 coinswitch_api_key="test_key",
-                coinswitch_secret_key="test_secret",
+                coinswitch_api_secret="aa" * 32,  # valid 64-char hex Ed25519 key
                 trading_pairs=["BTC-INR"],
                 trading_required=False
             )

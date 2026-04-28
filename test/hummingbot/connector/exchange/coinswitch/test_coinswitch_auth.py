@@ -20,8 +20,9 @@ class CoinswitchAuthTests(unittest.TestCase):
             from hummingbot.connector.exchange.coinswitch.coinswitch_auth import CoinswitchAuth
 
             auth = CoinswitchAuth(
-                api_key="test_api_key",
-                secret_key="test_secret_key"
+                api_key="",
+                secret_key="",
+                time_provider=MagicMock()
             )
 
             self.assertIsNotNone(auth)
@@ -35,10 +36,11 @@ class CoinswitchAuthTests(unittest.TestCase):
             from hummingbot.connector.exchange.coinswitch.coinswitch_auth import CoinswitchAuth
 
             mock_time_provider = MagicMock(return_value=1234567890.0)
+            valid_hex_key = "aa" * 32  # 64 hex chars = valid 32-byte Ed25519 key
 
             auth = CoinswitchAuth(
                 api_key="test_api_key",
-                secret_key="test_secret_key",
+                secret_key=valid_hex_key,
                 time_provider=mock_time_provider
             )
 

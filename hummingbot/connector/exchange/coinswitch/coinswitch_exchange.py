@@ -87,7 +87,7 @@ class CoinswitchExchange(ExchangePyBase):
         response = await self._api_get(
             path_url=CONSTANTS.TICKER_ALL_PATH_URL,
             params=params,
-            is_auth_required=True,
+            is_auth_required=False,
         )
         return response
 
@@ -263,12 +263,10 @@ class CoinswitchExchange(ExchangePyBase):
             List of trading pairs
         """
         try:
-            url = web_utils.build_api_url(CONSTANTS.ACTIVE_COINS_PATH_URL)
             params = {"exchange": self._exchange}
 
-            response = await self._rest_assistant.execute_request(
-                method="GET",
-                url=url,
+            response = await self._api_get(
+                path_url=CONSTANTS.ACTIVE_COINS_PATH_URL,
                 params=params,
                 is_auth_required=True,
             )
@@ -294,15 +292,13 @@ class CoinswitchExchange(ExchangePyBase):
 
         for trading_pair in trading_pairs:
             try:
-                url = web_utils.build_api_url(CONSTANTS.TICKER_PATH_URL)
                 params = {
                     "exchange": self._exchange,
                     "symbol": trading_pair
                 }
 
-                response = await self._rest_assistant.execute_request(
-                    method="GET",
-                    url=url,
+                response = await self._api_get(
+                    path_url=CONSTANTS.TICKER_PATH_URL,
                     params=params,
                     is_auth_required=True,
                 )
@@ -393,12 +389,10 @@ class CoinswitchExchange(ExchangePyBase):
         trading_fees = {}
 
         try:
-            url = web_utils.build_api_url(CONSTANTS.TRADING_FEE_PATH_URL)
             params = {"exchange": self._exchange}
 
-            response = await self._rest_assistant.execute_request(
-                method="GET",
-                url=url,
+            response = await self._api_get(
+                path_url=CONSTANTS.TRADING_FEE_PATH_URL,
                 params=params,
                 is_auth_required=True,
             )
@@ -484,10 +478,6 @@ class CoinswitchExchange(ExchangePyBase):
         except Exception as e:
             _logger.error(f"Error updating balances: {e}", exc_info=True)
 
-    async def _update_order_status(self) -> None:
-        """Update order status from the exchange."""
-        pass
-
     def _parse_order_response(self, order_response: Dict) -> Tuple[str, InFlightOrder]:
         """
         Parse order response from exchange.
@@ -496,9 +486,10 @@ class CoinswitchExchange(ExchangePyBase):
         """
         exchange_order_id = order_response.get("order_id")
         trading_pair = order_response.get("symbol")
+        client_order_id = order_response.get("client_order_id", "")
 
         in_flight_order = InFlightOrder(
-            client_order_id=None,
+            client_order_id=client_order_id,
             exchange_order_id=exchange_order_id,
             trading_pair=trading_pair,
             order_type=OrderType.LIMIT,
@@ -518,22 +509,27 @@ class CoinswitchExchange(ExchangePyBase):
         Returns:
             Trade update
         """
+        trade_type = TradeType.BUY if trade.get("is_buyer", True) else TradeType.SELL
+        fill_price = Decimal(str(trade.get("price", 0)))
+        fill_base_amount = Decimal(str(trade.get("qty", 0)))
+        fee = TradeFeeBase.new_spot_fee(
+            fee_schema=self.trade_fee_schema(),
+            trade_type=trade_type,
+            percent_token=trade.get("fee_asset", ""),
+            flat_fees=[TokenAmount(
+                amount=Decimal(str(trade.get("fee", 0))),
+                token=trade.get("fee_asset", ""),
+            )],
+        )
         return TradeUpdate(
-            trade_id=trade.get("trade_id"),
-            client_order_id=None,
-            exchange_order_id=trade.get("order_id"),
-            trading_pair=trade.get("symbol"),
-            fill_side=TradeType.BUY if trade.get("is_buyer", True) else TradeType.SELL,
-            fill_price=Decimal(str(trade.get("price", 0))),
-            fill_amount=Decimal(str(trade.get("qty", 0))),
-            fee=self._get_fee(
-                base=trade.get("symbol", "").split("/")[0],
-                quote=trade.get("symbol", "").split("/")[1],
-                order_type=OrderType.LIMIT,
-                order_side=TradeType.BUY if trade.get("is_buyer", True) else TradeType.SELL,
-                amount=Decimal(str(trade.get("qty", 0))),
-                price=Decimal(str(trade.get("price", 0))),
-            ),
+            trade_id=str(trade.get("trade_id", "")),
+            client_order_id=trade.get("client_order_id", ""),
+            exchange_order_id=str(trade.get("order_id", "")),
+            trading_pair=trade.get("symbol", ""),
+            fill_price=fill_price,
+            fill_base_amount=fill_base_amount,
+            fill_quote_amount=fill_base_amount * fill_price,
+            fee=fee,
             fill_timestamp=float(trade.get("time", 0)) / 1000.0,
         )
 
@@ -700,26 +696,28 @@ class CoinswitchExchange(ExchangePyBase):
                 params=params,
                 is_auth_required=True,
             )
-
-            if response and "data" in response:
-                order_data = response.get("data", {})
-                status_str = order_data.get("status", "")
-                new_state = CONSTANTS.ORDER_STATE.get(status_str)
-
-                order_update = OrderUpdate(
-                    client_order_id=tracked_order.client_order_id,
-                    exchange_order_id=str(tracked_order.exchange_order_id),
-                    trading_pair=tracked_order.trading_pair,
-                    update_timestamp=float(order_data.get("updated_time", 0)) / 1000.0,
-                    new_state=new_state,
+            if not response or "data" not in response:
+                raise ValueError(
+                    f"Unexpected order status response for {tracked_order.exchange_order_id}: {response}"
+                    )
+            order_data = response.get("data", {})
+            status_str = order_data.get("status", "")
+            new_state = CONSTANTS.ORDER_STATE.get(status_str)
+            if new_state is None:
+                raise ValueError(
+                    f"Unknown order status '{status_str}' for {tracked_order.exchange_order_id}"
                 )
-
-                return order_update
-
+            order_update = OrderUpdate(
+                client_order_id=tracked_order.client_order_id,
+                exchange_order_id=str(tracked_order.exchange_order_id),
+                trading_pair=tracked_order.trading_pair,
+                update_timestamp=float(order_data.get("updated_time", 0)) / 1000.0,
+                new_state=new_state,
+            )
+            return order_update
         except Exception as e:
             _logger.error(f"Error requesting order status for {tracked_order.exchange_order_id}: {e}")
-
-        return None
+            raise
 
     async def _get_last_traded_price(self, trading_pair: str) -> float:
         """

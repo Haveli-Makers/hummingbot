@@ -122,7 +122,7 @@ class CoinswitchAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 for trading_pair in self._trading_pairs:
                     try:
                         snapshot_msg = await self._order_book_snapshot(trading_pair)
-                        self._message_queue[self._diff_messages_queue_key].put_nowait(snapshot_msg)
+                        self._message_queue[self._snapshot_messages_queue_key].put_nowait(snapshot_msg)
                     except asyncio.CancelledError:
                         raise
                     except Exception as e:
@@ -134,39 +134,6 @@ class CoinswitchAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 raise
             except Exception:
                 _logger.exception("Unexpected error in listen_for_subscriptions. Retrying...")
-                await asyncio.sleep(1.0)
-
-    async def listen_for_order_book_diffs(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
-        """
-        Reads the order diffs events queue.
-
-        :param ev_loop: the event loop the method will run in
-        :param output: a queue to add the created diff messages
-        """
-        message_queue = self._message_queue[self._diff_messages_queue_key]
-        while True:
-            try:
-                message = await message_queue.get()
-                output.put_nowait(message)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                _logger.exception("Unexpected error when processing order book diffs from exchange")
-
-    async def listen_for_order_book_snapshots(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
-        """
-        Reads the order snapshot events queue.
-
-        :param ev_loop: the event loop the method will run in
-        :param output: a queue to add the created snapshot messages
-        """
-        while True:
-            try:
-                await asyncio.sleep(3600)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                _logger.exception("Unexpected error in listen_for_order_book_snapshots")
                 await asyncio.sleep(1.0)
 
     async def listen_for_trades(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
@@ -224,14 +191,18 @@ class CoinswitchAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 _logger.exception("Unexpected error in listen_for_trades. Retrying...")
                 await asyncio.sleep(1.0)
 
-    async def _parse_order_book_diff_message(self, raw_message: Any, message_queue: asyncio.Queue):
+    async def _parse_order_book_snapshot_message(self, raw_message: Any, message_queue: asyncio.Queue):
         """
-        Parses raw order book diff messages. For CoinSwitch, these are already OrderBookMessage objects.
+        Forwards an already-built OrderBookMessage snapshot to the output queue.
         """
         if isinstance(raw_message, OrderBookMessage):
             message_queue.put_nowait(raw_message)
-        else:
-            pass
+
+    async def _parse_order_book_diff_message(self, raw_message: Any, message_queue: asyncio.Queue):
+        """
+        CoinSwitch has no WebSocket diff stream; this queue remains empty and is never called.
+        """
+        pass
 
     async def _connected_websocket_assistant(self):
         return None

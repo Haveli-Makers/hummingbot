@@ -13,7 +13,6 @@ class FairPriceType(Enum):
     """Price type used to determine the fair price for the symmetric grid."""
     MidPrice = "MidPrice"
 
-
 class SymmetricGridExecutorConfig(ExecutorConfigBase):
     """
     Configuration for the Symmetric Grid Executor.
@@ -53,6 +52,8 @@ class SymmetricGridExecutorConfig(ExecutorConfigBase):
             raise ValueError("All spread_percentages must be less than 1.0 (100%)")
         if any(a <= 0 for a in self.order_amounts_quote):
             raise ValueError("All order_amounts_quote must be positive")
+        if not self.spread_percentages:
+            raise ValueError("spread_percentages must not be empty")
         return self
 
 
@@ -81,7 +82,7 @@ class SymmetricGridLevel(BaseModel):
     amount_quote: Decimal
     buy_order: Optional[TrackedOrder] = None
     sell_order: Optional[TrackedOrder] = None
-    pending_side: str = "both"
+    pending_side: Literal["buy", "sell", "both"] = "both"
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     @property

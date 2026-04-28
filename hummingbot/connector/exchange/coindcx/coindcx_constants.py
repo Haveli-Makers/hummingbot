@@ -52,7 +52,6 @@ ORDER_STATE = {
 
 DIFF_EVENT_TYPE = "depth-update"
 SNAPSHOT_EVENT_TYPE = "depth-snapshot"
-DEPTH_SNAPSHOT_EVENT_TYPE = "depth-snapshot"
 TRADE_EVENT_TYPE = "new-trade"
 ORDER_UPDATE_EVENT_TYPE = "order-update"
 BALANCE_UPDATE_EVENT_TYPE = "balance-update"

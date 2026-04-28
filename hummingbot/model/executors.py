@@ -34,28 +34,20 @@ class Executors(HummingbotBase):
     custom_info = Column(JSON, nullable=False)
     controller_id = Column(Text, nullable=True)
 
-    _TYPE_MIGRATIONS = {
-        "pmm_executor": "symmetric_grid_executor",
-    }
-
     def to_executor_info(self) -> ExecutorInfo:
         """
         Return an ExecutorInfo object based on the current instance.
         """
         close_type = CloseType(self.close_type) if self.close_type else None
         status = RunnableStatus(self.status)
-        executor_type = self._TYPE_MIGRATIONS.get(self.type, self.type)
-        config = self.config
-        if self.type in self._TYPE_MIGRATIONS:
-            config = {**config, "type": executor_type}
         return ExecutorInfo(
             id=self.id,
             timestamp=self.timestamp,
-            type=executor_type,
+            type=self.type,
             close_type=close_type,
             close_timestamp=self.close_timestamp,
             status=status,
-            config=config,
+            config=self.config,
             net_pnl_pct=Decimal(self.net_pnl_pct),
             net_pnl_quote=Decimal(self.net_pnl_quote),
             cum_fees_quote=Decimal(self.cum_fees_quote),

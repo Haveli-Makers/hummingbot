@@ -802,6 +802,7 @@ class SymmetricGridExecutor(ExecutorBase):
     async def on_start(self):
         """Start the executor, validate balance, and check barriers."""
         await super().on_start()
+        await self.validate_sufficient_balance()
         self.update_metrics()
         if self.check_barriers():
             self.logger().error(f"SymGrid executor already expired by {self.close_type}.")

@@ -222,8 +222,7 @@ class SymmetricGridExecutor(ExecutorBase):
                 self.cancel_all_orders()
                 self._status = RunnableStatus.SHUTTING_DOWN
                 return
-            if self.config.fair_price is None:
-                self.refresh_orders_on_price_change()
+            self.refresh_orders_on_price_change()
             self.manage_orders()
         elif self.status == RunnableStatus.SHUTTING_DOWN:
             await self.control_shutdown_process()
@@ -341,7 +340,6 @@ class SymmetricGridExecutor(ExecutorBase):
                     self._refresh_pending_levels.clear()
                     self._refresh_completed_levels.clear()
                     self._refresh_cancel_sent_ts = 0
-            return
 
         new_fair_price = self.get_fair_price()
         if self.fair_price == Decimal("0"):

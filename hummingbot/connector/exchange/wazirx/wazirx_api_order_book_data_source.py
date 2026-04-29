@@ -120,7 +120,8 @@ class WazirxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         return
 
     async def _parse_order_book_snapshot_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
-        return
+        if isinstance(raw_message, OrderBookMessage):
+            message_queue.put_nowait(raw_message)
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         raise NotImplementedError("WazirX order book streaming not implemented; using REST polling instead.")

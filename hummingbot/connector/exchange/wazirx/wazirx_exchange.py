@@ -514,6 +514,18 @@ class WazirxExchange(ExchangePyBase):
                 mapping[symbol] = hb_trading_pair
         self._set_trading_pair_symbol_map(mapping)
 
+    async def _get_last_traded_price(self, trading_pair: str) -> float:
+        symbol = await self._ticker_symbol_for_pair(trading_pair)
+        params = {"symbol": symbol}
+
+        resp_json = await self._api_request(
+            method=RESTMethod.GET,
+            path_url=CONSTANTS.TICKER_24HR_PATH_URL,
+            params=params
+        )
+
+        return self._extract_last_traded_price(resp_json, symbol)
+
     async def get_last_traded_prices(self, trading_pairs: List[str], domain: Optional[str] = None) -> Dict[str, float]:
         result = {}
 
@@ -535,3 +547,24 @@ class WazirxExchange(ExchangePyBase):
                 result[trading_pair] = 0.0
 
         return result
+
+    async def _ticker_symbol_for_pair(self, trading_pair: str) -> str:
+        try:
+            return await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+        except Exception:
+            return trading_pair.replace("-", "").lower()
+
+    @staticmethod
+    def _extract_last_traded_price(resp: Any, symbol: str) -> float:
+        if isinstance(resp, dict):
+            if "lastPrice" in resp:
+                return float(resp["lastPrice"])
+            legacy_ticker = resp.get(symbol)
+            if isinstance(legacy_ticker, dict) and "last" in legacy_ticker:
+                return float(legacy_ticker["last"])
+        elif isinstance(resp, list):
+            for ticker in resp:
+                if isinstance(ticker, dict) and ticker.get("symbol") == symbol and "lastPrice" in ticker:
+                    return float(ticker["lastPrice"])
+
+        raise ValueError(f"Unexpected WazirX ticker response for {symbol}: {resp}")

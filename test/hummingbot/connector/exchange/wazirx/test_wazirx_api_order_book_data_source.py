@@ -265,6 +265,25 @@ class WazirxAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         except asyncio.CancelledError:
             pass
 
+    async def test_parse_order_book_snapshot_message_forwards_order_book_message(self):
+        snapshot_message = OrderBookMessage(
+            OrderBookMessageType.SNAPSHOT,
+            {
+                "trading_pair": self.trading_pair,
+                "update_id": 12345,
+                "bids": [["100.0", "1.0"]],
+                "asks": [["101.0", "1.5"]],
+            },
+            timestamp=1234567890.0,
+        )
+
+        await self.data_source._parse_order_book_snapshot_message(
+            raw_message=snapshot_message,
+            message_queue=self.msg_queue,
+        )
+
+        self.assertEqual(snapshot_message, self.msg_queue.get_nowait())
+
     async def test_get_last_traded_prices(self):
         mock_prices = {
             self.trading_pair: "100.5"

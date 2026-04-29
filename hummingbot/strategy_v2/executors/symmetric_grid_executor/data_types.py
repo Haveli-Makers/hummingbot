@@ -40,6 +40,7 @@ class SymmetricGridExecutorConfig(ExecutorConfigBase):
     stop_loss: Optional[Decimal] = None
     time_limit: Optional[int] = None
     leverage: int = 20
+    level_id: Optional[str] = None
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 

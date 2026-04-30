@@ -3,6 +3,7 @@ from typing import List, Optional
 
 from pydantic import Field, field_validator, model_validator
 
+from hummingbot.connector.utils import split_hb_trading_pair
 from hummingbot.core.data_type.common import MarketDict, OrderType, PositionAction, PositionMode, PriceType, TradeType
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase, ControllerConfigBase
@@ -335,9 +336,9 @@ class GridV2Executor(ControllerBase):
         return [action] if action is not None else []
 
     def calculate_exposure(self, grid_executor: ExecutorInfo) -> Decimal:
-        custom_info = grid_executor.custom_info or {}
-        net_inventory_base = self._to_decimal(custom_info.get("net_inventory_base"))
-        return net_inventory_base - self.config.total_balance
+        base_asset, _ = split_hb_trading_pair(self.config.trading_pair)
+        balance = self._to_decimal(self.market_data_provider.get_balance(self.config.connector_name, base_asset))
+        return balance - self.config.total_balance
 
     def get_average_entry_price_for_exposure(self, grid_executor: ExecutorInfo, exposure: Decimal) -> Decimal:
         custom_info = grid_executor.custom_info or {}
@@ -436,6 +437,12 @@ class GridV2Executor(ControllerBase):
         except Exception:
             return Decimal("0")
 
+    def _get_base_balance_for_status(self, base_asset: str) -> Decimal:
+        try:
+            return self._to_decimal(self.market_data_provider.get_balance(self.config.connector_name, base_asset))
+        except Exception:
+            return Decimal("0")
+
     def _get_last_trades_from_sqlite(self, limit: int = 10) -> List[dict]:
         import glob
         import os
@@ -485,6 +492,8 @@ class GridV2Executor(ControllerBase):
         custom_info = grid_executor.custom_info if grid_executor and grid_executor.custom_info else {}
         exposure = self.calculate_exposure(grid_executor) if grid_executor else Decimal("0")
         avg_price = self.get_average_entry_price_for_exposure(grid_executor, exposure) if grid_executor else Decimal("0")
+        base_asset, _ = split_hb_trading_pair(self.config.trading_pair)
+        base_balance = self._get_base_balance_for_status(base_asset)
 
         status.append("┌" + "─" * width + "┐")
         status.append(self._box_line(
@@ -509,7 +518,7 @@ class GridV2Executor(ControllerBase):
         status.append(self._box_line("Balance & Exposure", width=width))
         status.append(self._box_line(
             f"Target Base: {self._format_decimal(self.config.total_balance)} | "
-            f"Net Base: {self._format_decimal(custom_info.get('net_inventory_base'))} | "
+            f"{base_asset} Balance: {self._format_decimal(base_balance)} | "
             f"Exposure: {self._format_decimal(exposure)}",
             f"Max Exposure: {self._format_decimal(self.config.max_exposure)}",
             width,

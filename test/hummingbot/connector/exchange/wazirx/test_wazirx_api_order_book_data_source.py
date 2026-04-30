@@ -284,6 +284,69 @@ class WazirxAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
 
         self.assertEqual(snapshot_message, self.msg_queue.get_nowait())
 
+    async def test_subscribe_channels_sends_depth_stream_request(self):
+        self.data_source = WazirxAPIOrderBookDataSource(
+            trading_pairs=["BTC-INR"],
+            connector=None,
+            api_factory=self.connector._web_assistants_factory,
+            domain=self.domain,
+        )
+        ws = AsyncMock()
+
+        await self.data_source._subscribe_channels(ws)
+
+        request = ws.send.call_args.args[0]
+        self.assertEqual(
+            {
+                "event": "subscribe",
+                "streams": ["btcinr@depth"],
+                "id": 1,
+            },
+            request.payload,
+        )
+
+    def test_channel_originating_message_routes_depth_stream_to_diff_queue(self):
+        event_message = {
+            "stream": "btcinr@depth",
+            "data": {
+                "E": 1631682370000,
+                "s": "btcinr",
+                "b": [["6.0", "50.0"]],
+                "a": [["10.0", "75.0"]],
+            },
+        }
+
+        self.assertEqual("order_book_diff", self.data_source._channel_originating_message(event_message))
+
+    async def test_parse_order_book_diff_message(self):
+        self.data_source = WazirxAPIOrderBookDataSource(
+            trading_pairs=["BTC-INR"],
+            connector=None,
+            api_factory=self.connector._web_assistants_factory,
+            domain=self.domain,
+        )
+        raw_message = {
+            "stream": "btcinr@depth",
+            "data": {
+                "E": 1631682370000,
+                "s": "btcinr",
+                "b": [["6.0", "50.0"]],
+                "a": [["10.0", "75.0"]],
+            },
+        }
+
+        await self.data_source._parse_order_book_diff_message(
+            raw_message=raw_message,
+            message_queue=self.msg_queue,
+        )
+
+        message = self.msg_queue.get_nowait()
+        self.assertEqual(OrderBookMessageType.DIFF, message.type)
+        self.assertEqual("BTC-INR", message.trading_pair)
+        self.assertEqual(1631682370000, message.update_id)
+        self.assertEqual([["6.0", "50.0"]], message.content["bids"])
+        self.assertEqual([["10.0", "75.0"]], message.content["asks"])
+
     async def test_get_last_traded_prices(self):
         mock_prices = {
             self.trading_pair: "100.5"

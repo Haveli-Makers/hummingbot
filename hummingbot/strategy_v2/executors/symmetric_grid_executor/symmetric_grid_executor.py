@@ -172,10 +172,9 @@ class SymmetricGridExecutor(ExecutorBase):
             )
         adjusted_buy = self.adjust_order_candidates(self.config.connector_name, [buy_candidate])
         if adjusted_buy[0].amount == Decimal("0"):
-            self.close_type = CloseType.INSUFFICIENT_BALANCE
-            self.logger().error("Not enough quote balance to open buy positions.")
-            self.stop()
-            return
+            self.logger().warning(
+                "Not enough quote balance to open buy positions. Continuing with tick and sell-side operations."
+            )
 
         if not self.is_perpetual:
             sell_candidate = OrderCandidate(

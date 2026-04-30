@@ -21,23 +21,26 @@ class CoindcxVolumeSource(VolumeSourceBase):
         for item in data:
             if not isinstance(item, dict):
                 continue
-
-            symbol = str(item.get("market", "")).upper()
+            symbol_raw = str(item.get("market", "")).upper()
+            if not symbol_raw:
+                continue
+            symbol = self._exchange.normalize_trading_pair(symbol_raw)
             if not symbol:
                 continue
 
             try:
-                result[symbol] = self._normalize_ticker(ticker=item)
+                ticker_data = self._normalize_ticker(ticker=item)
+                ticker_data["symbol"] = symbol  
+                result[symbol] = ticker_data
             except (KeyError, ValueError):
                 continue
 
         return result
 
     def _normalize_ticker(self, ticker: Dict[str, Any]) -> Dict[str, Decimal]:
-        symbol = str(ticker.get("market", "")).upper()
         result = {
             "exchange": self.name,
-            "symbol": symbol,
+            "symbol": "",
             "base_volume": Decimal(str(ticker["volume"])),
             "last_price": Decimal(str(ticker["last_price"])),
         }

@@ -7,7 +7,11 @@ import aiohttp
 from bidict import bidict
 
 from hummingbot.connector.constants import s_decimal_NaN
-from hummingbot.connector.exchange.wazirx import wazirx_constants as CONSTANTS, wazirx_web_utils as web_utils
+from hummingbot.connector.exchange.wazirx import (
+    wazirx_constants as CONSTANTS,
+    wazirx_web_utils as web_utils,
+    wazirx_utils,
+)
 from hummingbot.connector.exchange.wazirx.wazirx_api_order_book_data_source import WazirxAPIOrderBookDataSource
 from hummingbot.connector.exchange.wazirx.wazirx_api_user_stream_data_source import WazirxAPIUserStreamDataSource
 from hummingbot.connector.exchange.wazirx.wazirx_auth import WazirxAuth
@@ -113,6 +117,15 @@ class WazirxExchange(ExchangePyBase):
         pairs_prices = await self._api_get(path_url=CONSTANTS.TICKERS_PATH_URL)
         return pairs_prices
 
+    def normalize_trading_pair(self, trading_pair: str) -> str:
+        """Normalize WazirX symbol to Hummingbot `BASE-QUOTE` format.
+
+        Examples: "BTCUSDT" -> "BTC-USDT".
+        """
+        if trading_pair is None:
+            return trading_pair
+        return wazirx_utils.wazirx_pair_to_hb_pair(trading_pair)
+    
     async def get_all_24h_volume_tickers(self, trading_pairs: Optional[List[str]] = None) -> List[Dict[str, str]]:
         if not trading_pairs:
             return await self._api_get(path_url=CONSTANTS.TICKERS_PATH_URL)

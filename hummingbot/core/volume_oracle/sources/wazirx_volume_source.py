@@ -27,23 +27,24 @@ class WazirxVolumeSource(VolumeSourceBase):
             if not isinstance(item, dict):
                 continue
 
-            symbol = str(item.get("symbol", "")).lower()
-            if not symbol:
+            symbol_raw = str(item.get("symbol", "")).upper()
+            if not symbol_raw:
                 continue
 
+            symbol = self._exchange.normalize_trading_pair(symbol_raw)
+
             try:
-                result[symbol] = self._normalize_ticker(ticker=item)
+                ticker_data = self._normalize_ticker(ticker=item, symbol=symbol)
+                result[symbol] = ticker_data
             except (KeyError, ValueError):
-                # Skip malformed ticker entries but keep the bulk response available.
                 continue
 
         return result
 
-    def _normalize_ticker(self, ticker: Dict[str, Any]) -> Dict[str, Decimal]:
-        symbol = str(ticker.get("symbol", "")).lower()
+    def _normalize_ticker(self, ticker: Dict[str, Any], symbol: str) -> Dict[str, Decimal]:
         result = {
             "exchange": self.name,
-            "symbol": symbol,
+            "symbol": symbol, 
             "base_volume": Decimal(str(ticker["volume"])),
             "last_price": Decimal(str(ticker["lastPrice"])),
         }

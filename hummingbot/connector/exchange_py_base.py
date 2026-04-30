@@ -209,6 +209,13 @@ class ExchangePyBase(ExchangeBase, ABC):
     def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
         raise NotImplementedError
 
+    @abstractmethod
+    def normalize_trading_pair(self, trading_pair: str) -> str:
+        """
+        exchange-specific format → standard format
+        """
+        raise NotImplementedError
+
     # === Price logic ===
 
     def get_order_price_quantum(self, trading_pair: str, price: Decimal) -> Decimal:

@@ -48,7 +48,7 @@ class CubeVolumeSource(VolumeSourceBase):
             "last_price": Decimal(str(last_price)),
             "base_volume": Decimal(str(ticker.get("base_volume") if ticker.get("base_volume") is not None else ticker.get("volume", 0))),
         }
-        
+
         if ticker.get("quote_volume") is not None:
             result["quote_volume"] = Decimal(str(ticker["quote_volume"]))
         return result

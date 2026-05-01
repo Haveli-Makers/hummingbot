@@ -213,7 +213,7 @@ class ExchangePyBase(ExchangeBase, ABC):
         """
         Convert an exchange-specific symbol to the standard Hummingbot BASE-QUOTE format
         (e.g. "BTCUSDT" → "BTC-USDT", "btcusdt" → "BTC-USDT").
-        
+
         :param trading_pair: Raw symbol in the exchange's native format.
         :return: Normalised HB trading pair string (e.g. "BTC-USDT"), or None if the
                  symbol cannot be reliably converted.

@@ -39,7 +39,6 @@ class HyperliquidVolumeSource(VolumeSourceBase):
                 except (KeyError, ValueError, InvalidOperation):
                     continue
 
-        # Spot: response['spot'] = [{universe: [{name, ...}]}, [ctx, ...]]
         spot_data = response.get("spot", [])
         if len(spot_data) == 2:
             spot_contexts = spot_data[1]

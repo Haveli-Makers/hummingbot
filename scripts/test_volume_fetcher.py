@@ -9,6 +9,8 @@ from hummingbot.core.volume_oracle.volume_oracle import VolumeOracle
 
 logging.basicConfig(level=logging.WARNING, format="%(name)s - %(levelname)s - %(message)s")
 
+logging.basicConfig(level=logging.WARNING, format="%(name)s - %(levelname)s - %(message)s")
+
 
 async def main():
     exchange = sys.argv[1] if len(sys.argv) > 1 else "binance"

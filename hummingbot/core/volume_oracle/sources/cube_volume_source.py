@@ -1,5 +1,7 @@
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from decimal import Decimal, InvalidOperation
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from hummingbot.core.volume_oracle.sources.volume_source_base import VolumeSourceBase
 
@@ -14,9 +16,12 @@ class CubeVolumeSource(VolumeSourceBase):
         return "cube"
 
     async def get_all_24h_volumes(self, trading_pairs: Optional[List[str]] = None) -> Dict[str, Dict[str, Decimal]]:
+    async def get_all_24h_volumes(self, trading_pairs: Optional[List[str]] = None) -> Dict[str, Dict[str, Decimal]]:
         self._ensure_exchange()
         tickers = await self._exchange.get_all_24h_volume_tickers(trading_pairs)
+        tickers = await self._exchange.get_all_24h_volume_tickers(trading_pairs)
 
+        result: Dict[str, Dict[str, Decimal]] = {}
         result: Dict[str, Dict[str, Decimal]] = {}
         for item in tickers:
             if not isinstance(item, dict):
@@ -46,6 +51,7 @@ class CubeVolumeSource(VolumeSourceBase):
             "last_price": Decimal(str(last_price)),
             "base_volume": Decimal(str(ticker.get("base_volume") if ticker.get("base_volume") is not None else ticker.get("volume", 0))),
         }
+        if ticker.get("quote_volume") is not None:
         if ticker.get("quote_volume") is not None:
             result["quote_volume"] = Decimal(str(ticker["quote_volume"]))
         return result

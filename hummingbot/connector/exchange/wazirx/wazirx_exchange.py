@@ -7,7 +7,11 @@ import aiohttp
 from bidict import bidict
 
 from hummingbot.connector.constants import s_decimal_NaN
-from hummingbot.connector.exchange.wazirx import wazirx_constants as CONSTANTS, wazirx_web_utils as web_utils
+from hummingbot.connector.exchange.wazirx import (
+    wazirx_constants as CONSTANTS,
+    wazirx_web_utils as web_utils,
+    wazirx_utils,
+)
 from hummingbot.connector.exchange.wazirx.wazirx_api_order_book_data_source import WazirxAPIOrderBookDataSource
 from hummingbot.connector.exchange.wazirx.wazirx_api_user_stream_data_source import WazirxAPIUserStreamDataSource
 from hummingbot.connector.exchange.wazirx.wazirx_auth import WazirxAuth

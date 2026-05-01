@@ -1,5 +1,6 @@
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from hummingbot.core.volume_oracle.sources.volume_source_base import VolumeSourceBase
 

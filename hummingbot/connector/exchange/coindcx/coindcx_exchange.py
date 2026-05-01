@@ -185,6 +185,15 @@ class CoindcxExchange(ExchangePyBase):
         """
         return [OrderType.LIMIT, OrderType.LIMIT_MAKER, OrderType.MARKET]
 
+    def normalize_trading_pair(self, trading_pair: str) -> str:
+        """Normalize CoinDCX symbol to Hummingbot `BASE-QUOTE` format.
+
+        Examples: "BTCUSDT" -> "BTC-USDT".
+        """
+        if trading_pair is None:
+            return trading_pair
+        return coindcx_utils.coindcx_pair_to_hb_pair(trading_pair)
+
     async def start_network(self):
         """
         Start all required tasks and perform initial balance fetch to ensure connector becomes ready.

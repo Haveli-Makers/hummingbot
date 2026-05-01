@@ -42,23 +42,9 @@ class VolumeSourceBase(ABC):
         """
         ...
 
-    async def _ensure_symbol_map(self) -> None:
-        """
-        Pre-warms the exchange's trading-pair symbol map so that subsequent
-        normalize_symbol() calls are pure in-memory lookups.  Should be called
-        once at the top of get_all_24h_volumes() for exchanges whose
-        normalize_trading_pair() relies on the symbol map (e.g. Binance-family
-        where native symbols are concatenated like "BTCUSDT").
-        """
-        await self._exchange.trading_pair_symbol_map()
-
     async def normalize_symbol(self, raw_symbol: str) -> Optional[str]:
         """
-        Convert an exchange-specific symbol to Hummingbot BASE-QUOTE format
-        (e.g. "BTC-USDT") by delegating to the exchange's normalize_trading_pair
-        method, which is defined generically in ExchangePyBase and overridden in
-        each connector (e.g. CoindcxExchange, WazirxExchange) to handle their
-        respective native symbol formats.
+        Convert an exchange-specific symbol to Hummingbot BASE-QUOTE format.
 
         :param raw_symbol: Symbol in the exchange's native format.
         :return: Normalised HB trading pair string (e.g. "BTC-USDT"), or None.

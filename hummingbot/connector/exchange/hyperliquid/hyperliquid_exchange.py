@@ -171,14 +171,6 @@ class HyperliquidExchange(ExchangePyBase):
     def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
         return CONSTANTS.UNKNOWN_ORDER_MESSAGE in str(cancelation_exception)
 
-    async def normalize_trading_pair(self, trading_pair: str):
-        s = trading_pair.upper()
-        if "/" in s:
-            return s.replace("/", "-")
-        if "-" in s:
-            return s
-        return await super().normalize_trading_pair(trading_pair)
-
     def quantize_order_price(self, trading_pair: str, price: Decimal) -> Decimal:
         """
         Applies trading rule to quantize order price.

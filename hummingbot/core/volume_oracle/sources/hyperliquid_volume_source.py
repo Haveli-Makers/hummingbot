@@ -31,8 +31,11 @@ class HyperliquidVolumeSource(VolumeSourceBase):
                 if not name:
                     continue
                 symbol = name.upper() + "-USD"
+                hb_symbol = await self.normalize_symbol(symbol)
+                if not hb_symbol:
+                    continue
                 try:
-                    result[symbol] = self._normalize_ticker(symbol=symbol, context=ctx)
+                    result[hb_symbol] = self._normalize_ticker(symbol=hb_symbol, context=ctx)
                 except (KeyError, ValueError, InvalidOperation):
                     continue
 
@@ -46,9 +49,11 @@ class HyperliquidVolumeSource(VolumeSourceBase):
                 raw_symbol = str(ctx.get("coin", ""))
                 if not raw_symbol or raw_symbol.startswith("@"):
                     continue
-                symbol = raw_symbol.replace("/", "-").upper()
+                hb_symbol = await self.normalize_symbol(raw_symbol)
+                if not hb_symbol:
+                    continue
                 try:
-                    result[symbol] = self._normalize_ticker(symbol=symbol, context=ctx)
+                    result[hb_symbol] = self._normalize_ticker(symbol=hb_symbol, context=ctx)
                 except (KeyError, ValueError, InvalidOperation):
                     continue
 

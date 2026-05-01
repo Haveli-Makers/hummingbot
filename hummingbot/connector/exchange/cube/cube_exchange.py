@@ -871,7 +871,10 @@ class CubeExchange(ExchangePyBase):
         mapping_market_id = bidict()
 
         for asset in assets.values():
-            mapping_token_id[asset["assetId"]] = asset["symbol"].upper()
+            try:
+                mapping_token_id[asset["assetId"]] = asset["symbol"].upper()
+            except ValueDuplicationError:
+                self.logger().debug(f"Duplicate symbol found for asset {asset.get('assetId')}: {asset.get('symbol')}")
 
         self.logger().debug(f"markets: {markets}")
 
@@ -879,9 +882,13 @@ class CubeExchange(ExchangePyBase):
             self.logger().debug(f"Processing market {market}")
             base_asset = assets[market.get("baseAssetId")]
             quote_asset = assets[market.get("quoteAssetId")]
-            mapping_symbol[market["symbol"].upper()] = combine_to_hb_trading_pair(
-                base=base_asset["symbol"].upper(), quote=quote_asset["symbol"].upper()
-            )
+            try:
+                mapping_symbol[market["symbol"].upper()] = combine_to_hb_trading_pair(
+                    base=base_asset["symbol"].upper(), quote=quote_asset["symbol"].upper()
+                )
+            except ValueDuplicationError:
+                self.logger().debug(f"Duplicate hb pair found for market {market.get('symbol')}")
+                pass
             try:
                 mapping_market_id[market.get("marketId")] = combine_to_hb_trading_pair(
                     base=base_asset["symbol"].upper(), quote=quote_asset["symbol"].upper()

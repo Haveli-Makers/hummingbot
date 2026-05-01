@@ -22,18 +22,21 @@ class GateIoVolumeSource(VolumeSourceBase):
             if not isinstance(item, dict):
                 continue
 
-            symbol = str(item.get("currency_pair", "")).upper()
-            if not symbol:
+            raw_symbol = str(item.get("currency_pair", ""))
+            if not raw_symbol:
+                continue
+            hb_symbol = await self.normalize_symbol(raw_symbol)
+            if not hb_symbol:
                 continue
 
-            result[symbol] = self._normalize_ticker(item)
+            result[hb_symbol] = self._normalize_ticker(item, hb_symbol)
 
         return result
 
-    def _normalize_ticker(self, ticker: Dict[str, Any]) -> Dict[str, Decimal]:
+    def _normalize_ticker(self, ticker: Dict[str, Any], hb_symbol: str) -> Dict[str, Decimal]:
         result = {
             "exchange": self.name,
-            "symbol": str(ticker["currency_pair"]).upper(),
+            "symbol": hb_symbol,
             "base_volume": Decimal(str(ticker["base_volume"])),
             "last_price": Decimal(str(ticker["last"])),
         }

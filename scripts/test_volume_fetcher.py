@@ -3,9 +3,9 @@ import logging
 import os
 import sys
 
-from hummingbot.core.volume_oracle.volume_oracle import VolumeOracle
-
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from hummingbot.core.volume_oracle.volume_oracle import VolumeOracle
 
 logging.basicConfig(level=logging.WARNING, format="%(name)s - %(levelname)s - %(message)s")
 

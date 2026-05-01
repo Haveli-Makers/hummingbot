@@ -173,12 +173,6 @@ class AscendExExchange(ExchangePyBase):
         # dummy implementation
         return False
 
-    async def normalize_trading_pair(self, trading_pair: str):
-        s = trading_pair.upper()
-        if "/" in s:
-            return s.replace("/", "-")
-        return await super().normalize_trading_pair(trading_pair)
-
     async def _api_request_url(self, path_url: str, is_auth_required: bool = False) -> str:
         url = await super()._api_request_url(path_url, is_auth_required)
 

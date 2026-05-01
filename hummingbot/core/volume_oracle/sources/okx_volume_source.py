@@ -40,7 +40,7 @@ class OkxVolumeSource(VolumeSourceBase):
             try:
                 result[hb_symbol] = self._normalize_ticker(ticker=item, hb_symbol=hb_symbol)
             except Exception as e:
-                print(f"Bad ticker data for {raw_symbol}: {item} | Error: {e}")
+                self.logger().warning(f"Bad ticker data for {raw_symbol}: {item} | Error: {e}")
                 continue
 
         return result

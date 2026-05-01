@@ -19,7 +19,6 @@ class HyperliquidVolumeSource(VolumeSourceBase):
 
         result: Dict[str, Dict[str, Decimal]] = {}
 
-        # Perps: response['perps'] = [{universe: [{name, ...}]}, [ctx, ...]]
         perps_data = response.get("perps", [])
         if len(perps_data) == 2:
             perps_universe = perps_data[0].get("universe", [])

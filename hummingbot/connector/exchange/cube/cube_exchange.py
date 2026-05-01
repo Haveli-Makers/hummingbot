@@ -888,7 +888,6 @@ class CubeExchange(ExchangePyBase):
                 )
             except ValueDuplicationError:
                 self.logger().debug(f"Duplicate hb pair found for market {market.get('symbol')}")
-                pass
             try:
                 mapping_market_id[market.get("marketId")] = combine_to_hb_trading_pair(
                     base=base_asset["symbol"].upper(), quote=quote_asset["symbol"].upper()

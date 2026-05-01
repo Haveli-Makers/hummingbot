@@ -203,12 +203,6 @@ class DexalotExchange(ExchangePyBase):
     def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
         return False
 
-    async def normalize_trading_pair(self, trading_pair: str):
-        s = trading_pair.upper()
-        if "/" in s:
-            return s.replace("/", "-")
-        return await super().normalize_trading_pair(trading_pair)
-
     def _create_web_assistants_factory(self) -> WebAssistantsFactory:
         return web_utils.build_api_factory(
             throttler=self._throttler,

@@ -16,9 +16,7 @@ class CubeVolumeSource(VolumeSourceBase):
     async def get_all_24h_volumes(self, trading_pairs: Optional[List[str]] = None) -> Dict[str, Dict[str, Decimal]]:
         self._ensure_exchange()
         tickers = await self._exchange.get_all_24h_volume_tickers(trading_pairs)
-        tickers = await self._exchange.get_all_24h_volume_tickers(trading_pairs)
 
-        result: Dict[str, Dict[str, Decimal]] = {}
         result: Dict[str, Dict[str, Decimal]] = {}
         for item in tickers:
             if not isinstance(item, dict):

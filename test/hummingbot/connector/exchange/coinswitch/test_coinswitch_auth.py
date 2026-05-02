@@ -111,6 +111,7 @@ class CoinswitchAuthTests(unittest.TestCase):
     def test_rest_authenticate_post_excludes_epoch_header(self):
         """POST requests must NOT include X-AUTH-EPOCH (per CoinSwitch spec)."""
         import json
+
         from hummingbot.core.web_assistant.connections.data_types import RESTMethod, RESTRequest
 
         auth = self._make_auth()
@@ -129,11 +130,13 @@ class CoinswitchAuthTests(unittest.TestCase):
         from hummingbot.core.web_assistant.connections.data_types import RESTMethod, RESTRequest
 
         auth = self._make_auth()
-        make_req = lambda: RESTRequest(
-            method=RESTMethod.GET,
-            url="https://coinswitch.co/trade/api/v2/24hr/all-pairs/ticker",
-            params={"exchange": "coinswitchx"},
-        )
+
+        def make_req():
+            return RESTRequest(
+                method=RESTMethod.GET,
+                url="https://coinswitch.co/trade/api/v2/24hr/all-pairs/ticker",
+                params={"exchange": "coinswitchx"},
+            )
         sig1 = self._run(auth.rest_authenticate(make_req())).headers["X-AUTH-SIGNATURE"]
         # Reset nonce so the second call gets the same timestamp.
         auth._last_timestamp = 0

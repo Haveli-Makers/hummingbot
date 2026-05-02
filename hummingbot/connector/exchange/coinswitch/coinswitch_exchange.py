@@ -734,8 +734,7 @@ class CoinswitchExchange(ExchangePyBase):
             )
             if not response or "data" not in response:
                 raise ValueError(
-                    f"Unexpected order status response for {tracked_order.exchange_order_id}: {response}"
-                    )
+                    f"Unexpected order status response for {tracked_order.exchange_order_id}: {response}")
             order_data = response.get("data", {})
             status_str = order_data.get("status", "")
             new_state = CONSTANTS.ORDER_STATE.get(status_str)

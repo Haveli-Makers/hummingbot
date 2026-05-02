@@ -90,7 +90,7 @@ class CoinswitchWebUtils:
     @staticmethod
     def parse_trading_pair(trading_pair: str) -> tuple:
         if not trading_pair:
-            raise ValueError(f"Cannot parse empty trading pair.")
+            raise ValueError(f"Cannot parse empty trading pair.{trading_pair}")
         for sep in ("-", "/"):
             parts = trading_pair.split(sep)
             if len(parts) == 2 and parts[0] and parts[1]:

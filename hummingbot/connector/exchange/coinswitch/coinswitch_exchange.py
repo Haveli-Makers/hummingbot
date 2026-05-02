@@ -91,6 +91,42 @@ class CoinswitchExchange(ExchangePyBase):
         )
         return response
 
+    async def get_all_24h_volume_tickers(self, trading_pairs: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """
+        Fetch 24h volume ticker data from CoinSwitch.
+        """
+        params = {"exchange": self._exchange}
+        results: List[Dict[str, Any]] = []
+
+        if not trading_pairs:
+            response = await self._api_get(
+                path_url=CONSTANTS.TICKER_ALL_PATH_URL,
+                params=params,
+                is_auth_required=False,
+            )
+            if response and "data" in response:
+                for symbol, ticker in response["data"].items():
+                    ticker["symbol"] = symbol
+                    results.append(ticker)
+        else:
+            for tp in trading_pairs:
+                base, quote = tp.split("-", 1)
+                symbol = f"{base}/{quote}"
+                try:
+                    response = await self._api_get(
+                        path_url=CONSTANTS.TICKER_PATH_URL,
+                        params={**params, "symbol": symbol},
+                        is_auth_required=False,
+                    )
+                    if response and "data" in response:
+                        for sym, ticker in response["data"].items():
+                            ticker["symbol"] = sym
+                            results.append(ticker)
+                except Exception:
+                    self.logger().warning(f"Skipping {tp}: pair not found on {self.name}")
+
+        return results
+
     @property
     def authenticator(self):
         """Get the authenticator for API requests."""

@@ -92,7 +92,7 @@ class CoinswitchAuth(AuthBase):
         auth_message = f"GET/ws/auth{epoch_time}"
         signature = self._generate_ws_signature(auth_message, epoch_time)
 
-        if request.headers is None:
+        if not hasattr(request, "headers") or request.headers is None:
             request.headers = {}
 
         request.headers["X-AUTH-APIKEY"] = self.api_key

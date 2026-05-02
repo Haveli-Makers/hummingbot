@@ -13,7 +13,6 @@ class CoinswitchAuth(AuthBase):
     """
 
     def __init__(self, api_key: str, secret_key: str, time_provider):
-        # Allow empty credentials for connectors used only for public (unauthenticated) requests.
         if api_key or secret_key:
             try:
                 secret_key_bytes = bytes.fromhex(secret_key)

@@ -2,11 +2,9 @@ import asyncio
 import unittest
 from unittest.mock import MagicMock
 
-# Ed25519 private key: exactly 32 bytes expressed as 64 hex chars.
 _VALID_HEX_KEY = "aa" * 32
-# Fixed epoch in seconds; auth will multiply by 1000 to get ms.
 _FIXED_TS_SECONDS = 1_000_000.0
-_FIXED_EPOCH_MS = 1_000_000_000  # 1_000_000 * 1000
+_FIXED_EPOCH_MS = 1_000_000_000
 
 
 def _make_time_provider(ts_seconds: float = _FIXED_TS_SECONDS) -> MagicMock:
@@ -58,7 +56,7 @@ class CoinswitchAuthTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             CoinswitchAuth(
                 api_key="k",
-                secret_key="aa" * 16,  # 16 bytes — too short
+                secret_key="aa" * 16,
                 time_provider=_make_time_provider(),
             )
 
@@ -138,7 +136,6 @@ class CoinswitchAuthTests(unittest.TestCase):
                 params={"exchange": "coinswitchx"},
             )
         sig1 = self._run(auth.rest_authenticate(make_req())).headers["X-AUTH-SIGNATURE"]
-        # Reset nonce so the second call gets the same timestamp.
         auth._last_timestamp = 0
         sig2 = self._run(auth.rest_authenticate(make_req())).headers["X-AUTH-SIGNATURE"]
         self.assertEqual(sig1, sig2)

@@ -34,7 +34,6 @@ class CoinswitchUserStreamDataSourceTests(unittest.TestCase):
             "timestamp": 1234567890000
         }
 
-        # Should contain required fields
         self.assertIn("type", order_update)
         self.assertIn("order_id", order_update)
         self.assertIn("status", order_update)
@@ -51,7 +50,6 @@ class CoinswitchUserStreamDataSourceTests(unittest.TestCase):
             "timestamp": 1234567890000
         }
 
-        # Should contain required fields
         self.assertIn("type", balance_update)
         self.assertIn("balance", balance_update)
         self.assertEqual("balance_update", balance_update["type"])
@@ -60,7 +58,6 @@ class CoinswitchUserStreamDataSourceTests(unittest.TestCase):
         """Test WebSocket connection URL format"""
         from hummingbot.connector.exchange.coinswitch.coinswitch_constants import HBOT_ORDER_ID_PREFIX
 
-        # Stream URLs should be valid
         self.assertIsNotNone(HBOT_ORDER_ID_PREFIX)
 
     def test_order_event_parsing(self):

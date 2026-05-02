@@ -19,7 +19,7 @@ class CoinswitchExchangeTests(unittest.TestCase):
 
             exchange = CoinswitchExchange(
                 coinswitch_api_key="test_key",
-                coinswitch_api_secret="aa" * 32,  # valid 64-char hex Ed25519 key
+                coinswitch_api_secret="aa" * 32,
                 trading_pairs=["BTC-INR"],
                 trading_required=False
             )

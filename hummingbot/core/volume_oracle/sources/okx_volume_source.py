@@ -30,27 +30,29 @@ class OkxVolumeSource(VolumeSourceBase):
             if not isinstance(item, dict):
                 continue
 
-            symbol = str(item.get("instId", "")).upper()
-            if not symbol:
+            raw_symbol = str(item.get("instId", ""))
+            if not raw_symbol:
+                continue
+            hb_symbol = await self.normalize_symbol(raw_symbol)
+            if not hb_symbol:
                 continue
 
             try:
-                result[symbol] = self._normalize_ticker(ticker=item)
+                result[hb_symbol] = self._normalize_ticker(ticker=item, hb_symbol=hb_symbol)
             except Exception as e:
-                print(f"Bad ticker data for {symbol}: {item} | Error: {e}")
+                self.logger().warning(f"Bad ticker data for {raw_symbol}: {item} | Error: {e}")
                 continue
 
         return result
 
-    def _normalize_ticker(self, ticker: Dict[str, Any]) -> Dict[str, Decimal]:
-        symbol = str(ticker.get("instId", "")).upper()
+    def _normalize_ticker(self, ticker: Dict[str, Any], hb_symbol: str) -> Dict[str, Decimal]:
         vol24h = ticker.get("vol24h")
         last = ticker.get("last")
         if vol24h is None or last is None:
-            raise ValueError(f"Missing vol24h or last for {symbol}")
+            raise ValueError(f"Missing vol24h or last for {hb_symbol}")
         result = {
             "exchange": self.name,
-            "symbol": symbol,
+            "symbol": hb_symbol,
             "base_volume": self._safe_decimal(vol24h),
             "last_price": self._safe_decimal(last),
         }

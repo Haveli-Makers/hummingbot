@@ -22,25 +22,27 @@ class DexalotVolumeSource(VolumeSourceBase):
             if not isinstance(item, dict):
                 continue
 
-            symbol = str(item.get("pair", "")).upper()
-            if not symbol:
+            raw_symbol = str(item.get("pair", ""))
+            if not raw_symbol:
+                continue
+            hb_symbol = await self.normalize_symbol(raw_symbol)
+            if not hb_symbol:
                 continue
 
             try:
-                result[symbol] = self._normalize_ticker(ticker=item)
+                result[hb_symbol] = self._normalize_ticker(ticker=item, hb_symbol=hb_symbol)
             except (KeyError, ValueError, InvalidOperation):
                 continue
 
         return result
 
-    def _normalize_ticker(self, ticker: Dict[str, Any]) -> Dict[str, Decimal]:
-        symbol = str(ticker.get("pair", "")).upper()
+    def _normalize_ticker(self, ticker: Dict[str, Any], hb_symbol: str) -> Dict[str, Decimal]:
         last_price_raw = ticker.get("close") or ticker.get("last") or ticker.get("high")
         if last_price_raw is None:
-            raise ValueError(f"Missing last_price for {symbol}")
+            raise ValueError(f"Missing last_price for {hb_symbol}")
         result = {
             "exchange": self.name,
-            "symbol": symbol,
+            "symbol": hb_symbol,
             "last_price": Decimal(str(last_price_raw)),
             "base_volume": Decimal(str(ticker.get("volume") or "0")),
         }

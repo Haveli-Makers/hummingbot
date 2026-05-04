@@ -19,7 +19,6 @@ class HyperliquidVolumeSource(VolumeSourceBase):
 
         result: Dict[str, Dict[str, Decimal]] = {}
 
-        # Perps: response['perps'] = [{universe: [{name, ...}]}, [ctx, ...]]
         perps_data = response.get("perps", [])
         if len(perps_data) == 2:
             perps_universe = perps_data[0].get("universe", [])
@@ -31,12 +30,14 @@ class HyperliquidVolumeSource(VolumeSourceBase):
                 if not name:
                     continue
                 symbol = name.upper() + "-USD"
+                hb_symbol = await self.normalize_symbol(symbol)
+                if not hb_symbol:
+                    continue
                 try:
-                    result[symbol] = self._normalize_ticker(symbol=symbol, context=ctx)
+                    result[hb_symbol] = self._normalize_ticker(symbol=hb_symbol, context=ctx)
                 except (KeyError, ValueError, InvalidOperation):
                     continue
 
-        # Spot: response['spot'] = [{universe: [{name, ...}]}, [ctx, ...]]
         spot_data = response.get("spot", [])
         if len(spot_data) == 2:
             spot_contexts = spot_data[1]
@@ -46,9 +47,11 @@ class HyperliquidVolumeSource(VolumeSourceBase):
                 raw_symbol = str(ctx.get("coin", ""))
                 if not raw_symbol or raw_symbol.startswith("@"):
                     continue
-                symbol = raw_symbol.replace("/", "-").upper()
+                hb_symbol = await self.normalize_symbol(raw_symbol)
+                if not hb_symbol:
+                    continue
                 try:
-                    result[symbol] = self._normalize_ticker(symbol=symbol, context=ctx)
+                    result[hb_symbol] = self._normalize_ticker(symbol=hb_symbol, context=ctx)
                 except (KeyError, ValueError, InvalidOperation):
                     continue
 

@@ -10,7 +10,6 @@ from hummingbot.core.volume_oracle.sources.coinbase_advanced_trade_volume_source
     CoinbaseAdvancedTradeVolumeSource,
 )
 from hummingbot.core.volume_oracle.sources.coindcx_volume_source import CoindcxVolumeSource
-from hummingbot.core.volume_oracle.sources.coinswitch_volume_source import CoinswitchVolumeSource
 from hummingbot.core.volume_oracle.sources.cube_volume_source import CubeVolumeSource
 from hummingbot.core.volume_oracle.sources.derive_volume_source import DeriveVolumeSource
 from hummingbot.core.volume_oracle.sources.dexalot_volume_source import DexalotVolumeSource
@@ -30,7 +29,6 @@ VOLUME_ORACLE_SOURCES = {
     "bybit": BybitVolumeSource,
     "coinbase_advanced_trade": CoinbaseAdvancedTradeVolumeSource,
     "coindcx": CoindcxVolumeSource,
-    "coinswitch": CoinswitchVolumeSource,
     "cube": CubeVolumeSource,
     "derive": DeriveVolumeSource,
     "dexalot": DexalotVolumeSource,

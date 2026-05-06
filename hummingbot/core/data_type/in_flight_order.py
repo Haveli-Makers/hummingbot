@@ -34,6 +34,7 @@ class OrderState(Enum):
     APPROVED = 8
     CREATED = 9
     COMPLETED = 10
+    PENDING_EDIT = 11
 
 
 class OrderUpdate(NamedTuple):
@@ -178,12 +179,17 @@ class InFlightOrder:
         return self.current_state == OrderState.PENDING_CANCEL
 
     @property
+    def is_pending_edit(self) -> bool:
+        return self.current_state == OrderState.PENDING_EDIT
+
+    @property
     def is_open(self) -> bool:
         return self.current_state in {
             OrderState.PENDING_CREATE,
             OrderState.OPEN,
             OrderState.PARTIALLY_FILLED,
-            OrderState.PENDING_CANCEL}
+            OrderState.PENDING_CANCEL,
+            OrderState.PENDING_EDIT}
 
     @property
     def is_done(self) -> bool:

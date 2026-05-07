@@ -24,6 +24,7 @@ SUPPORTED_CONNECTORS = [
     "dexalot",
     "coindcx",
     "wazirx",
+    "ajaib",
 ]
 
 
@@ -119,6 +120,10 @@ def get_rate_source(connector_name: str) -> RateSourceBase:
         from hummingbot.core.rate_oracle.sources.coindcx_rate_source import CoindcxRateSource
 
         return CoindcxRateSource()
+    elif connector_name_lower == "ajaib":
+        from hummingbot.core.rate_oracle.sources.ajaib_rate_source import AjaibRateSource
+
+        return AjaibRateSource()
 
     else:
         raise ValueError(

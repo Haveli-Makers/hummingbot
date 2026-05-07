@@ -328,9 +328,13 @@ class CoinswitchExchange(ExchangePyBase):
 
         for trading_pair in trading_pairs:
             try:
+                try:
+                    symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+                except KeyError:
+                    symbol = trading_pair.replace("-", "/")
                 params = {
                     "exchange": self._exchange,
-                    "symbol": trading_pair
+                    "symbol": symbol
                 }
 
                 response = await self._api_get(
@@ -341,7 +345,7 @@ class CoinswitchExchange(ExchangePyBase):
 
                 if response and "data" in response:
                     ticker_data = response.get("data", {})
-                    ticker_key = trading_pair.upper()
+                    ticker_key = symbol.upper()
                     if ticker_key in ticker_data:
                         ticker = ticker_data[ticker_key]
                         price = float(ticker.get("lastPrice", 0))
@@ -759,20 +763,25 @@ class CoinswitchExchange(ExchangePyBase):
         Get the last traded price for a trading pair.
         """
         try:
+            try:
+                symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+            except KeyError:
+                symbol = trading_pair.replace("-", "/")
             params = {
                 "exchange": self._exchange,
-                "symbol": trading_pair
+                "symbol": symbol
             }
 
             response = await self._api_get(
                 path_url=CONSTANTS.TICKER_PATH_URL,
                 params=params,
+                is_auth_required=True,
             )
 
             if response and "data" in response:
                 ticker_data = response.get("data", {})
-                if trading_pair.upper() in ticker_data:
-                    ticker = ticker_data[trading_pair.upper()]
+                if symbol.upper() in ticker_data:
+                    ticker = ticker_data[symbol.upper()]
                     return float(ticker.get("lastPrice", 0))
 
         except Exception as e:

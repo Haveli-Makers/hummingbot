@@ -34,6 +34,20 @@ TRADING_FEE_PATH_URL = "/trade/api/v2/tradingFee"
 
 WS_HEARTBEAT_TIME_INTERVAL = 30
 
+WS_SPOT_SOCKETIO_PATH = "pro/realtime-rates-socket/spot"
+WS_ORDER_UPDATES_SOCKETIO_PATH = "pro/realtime-rates-socket/spot/order-updates"
+WS_BALANCE_UPDATES_SOCKETIO_PATH = "pro/realtime-rates-socket/spot/balance-updates"
+
+WS_ORDER_UPDATES_NAMESPACE = "/orderupdates"
+WS_BALANCE_UPDATES_NAMESPACE = "/balanceupdates"
+
+EXCHANGE_NAMESPACE_MAP = {
+    "coinswitchx": "/coinswitchx",
+    "wazirx": "/wazirx",
+    "c2c1": "/c2c1",
+    "c2c2": "/c2c2",
+}
+
 SIDE_BUY = "buy"
 SIDE_SELL = "sell"
 

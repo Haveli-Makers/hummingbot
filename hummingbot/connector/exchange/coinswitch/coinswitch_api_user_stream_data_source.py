@@ -1,37 +1,29 @@
 import asyncio
-import logging
 import time
-from typing import Any, List, Optional
+from typing import TYPE_CHECKING, List, Optional
+
+import socketio
 
 from hummingbot.connector.exchange.coinswitch import coinswitch_constants as CONSTANTS
+from hummingbot.connector.exchange.coinswitch.coinswitch_auth import CoinswitchAuth
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
-from hummingbot.core.web_assistant.auth import AuthBase
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
-_logger = logging.getLogger(__name__)
+if TYPE_CHECKING:
+    from hummingbot.connector.exchange.coinswitch.coinswitch_exchange import CoinswitchExchange
 
 
 class CoinswitchAPIUserStreamDataSource(UserStreamTrackerDataSource):
     """
-    User stream data source for CoinSwitch API.
+    User stream data source for CoinSwitch using Socket.IO v4.
     """
 
     def __init__(self,
-                 auth: Optional[AuthBase] = None,
+                 auth: Optional[CoinswitchAuth] = None,
                  trading_pairs: Optional[List[str]] = None,
-                 connector=None,
+                 connector: Optional['CoinswitchExchange'] = None,
                  api_factory: Optional[WebAssistantsFactory] = None,
                  domain: str = CONSTANTS.DEFAULT_DOMAIN):
-        """
-        Initialize the CoinSwitch user stream data source.
-
-        Args:
-            auth: Authentication handler
-            trading_pairs: List of trading pairs
-            connector: The exchange connector
-            api_factory: WebAssistantsFactory for API calls
-            domain: The domain (default: com)
-        """
         super().__init__()
         self._auth = auth
         self._trading_pairs = trading_pairs or []
@@ -39,68 +31,146 @@ class CoinswitchAPIUserStreamDataSource(UserStreamTrackerDataSource):
         self._api_factory = api_factory
         self._domain = domain
         self._last_recv_time = 0.0
+        self._order_client: Optional[socketio.AsyncClient] = None
+        self._balance_client: Optional[socketio.AsyncClient] = None
 
     @property
     def last_recv_time(self) -> float:
-        """
-        Returns the time of the last received message.
-        """
         return self._last_recv_time
 
-    async def _connected_websocket_assistant(self) -> Any:
-        return None
+    def _build_order_client(self, output: asyncio.Queue) -> socketio.AsyncClient:
+        client = socketio.AsyncClient(logger=False, reconnection=False)
+        api_key = self._auth.api_key if self._auth else ""
+        namespace = CONSTANTS.WS_ORDER_UPDATES_NAMESPACE
+
+        @client.event(namespace=namespace)
+        async def connect():
+            self.logger().info("CoinSwitch order-updates stream connected")
+            await client.emit(
+                CONSTANTS.ORDER_UPDATE_EVENT_TYPE,
+                {"apikey": api_key, "event": "subscribe"},
+                namespace=namespace,
+            )
+            self._last_recv_time = time.time()
+
+        @client.event(namespace=namespace)
+        async def disconnect():
+            self.logger().warning("CoinSwitch order-updates stream disconnected")
+
+        @client.on(CONSTANTS.ORDER_UPDATE_EVENT_TYPE, namespace=namespace)
+        async def on_order_update(message):
+            self._last_recv_time = time.time()
+            if isinstance(message, dict):
+                message["event"] = CONSTANTS.ORDER_UPDATE_EVENT_TYPE
+            await output.put(message)
+
+        @client.on("error", namespace=namespace)
+        async def on_error(message):
+            self.logger().warning(f"CoinSwitch order-updates error: {message}")
+
+        return client
+
+    def _build_balance_client(self, output: asyncio.Queue) -> socketio.AsyncClient:
+        client = socketio.AsyncClient(logger=False, reconnection=False)
+        api_key = self._auth.api_key if self._auth else ""
+        namespace = CONSTANTS.WS_BALANCE_UPDATES_NAMESPACE
+
+        @client.event(namespace=namespace)
+        async def connect():
+            self.logger().info("CoinSwitch balance-updates stream connected")
+            await client.emit(
+                CONSTANTS.BALANCE_UPDATE_EVENT_TYPE,
+                {"apikey": api_key, "event": "subscribe"},
+                namespace=namespace,
+            )
+            self._last_recv_time = time.time()
+
+        @client.event(namespace=namespace)
+        async def disconnect():
+            self.logger().warning("CoinSwitch balance-updates stream disconnected")
+
+        @client.on(CONSTANTS.BALANCE_UPDATE_EVENT_TYPE, namespace=namespace)
+        async def on_balance_update(message):
+            self._last_recv_time = time.time()
+            if isinstance(message, dict):
+                message["event"] = CONSTANTS.BALANCE_UPDATE_EVENT_TYPE
+            await output.put(message)
+
+        @client.on("error", namespace=namespace)
+        async def on_error(message):
+            self.logger().warning(f"CoinSwitch balance-updates error: {message}")
+
+        return client
+
+    async def _disconnect_all(self):
+        for attr in ("_order_client", "_balance_client"):
+            client = getattr(self, attr, None)
+            if client is not None:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    self.logger().debug(f"Error disconnecting {attr}", exc_info=True)
+                setattr(self, attr, None)
+
+    async def _ping_task(self):
+        try:
+            while True:
+                await asyncio.sleep(CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL)
+                for client, namespace in [
+                    (self._order_client, CONSTANTS.WS_ORDER_UPDATES_NAMESPACE),
+                    (self._balance_client, CONSTANTS.WS_BALANCE_UPDATES_NAMESPACE),
+                ]:
+                    if client and client.connected:
+                        try:
+                            await client.emit("ping", {}, namespace=namespace)
+                        except Exception as e:
+                            self.logger().debug(f"Error sending ping: {e}")
+        except asyncio.CancelledError:
+            pass
 
     async def listen_for_user_stream(self, output: asyncio.Queue) -> None:
-        """
-        Listen for user stream updates.
-
-        Args:
-            output: Queue to output user stream messages
-        """
         while True:
             try:
-                self._last_recv_time = time.time()
+                self._order_client = self._build_order_client(output)
+                self._balance_client = self._build_balance_client(output)
 
+                await self._order_client.connect(
+                    CONSTANTS.WSS_URL,
+                    namespaces=[CONSTANTS.WS_ORDER_UPDATES_NAMESPACE],
+                    socketio_path=CONSTANTS.WS_ORDER_UPDATES_SOCKETIO_PATH,
+                    transports=["websocket"],
+                )
+                await self._balance_client.connect(
+                    CONSTANTS.WSS_URL,
+                    namespaces=[CONSTANTS.WS_BALANCE_UPDATES_NAMESPACE],
+                    socketio_path=CONSTANTS.WS_BALANCE_UPDATES_SOCKETIO_PATH,
+                    transports=["websocket"],
+                )
+                self.logger().info("CoinSwitch user stream connections established")
+
+                ping_task = asyncio.create_task(self._ping_task())
                 try:
-                    portfolio_response = await self._connector._api_get(
-                        path_url=CONSTANTS.GET_PORTFOLIO_PATH_URL,
-                        is_auth_required=True,
+                    await asyncio.gather(
+                        self._order_client.wait(),
+                        self._balance_client.wait(),
                     )
-
-                    if portfolio_response and "data" in portfolio_response:
-                        message = {
-                            "type": "balance_update",
-                            "data": portfolio_response.get("data", [])
-                        }
-                        output.put_nowait(message)
-                        self._last_recv_time = time.time()
-                except Exception as e:
-                    _logger.debug(f"Error fetching portfolio: {e}")
-
-                try:
-                    orders_response = await self._connector._api_get(
-                        path_url=CONSTANTS.OPEN_ORDERS_PATH_URL,
-                        params={"open": True},
-                        is_auth_required=True,
-                    )
-
-                    if orders_response and "data" in orders_response:
-                        message = {
-                            "type": "order_update",
-                            "data": orders_response.get("data", {}).get("orders", [])
-                        }
-                        output.put_nowait(message)
-                        self._last_recv_time = time.time()
-                except Exception as e:
-                    _logger.debug(f"Error fetching orders: {e}")
-
-                await asyncio.sleep(5)
+                finally:
+                    ping_task.cancel()
+                    try:
+                        await ping_task
+                    except asyncio.CancelledError:
+                        pass
 
             except asyncio.CancelledError:
+                await self._disconnect_all()
                 raise
-            except Exception as e:
-                _logger.warning(f"Error in listen_for_user_stream: {e}")
-                await asyncio.sleep(5)
+            except Exception:
+                self.logger().exception("Unexpected error in user stream. Retrying in 5 seconds...")
+                await self._disconnect_all()
+                await asyncio.sleep(5.0)
+            finally:
+                await self._disconnect_all()
+                await asyncio.sleep(1.0)
 
     async def _subscribe_to_user_stream(self) -> None:
         pass

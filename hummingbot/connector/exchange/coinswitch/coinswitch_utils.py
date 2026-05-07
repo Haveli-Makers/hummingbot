@@ -83,7 +83,7 @@ class CoinswitchUtils:
         """
         try:
             return Decimal(str(s))
-        except Exception:
+        except (ValueError, TypeError):
             return Decimal(0)
 
     @staticmethod

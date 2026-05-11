@@ -166,7 +166,7 @@ class CoinswitchAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
                 self._client = self._build_client()
                 await self._client.connect(
-                    CONSTANTS.WSS_URL,
+                    CONSTANTS.WS_URL,
                     namespaces=[self._namespace],
                     socketio_path=CONSTANTS.WS_SPOT_SOCKETIO_PATH,
                     transports=["websocket"],
@@ -185,15 +185,16 @@ class CoinswitchAPIOrderBookDataSource(OrderBookTrackerDataSource):
                         pass
 
             except asyncio.CancelledError:
-                await self._disconnect()
                 raise
             except Exception:
                 self.logger().exception("Unexpected error in order book stream. Retrying in 5 seconds...")
-                await self._disconnect()
                 await asyncio.sleep(5.0)
             finally:
                 await self._disconnect()
-                await asyncio.sleep(1.0)
+                try:
+                    await asyncio.sleep(1.0)
+                except asyncio.CancelledError:
+                    raise
 
     async def _parse_order_book_snapshot_message(self, raw_message: Any, message_queue: asyncio.Queue):
         """
@@ -254,4 +255,4 @@ class CoinswitchAPIOrderBookDataSource(OrderBookTrackerDataSource):
             await self._parse_order_book_snapshot_message(raw_message, message_queue)
 
     async def _connected_websocket_assistant(self):
-        pass
+        raise NotImplementedError("CoinswitchAPIOrderBookDataSource uses Socket.IO directly.")

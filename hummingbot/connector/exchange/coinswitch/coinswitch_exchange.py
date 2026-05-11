@@ -164,11 +164,6 @@ class CoinswitchExchange(ExchangePyBase):
         return CONSTANTS.PING_PATH_URL
 
     @property
-    def trading_rules_rest_request_path(self):
-        """Get the REST request path for trading rules."""
-        return CONSTANTS.EXCHANGE_INFO_PATH_URL
-
-    @property
     def trading_pairs(self) -> List[str]:
         """Get the list of trading pairs."""
         return self._trading_pairs
@@ -277,7 +272,7 @@ class CoinswitchExchange(ExchangePyBase):
 
     async def _import_trading_pairs(self):
         """Import trading pairs from the exchange."""
-        return {}
+        return []
 
     async def _get_trading_pairs(self) -> List[str]:
         """
@@ -501,61 +496,6 @@ class CoinswitchExchange(ExchangePyBase):
 
         except Exception as e:
             _logger.error(f"Error updating balances: {e}", exc_info=True)
-
-    def _parse_order_response(self, order_response: Dict) -> Tuple[str, InFlightOrder]:
-        """
-        Parse order response from exchange.
-        Args:
-            order_response: Order response from exchange
-        """
-        exchange_order_id = order_response.get("order_id")
-        trading_pair = order_response.get("symbol")
-        client_order_id = order_response.get("client_order_id", "")
-
-        in_flight_order = InFlightOrder(
-            client_order_id=client_order_id,
-            exchange_order_id=exchange_order_id,
-            trading_pair=trading_pair,
-            order_type=OrderType.LIMIT,
-            trade_type=TradeType.BUY if order_response.get("side", "").lower() == "buy" else TradeType.SELL,
-            price=Decimal(str(order_response.get("price", 0))),
-            amount=Decimal(str(order_response.get("orig_qty", 0))),
-            creation_timestamp=float(order_response.get("created_time", 0)) / 1000.0,
-        )
-
-        return exchange_order_id, in_flight_order
-
-    def _parse_trade_update(self, trade: Dict) -> TradeUpdate:
-        """
-        Parse trade update from exchange.
-        Args:
-            trade: Trade data from exchange
-        Returns:
-            Trade update
-        """
-        trade_type = TradeType.BUY if trade.get("is_buyer", True) else TradeType.SELL
-        fill_price = Decimal(str(trade.get("price", 0)))
-        fill_base_amount = Decimal(str(trade.get("qty", 0)))
-        fee = TradeFeeBase.new_spot_fee(
-            fee_schema=self.trade_fee_schema(),
-            trade_type=trade_type,
-            percent_token=trade.get("fee_asset", ""),
-            flat_fees=[TokenAmount(
-                amount=Decimal(str(trade.get("fee", 0))),
-                token=trade.get("fee_asset", ""),
-            )],
-        )
-        return TradeUpdate(
-            trade_id=str(trade.get("trade_id", "")),
-            client_order_id=trade.get("client_order_id", ""),
-            exchange_order_id=str(trade.get("order_id", "")),
-            trading_pair=trade.get("symbol", ""),
-            fill_price=fill_price,
-            fill_base_amount=fill_base_amount,
-            fill_quote_amount=fill_base_amount * fill_price,
-            fee=fee,
-            fill_timestamp=float(trade.get("time", 0)) / 1000.0,
-        )
 
     async def _update_trading_fees(self):
         """

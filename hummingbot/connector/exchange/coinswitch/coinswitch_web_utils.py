@@ -1,4 +1,4 @@
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 import hummingbot.connector.exchange.coinswitch.coinswitch_constants as CONSTANTS
 from hummingbot.connector.time_synchronizer import TimeSynchronizer
@@ -66,43 +66,3 @@ async def get_current_server_time(
     )
     server_time = response.get("serverTime", response.get("data", {}).get("serverTime", 0))
     return server_time
-
-
-class CoinswitchWebUtils:
-    @staticmethod
-    def build_ws_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
-        return f"{CONSTANTS.WSS_URL}{path_url}"
-
-    @staticmethod
-    def async_run_with_timeout(coroutine, timeout_seconds: float = 30):
-        import asyncio
-        return asyncio.wait_for(coroutine, timeout=timeout_seconds)
-
-    @staticmethod
-    async def get_rest_assistant(client_config_map) -> Any:
-        api_factory = build_api_factory()
-        return await api_factory.get_rest_assistant()
-
-    @staticmethod
-    def get_ws_path_for_client(domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
-        return "/pro/realtime-rates-socket/spot"
-
-    @staticmethod
-    def parse_trading_pair(trading_pair: str) -> tuple:
-        if not trading_pair:
-            raise ValueError(f"Cannot parse empty trading pair.{trading_pair}")
-        for sep in ("-", "/"):
-            parts = trading_pair.split(sep)
-            if len(parts) == 2 and parts[0] and parts[1]:
-                return parts[0], parts[1]
-        raise ValueError(
-            f"Cannot parse trading pair '{trading_pair}': expected 'BASE-QUOTE' or 'BASE/QUOTE' format."
-        )
-
-    @staticmethod
-    def format_trading_pair(base: str, quote: str) -> str:
-        return f"{base}/{quote}"
-
-    @staticmethod
-    def normalize_symbol(symbol: str) -> str:
-        return symbol.upper()

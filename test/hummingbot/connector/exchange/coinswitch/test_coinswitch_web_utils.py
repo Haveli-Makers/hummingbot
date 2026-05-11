@@ -4,7 +4,6 @@ from hummingbot.connector.exchange.coinswitch import (
     coinswitch_constants as CONSTANTS,
     coinswitch_web_utils as web_utils,
 )
-from hummingbot.connector.exchange.coinswitch.coinswitch_web_utils import CoinswitchWebUtils
 
 
 class CoinswitchWebUtilsTests(unittest.TestCase):
@@ -71,45 +70,6 @@ class CoinswitchWebUtilsTests(unittest.TestCase):
         throttler = web_utils.create_throttler()
         api_factory = web_utils.build_api_factory_without_time_synchronizer_pre_processor(throttler=throttler)
         self.assertIsNotNone(api_factory)
-
-    def test_build_ws_url_starts_with_wss(self):
-        ws_url = CoinswitchWebUtils.build_ws_url("/spot")
-        self.assertTrue(ws_url.startswith("wss://"))
-        self.assertIn("/spot", ws_url)
-
-    def test_get_ws_path_for_client(self):
-        path = CoinswitchWebUtils.get_ws_path_for_client()
-        self.assertIn("spot", path)
-
-    def test_parse_trading_pair_hyphen_format(self):
-        base, quote = CoinswitchWebUtils.parse_trading_pair("BTC-INR")
-        self.assertEqual("BTC", base)
-        self.assertEqual("INR", quote)
-
-    def test_parse_trading_pair_slash_format(self):
-        base, quote = CoinswitchWebUtils.parse_trading_pair("BTC/INR")
-        self.assertEqual("BTC", base)
-        self.assertEqual("INR", quote)
-
-    def test_parse_trading_pair_invalid_raises_value_error(self):
-        with self.assertRaises(ValueError):
-            CoinswitchWebUtils.parse_trading_pair("BTCINR")
-
-    def test_parse_trading_pair_empty_raises_value_error(self):
-        with self.assertRaises(ValueError):
-            CoinswitchWebUtils.parse_trading_pair("")
-
-    def test_format_trading_pair(self):
-        result = CoinswitchWebUtils.format_trading_pair("BTC", "INR")
-        self.assertEqual("BTC/INR", result)
-
-    def test_normalize_symbol_lowercase(self):
-        result = CoinswitchWebUtils.normalize_symbol("btc")
-        self.assertEqual("BTC", result)
-
-    def test_normalize_symbol_already_upper(self):
-        result = CoinswitchWebUtils.normalize_symbol("BTC")
-        self.assertEqual("BTC", result)
 
 
 if __name__ == "__main__":

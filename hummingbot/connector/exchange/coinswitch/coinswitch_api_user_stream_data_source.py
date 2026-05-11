@@ -162,15 +162,16 @@ class CoinswitchAPIUserStreamDataSource(UserStreamTrackerDataSource):
                         pass
 
             except asyncio.CancelledError:
-                await self._disconnect_all()
                 raise
             except Exception:
                 self.logger().exception("Unexpected error in user stream. Retrying in 5 seconds...")
-                await self._disconnect_all()
                 await asyncio.sleep(5.0)
             finally:
                 await self._disconnect_all()
-                await asyncio.sleep(1.0)
+                try:
+                    await asyncio.sleep(1.0)
+                except asyncio.CancelledError:
+                    raise
 
     async def _subscribe_to_user_stream(self) -> None:
         pass

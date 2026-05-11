@@ -256,8 +256,9 @@ class CoinswitchAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
 
         mock_client.connect.assert_called_once()
         self.assertEqual(
-            CONSTANTS.WSS_URL,
+            CONSTANTS.WS_URL,
             mock_client.connect.call_args[0][0],
+            "Order book must connect via https:// (WS_URL) for Socket.IO v4, not wss://",
         )
 
 

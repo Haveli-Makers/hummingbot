@@ -40,7 +40,6 @@ VOLUME_ORACLE_SOURCES = {
     "mexc": MexcVolumeSource,
     "okx": OkxVolumeSource,
     "wazirx": WazirxVolumeSource,
-    "coinswitch": CoinswitchVolumeSource,
 }
 
 

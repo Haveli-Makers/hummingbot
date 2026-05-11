@@ -87,7 +87,7 @@ class CoinswitchExchange(ExchangePyBase):
         response = await self._api_get(
             path_url=CONSTANTS.TICKER_ALL_PATH_URL,
             params=params,
-            is_auth_required=False,
+            is_auth_required=True,
         )
         return response
 
@@ -101,7 +101,7 @@ class CoinswitchExchange(ExchangePyBase):
         response = await self._api_get(
             path_url=CONSTANTS.TICKER_ALL_PATH_URL,
             params=params,
-            is_auth_required=False,
+            is_auth_required=True,
         )
         if response and "data" in response:
             requested = None

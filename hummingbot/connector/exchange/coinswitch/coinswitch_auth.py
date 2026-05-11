@@ -3,7 +3,7 @@ import asyncio
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
 from hummingbot.core.web_assistant.auth import AuthBase
-from hummingbot.core.web_assistant.connections.data_types import RESTMethod, RESTRequest, WSRequest
+from hummingbot.core.web_assistant.connections.data_types import RESTRequest, WSRequest
 
 
 class CoinswitchAuth(AuthBase):
@@ -43,6 +43,9 @@ class CoinswitchAuth(AuthBase):
         """
         import json
         from urllib.parse import urlparse
+
+        if not self.api_key or not self.secret_key:
+            return request
 
         headers = request.headers or {}
 
@@ -169,39 +172,3 @@ class CoinswitchAuth(AuthBase):
         signature_bytes = private_key.sign(request_string)
 
         return signature_bytes.hex()
-
-    async def add_auth_params(self, request: object, method: RESTMethod = None, params: dict = None, data: dict = None, headers: dict = None, url: str = None) -> None:
-        """
-        Add authentication signature to request headers.
-
-        Args:
-            request: The request object
-            method: HTTP method
-            params: Query parameters (GET) or request body (POST/DELETE)
-            data: Alternative request body parameter
-            headers: Request headers
-            url: Request URL
-        """
-        if headers is None:
-            headers = {}
-
-        epoch_time = await self._get_timestamp()
-
-        if url:
-            from urllib.parse import urlparse
-            parsed_url = urlparse(url)
-            endpoint = parsed_url.path
-            if parsed_url.query:
-                endpoint += "?" + parsed_url.query
-        else:
-            endpoint = ""
-
-        body_params = data if data is not None else (params if params is not None else {})
-
-        method_str = method.name if hasattr(method, 'name') else str(method).upper()
-        signature = self._generate_signature(method_str, endpoint, body_params, epoch_time)
-
-        headers["X-AUTH-SIGNATURE"] = signature
-        headers["X-AUTH-EPOCH"] = epoch_time
-        headers["X-AUTH-APIKEY"] = self.api_key
-        headers["Content-Type"] = "application/json"

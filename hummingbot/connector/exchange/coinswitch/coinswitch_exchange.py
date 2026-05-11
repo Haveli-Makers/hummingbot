@@ -104,11 +104,18 @@ class CoinswitchExchange(ExchangePyBase):
             is_auth_required=True,
         )
         if response and "data" in response:
-            requested = None
             if trading_pairs:
-                requested = {f"{tp.split('-', 1)[0]}/{tp.split('-', 1)[1]}" for tp in trading_pairs}
-            for symbol, ticker in response["data"].items():
-                if requested is None or symbol.upper() in {s.upper() for s in requested}:
+                requested = {f"{tp.split('-', 1)[0]}/{tp.split('-', 1)[1]}".upper() for tp in trading_pairs}
+                found = {symbol.upper() for symbol in response["data"]}
+                for sym in requested:
+                    if sym not in found:
+                        self.logger().warning(f"Skipping {sym}: symbol not found on {self.name}")
+                for symbol, ticker in response["data"].items():
+                    if symbol.upper() in requested:
+                        ticker["symbol"] = symbol
+                        results.append(ticker)
+            else:
+                for symbol, ticker in response["data"].items():
                     ticker["symbol"] = symbol
                     results.append(ticker)
 

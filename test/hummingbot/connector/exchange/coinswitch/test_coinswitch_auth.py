@@ -17,8 +17,6 @@ def _make_time_provider(ts_seconds: float = _FIXED_TS_SECONDS) -> MagicMock:
 class CoinswitchAuthTests(unittest.TestCase):
     """Test cases for CoinSwitch authentication."""
 
-    # ------------------------------------------------------------------ helpers
-
     def _import_auth(self):
         try:
             from hummingbot.connector.exchange.coinswitch.coinswitch_auth import CoinswitchAuth
@@ -32,8 +30,6 @@ class CoinswitchAuthTests(unittest.TestCase):
 
     def _run(self, coro):
         return asyncio.get_event_loop().run_until_complete(coro)
-
-    # --------------------------------------------------------------- init tests
 
     def test_auth_module_imports(self):
         CoinswitchAuth = self._import_auth()
@@ -59,8 +55,6 @@ class CoinswitchAuthTests(unittest.TestCase):
                 secret_key="aa" * 16,
                 time_provider=_make_time_provider(),
             )
-
-    # ------------------------------------------------------- rest_authenticate
 
     def test_rest_authenticate_get_sets_required_headers(self):
         """GET rest_authenticate must produce X-AUTH-APIKEY, X-AUTH-SIGNATURE, X-AUTH-EPOCH."""
@@ -106,8 +100,8 @@ class CoinswitchAuthTests(unittest.TestCase):
         self.assertEqual(len(sig), 128)
         self.assertTrue(all(c in "0123456789abcdefABCDEF" for c in sig))
 
-    def test_rest_authenticate_post_excludes_epoch_header(self):
-        """POST requests must NOT include X-AUTH-EPOCH (per CoinSwitch spec)."""
+    def test_rest_authenticate_post_includes_epoch_header(self):
+        """POST requests include X-AUTH-EPOCH, X-AUTH-SIGNATURE, and X-AUTH-APIKEY."""
         import json
 
         from hummingbot.core.web_assistant.connections.data_types import RESTMethod, RESTRequest
@@ -119,7 +113,7 @@ class CoinswitchAuthTests(unittest.TestCase):
             data=json.dumps({"symbol": "BTC/INR", "side": "buy"}),
         )
         result = self._run(auth.rest_authenticate(request))
-        self.assertNotIn("X-AUTH-EPOCH", result.headers)
+        self.assertIn("X-AUTH-EPOCH", result.headers)
         self.assertIn("X-AUTH-SIGNATURE", result.headers)
         self.assertIn("X-AUTH-APIKEY", result.headers)
 
@@ -139,8 +133,6 @@ class CoinswitchAuthTests(unittest.TestCase):
         auth._last_timestamp = 0
         sig2 = self._run(auth.rest_authenticate(make_req())).headers["X-AUTH-SIGNATURE"]
         self.assertEqual(sig1, sig2)
-
-    # -------------------------------------------------------- ws_authenticate
 
     def test_ws_authenticate_sets_required_headers(self):
         """ws_authenticate must set X-AUTH-APIKEY, X-AUTH-SIGNATURE, X-AUTH-EPOCH."""
@@ -165,6 +157,47 @@ class CoinswitchAuthTests(unittest.TestCase):
         sig = result.headers["X-AUTH-SIGNATURE"]
         self.assertEqual(len(sig), 128)
         self.assertTrue(all(c in "0123456789abcdefABCDEF" for c in sig))
+
+    def test_rest_authenticate_post_body_is_sorted_json(self):
+        """POST body is re-serialized as compact sorted JSON."""
+        import json
+
+        from hummingbot.core.web_assistant.connections.data_types import RESTMethod, RESTRequest
+
+        auth = self._make_auth()
+        payload = {"z_key": "last", "a_key": "first"}
+        request = RESTRequest(
+            method=RESTMethod.POST,
+            url="https://coinswitch.co/trade/api/v2/order",
+            data=json.dumps(payload),
+        )
+        result = self._run(auth.rest_authenticate(request))
+        body = json.loads(result.data)
+        keys = list(body.keys())
+        self.assertEqual(sorted(keys), keys)
+
+    def test_rest_authenticate_delete_sets_required_headers(self):
+        """DELETE requests must have X-AUTH-APIKEY and X-AUTH-SIGNATURE."""
+        import json
+
+        from hummingbot.core.web_assistant.connections.data_types import RESTMethod, RESTRequest
+
+        auth = self._make_auth()
+        request = RESTRequest(
+            method=RESTMethod.DELETE,
+            url="https://coinswitch.co/trade/api/v2/order",
+            data=json.dumps({"order_id": "ex_001"}),
+        )
+        result = self._run(auth.rest_authenticate(request))
+        self.assertIn("X-AUTH-APIKEY", result.headers)
+        self.assertIn("X-AUTH-SIGNATURE", result.headers)
+
+    def test_get_timestamp_is_monotonically_increasing(self):
+        """Rapid sequential calls must never produce a duplicate epoch."""
+        auth = self._make_auth()
+        times = [int(self._run(auth._get_timestamp())) for _ in range(5)]
+        for i in range(1, len(times)):
+            self.assertGreater(times[i], times[i - 1])
 
 
 if __name__ == "__main__":

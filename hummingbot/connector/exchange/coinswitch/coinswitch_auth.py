@@ -36,9 +36,10 @@ class CoinswitchAuth(AuthBase):
         """
         Adds authentication headers to the request including signature.
 
-        CoinSwitch API authentication:
-        - GET requests: X-AUTH-EPOCH header included, signature = method + endpoint + epoch
-        - POST/DELETE requests: NO X-AUTH-EPOCH header, signature = method + endpoint + json_body
+        CoinSwitch API authentication (new format since July 2024):
+        - All requests: X-AUTH-EPOCH header included
+        - GET:    signature = method + endpoint_with_query_params + epoch_time
+        - POST/DELETE: signature = method + endpoint + epoch_time  (body NOT in signature)
         """
         import json
         from urllib.parse import urlparse
@@ -70,10 +71,8 @@ class CoinswitchAuth(AuthBase):
 
         headers["X-AUTH-APIKEY"] = self.api_key
         headers["X-AUTH-SIGNATURE"] = signature
+        headers["X-AUTH-EPOCH"] = epoch_time
         headers["Content-Type"] = "application/json"
-
-        if method_str == "GET":
-            headers["X-AUTH-EPOCH"] = epoch_time
 
         request.headers = headers
         return request
@@ -135,20 +134,19 @@ class CoinswitchAuth(AuthBase):
         """
         Generate Ed25519 signature for the request.
 
-        Signature message format:
-        - GET: METHOD + endpoint_with_query_params + epoch_time
-        - POST/DELETE: METHOD + endpoint + json_body (NO epoch_time in signature)
+        Signature message format (new CoinSwitch format since July 2024):
+        - GET:    METHOD + endpoint_with_query_params + epoch_time
+        - POST/DELETE: METHOD + endpoint + epoch_time  (body is NOT part of signature)
 
         Args:
             method: HTTP method (GET, POST, DELETE)
             endpoint: API endpoint path
-            params: Query parameters (for GET) or body (for POST/DELETE)
+            params: Query parameters (for GET); ignored in signature for POST/DELETE
             epoch_time: Epoch time in milliseconds
 
         Returns:
             Hex-encoded signature
         """
-        import json
 
         if method == "GET":
             if params:
@@ -163,8 +161,7 @@ class CoinswitchAuth(AuthBase):
 
             signature_msg = method + endpoint_with_params + epoch_time
         else:
-            json_body = json.dumps(params, separators=(',', ':'), sort_keys=True) if params else ""
-            signature_msg = method + endpoint + json_body
+            signature_msg = method + endpoint + epoch_time
 
         request_string = bytes(signature_msg, 'utf-8')
         secret_key_bytes = bytes.fromhex(self.secret_key)

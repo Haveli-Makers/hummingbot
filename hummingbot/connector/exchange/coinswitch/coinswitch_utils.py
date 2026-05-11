@@ -1,4 +1,4 @@
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict
 
 from pydantic import ConfigDict, Field, SecretStr
@@ -83,7 +83,7 @@ class CoinswitchUtils:
         """
         try:
             return Decimal(str(s))
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, InvalidOperation):
             return Decimal(0)
 
     @staticmethod

@@ -98,32 +98,19 @@ class CoinswitchExchange(ExchangePyBase):
         params = {"exchange": self._exchange}
         results: List[Dict[str, Any]] = []
 
-        if not trading_pairs:
-            response = await self._api_get(
-                path_url=CONSTANTS.TICKER_ALL_PATH_URL,
-                params=params,
-                is_auth_required=False,
-            )
-            if response and "data" in response:
-                for symbol, ticker in response["data"].items():
+        response = await self._api_get(
+            path_url=CONSTANTS.TICKER_ALL_PATH_URL,
+            params=params,
+            is_auth_required=False,
+        )
+        if response and "data" in response:
+            requested = None
+            if trading_pairs:
+                requested = {f"{tp.split('-', 1)[0]}/{tp.split('-', 1)[1]}" for tp in trading_pairs}
+            for symbol, ticker in response["data"].items():
+                if requested is None or symbol.upper() in {s.upper() for s in requested}:
                     ticker["symbol"] = symbol
                     results.append(ticker)
-        else:
-            for tp in trading_pairs:
-                base, quote = tp.split("-", 1)
-                symbol = f"{base}/{quote}"
-                try:
-                    response = await self._api_get(
-                        path_url=CONSTANTS.TICKER_PATH_URL,
-                        params={**params, "symbol": symbol},
-                        is_auth_required=False,
-                    )
-                    if response and "data" in response:
-                        for sym, ticker in response["data"].items():
-                            ticker["symbol"] = sym
-                            results.append(ticker)
-                except Exception:
-                    self.logger().warning(f"Skipping {tp}: pair not found on {self.name}")
 
         return results
 
@@ -164,7 +151,7 @@ class CoinswitchExchange(ExchangePyBase):
     @property
     def trading_rules_request_path(self):
         """Get the trading rules request path."""
-        return CONSTANTS.EXCHANGE_INFO_PATH_URL
+        return CONSTANTS.TRADE_INFO_PATH_URL
 
     @property
     def trading_pairs_request_path(self):
@@ -282,7 +269,7 @@ class CoinswitchExchange(ExchangePyBase):
     async def _make_trading_rules_request(self) -> Any:
         params = {"exchange": self._exchange}
         exchange_info = await self._api_get(
-            path_url=CONSTANTS.TICKER_ALL_PATH_URL,
+            path_url=CONSTANTS.TRADE_INFO_PATH_URL,
             params=params,
             is_auth_required=True,
         )
@@ -441,13 +428,10 @@ class CoinswitchExchange(ExchangePyBase):
                 fee_data = response.get("data", {}).get(self._exchange.lower(), {})
 
                 for asset, fee_info in fee_data.items():
-                    maker_fee = Decimal(str(fee_info.get("maker_fee_after_discount", 0)))
                     taker_fee = Decimal(str(fee_info.get("taker_fee_after_discount", 0)))
 
                     trading_fees[asset] = DeductedFromReturnsTradeFee(
-                        token=TokenAmount(asset),
-                        maker=maker_fee,
-                        taker=taker_fee,
+                        percent=taker_fee,
                     )
 
         except Exception as e:
@@ -577,7 +561,7 @@ class CoinswitchExchange(ExchangePyBase):
         """
         Update trading fees from the exchange.
         """
-        pass
+        self._trading_fees = await self._get_trading_fees()
 
     async def _user_stream_event_listener(self):
         """
@@ -586,9 +570,9 @@ class CoinswitchExchange(ExchangePyBase):
         """
         async for event_message in self._iter_user_event_queue():
             try:
-                event_type = event_message.get("type")
+                event_type = event_message.get("event")
 
-                if event_type == "balance_update":
+                if event_type == CONSTANTS.BALANCE_UPDATE_EVENT_TYPE:
                     balance_data = event_message.get("data", [])
                     for asset_data in balance_data:
                         asset = asset_data.get("currency", "").upper()
@@ -598,7 +582,7 @@ class CoinswitchExchange(ExchangePyBase):
                         self._account_balances[asset] = total
                         self._account_available_balances[asset] = free
 
-                elif event_type == "order_update":
+                elif event_type == CONSTANTS.ORDER_UPDATE_EVENT_TYPE:
                     orders_data = event_message.get("data", [])
                     for order_data in orders_data:
                         client_order_id = order_data.get("client_order_id")
@@ -626,48 +610,48 @@ class CoinswitchExchange(ExchangePyBase):
 
     async def _format_trading_rules(self, exchange_info_dict: Dict[str, Any]) -> List[TradingRule]:
         """
-        Format trading rules from ticker data.
+        Format trading rules from tradeInfo data.
         Args:
-            exchange_info_dict: Ticker data dictionary from TICKER_ALL_PATH_URL
+            exchange_info_dict: tradeInfo data dictionary from TRADE_INFO_PATH_URL
         Returns:
             List of trading rules
         """
         trading_rules = []
         try:
-            tickers_data = exchange_info_dict.get("data", {})
+            exchange_data = exchange_info_dict.get("data", {}).get(self._exchange.lower(), {})
 
-            if isinstance(tickers_data, dict):
-                for symbol, ticker_info in tickers_data.items():
-                    try:
-                        if "/" in symbol:
-                            base, quote = symbol.split("/")
-                        elif "-" in symbol:
-                            base, quote = symbol.split("-")
-                        else:
-                            continue
+            for symbol, info in exchange_data.items():
+                try:
+                    if "/" in symbol:
+                        base, quote = symbol.split("/")
+                    elif "-" in symbol:
+                        base, quote = symbol.split("-")
+                    else:
+                        continue
 
-                        trading_pair = f"{base}-{quote}"
+                    trading_pair = f"{base}-{quote}"
 
-                        base_precision = 8
-                        quote_precision = 2 if quote == "INR" else 8
+                    precision = info.get("precision", {})
+                    quote_limits = info.get("quote", {})
 
-                        min_qty = Decimal("0.00000001")
-                        min_notional = Decimal("1") if quote == "INR" else Decimal("0.0001")
+                    base_precision = int(precision.get("base", 8))
+                    quote_precision = int(precision.get("quote", 2))
 
-                        step_size = Decimal(10) ** -base_precision
-                        tick_size = Decimal(10) ** -quote_precision
+                    step_size = Decimal(10) ** -base_precision
+                    tick_size = Decimal(10) ** -quote_precision
+                    min_notional = Decimal(str(quote_limits.get("min", "1")))
 
-                        trading_rules.append(
-                            TradingRule(
-                                trading_pair=trading_pair,
-                                min_order_size=min_qty,
-                                min_price_increment=tick_size,
-                                min_base_amount_increment=step_size,
-                                min_notional_size=min_notional,
-                            )
+                    trading_rules.append(
+                        TradingRule(
+                            trading_pair=trading_pair,
+                            min_order_size=step_size,
+                            min_price_increment=tick_size,
+                            min_base_amount_increment=step_size,
+                            min_notional_size=min_notional,
                         )
-                    except Exception as e:
-                        _logger.debug(f"Error parsing trading rule for {symbol}: {e}")
+                    )
+                except Exception as e:
+                    _logger.debug(f"Error parsing trading rule for {symbol}: {e}")
 
         except Exception as e:
             _logger.error(f"Error formatting trading rules: {e}")

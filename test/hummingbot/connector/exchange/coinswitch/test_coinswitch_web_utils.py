@@ -1,111 +1,115 @@
-import asyncio
 import unittest
 
-from typing_extensions import Awaitable
-
-from hummingbot.connector.exchange.coinswitch import coinswitch_constants as cs_constants, coinswitch_web_utils
+from hummingbot.connector.exchange.coinswitch import (
+    coinswitch_constants as CONSTANTS,
+    coinswitch_web_utils as web_utils,
+)
+from hummingbot.connector.exchange.coinswitch.coinswitch_web_utils import CoinswitchWebUtils
 
 
 class CoinswitchWebUtilsTests(unittest.TestCase):
-    """Test CoinSwitch web utilities"""
+    """Test CoinSwitch web utility functions."""
 
-    def setUp(self) -> None:
-        self.web_utils = coinswitch_web_utils
-
-    def async_run_with_timeout(self, coroutine: Awaitable, timeout: float = 1):
-        ret = asyncio.get_event_loop().run_until_complete(asyncio.wait_for(coroutine, timeout))
-        return ret
-
-    def test_public_rest_url_building(self):
-        """Test building public REST URLs"""
-        endpoint = "/trade/api/v2/depth"
-        url = self.web_utils.public_rest_url(endpoint)
-
+    def test_public_rest_url_starts_with_https(self):
+        url = web_utils.public_rest_url(CONSTANTS.DEPTH_PATH_URL)
         self.assertTrue(url.startswith("https://"))
-        self.assertIn(endpoint, url)
+        self.assertIn(CONSTANTS.DEPTH_PATH_URL, url)
 
-    def test_private_rest_url_building(self):
-        """Test building private REST URLs"""
-        endpoint = "/trade/api/v2/order"
-        url = self.web_utils.private_rest_url(endpoint)
-
+    def test_private_rest_url_starts_with_https(self):
+        url = web_utils.private_rest_url(CONSTANTS.CREATE_ORDER_PATH_URL)
         self.assertTrue(url.startswith("https://"))
-        self.assertIn(endpoint, url)
+        self.assertIn(CONSTANTS.CREATE_ORDER_PATH_URL, url)
 
     def test_build_api_url(self):
-        """Test building API URLs"""
-        endpoint = "/trade/api/v2/depth"
-        url = self.web_utils.build_api_url(endpoint)
-
+        url = web_utils.build_api_url(CONSTANTS.DEPTH_PATH_URL)
         self.assertTrue(url.startswith("https://"))
-        self.assertIn(endpoint, url)
+        self.assertIn(CONSTANTS.DEPTH_PATH_URL, url)
 
-    def test_rest_api_factory_creation(self):
-        """Test REST API factory creation"""
-        api_factory = self.web_utils.build_api_factory()
-        self.assertIsNotNone(api_factory)
+    def test_public_and_private_rest_url_same_base(self):
+        """CoinSwitch uses the same base for public and private endpoints."""
+        pub = web_utils.public_rest_url(CONSTANTS.DEPTH_PATH_URL)
+        priv = web_utils.private_rest_url(CONSTANTS.DEPTH_PATH_URL)
+        self.assertEqual(pub, priv)
 
-    def test_rest_api_factory_without_sync(self):
-        """Test REST API factory without time synchronizer"""
-        throttler = self.web_utils.create_throttler()
-        api_factory = self.web_utils.build_api_factory_without_time_synchronizer_pre_processor(throttler=throttler)
+    def test_trade_info_url(self):
+        url = web_utils.build_api_url(CONSTANTS.TRADE_INFO_PATH_URL)
+        self.assertIn("/trade/api/v2/tradeInfo", url)
 
-        self.assertIsNotNone(api_factory)
+    def test_order_url(self):
+        url = web_utils.build_api_url(CONSTANTS.CREATE_ORDER_PATH_URL)
+        self.assertIn("/order", url)
 
-    def test_create_throttler(self):
-        """Test throttler creation"""
-        throttler = self.web_utils.create_throttler()
+    def test_ticker_all_url(self):
+        url = web_utils.build_api_url(CONSTANTS.TICKER_ALL_PATH_URL)
+        self.assertIn("ticker", url)
 
+    def test_trading_fee_url(self):
+        url = web_utils.build_api_url(CONSTANTS.TRADING_FEE_PATH_URL)
+        self.assertIn("tradingFee", url)
+
+    def test_depth_url(self):
+        url = web_utils.build_api_url(CONSTANTS.DEPTH_PATH_URL)
+        self.assertIn("/depth", url)
+
+    def test_trades_url(self):
+        url = web_utils.build_api_url(CONSTANTS.TRADES_PATH_URL)
+        self.assertIn("/trades", url)
+
+    def test_portfolio_url(self):
+        url = web_utils.build_api_url(CONSTANTS.GET_PORTFOLIO_PATH_URL)
+        self.assertIn("/portfolio", url)
+
+    def test_create_throttler_returns_non_none(self):
+        throttler = web_utils.create_throttler()
         self.assertIsNotNone(throttler)
 
-    def test_build_ws_url(self):
-        """Test WebSocket URL building"""
-        path = "/spot"
-        ws_url = self.web_utils.CoinswitchWebUtils.build_ws_url(path)
+    def test_build_api_factory_returns_non_none(self):
+        api_factory = web_utils.build_api_factory()
+        self.assertIsNotNone(api_factory)
 
+    def test_build_api_factory_without_sync_returns_non_none(self):
+        throttler = web_utils.create_throttler()
+        api_factory = web_utils.build_api_factory_without_time_synchronizer_pre_processor(throttler=throttler)
+        self.assertIsNotNone(api_factory)
+
+    def test_build_ws_url_starts_with_wss(self):
+        ws_url = CoinswitchWebUtils.build_ws_url("/spot")
         self.assertTrue(ws_url.startswith("wss://"))
+        self.assertIn("/spot", ws_url)
+
+    def test_get_ws_path_for_client(self):
+        path = CoinswitchWebUtils.get_ws_path_for_client()
+        self.assertIn("spot", path)
 
     def test_parse_trading_pair_hyphen_format(self):
-        """Test parsing trading pair in hyphen format"""
-        base, quote = self.web_utils.CoinswitchWebUtils.parse_trading_pair("BTC-INR")
+        base, quote = CoinswitchWebUtils.parse_trading_pair("BTC-INR")
         self.assertEqual("BTC", base)
         self.assertEqual("INR", quote)
 
     def test_parse_trading_pair_slash_format(self):
-        """Test parsing trading pair in slash format"""
-        base, quote = self.web_utils.CoinswitchWebUtils.parse_trading_pair("BTC/INR")
+        base, quote = CoinswitchWebUtils.parse_trading_pair("BTC/INR")
         self.assertEqual("BTC", base)
         self.assertEqual("INR", quote)
 
+    def test_parse_trading_pair_invalid_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            CoinswitchWebUtils.parse_trading_pair("BTCINR")
+
+    def test_parse_trading_pair_empty_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            CoinswitchWebUtils.parse_trading_pair("")
+
     def test_format_trading_pair(self):
-        """Test formatting trading pair"""
-        result = self.web_utils.CoinswitchWebUtils.format_trading_pair("BTC", "INR")
+        result = CoinswitchWebUtils.format_trading_pair("BTC", "INR")
         self.assertEqual("BTC/INR", result)
 
-    def test_normalize_symbol(self):
-        """Test symbol normalization"""
-        result = self.web_utils.CoinswitchWebUtils.normalize_symbol("btc")
+    def test_normalize_symbol_lowercase(self):
+        result = CoinswitchWebUtils.normalize_symbol("btc")
         self.assertEqual("BTC", result)
 
-    def test_order_url_building(self):
-        """Test order endpoint URL building"""
-        order_url = self.web_utils.build_api_url(cs_constants.CREATE_ORDER_PATH_URL)
-        self.assertIn("/order", order_url)
-
-    def test_depth_url_building(self):
-        """Test depth/order book endpoint URL building"""
-        depth_url = self.web_utils.build_api_url(cs_constants.DEPTH_PATH_URL)
-        self.assertIn("/depth", depth_url)
-
-    def test_trades_url_building(self):
-        """Test recent trades endpoint URL building"""
-        trades_url = self.web_utils.build_api_url(cs_constants.TRADES_PATH_URL)
-        self.assertIn("/trades", trades_url)
-
-    def test_portfolio_url_building(self):
-        """Test portfolio endpoint URL building"""
-        portfolio_url = self.web_utils.build_api_url(cs_constants.GET_PORTFOLIO_PATH_URL)
-        self.assertIn("/portfolio", portfolio_url)
+    def test_normalize_symbol_already_upper(self):
+        result = CoinswitchWebUtils.normalize_symbol("BTC")
+        self.assertEqual("BTC", result)
 
 
 if __name__ == "__main__":

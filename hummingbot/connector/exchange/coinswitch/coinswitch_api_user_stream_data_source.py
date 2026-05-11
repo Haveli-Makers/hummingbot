@@ -135,13 +135,13 @@ class CoinswitchAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 self._balance_client = self._build_balance_client(output)
 
                 await self._order_client.connect(
-                    CONSTANTS.WSS_URL,
+                    CONSTANTS.WS_URL,
                     namespaces=[CONSTANTS.WS_ORDER_UPDATES_NAMESPACE],
                     socketio_path=CONSTANTS.WS_ORDER_UPDATES_SOCKETIO_PATH,
                     transports=["websocket"],
                 )
                 await self._balance_client.connect(
-                    CONSTANTS.WSS_URL,
+                    CONSTANTS.WS_URL,
                     namespaces=[CONSTANTS.WS_BALANCE_UPDATES_NAMESPACE],
                     socketio_path=CONSTANTS.WS_BALANCE_UPDATES_SOCKETIO_PATH,
                     transports=["websocket"],

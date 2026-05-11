@@ -8,6 +8,7 @@ MAX_ORDER_ID_LEN = 36
 
 REST_URL = "https://coinswitch.co"
 WSS_URL = "wss://ws.coinswitch.co"
+WS_URL = "https://ws.coinswitch.co"
 
 PUBLIC_API_VERSION = "v2"
 PRIVATE_API_VERSION = "v2"

@@ -22,21 +22,24 @@ class BybitVolumeSource(VolumeSourceBase):
             if not isinstance(item, dict):
                 continue
 
-            symbol = str(item.get("symbol", "")).upper()
-            if not symbol:
+            raw_symbol = str(item.get("symbol", ""))
+            if not raw_symbol:
+                continue
+            hb_symbol = await self.normalize_symbol(raw_symbol)
+            if not hb_symbol:
                 continue
 
             try:
-                result[symbol] = self._normalize_ticker(item)
+                result[hb_symbol] = self._normalize_ticker(item, hb_symbol)
             except (KeyError, ValueError):
                 continue
 
         return result
 
-    def _normalize_ticker(self, ticker: Dict[str, Any]) -> Dict[str, Decimal]:
+    def _normalize_ticker(self, ticker: Dict[str, Any], hb_symbol: str) -> Dict[str, Decimal]:
         result = {
             "exchange": self.name,
-            "symbol": str(ticker["symbol"]).upper(),
+            "symbol": hb_symbol,
             "base_volume": Decimal(str(ticker["volume24h"])),
             "last_price": Decimal(str(ticker["lastPrice"])),
         }

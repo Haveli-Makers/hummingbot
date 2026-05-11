@@ -1,6 +1,7 @@
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+from hummingbot.connector.exchange.wazirx import wazirx_utils
 from hummingbot.core.volume_oracle.sources.volume_source_base import VolumeSourceBase
 
 if TYPE_CHECKING:
@@ -27,23 +28,25 @@ class WazirxVolumeSource(VolumeSourceBase):
             if not isinstance(item, dict):
                 continue
 
-            symbol = str(item.get("symbol", "")).lower()
-            if not symbol:
+            raw_symbol = str(item.get("symbol", ""))
+            if not raw_symbol:
+                continue
+            hb_symbol = wazirx_utils.wazirx_pair_to_hb_pair(raw_symbol)
+            if not hb_symbol:
                 continue
 
             try:
-                result[symbol] = self._normalize_ticker(ticker=item)
+                result[hb_symbol] = self._normalize_ticker(ticker=item, hb_symbol=hb_symbol)
             except (KeyError, ValueError):
                 # Skip malformed ticker entries but keep the bulk response available.
                 continue
 
         return result
 
-    def _normalize_ticker(self, ticker: Dict[str, Any]) -> Dict[str, Decimal]:
-        symbol = str(ticker.get("symbol", "")).lower()
+    def _normalize_ticker(self, ticker: Dict[str, Any], hb_symbol: str) -> Dict[str, Decimal]:
         result = {
             "exchange": self.name,
-            "symbol": symbol,
+            "symbol": hb_symbol,
             "base_volume": Decimal(str(ticker["volume"])),
             "last_price": Decimal(str(ticker["lastPrice"])),
         }

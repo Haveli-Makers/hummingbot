@@ -24,12 +24,15 @@ class CoinbaseAdvancedTradeVolumeSource(VolumeSourceBase):
             if not isinstance(item, dict):
                 continue
 
-            symbol = str(item.get("product_id", "")).upper()
-            if not symbol:
+            raw_symbol = str(item.get("product_id", ""))
+            if not raw_symbol:
+                continue
+            hb_symbol = await self.normalize_symbol(raw_symbol)
+            if not hb_symbol:
                 continue
 
             try:
-                result[symbol] = self._normalize_ticker(item)
+                result[hb_symbol] = self._normalize_ticker(item, hb_symbol)
             except (KeyError, ValueError, InvalidOperation):
                 continue
 
@@ -40,10 +43,10 @@ class CoinbaseAdvancedTradeVolumeSource(VolumeSourceBase):
         v = str(value).strip() if value is not None else ""
         return Decimal(v) if v else Decimal(default)
 
-    def _normalize_ticker(self, ticker: Dict[str, Any]) -> Dict[str, Decimal]:
+    def _normalize_ticker(self, ticker: Dict[str, Any], hb_symbol: str) -> Dict[str, Decimal]:
         result = {
             "exchange": self.name,
-            "symbol": str(ticker["product_id"]).upper(),
+            "symbol": hb_symbol,
             "last_price": self._safe_decimal(ticker.get("price")),
             "base_volume": self._safe_decimal(ticker.get("volume_24h")),
         }

@@ -26,18 +26,21 @@ class DeriveVolumeSource(VolumeSourceBase):
             if not isinstance(ticker, dict):
                 continue
 
-            symbol = str(ticker.get("instrument_name", "")).upper()
-            if not symbol:
+            raw_symbol = str(ticker.get("instrument_name", ""))
+            if not raw_symbol:
+                continue
+            hb_symbol = await self.normalize_symbol(raw_symbol)
+            if not hb_symbol:
                 continue
 
-            result[symbol] = self._normalize_ticker(ticker)
+            result[hb_symbol] = self._normalize_ticker(ticker, hb_symbol)
 
         return result
 
-    def _normalize_ticker(self, ticker: Dict[str, Any]) -> Dict[str, Decimal]:
+    def _normalize_ticker(self, ticker: Dict[str, Any], hb_symbol: str) -> Dict[str, Decimal]:
         result = {
             "exchange": self.name,
-            "symbol": str(ticker["instrument_name"]).upper(),
+            "symbol": hb_symbol,
             "last_price": Decimal(str(ticker.get("mark_price", ticker.get("best_bid_price", "0")))),
             "base_volume": Decimal(str(ticker.get("amount_24h", ticker.get("volume_24h", "0")))),
         }

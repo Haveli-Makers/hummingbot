@@ -42,6 +42,15 @@ class VolumeSourceBase(ABC):
         """
         ...
 
+    async def normalize_symbol(self, raw_symbol: str) -> Optional[str]:
+        """
+        Convert an exchange-specific symbol to Hummingbot BASE-QUOTE format.
+
+        :param raw_symbol: Symbol in the exchange's native format.
+        :return: Normalised HB trading pair string (e.g. "BTC-USDT"), or None.
+        """
+        return await self._exchange.normalize_trading_pair(raw_symbol)
+
     async def close(self):
         pass
 

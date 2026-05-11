@@ -22,28 +22,31 @@ class CubeVolumeSource(VolumeSourceBase):
             if not isinstance(item, dict):
                 continue
 
-            symbol = str(item.get("ticker_id", "")).upper()
-            if not symbol:
+            raw_symbol = str(item.get("ticker_id", ""))
+            if not raw_symbol:
+                continue
+            hb_symbol = await self.normalize_symbol(raw_symbol)
+            if not hb_symbol:
                 continue
 
             try:
-                result[symbol] = self._normalize_ticker(ticker=item)
+                result[hb_symbol] = self._normalize_ticker(ticker=item, hb_symbol=hb_symbol)
             except (KeyError, ValueError, InvalidOperation):
                 continue
 
         return result
 
-    def _normalize_ticker(self, ticker: Dict[str, Any]) -> Dict[str, Decimal]:
-        symbol = str(ticker.get("ticker_id", "")).upper()
+    def _normalize_ticker(self, ticker: Dict[str, Any], hb_symbol: str) -> Dict[str, Decimal]:
         last_price = ticker.get("last_price")
         if last_price is None:
-            raise ValueError(f"Missing last_price for {symbol}")
+            raise ValueError(f"Missing last_price for {hb_symbol}")
         result = {
             "exchange": self.name,
-            "symbol": symbol,
+            "symbol": hb_symbol,
             "last_price": Decimal(str(last_price)),
             "base_volume": Decimal(str(ticker.get("base_volume") if ticker.get("base_volume") is not None else ticker.get("volume", 0))),
         }
+
         if ticker.get("quote_volume") is not None:
             result["quote_volume"] = Decimal(str(ticker["quote_volume"]))
         return result

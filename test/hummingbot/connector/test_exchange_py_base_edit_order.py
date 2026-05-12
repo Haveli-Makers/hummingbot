@@ -1,20 +1,7 @@
-"""
-Tests for order-edit functionality in ExchangePyBase.
-
-Groups:
-  TestOrderUpdatePriceAmountFields   – OrderUpdate NamedTuple carries new_price/new_amount;
-                                       update_with_order_update() applies them.
-  TestPendingEditContextNestedClass  – PendingEditContext is a nested class of ExchangePyBase.
-  TestIsOrderEditable                – _is_order_editable() classifies every OrderState correctly.
-  TestExecuteNativeEdit              – _execute_native_edit() happy path, failure rollback, events.
-  TestExecuteCancelReplace           – _execute_edit_via_cancel_replace() happy path.
-  TestEditOrderRouting               – edit_order() / _execute_edit() routing and edge cases.
-"""
-
 import asyncio
 import unittest
 from decimal import Decimal
-from typing import Any, AsyncIterable, Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from hummingbot.connector.exchange_py_base import ExchangePyBase
@@ -23,7 +10,7 @@ from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee
 from hummingbot.core.event.event_logger import EventLogger
-from hummingbot.core.event.events import MarketEvent, OrderEditedEvent, OrderEditFailedEvent
+from hummingbot.core.event.events import MarketEvent, OrderEditedEvent
 from hummingbot.exceptions import OrderEditError
 
 
@@ -226,6 +213,7 @@ class _MockExchange(ExchangePyBase):
         self._order_tracker.start_tracking_order(order)
         return order
 
+
 class TestOrderUpdatePriceAmountFields(unittest.TestCase):
 
     def test_order_update_has_new_price_field(self):
@@ -368,6 +356,7 @@ class TestPendingEditContextNestedClass(unittest.TestCase):
         self.assertEqual(Decimal("101"), ctx.new_price)
         self.assertEqual(Decimal("2"), ctx.new_amount)
         self.assertFalse(ctx.cancel_confirmed)
+
 
 class TestIsOrderEditable(unittest.IsolatedAsyncioTestCase):
 
@@ -616,6 +605,7 @@ class TestExecuteCancelReplace(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         self.assertEqual(OrderState.OPEN, order.current_state)
 
+
 class TestEditOrderRouting(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self):
@@ -625,7 +615,7 @@ class TestEditOrderRouting(unittest.IsolatedAsyncioTestCase):
 
     async def test_edit_order_routes_to_native_when_supported(self):
         """When is_edit_order_supported_by_exchange=True, _execute_native_edit is called."""
-        order = self.exchange._make_tracked_order()
+        self.exchange._make_tracked_order()
         self.exchange._place_edit_result = ("OID-1", "EX-NEW", 1_700_000_001.0)
 
         with patch.object(type(self.exchange), "is_edit_order_supported_by_exchange",
@@ -644,7 +634,7 @@ class TestEditOrderRouting(unittest.IsolatedAsyncioTestCase):
 
     async def test_edit_order_routes_to_cancel_replace_by_default(self):
         """When is_edit_order_supported_by_exchange=False, _execute_edit_via_cancel_replace is called."""
-        order = self.exchange._make_tracked_order()
+        self.exchange._make_tracked_order()
 
         cancel_replace_mock = AsyncMock(return_value="OID-REPLACE")
         self.exchange._execute_edit_via_cancel_replace = cancel_replace_mock
@@ -660,7 +650,7 @@ class TestEditOrderRouting(unittest.IsolatedAsyncioTestCase):
 
     async def test_edit_order_returns_client_id_synchronously(self):
         """edit_order() must return the client_order_id synchronously."""
-        order = self.exchange._make_tracked_order(client_order_id="OID-SYNC")
+        self.exchange._make_tracked_order(client_order_id="OID-SYNC")
         result = self.exchange.edit_order(
             client_order_id="OID-SYNC",
             trading_pair="BTC-USDT",
@@ -678,7 +668,7 @@ class TestEditOrderRouting(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result)
 
     async def test_edit_order_non_editable_state_emits_failed_event(self):
-        order = self.exchange._make_tracked_order(state=OrderState.FILLED)
+        self.exchange._make_tracked_order(state=OrderState.FILLED)
 
         result = await self.exchange._execute_edit(
             client_order_id="OID-1",
@@ -693,7 +683,7 @@ class TestEditOrderRouting(unittest.IsolatedAsyncioTestCase):
 
     async def test_edit_order_uses_original_price_when_new_price_is_none(self):
         """If new_price=None, the existing order price is used."""
-        order = self.exchange._make_tracked_order(price=Decimal("99"), amount=Decimal("1"))
+        self.exchange._make_tracked_order(price=Decimal("99"), amount=Decimal("1"))
         self.exchange._place_edit_result = ("OID-1", "EX-NEW", 1_700_000_001.0)
 
         with patch.object(type(self.exchange), "is_edit_order_supported_by_exchange",
@@ -713,7 +703,7 @@ class TestEditOrderRouting(unittest.IsolatedAsyncioTestCase):
 
     async def test_edit_order_exception_emits_failed_event(self):
         """An unexpected exception inside _execute_native_edit propagates as OrderEditFailed event."""
-        order = self.exchange._make_tracked_order()
+        self.exchange._make_tracked_order()
 
         with patch.object(type(self.exchange), "is_edit_order_supported_by_exchange",
                           new_callable=lambda: property(lambda self: True)):

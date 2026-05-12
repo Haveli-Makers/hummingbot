@@ -44,6 +44,8 @@ class OrderUpdate(NamedTuple):
     client_order_id: Optional[str] = None
     exchange_order_id: Optional[str] = None
     misc_updates: Optional[Dict[str, Any]] = None
+    new_price: Optional[Decimal] = None
+    new_amount: Optional[Decimal] = None
 
 
 class TradeUpdate(NamedTuple):
@@ -349,6 +351,11 @@ class InFlightOrder:
 
         self.current_state = order_update.new_state
         self.check_processed_by_exchange_condition()
+
+        if order_update.new_price is not None:
+            self.price = order_update.new_price
+        if order_update.new_amount is not None:
+            self.amount = order_update.new_amount
 
         updated: bool = prev_data != (self.exchange_order_id, self.current_state)
 

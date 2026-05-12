@@ -198,7 +198,6 @@ class OrderEditExample(ScriptStrategyBase):
                 new_price=new_price,
                 new_amount=order.quantity,
             )
-            self._edit_done = True
         except Exception as e:
             self.logger().error(f"Failed to edit order {order.client_order_id}: {e}")
 
@@ -244,6 +243,8 @@ class OrderEditExample(ScriptStrategyBase):
         if not event.recoverable:
             msg += " (CRITICAL: Order was cancelled but replacement failed!)"
             self._reset_tracking()
+        else:
+            self._edit_done = False
         self.log_with_clock(logging.ERROR, msg)
         self.notify_hb_app_with_timestamp(msg)
 

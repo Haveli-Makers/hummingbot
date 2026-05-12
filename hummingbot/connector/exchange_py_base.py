@@ -43,22 +43,6 @@ from hummingbot.exceptions import (
 from hummingbot.logger import HummingbotLogger
 
 
-@dataclass
-class PendingEditContext:
-    """Tracks state during cancel-replace operation"""
-    original_order: InFlightOrder
-    new_price: Decimal
-    new_amount: Decimal
-    cancel_initiated_at: float
-    cancel_confirmed: bool = False
-    cancel_confirmed_at: Optional[float] = None
-    expected_released_base: Decimal = Decimal("0")
-    expected_released_quote: Decimal = Decimal("0")
-    max_balance_wait_seconds: float = 30.0
-    balance_poll_interval: float = 1.0
-    max_retries: int = 3
-
-
 class ExchangePyBase(ExchangeBase, ABC):
     _logger = None
 
@@ -67,6 +51,21 @@ class ExchangePyBase(ExchangeBase, ABC):
     TRADING_RULES_INTERVAL = 30 * MINUTE
     TRADING_FEES_INTERVAL = TWELVE_HOURS
     TICK_INTERVAL_LIMIT = 60.0
+
+    @dataclass
+    class PendingEditContext:
+        """Tracks state during a cancel-replace edit operation."""
+        original_order: InFlightOrder
+        new_price: Decimal
+        new_amount: Decimal
+        cancel_initiated_at: float
+        cancel_confirmed: bool = False
+        cancel_confirmed_at: Optional[float] = None
+        expected_released_base: Decimal = Decimal("0")
+        expected_released_quote: Decimal = Decimal("0")
+        max_balance_wait_seconds: float = 30.0
+        balance_poll_interval: float = 1.0
+        max_retries: int = 3
 
     def __init__(self,
                  balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
@@ -555,11 +554,10 @@ class ExchangePyBase(ExchangeBase, ABC):
                 trading_pair=tracked_order.trading_pair,
                 update_timestamp=update_timestamp,
                 new_state=OrderState.OPEN,
+                new_price=new_price,
+                new_amount=new_amount,
             )
             self._order_tracker.process_order_update(order_update)
-
-            tracked_order.price = new_price
-            tracked_order.amount = new_amount
 
             self._emit_order_edited_event(
                 original_order=tracked_order,
@@ -593,7 +591,7 @@ class ExchangePyBase(ExchangeBase, ABC):
         Fallback strategy: Cancel existing order and create a new one.
         Handles balance verification and recovery.
         """
-        context = PendingEditContext(
+        context = self.PendingEditContext(
             original_order=tracked_order,
             new_price=new_price,
             new_amount=new_amount,

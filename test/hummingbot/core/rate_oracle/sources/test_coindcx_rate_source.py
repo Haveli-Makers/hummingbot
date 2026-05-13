@@ -18,7 +18,7 @@ class CoindcxRateSourceTest(IsolatedAsyncioWrapperTestCase):
         cls.ignored_trading_pair = combine_to_hb_trading_pair(base="SOME", quote="PAIR")
 
     def setup_coindcx_responses(self, mock_tickers):
-        exchange = CoindcxRateSource._build_coindcx_connector_without_private_keys()
+        exchange = CoindcxRateSource()._build_exchange()
         mapping = bidict({mock_tickers[0].get("market") if mock_tickers and mock_tickers[0].get("market") else mock_tickers[0].get("symbol"): self.trading_pair})
         exchange._set_trading_pair_symbol_map(mapping)
 
@@ -43,7 +43,7 @@ class CoindcxRateSourceTest(IsolatedAsyncioWrapperTestCase):
         fake_ex = self.setup_coindcx_responses(tickers)
 
         rate_source = CoindcxRateSource()
-        with patch.object(rate_source, "_build_coindcx_connector_without_private_keys", return_value=fake_ex):
+        with patch.object(rate_source, "_build_exchange", return_value=fake_ex):
             prices = await rate_source.get_prices()
 
         self.assertIn(self.trading_pair, prices)
@@ -56,7 +56,7 @@ class CoindcxRateSourceTest(IsolatedAsyncioWrapperTestCase):
         fake_ex = self.setup_coindcx_responses(tickers)
 
         rate_source = CoindcxRateSource()
-        with patch.object(rate_source, "_build_coindcx_connector_without_private_keys", return_value=fake_ex):
+        with patch.object(rate_source, "_build_exchange", return_value=fake_ex):
             bid_ask_prices = await rate_source.get_bid_ask_prices()
 
         self.assertIn(self.trading_pair, bid_ask_prices)
@@ -75,7 +75,7 @@ class CoindcxRateSourceTest(IsolatedAsyncioWrapperTestCase):
         fake_ex = self.setup_coindcx_responses(tickers)
 
         rate_source = CoindcxRateSource()
-        with patch.object(rate_source, "_build_coindcx_connector_without_private_keys", return_value=fake_ex):
+        with patch.object(rate_source, "_build_exchange", return_value=fake_ex):
             prices = await rate_source.get_prices(quote_token="USDT")
             self.assertIn("BTC-USDT", prices)
             self.assertNotIn("BTC-INR", prices)
@@ -85,7 +85,7 @@ class CoindcxRateSourceTest(IsolatedAsyncioWrapperTestCase):
         fake_ex = self.setup_coindcx_responses(tickers)
 
         rate_source = CoindcxRateSource()
-        with patch.object(rate_source, "_build_coindcx_connector_without_private_keys", return_value=fake_ex):
+        with patch.object(rate_source, "_build_exchange", return_value=fake_ex):
             prices = await rate_source.get_prices()
             self.assertEqual(prices, {})
 
@@ -94,7 +94,7 @@ class CoindcxRateSourceTest(IsolatedAsyncioWrapperTestCase):
         fake_ex = self.setup_coindcx_responses(tickers)
 
         rate_source = CoindcxRateSource()
-        with patch.object(rate_source, "_build_coindcx_connector_without_private_keys", return_value=fake_ex):
+        with patch.object(rate_source, "_build_exchange", return_value=fake_ex):
             prices = await rate_source.get_prices()
             self.assertEqual(prices, {})
 
@@ -103,7 +103,7 @@ class CoindcxRateSourceTest(IsolatedAsyncioWrapperTestCase):
         fake_ex = self.setup_coindcx_responses(tickers)
 
         rate_source = CoindcxRateSource()
-        with patch.object(rate_source, "_build_coindcx_connector_without_private_keys", return_value=fake_ex):
+        with patch.object(rate_source, "_build_exchange", return_value=fake_ex):
             bid_asks = await rate_source.get_bid_ask_prices()
             self.assertEqual(bid_asks, {})
 

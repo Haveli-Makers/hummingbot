@@ -130,6 +130,31 @@ class AscendExExchange(ExchangePyBase):
         pairs_prices["data"] = spot_valid_token_entries
         return pairs_prices
 
+    async def get_all_24h_volume_tickers(self, trading_pairs: Optional[List[str]] = None) -> Dict[str, Any]:
+        if not trading_pairs:
+            return await self._api_get(path_url=CONSTANTS.TICKER_PATH_URL)
+        all_data = []
+        for tp in trading_pairs:
+            base, quote = tp.split("-", 1)
+            symbol = f"{base}/{quote}"
+            try:
+                resp = await self._api_get(
+                    path_url=CONSTANTS.TICKER_PATH_URL,
+                    params={"symbol": symbol},
+                )
+                data = resp.get("data")
+                if isinstance(data, list):
+                    all_data.extend(data)
+                elif isinstance(data, dict):
+                    all_data.append(data)
+            except IOError as e:
+                err = str(e)
+                if "HTTP status is 400" in err or "HTTP status is 404" in err:
+                    self.logger().warning(f"Skipping {tp}: symbol not found on {self.name}")
+                else:
+                    raise
+        return {"data": all_data}
+
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
         # API documentation does not clarify the error message for timestamp related problems
         return False

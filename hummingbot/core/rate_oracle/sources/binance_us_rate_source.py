@@ -11,10 +11,6 @@ if TYPE_CHECKING:
 
 
 class BinanceUSRateSource(RateSourceBase):
-    def __init__(self):
-        super().__init__()
-        self._binance_us_exchange: Optional[BinanceExchange] = None  # delayed because of circular reference
-
     @property
     def name(self) -> str:
         return "binance_us"
@@ -24,7 +20,7 @@ class BinanceUSRateSource(RateSourceBase):
         self._ensure_exchanges()
         results = {}
         tasks = [
-            self._get_binance_prices(exchange=self._binance_us_exchange, quote_token="USD"),
+            self._get_binance_prices(exchange=self._exchange, quote_token="USD"),
         ]
         task_results = await safe_gather(*tasks, return_exceptions=True)
         for task_result in task_results:
@@ -49,10 +45,10 @@ class BinanceUSRateSource(RateSourceBase):
         self._ensure_exchanges()
         results = {}
         try:
-            pairs_prices = await self._binance_us_exchange.get_all_pairs_prices()
+            pairs_prices = await self._exchange.get_all_pairs_prices()
             for pair_price in pairs_prices:
                 try:
-                    trading_pair = await self._binance_us_exchange.trading_pair_associated_to_exchange_symbol(
+                    trading_pair = await self._exchange.trading_pair_associated_to_exchange_symbol(
                         symbol=pair_price["symbol"]
                     )
                 except KeyError:
@@ -81,10 +77,6 @@ class BinanceUSRateSource(RateSourceBase):
             )
         return results
 
-    def _ensure_exchanges(self):
-        if self._binance_us_exchange is None:
-            self._binance_us_exchange = self._build_binance_connector_without_private_keys(domain="us")
-
     @staticmethod
     async def _get_binance_prices(exchange: 'BinanceExchange', quote_token: str = None) -> Dict[str, Decimal]:
         """
@@ -112,8 +104,7 @@ class BinanceUSRateSource(RateSourceBase):
 
         return results
 
-    @staticmethod
-    def _build_binance_connector_without_private_keys(domain: str) -> 'BinanceExchange':
+    def _build_exchange(self) -> 'BinanceExchange':
         from hummingbot.connector.exchange.binance.binance_exchange import BinanceExchange
 
         return BinanceExchange(
@@ -121,5 +112,5 @@ class BinanceUSRateSource(RateSourceBase):
             binance_api_secret="",
             trading_pairs=[],
             trading_required=False,
-            domain=domain,
+            domain="us",
         )

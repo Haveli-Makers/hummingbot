@@ -209,6 +209,28 @@ class ExchangePyBase(ExchangeBase, ABC):
     def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
         raise NotImplementedError
 
+    async def normalize_trading_pair(self, trading_pair: str) -> Optional[str]:
+        """
+        Convert an exchange-specific symbol to the standard Hummingbot BASE-QUOTE format
+        (e.g. "BTCUSDT" → "BTC-USDT", "btcusdt" → "BTC-USDT").
+
+        :param trading_pair: Raw symbol in the exchange's native format.
+        :return: Normalised HB trading pair string (e.g. "BTC-USDT"), or None if the
+                 symbol cannot be reliably converted.
+        """
+        try:
+            return await self.trading_pair_associated_to_exchange_symbol(trading_pair)
+        except KeyError:
+            pass
+        s = trading_pair.upper()
+        if "-" in s:
+            return s
+        if "/" in s:
+            return s.replace("/", "-")
+        if "_" in s:
+            return s.replace("_", "-")
+        return None
+
     # === Price logic ===
 
     def get_order_price_quantum(self, trading_pair: str, price: Decimal) -> Decimal:

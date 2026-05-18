@@ -127,6 +127,10 @@ def get_rate_source(connector_name: str) -> RateSourceBase:
         from hummingbot.core.rate_oracle.sources.coindcx_rate_source import CoindcxRateSource
 
         return CoindcxRateSource()
+    elif connector_name_lower == "coinswitch":
+        from hummingbot.core.rate_oracle.sources.coinswitch_rate_source import CoinswitchRateSource
+
+        return CoinswitchRateSource()
 
     else:
         raise ValueError(

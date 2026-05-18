@@ -252,10 +252,10 @@ class CoinswitchExchange(ExchangePyBase):
                             hb_pair = combine_to_hb_trading_pair(base=base, quote=quote)
                             mapping[symbol] = hb_pair
                     except Exception as e:
-                        _logger.debug(f"Error parsing symbol {symbol}: {e}")
+                        self.logger().debug(f"Error parsing symbol {symbol}: {e}")
 
         except Exception as e:
-            _logger.error(f"Error initializing trading pair symbols: {e}")
+            self.logger().error(f"Error initializing trading pair symbols: {e}")
 
         self._set_trading_pair_symbol_map(mapping)
 
@@ -301,7 +301,7 @@ class CoinswitchExchange(ExchangePyBase):
                 return coins
 
         except Exception as e:
-            _logger.error(f"Error fetching trading pairs: {e}")
+            self.logger().error(f"Error fetching trading pairs: {e}")
 
         return []
 
@@ -315,6 +315,7 @@ class CoinswitchExchange(ExchangePyBase):
         """
         prices = {}
 
+        # TODO: Optimize this by fetching all tickers and extracting prices for requested trading pairs instead of making individual requests for each pair
         for trading_pair in trading_pairs:
             try:
                 try:
@@ -341,7 +342,7 @@ class CoinswitchExchange(ExchangePyBase):
                         prices[trading_pair] = price
 
             except Exception as e:
-                _logger.warning(f"Error fetching price for {trading_pair}: {e}")
+                self.logger().warning(f"Error fetching price for {trading_pair}: {e}")
 
         return prices
 
@@ -437,7 +438,7 @@ class CoinswitchExchange(ExchangePyBase):
                     )
 
         except Exception as e:
-            _logger.error(f"Error fetching trading fees: {e}")
+            self.logger().error(f"Error fetching trading fees: {e}")
 
         return trading_fees
 
@@ -502,7 +503,7 @@ class CoinswitchExchange(ExchangePyBase):
                 del self._account_balances[asset_name]
 
         except Exception as e:
-            _logger.error(f"Error updating balances: {e}", exc_info=True)
+            self.logger().error(f"Error updating balances: {e}", exc_info=True)
 
     async def _update_trading_fees(self):
         """
@@ -598,10 +599,10 @@ class CoinswitchExchange(ExchangePyBase):
                         )
                     )
                 except Exception as e:
-                    _logger.debug(f"Error parsing trading rule for {symbol}: {e}")
+                    self.logger().debug(f"Error parsing trading rule for {symbol}: {e}")
 
         except Exception as e:
-            _logger.error(f"Error formatting trading rules: {e}")
+            self.logger().error(f"Error formatting trading rules: {e}")
 
         return trading_rules
 
@@ -651,7 +652,7 @@ class CoinswitchExchange(ExchangePyBase):
                         trade_updates.append(trade_update)
 
             except Exception as e:
-                _logger.error(f"Error fetching trade updates for order {order.exchange_order_id}: {e}")
+                self.logger().error(f"Error fetching trade updates for order {order.exchange_order_id}: {e}")
 
         return trade_updates
 
@@ -686,7 +687,7 @@ class CoinswitchExchange(ExchangePyBase):
             )
             return order_update
         except Exception as e:
-            _logger.error(f"Error requesting order status for {tracked_order.exchange_order_id}: {e}")
+            self.logger().error(f"Error requesting order status for {tracked_order.exchange_order_id}: {e}")
             raise
 
     async def _get_last_traded_price(self, trading_pair: str) -> float:
@@ -716,6 +717,6 @@ class CoinswitchExchange(ExchangePyBase):
                     return float(ticker.get("lastPrice", 0))
 
         except Exception as e:
-            _logger.error(f"Error fetching last traded price for {trading_pair}: {e}")
+            self.logger().error(f"Error fetching last traded price for {trading_pair}: {e}")
 
         return 0.0

@@ -21,13 +21,14 @@ class CoinswitchAuth(AuthBase):
                     "CoinSwitch API secret must be a hex-encoded Ed25519 private key. "
                     "Ensure the secret key contains only hexadecimal characters."
                 )
-            if len(secret_key_bytes) != 32:
+            if not secret_key_bytes or len(secret_key_bytes) != 32:
                 raise ValueError(
                     f"CoinSwitch API secret must be a 32-byte (64 hex character) Ed25519 private key, "
                     f"got {len(secret_key_bytes)} bytes ({len(secret_key)} hex characters)."
                 )
         self.api_key = api_key
         self.secret_key = secret_key
+        self.private_key = ed25519.Ed25519PrivateKey.from_private_bytes(secret_key_bytes)
         self._time_provider = time_provider
         self._nonce_lock = asyncio.Lock()
         self._last_timestamp = 0
@@ -114,9 +115,7 @@ class CoinswitchAuth(AuthBase):
             Hex-encoded signature
         """
         request_string = bytes(message, 'utf-8')
-        secret_key_bytes = bytes.fromhex(self.secret_key)
-        private_key = ed25519.Ed25519PrivateKey.from_private_bytes(secret_key_bytes)
-        signature_bytes = private_key.sign(request_string)
+        signature_bytes = self.private_key.sign(request_string)
 
         return signature_bytes.hex()
 
@@ -167,8 +166,6 @@ class CoinswitchAuth(AuthBase):
             signature_msg = method + endpoint + epoch_time
 
         request_string = bytes(signature_msg, 'utf-8')
-        secret_key_bytes = bytes.fromhex(self.secret_key)
-        private_key = ed25519.Ed25519PrivateKey.from_private_bytes(secret_key_bytes)
-        signature_bytes = private_key.sign(request_string)
+        signature_bytes = self.private_key.sign(request_string)
 
         return signature_bytes.hex()

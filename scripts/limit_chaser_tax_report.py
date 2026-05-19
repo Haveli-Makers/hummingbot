@@ -118,7 +118,6 @@ class LimitChaserTaxReportScript(ScriptStrategyBase):
         self._leg1_executor: Optional[OrderExecutor] = None
         self._leg: int = 0
         self._leg1_done: bool = False
-        self._leg2_done: bool = False
         self._leg1_close_ts: float = 0.0
         self._last_status_log: float = 0.0
         self._reported_close: bool = False
@@ -229,7 +228,6 @@ class LimitChaserTaxReportScript(ScriptStrategyBase):
                 f"[Leg 2] {self._sides[1].name} filled. Round-trip complete!"
             )
             self._reported_close = True
-            self._leg2_done = True
             self._log_tax_report()
 
     def _log_tax_report(self):

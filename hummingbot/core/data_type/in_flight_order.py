@@ -341,32 +341,6 @@ class InFlightOrder:
             total_tds += trade_update.tds_amount
         return total_tds
 
-    def total_deductions_quote(self, exchange: Optional['ExchangeBase'] = None) -> Decimal:
-        """
-        Returns total deductions (exchange fees + TDS) in quote currency.
-
-        :param exchange: Optional exchange for rate lookups
-        :return: Total deductions in quote currency
-        """
-        fee_in_quote = self.cumulative_fee_paid(self.quote_asset, exchange=exchange)
-        tds = self.total_tds_paid()
-        return fee_in_quote + tds
-
-    def net_value_received_quote(self, exchange: Optional['ExchangeBase'] = None) -> Decimal:
-        """
-        Returns the net value received after all deductions (fees + TDS) in quote currency.
-        For buy orders: -(executed_quote + fees)
-        For sell orders: executed_quote - fees - TDS
-
-        :param exchange: Optional exchange for rate lookups
-        :return: Net value in quote currency
-        """
-        deductions = self.total_deductions_quote(exchange)
-        if self.trade_type == TradeType.SELL:
-            return self.executed_amount_quote - deductions
-        else:
-            return -(self.executed_amount_quote + deductions)
-
     def update_with_order_update(self, order_update: OrderUpdate) -> bool:
         """
         Updates the in flight order with an order update (from REST API or WS API)

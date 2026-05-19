@@ -6,12 +6,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from hummingbot.connector.utils import combine_to_hb_trading_pair, split_hb_trading_pair
 from hummingbot.core.data_type.common import PositionAction, TradeType
-from hummingbot.core.data_type.india_crypto_tax import (
-    IndiaCryptoTaxConfig,
-    MarketType,
-    calculate_profit_tax,
-    calculate_tds,
-)
 from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TokenAmount
 from hummingbot.core.rate_oracle.rate_oracle import RateOracle
 from hummingbot.logger import HummingbotLogger
@@ -330,55 +324,3 @@ class PerformanceMetrics:
 
         self.total_pnl = self.trade_pnl - self.fee_in_quote
         self.return_pct = self.divide(self.total_pnl, self.hold_value)
-
-    def calculate_total_tds(self, trades: List[Any],
-                            tds_rate: Decimal = Decimal("0.01")) -> Decimal:
-        """
-        Sum TDS across all fills by delegating each fill to calculate_tds().
-
-        INR markets (quote = INR): only sell fills incur TDS.
-        Crypto-Crypto markets (quote ≠ INR): BOTH buy and sell fills incur
-        1% TDS on the fill value in the quote asset (Section 194S).
-
-        Market type is detected from the trade's quote_asset attribute (TradeFill
-        objects carry this column); falls back to CRYPTO_CRYPTO when unknown.
-
-        :param trades: List of TradeFill or Trade objects
-        :param tds_rate: TDS rate (default 1%)
-        :return: Total TDS paid in quote currency across all fills
-        """
-        config = IndiaCryptoTaxConfig(tds_rate=tds_rate)
-        total_tds = s_decimal_0
-        for trade in trades:
-            quote_asset = getattr(trade, "quote_asset", None) or ""
-            mtype = MarketType.INR if quote_asset.upper() == "INR" else MarketType.CRYPTO_CRYPTO
-
-            trade_type = trade.trade_type if isinstance(trade.trade_type, str) else trade.trade_type.name
-            fill_value = Decimal(str(trade.amount)) * Decimal(str(trade.price))
-
-            is_buyer = trade_type.upper() == TradeType.BUY.name.upper()
-            total_tds += calculate_tds(
-                fill_value_quote=fill_value,
-                is_buyer=is_buyer,
-                market_type=mtype,
-                config=config,
-            ).tds_amount_quote
-        return total_tds
-
-    def estimate_profit_tax(self, tds_already_paid: Decimal = s_decimal_0,
-                            config: IndiaCryptoTaxConfig = None) -> Decimal:
-        """
-        Additional 30% tax due after crediting TDS already paid at source.
-        Delegates to india_crypto_tax.calculate_profit_tax() as the single source
-        of truth for Section 115BBH tax liability.
-
-        :param tds_already_paid: Total TDS deducted at source (advance tax credit)
-        :param config: Tax rates config (uses defaults if None)
-        :return: Additional tax due after TDS credit; 0 when TDS covers the liability
-        """
-        result = calculate_profit_tax(
-            profit_after_fees=self.total_pnl,
-            tds_already_paid=tds_already_paid,
-            config=config,
-        )
-        return max(result.additional_tax_due, s_decimal_0)

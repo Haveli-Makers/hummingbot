@@ -89,10 +89,10 @@ class OrderExecutor(ExecutorBase):
         The distance is treated as a percentage of the current market price.
 
         Reprice only when the new target price has moved more than refresh_threshold away
-        from the current order price. 
+        from the current order price.
         """
         if self._pending_cancel_order_ids:
-            return 
+            return
         if not self._order or not self._order.order or not self._order.order.is_open:
             return
 

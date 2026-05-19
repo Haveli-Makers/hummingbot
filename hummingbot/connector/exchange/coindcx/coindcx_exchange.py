@@ -57,7 +57,7 @@ class CoindcxExchange(ExchangePyBase):
             tds_rate=Decimal(CONSTANTS.TDS_RATE),
             profit_tax_rate=Decimal(CONSTANTS.PROFIT_TAX_RATE),
         )
-        self._buy_order_costs: Dict[str, Dict[str, Tuple[Decimal, Decimal]]] = {}
+        self._buy_order_costs: Dict[str, Dict[str, Tuple[Decimal, Decimal, Decimal]]] = {}
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     @staticmethod
@@ -291,7 +291,8 @@ class CoindcxExchange(ExchangePyBase):
                  is_maker: Optional[bool] = None) -> TradeFeeBase:
         """
         Calculate the trading fee for an order.
-        For sell orders, includes TDS as a flat fee component.
+        Returns a DeductedFromReturnsTradeFee using the maker/taker fee percentage.
+        TDS is tracked separately in _track_and_log_tax.
         """
         is_maker = order_type is OrderType.LIMIT_MAKER
         fee_pct = self.estimate_fee_pct(is_maker)

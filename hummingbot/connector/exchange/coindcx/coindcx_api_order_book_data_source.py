@@ -34,6 +34,7 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._domain = domain
         self._api_factory = api_factory
         self._client: Optional[socketio.AsyncClient] = None
+        self._last_diff_vs: Dict[str, int] = {}
 
     async def get_last_traded_prices(self,
                                      trading_pairs: List[str],
@@ -176,7 +177,7 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         snapshot_msg: OrderBookMessage = CoinDCXOrderBook.snapshot_message_from_exchange(
             snapshot,
             snapshot_timestamp,
-            metadata={"trading_pair": trading_pair}
+            metadata={"trading_pair": trading_pair, "fallback_vs": self._last_diff_vs.get(trading_pair, 0)}
         )
         return snapshot_msg
 
@@ -226,6 +227,9 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     return
 
             if trading_pair:
+                vs = raw_message.get("vs")
+                if vs is not None:
+                    self._last_diff_vs[trading_pair] = int(vs)
                 order_book_message: OrderBookMessage = CoinDCXOrderBook.diff_message_from_exchange(
                     raw_message, time.time(), {"trading_pair": trading_pair})
                 message_queue.put_nowait(order_book_message)

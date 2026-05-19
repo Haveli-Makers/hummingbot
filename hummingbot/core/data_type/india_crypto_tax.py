@@ -63,7 +63,7 @@ class TDSResult:
 @dataclass
 class ProfitTaxResult:
     """Profit tax calculation result for a buy-sell pair."""
-    profit_after_fees: Decimal
+    taxable_profit: Decimal
     tax_rate: Decimal
     tax_liability: Decimal
     tds_already_paid: Decimal
@@ -113,16 +113,20 @@ def calculate_tds(
     )
 
 
-def calculate_profit_tax(profit_after_fees: Decimal,
+def calculate_profit_tax(taxable_profit: Decimal,
                          tds_already_paid: Decimal = S_DECIMAL_0,
                          config: IndiaCryptoTaxConfig = None) -> ProfitTaxResult:
     """
     Calculate 30% income tax on crypto profit (Section 115BBH).
 
-    If profit > 0: tax = profit × 30%, additional_due = tax - tds_paid
-    If profit <= 0: tax = 0, TDS already paid can be claimed as refund at ITR filing.
+    Tax base is the gross transfer gain (sell value minus cost of acquisition).
+    Under s.115BBH(2)(b) no deduction for exchange fees or any other expenditure
+    is permitted — only the cost of acquisition may be subtracted.
 
-    :param profit_after_fees: Net profit after all trade fees
+    If taxable_profit > 0: tax = taxable_profit × 30%, additional_due = tax - tds_paid
+    If taxable_profit <= 0: tax = 0; TDS already paid is claimable as refund at ITR.
+
+    :param taxable_profit: Gross transfer gain (sell_value - buy_value), fees excluded
     :param tds_already_paid: Total TDS deducted at source — include BOTH buy-side
                              and sell-side TDS for crypto-crypto markets
     :param config: Tax config with rates (uses defaults if None)
@@ -131,15 +135,15 @@ def calculate_profit_tax(profit_after_fees: Decimal,
     if config is None:
         config = IndiaCryptoTaxConfig()
 
-    if profit_after_fees > S_DECIMAL_0:
-        tax_liability = profit_after_fees * config.profit_tax_rate
+    if taxable_profit > S_DECIMAL_0:
+        tax_liability = taxable_profit * config.profit_tax_rate
     else:
         tax_liability = S_DECIMAL_0
 
     additional_tax_due = tax_liability - tds_already_paid
 
     return ProfitTaxResult(
-        profit_after_fees=profit_after_fees,
+        taxable_profit=taxable_profit,
         tax_rate=config.profit_tax_rate,
         tax_liability=tax_liability,
         tds_already_paid=tds_already_paid,

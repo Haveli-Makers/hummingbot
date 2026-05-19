@@ -73,7 +73,7 @@ def calculate_order_profit(
     profit_after_fees = gross_profit - total_fees
 
     profit_tax = calculate_profit_tax(
-        profit_after_fees=profit_after_fees,
+        taxable_profit=gross_profit,
         tds_already_paid=total_tds,
         config=tax_config,
     )
@@ -123,7 +123,9 @@ def format_profit_report(result: OrderProfitResult, quote_currency: str = "INR")
         f"  Profit After Fees:   {result.profit_after_fees:.2f} {quote_currency}",
         f"  30% Tax Liability:   {result.profit_tax.tax_liability:.2f} {quote_currency}",
         f"  TDS Credit:          {result.profit_tax.tds_already_paid:.2f} {quote_currency}",
-        f"  Additional Tax Due:  {result.profit_tax.additional_tax_due:.2f} {quote_currency}",
+        (f"  TDS Refund at ITR:   {abs(result.profit_tax.additional_tax_due):.2f} {quote_currency}  (claim at filing)"
+         if result.profit_tax.additional_tax_due <= S_DECIMAL_0 else
+         f"  Additional Tax Due:  {result.profit_tax.additional_tax_due:.2f} {quote_currency}"),
         f"  Net Profit (Post-Tax): {result.net_profit_post_tax:.2f} {quote_currency}",
         f"  Effective Tax Rate:  {result.effective_tax_rate_pct:.1f}%",
         f"  Net Return:          {result.net_return_pct:.2f}%",

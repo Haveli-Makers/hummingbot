@@ -433,11 +433,11 @@ class WazirxExchange(ExchangePyBase):
                     fee = TradeFeeBase.new_spot_fee(
                         fee_schema=self.trade_fee_schema(),
                         trade_type=order.trade_type,
-                        percent_token=trade.get("feeCurrency", trade.get("commissionAsset", "")),
+                        percent_token=trade.get("feeCurrency", trade.get("commissionAsset", "")).upper(),
                         flat_fees=[
                             TokenAmount(
                                 amount=Decimal(trade.get("fee", trade.get("commission", "0"))),
-                                token=trade.get("feeCurrency", trade.get("commissionAsset", "")),
+                                token=trade.get("feeCurrency", trade.get("commissionAsset", "")).upper(),
                             )
                         ],
                     )

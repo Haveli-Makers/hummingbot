@@ -19,11 +19,12 @@ from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate, TradeUpdate
-from hummingbot.core.data_type.india_crypto_tax import IndiaCryptoTaxConfig, calculate_tds
+from hummingbot.core.data_type.india_crypto_tax import IndiaCryptoTaxConfig, MarketType, calculate_tds
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.order_profit import calculate_order_profit, format_profit_report
 from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
+from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
 
@@ -294,14 +295,8 @@ class CoindcxExchange(ExchangePyBase):
         """
         is_maker = order_type is OrderType.LIMIT_MAKER
         fee_pct = self.estimate_fee_pct(is_maker)
-        flat_fees = []
 
-        if order_side == TradeType.SELL and price and price != s_decimal_NaN:
-            sell_value = amount * price
-            tds_result = calculate_tds(sell_value, config=self._tax_config)
-            flat_fees.append(TokenAmount(token=quote_currency, amount=tds_result.tds_amount_quote))
-
-        return DeductedFromReturnsTradeFee(percent=fee_pct, flat_fees=flat_fees)
+        return DeductedFromReturnsTradeFee(percent=fee_pct, flat_fees=[])
 
     async def _place_order(self,
                            order_id: str,
@@ -591,7 +586,7 @@ class CoindcxExchange(ExchangePyBase):
             self._order_tracker.process_order_update(order_update=order_update)
 
             if new_state == CONSTANTS.ORDER_STATE.get("filled"):
-                await self._fetch_fills_and_log_tax(tracked_order)
+                safe_ensure_future(self._fetch_fills_and_log_tax(tracked_order))
 
     async def _fetch_fills_and_log_tax(self, tracked_order: InFlightOrder):
         """
@@ -614,27 +609,26 @@ class CoindcxExchange(ExchangePyBase):
 
                     fill_value = trade_update.fill_base_amount * trade_update.fill_price
 
-                    flat_fees = list(trade_update.fee.flat_fees)
-                    if tracked_order.trade_type == TradeType.SELL:
-                        tds_result = calculate_tds(fill_value, config=self._tax_config)
-                        flat_fees.append(TokenAmount(amount=tds_result.tds_amount_quote, token=quote))
-
-                    fee = TradeFeeBase.new_spot_fee(
-                        fee_schema=self.trade_fee_schema(),
-                        trade_type=tracked_order.trade_type,
-                        flat_fees=flat_fees,
-                    )
+                    is_buyer = tracked_order.trade_type == TradeType.BUY
+                    mtype = self._get_market_type(trading_pair)
+                    tds_amount = calculate_tds(
+                        fill_value_quote=fill_value,
+                        is_buyer=is_buyer,
+                        market_type=mtype,
+                        config=self._tax_config,
+                    ).tds_amount_quote
 
                     updated_trade = TradeUpdate(
                         trade_id=trade_update.trade_id,
                         client_order_id=trade_update.client_order_id,
                         exchange_order_id=trade_update.exchange_order_id,
                         trading_pair=trading_pair,
-                        fee=fee,
+                        fee=trade_update.fee,
                         fill_base_amount=trade_update.fill_base_amount,
                         fill_quote_amount=trade_update.fill_quote_amount,
                         fill_price=trade_update.fill_price,
                         fill_timestamp=trade_update.fill_timestamp,
+                        tds_amount=tds_amount,
                     )
                     self._order_tracker.process_trade_update(updated_trade)
 
@@ -646,6 +640,7 @@ class CoindcxExchange(ExchangePyBase):
                         client_order_id=tracked_order.client_order_id,
                         fill_value=fill_value,
                         fee_amount=fee_amount,
+                        tds_amount=tds_amount,
                         quote=quote,
                     )
                 return
@@ -681,9 +676,15 @@ class CoindcxExchange(ExchangePyBase):
             fill_value = fill_amount * fill_price
 
             flat_fees = [TokenAmount(amount=fee_amount, token=fee_token)]
-            if tracked_order.trade_type == TradeType.SELL:
-                tds_result = calculate_tds(fill_value, config=self._tax_config)
-                flat_fees.append(TokenAmount(amount=tds_result.tds_amount_quote, token=quote))
+
+            is_buyer = tracked_order.trade_type == TradeType.BUY
+            mtype = self._get_market_type(tracked_order.trading_pair)
+            tds_amount = calculate_tds(
+                fill_value_quote=fill_value,
+                is_buyer=is_buyer,
+                market_type=mtype,
+                config=self._tax_config,
+            ).tds_amount_quote
 
             fee = TradeFeeBase.new_spot_fee(
                 fee_schema=self.trade_fee_schema(),
@@ -701,6 +702,7 @@ class CoindcxExchange(ExchangePyBase):
                 fill_quote_amount=fill_value,
                 fill_price=fill_price,
                 fill_timestamp=trade_data.get("timestamp", self._time_synchronizer.time() * 1000) / 1000,
+                tds_amount=tds_amount,
             )
             self._order_tracker.process_trade_update(trade_update)
 
@@ -710,55 +712,67 @@ class CoindcxExchange(ExchangePyBase):
                 client_order_id=client_order_id,
                 fill_value=fill_value,
                 fee_amount=fee_amount,
+                tds_amount=tds_amount,
                 quote=quote,
             )
 
+    @staticmethod
+    def _get_market_type(trading_pair: str) -> MarketType:
+        """Return MarketType based on the quote currency of the trading pair."""
+        quote = trading_pair.split("-")[-1].upper()
+        return MarketType.INR if quote == "INR" else MarketType.CRYPTO_CRYPTO
+
     def _track_and_log_tax(self, trade_type: TradeType, trading_pair: str,
                            client_order_id: str, fill_value: Decimal,
-                           fee_amount: Decimal, quote: str):
-        """Track buy costs and log tax breakdown for any fill."""
+                           fee_amount: Decimal, tds_amount: Decimal, quote: str):
         if trade_type == TradeType.BUY:
             if trading_pair not in self._buy_order_costs:
                 self._buy_order_costs[trading_pair] = {}
-            prev = self._buy_order_costs[trading_pair].get(client_order_id, (Decimal("0"), Decimal("0")))
+            prev = self._buy_order_costs[trading_pair].get(client_order_id, (Decimal("0"), Decimal("0"), Decimal("0")))
             self._buy_order_costs[trading_pair][client_order_id] = (
                 prev[0] + fill_value,
                 prev[1] + fee_amount,
+                prev[2] + tds_amount,
             )
-            total_cost = fill_value + fee_amount
+            total_cost = fill_value + fee_amount + tds_amount
+            mtype = self._get_market_type(trading_pair)
+            tds_note = "(1% on crypto-crypto buy)" if mtype == MarketType.CRYPTO_CRYPTO else "(not applicable on INR-market buy)"
             self.logger().info(
                 f"Tax Report ({trading_pair}) - Buy Fill:\n"
-                f"  Buy Value: {fill_value:.2f} {quote}\n"
-                f"  Trade Fee: {fee_amount:.2f} {quote}\n"
-                f"  TDS: 0.00 {quote} (not applicable on buy)\n"
+                f"  Buy Value:  {fill_value:.2f} {quote}\n"
+                f"  Trade Fee:  {fee_amount:.2f} {quote}\n"
+                f"  TDS {tds_note}: {tds_amount:.2f} {quote}\n"
                 f"  Total Cost: {total_cost:.2f} {quote}"
             )
         else:
-            tds_result = calculate_tds(fill_value, config=self._tax_config)
             buy_costs = self._buy_order_costs.get(trading_pair, {})
             if not buy_costs:
                 self.logger().info(
                     f"Tax Report ({trading_pair}) - Sell Fill:\n"
-                    f"  Sell Value: {fill_value:.2f} {quote}\n"
-                    f"  Sell Fee: {fee_amount:.2f} {quote}\n"
-                    f"  TDS (1%): {tds_result.tds_amount_quote:.2f} {quote}\n"
-                    f"  Net Received: {fill_value - fee_amount - tds_result.tds_amount_quote:.2f} {quote}\n"
+                    f"  Sell Value:  {fill_value:.2f} {quote}\n"
+                    f"  Sell Fee:    {fee_amount:.2f} {quote}\n"
+                    f"  TDS (1%):    {tds_amount:.2f} {quote}\n"
+                    f"  Net Received: {fill_value - fee_amount - tds_amount:.2f} {quote}\n"
                     f"  (No matching buy orders tracked yet for profit calculation)"
                 )
                 return
 
-            total_buy_value = sum(v for v, _ in buy_costs.values())
-            total_buy_fee = sum(f for _, f in buy_costs.values())
+            total_buy_value = sum(v for v, _, _ in buy_costs.values())
+            total_buy_fee = sum(f for _, f, _ in buy_costs.values())
+            total_buy_tds = sum(t for _, _, t in buy_costs.values())
 
             result = calculate_order_profit(
                 buy_value_quote=total_buy_value,
                 sell_value_quote=fill_value,
                 buy_fee_quote=total_buy_fee,
                 sell_fee_quote=fee_amount,
+                buy_tds_quote=total_buy_tds,
+                market_type=self._get_market_type(trading_pair),
                 tax_config=self._tax_config,
             )
             report = format_profit_report(result, quote_currency=quote)
             self.logger().info(f"Tax & Profit Report ({trading_pair}):\n{report}")
+            self._buy_order_costs.pop(trading_pair, None)
 
     def _process_balance_update(self, balance_data: Dict[str, Any]):
         """
@@ -823,15 +837,19 @@ class CoindcxExchange(ExchangePyBase):
                             fill_amount = Decimal(str(trade.get("quantity", 0)))
                             fill_value = fill_amount * fill_price
 
-                            flat_fees = [TokenAmount(amount=fee_amount, token=quote)]
-                            if tracked_order.trade_type == TradeType.SELL:
-                                tds_result = calculate_tds(fill_value, config=self._tax_config)
-                                flat_fees.append(TokenAmount(amount=tds_result.tds_amount_quote, token=quote))
+                            is_buyer = tracked_order.trade_type == TradeType.BUY
+                            mtype = self._get_market_type(trading_pair)
+                            tds_amount = calculate_tds(
+                                fill_value_quote=fill_value,
+                                is_buyer=is_buyer,
+                                market_type=mtype,
+                                config=self._tax_config,
+                            ).tds_amount_quote
 
                             fee = TradeFeeBase.new_spot_fee(
                                 fee_schema=self.trade_fee_schema(),
                                 trade_type=tracked_order.trade_type,
-                                flat_fees=flat_fees,
+                                flat_fees=[TokenAmount(amount=fee_amount, token=quote)],
                             )
 
                             trade_update = TradeUpdate(
@@ -844,6 +862,7 @@ class CoindcxExchange(ExchangePyBase):
                                 fill_quote_amount=fill_value,
                                 fill_price=fill_price,
                                 fill_timestamp=trade.get("timestamp", self._time_synchronizer.time() * 1000) / 1000,
+                                tds_amount=tds_amount,
                             )
                             self._order_tracker.process_trade_update(trade_update)
 
@@ -853,6 +872,7 @@ class CoindcxExchange(ExchangePyBase):
                                 client_order_id=tracked_order.client_order_id,
                                 fill_value=fill_value,
                                 fee_amount=fee_amount,
+                                tds_amount=tds_amount,
                                 quote=quote,
                             )
 
@@ -890,16 +910,30 @@ class CoindcxExchange(ExchangePyBase):
                             flat_fees=[TokenAmount(amount=fee_amount, token=quote)]
                         )
 
+                        fill_amount = Decimal(str(trade.get("quantity", 0)))
+                        fill_price = Decimal(str(trade.get("price", 0)))
+                        fill_value = fill_amount * fill_price
+
+                        is_buyer = order.trade_type == TradeType.BUY
+                        mtype = self._get_market_type(order.trading_pair)
+                        tds_amount = calculate_tds(
+                            fill_value_quote=fill_value,
+                            is_buyer=is_buyer,
+                            market_type=mtype,
+                            config=self._tax_config,
+                        ).tds_amount_quote
+
                         trade_update = TradeUpdate(
                             trade_id=str(trade.get("id", "")),
                             client_order_id=order.client_order_id,
                             exchange_order_id=order.exchange_order_id,
                             trading_pair=trading_pair,
                             fee=fee,
-                            fill_base_amount=Decimal(str(trade.get("quantity", 0))),
-                            fill_quote_amount=Decimal(str(trade.get("quantity", 0))) * Decimal(str(trade.get("price", 0))),
-                            fill_price=Decimal(str(trade.get("price", 0))),
+                            fill_base_amount=fill_amount,
+                            fill_quote_amount=fill_value,
+                            fill_price=fill_price,
                             fill_timestamp=trade.get("timestamp", self._time_synchronizer.time() * 1000) / 1000,
+                            tds_amount=tds_amount,
                         )
                         trade_updates.append(trade_update)
 

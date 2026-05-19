@@ -2,19 +2,46 @@
 India Crypto Tax Calculator
 
 Implements TDS (Tax Deducted at Source) and Income Tax calculations per Indian tax law:
-- TDS: 1% deducted on every sell transaction from the sell value (Section 194S)
-- Income Tax: 30% flat tax on crypto profits (Section 115BBH), no loss offset allowed
-- TDS is an advance tax adjusted against the 30% liability during ITR filing
+
+Section 194S — 1% TDS on every crypto transfer (applicable from 1 July 2022):
+  • INR markets (e.g., BTC-INR):
+      - SELLER pays 1% TDS on the INR proceeds they receive.
+      - BUYER pays NO TDS (exempt when paying with INR).
+  • Crypto-Crypto markets (e.g., BTC-USDT, ETH-BTC):
+      - BOTH buyer and seller pay 1% TDS on the fill value in the QUOTE asset.
+      - Seller receives 1% less of the quote asset.
+      - Buyer pays 1% more of the quote asset (extra cost on top of the trade).
+
+Section 115BBH — 30% flat tax on crypto profits, no loss offset allowed.
+TDS is advance tax, fully credited against the 30% liability at ITR filing.
+
+References:
+  WazirX: https://support.wazirx.com/hc/en-us/articles/4701662097050-TDS-on-Crypto-Trades
+  CoinDCX: https://coindcx.com/calculators/crypto-tax-calculator/
 """
 from dataclasses import dataclass
 from decimal import Decimal
+from enum import Enum
 
 S_DECIMAL_0 = Decimal("0")
-S_DECIMAL_1 = Decimal("1")
 
 # Default rates per Indian tax law
-DEFAULT_TDS_RATE = Decimal("0.01")          # 1% TDS on sell value
-DEFAULT_PROFIT_TAX_RATE = Decimal("0.30")   # 30% flat tax on profits
+DEFAULT_TDS_RATE = Decimal("0.01")          # 1% TDS (Section 194S)
+DEFAULT_PROFIT_TAX_RATE = Decimal("0.30")   # 30% flat tax (Section 115BBH)
+
+
+class MarketType(Enum):
+    """
+    Determines which sides of a trade owe TDS (Section 194S).
+
+    INR:           Quote currency is INR (e.g., BTC-INR).
+                   Only the SELLER pays TDS on their INR proceeds.
+    CRYPTO_CRYPTO: Quote currency is a crypto asset (USDT, BTC, ETH, etc.).
+                   BOTH buyer and seller pay 1% TDS on the fill value in
+                   the quote asset.
+    """
+    INR = "inr"
+    CRYPTO_CRYPTO = "crypto_crypto"
 
 
 @dataclass
@@ -26,10 +53,11 @@ class IndiaCryptoTaxConfig:
 
 @dataclass
 class TDSResult:
-    """TDS deduction details for a single sell trade."""
-    sell_value_quote: Decimal
+    """TDS deduction details for a single fill (buy or sell side)."""
+    fill_value_quote: Decimal
     tds_rate: Decimal
     tds_amount_quote: Decimal
+    is_applicable: bool
 
 
 @dataclass
@@ -42,27 +70,46 @@ class ProfitTaxResult:
     additional_tax_due: Decimal
 
 
-def calculate_tds(sell_value_quote: Decimal,
-                  config: IndiaCryptoTaxConfig = None) -> TDSResult:
+def calculate_tds(
+    fill_value_quote: Decimal,
+    is_buyer: bool,
+    market_type: MarketType = MarketType.CRYPTO_CRYPTO,
+    config: IndiaCryptoTaxConfig = None,
+) -> TDSResult:
     """
-    Calculate TDS for a sell transaction.
+    Calculate TDS for a single trade fill (Section 194S).
 
-    TDS = sell_value × 1%
-    Applied only on sell transactions, deducted immediately at source.
+    INR markets (quote = INR):
+      - SELLER: TDS = fill_value × 1%   (seller receives 1% less INR)
+      - BUYER:  TDS = 0                  (buyers in INR markets are exempt)
 
-    :param sell_value_quote: Total sell value in quote currency (amount × price)
-    :param config: Tax config with rates (uses defaults if None)
-    :return: TDSResult with deduction details
+    Crypto-Crypto markets (quote = USDT / BTC / ETH / etc.):
+      - SELLER: TDS = fill_value × 1%   (seller receives 1% less quote asset)
+      - BUYER:  TDS = fill_value × 1%   (buyer pays 1% extra in quote asset)
+
+    :param fill_value_quote: fill_amount × fill_price in the quote currency
+    :param is_buyer: True for the buy side, False for the sell side
+    :param market_type: INR or CRYPTO_CRYPTO (default CRYPTO_CRYPTO for safety)
+    :param config: tax rates config (uses defaults if None)
+    :return: TDSResult; tds_amount_quote == 0 when is_applicable is False
     """
     if config is None:
         config = IndiaCryptoTaxConfig()
 
-    tds_amount = sell_value_quote * config.tds_rate
+    if market_type == MarketType.INR and is_buyer:
+        return TDSResult(
+            fill_value_quote=fill_value_quote,
+            tds_rate=config.tds_rate,
+            tds_amount_quote=S_DECIMAL_0,
+            is_applicable=False,
+        )
 
+    tds_amount = fill_value_quote * config.tds_rate
     return TDSResult(
-        sell_value_quote=sell_value_quote,
+        fill_value_quote=fill_value_quote,
         tds_rate=config.tds_rate,
         tds_amount_quote=tds_amount,
+        is_applicable=True,
     )
 
 
@@ -70,13 +117,14 @@ def calculate_profit_tax(profit_after_fees: Decimal,
                          tds_already_paid: Decimal = S_DECIMAL_0,
                          config: IndiaCryptoTaxConfig = None) -> ProfitTaxResult:
     """
-    Calculate 30% income tax on crypto profit.
+    Calculate 30% income tax on crypto profit (Section 115BBH).
 
     If profit > 0: tax = profit × 30%, additional_due = tax - tds_paid
-    If profit <= 0: tax = 0, TDS can be claimed as refund
+    If profit <= 0: tax = 0, TDS already paid can be claimed as refund at ITR filing.
 
     :param profit_after_fees: Net profit after all trade fees
-    :param tds_already_paid: Total TDS deducted from sell transactions
+    :param tds_already_paid: Total TDS deducted at source — include BOTH buy-side
+                             and sell-side TDS for crypto-crypto markets
     :param config: Tax config with rates (uses defaults if None)
     :return: ProfitTaxResult with full tax breakdown
     """

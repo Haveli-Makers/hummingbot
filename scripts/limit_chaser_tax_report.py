@@ -8,6 +8,7 @@ from pydantic import Field
 from hummingbot.client.config.config_data_types import BaseClientModel
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.core.data_type.common import PriceType, TradeType
+from hummingbot.core.data_type.india_crypto_tax import MarketType, calculate_profit_tax, calculate_tds
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 from hummingbot.strategy_v2.executors.order_executor.data_types import (
     ExecutionStrategy,
@@ -32,7 +33,7 @@ SUPPORTED_CONNECTORS = [
 ]
 
 
-class LimitChaserRoundTripConfig(BaseClientModel):
+class LimitChaserTaxReportConfig(BaseClientModel):
     """
     Configuration for the limit-chaser round-trip script.
     Executes a BUY then a SELL (or SELL then BUY) in a single session
@@ -105,15 +106,16 @@ class LimitChaserRoundTripConfig(BaseClientModel):
     )
 
 
-class LimitChaserRoundTripScript(ScriptStrategyBase):
+class LimitChaserTaxReportScript(ScriptStrategyBase):
     @classmethod
-    def init_markets(cls, config: LimitChaserRoundTripConfig):
+    def init_markets(cls, config: LimitChaserTaxReportConfig):
         cls.markets = {config.connector_name: {config.trading_pair}}
 
-    def __init__(self, connectors: Dict[str, ConnectorBase], config: LimitChaserRoundTripConfig):
+    def __init__(self, connectors: Dict[str, ConnectorBase], config: LimitChaserTaxReportConfig):
         super().__init__(connectors, config)
         self.config = config
         self._executor: Optional[OrderExecutor] = None
+        self._leg1_executor: Optional[OrderExecutor] = None
         self._leg: int = 0
         self._leg1_done: bool = False
         self._leg2_done: bool = False
@@ -197,15 +199,15 @@ class LimitChaserRoundTripScript(ScriptStrategyBase):
         if (self.current_timestamp - self._last_status_log > 5
                 and self._executor is not None
                 and not self._executor.is_closed):
+            side = self._sides[self._leg - 1]
             if self._executor._order and self._executor._order.order:
-                price = self._executor._order.order.price
+                order_price = self._executor._order.order.price
                 self.logger().info(
-                    f"[Leg {self._leg}] Active chaser {self._sides[self._leg - 1].name} "
-                    f"id={self._executor._order.order_id} price={price}"
+                    f"[Leg {self._leg}] Active chaser {side.name} "
+                    f"id={self._executor._order.order_id} | order={order_price}"
                 )
             self._last_status_log = self.current_timestamp
 
-        # --- Leg 1 filled → wait delay → start Leg 2 ---
         if self._leg == 1 and self._executor and self._executor.is_closed:
             if not self._leg1_done:
                 self._leg1_done = True
@@ -216,16 +218,83 @@ class LimitChaserRoundTripScript(ScriptStrategyBase):
                 )
 
             if self.current_timestamp - self._leg1_close_ts >= self.config.delay_between_legs:
+                self._leg1_executor = self._executor
                 self._leg = 2
                 if not self._start_leg(self._sides[1]):
                     self._leg = 1
             return
 
-        # --- Leg 2 filled → done ---
         if self._leg == 2 and self._executor and self._executor.is_closed and not self._reported_close:
             self.logger().info(
-                f"[Leg 2] {self._sides[1].name} filled. "
-                f"Round-trip complete! Check logs above for Tax & Profit Report."
+                f"[Leg 2] {self._sides[1].name} filled. Round-trip complete!"
             )
             self._reported_close = True
             self._leg2_done = True
+            self._log_tax_report()
+
+    def _log_tax_report(self):
+        """Calculate and log the India crypto tax & profit report for this round-trip."""
+        try:
+            if self._sides[0] == TradeType.BUY:
+                buy_exec, sell_exec = self._leg1_executor, self._executor
+            else:
+                sell_exec, buy_exec = self._leg1_executor, self._executor
+
+            def _order_info(exec_: Optional[OrderExecutor]):
+                """Return (fill_price, base_amount, tds_paid) for a closed executor."""
+                if not exec_ or not exec_._order or not exec_._order.order:
+                    return Decimal("0"), self.config.amount, Decimal("0")
+                order = exec_._order.order
+                avg_price = order.average_executed_price
+                price = avg_price if avg_price else order.price
+                amount = order.executed_amount_base if order.executed_amount_base > Decimal("0") else self.config.amount
+                return price, amount, order.total_tds_paid()
+
+            buy_price, buy_amount, buy_tds = _order_info(buy_exec)
+            sell_price, sell_amount, sell_tds = _order_info(sell_exec)
+
+            _, quote = self.config.trading_pair.split("-")
+            market_type = MarketType.INR if quote.upper() == "INR" else MarketType.CRYPTO_CRYPTO
+
+            buy_fill_value = buy_price * buy_amount
+            sell_fill_value = sell_price * sell_amount
+
+            if buy_tds == Decimal("0") and sell_tds == Decimal("0"):
+                buy_tds = calculate_tds(buy_fill_value, is_buyer=True, market_type=market_type).tds_amount_quote
+                sell_tds = calculate_tds(sell_fill_value, is_buyer=False, market_type=market_type).tds_amount_quote
+
+            total_tds = buy_tds + sell_tds
+            gross_profit = sell_fill_value - buy_fill_value
+            tax = calculate_profit_tax(gross_profit, tds_already_paid=total_tds)
+
+            sep = "=" * 62
+            base, _ = self.config.trading_pair.split("-")
+            self.logger().info(sep)
+            self.logger().info("  INDIA CRYPTO TAX REPORT — Round-Trip")
+            self.logger().info(sep)
+            self.logger().info(f"  Pair  : {self.config.trading_pair}  |  Market type: {market_type.value.upper()}")
+            self.logger().info(
+                f"  BUY   : {buy_amount:.4f} {base} @ {buy_price:.4f} {quote} = {buy_fill_value:.4f} {quote}"
+            )
+            self.logger().info(
+                f"  SELL  : {sell_amount:.4f} {base} @ {sell_price:.4f} {quote} = {sell_fill_value:.4f} {quote}"
+            )
+            self.logger().info(f"  Gross Profit          : {gross_profit:+.4f} {quote}")
+            self.logger().info(
+                f"  TDS on BUY (Sec 194S) : {buy_tds:.4f} {quote}"
+                + ("  [exempt — INR buyer]" if market_type == MarketType.INR else "  [1%]")
+            )
+            self.logger().info(f"  TDS on SELL (Sec 194S): {sell_tds:.4f} {quote}  [1%]")
+            self.logger().info(f"  Total TDS paid        : {total_tds:.4f} {quote}")
+            self.logger().info(f"  30% Tax (Sec 115BBH)  : {tax.tax_liability:.4f} {quote}")
+            if tax.additional_tax_due <= Decimal("0"):
+                self.logger().info(
+                    f"  TDS refund at ITR     : {abs(tax.additional_tax_due):.4f} {quote}  (claim at filing)"
+                )
+            else:
+                self.logger().info(
+                    f"  Additional tax due    : {tax.additional_tax_due:.4f} {quote}"
+                )
+            self.logger().info(sep)
+        except Exception as e:
+            self.logger().error(f"Tax report generation failed: {e}", exc_info=True)

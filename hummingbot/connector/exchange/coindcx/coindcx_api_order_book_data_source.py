@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -6,7 +7,7 @@ import socketio
 
 from hummingbot.connector.exchange.coindcx import coindcx_constants as CONSTANTS, coindcx_web_utils as web_utils
 from hummingbot.connector.exchange.coindcx.coindcx_order_book import CoinDCXOrderBook
-from hummingbot.connector.exchange.coindcx.coindcx_utils import hb_pair_to_coindcx_pair
+from hummingbot.connector.exchange.coindcx.coindcx_utils import coindcx_pair_to_hb_pair, hb_pair_to_coindcx_pair
 from hummingbot.core.data_type.order_book_message import OrderBookMessage
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod
@@ -111,15 +112,27 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
         @client.on(CONSTANTS.DIFF_EVENT_TYPE)
         async def on_depth_update(message):
-            self.logger().debug(f"Received depth-update: {type(message)}")
-            if isinstance(message, dict) and ("bids" in message or "asks" in message):
-                await self._parse_order_book_diff_message(message, diff_queue)
+            if isinstance(message, dict) and "data" in message:
+                try:
+                    inner = json.loads(message["data"]) if isinstance(message["data"], str) else message["data"]
+                except Exception:
+                    inner = message
+            else:
+                inner = message
+            if isinstance(inner, dict) and ("bids" in inner or "asks" in inner):
+                diff_queue.put_nowait(inner)
 
         @client.on(CONSTANTS.TRADE_EVENT_TYPE)
         async def on_new_trade(message):
-            self.logger().debug(f"Received new-trade: {type(message)}")
-            if isinstance(message, dict) and "p" in message and "q" in message:
-                await self._parse_trade_message(message, trade_queue)
+            if isinstance(message, dict) and "data" in message:
+                try:
+                    inner = json.loads(message["data"]) if isinstance(message["data"], str) else message["data"]
+                except Exception:
+                    inner = message
+            else:
+                inner = message
+            if isinstance(inner, dict) and "p" in inner and "q" in inner:
+                trade_queue.put_nowait(inner)
 
         return client
 
@@ -171,10 +184,14 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         """
         Parse and enqueue a trade message from the exchange.
         """
-        self.logger().debug(f"Received trade message: {raw_message}")
         pair_symbol = raw_message.get("s", "")
         if pair_symbol:
-            trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=pair_symbol)
+            try:
+                trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=pair_symbol)
+            except KeyError:
+                trading_pair = coindcx_pair_to_hb_pair(pair_symbol)
+                if trading_pair not in self._trading_pairs:
+                    return
             trade_message = CoinDCXOrderBook.trade_message_from_exchange(
                 raw_message, {"trading_pair": trading_pair})
             message_queue.put_nowait(trade_message)
@@ -188,12 +205,25 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
             pair_symbol = raw_message.get("s") or raw_message.get("symbol") or ""
             if pair_symbol:
-                trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=pair_symbol)
+                try:
+                    trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=pair_symbol)
+                except Exception:
+                    trading_pair = None
             else:
                 channel = raw_message.get("channel", "")
                 if "@orderbook" in channel:
                     pair_part = channel.split("@")[0]
                     trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=pair_part)
+
+            if trading_pair is None:
+                if len(self._trading_pairs) == 1:
+                    trading_pair = self._trading_pairs[0]
+                else:
+                    self.logger().debug(
+                        f"Cannot identify trading pair for depth-update — skipping. "
+                        f"Message keys: {list(raw_message.keys())}"
+                    )
+                    return
 
             if trading_pair:
                 order_book_message: OrderBookMessage = CoinDCXOrderBook.diff_message_from_exchange(

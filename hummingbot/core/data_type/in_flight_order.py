@@ -56,6 +56,7 @@ class TradeUpdate(NamedTuple):
     fill_quote_amount: Decimal
     fee: TradeFeeBase
     is_taker: bool = True  # CEXs deliver trade events from the taker's perspective
+    tds_amount: Decimal = Decimal("0")
 
     @property
     def fee_asset(self):
@@ -73,6 +74,7 @@ class TradeUpdate(NamedTuple):
             fill_base_amount=Decimal(data["fill_base_amount"]),
             fill_quote_amount=Decimal(data["fill_quote_amount"]),
             fee=TradeFeeBase.from_json(data["fee"]),
+            tds_amount=Decimal(data.get("tds_amount", "0")),
         )
 
         return instance
@@ -84,6 +86,7 @@ class TradeUpdate(NamedTuple):
             "fill_base_amount": str(self.fill_base_amount),
             "fill_quote_amount": str(self.fill_quote_amount),
             "fee": self.fee.to_json(),
+            "tds_amount": str(self.tds_amount),
         })
         return json_dict
 
@@ -327,51 +330,42 @@ class InFlightOrder:
             self.logger().error(f"Error calculating fee paid in {token}: {e}")
         return total_fee_in_token
 
-    def total_tds_paid(self, tds_rate: Decimal = Decimal("0.01")) -> Decimal:
+    def total_tds_paid(self) -> Decimal:
         """
-        Returns the total TDS paid across all trade fills for this order.
-        TDS is only applicable on sell transactions.
+        Returns total TDS paid across all trade fills for this order.
 
-        :param tds_rate: TDS rate (default 1%)
         :return: Total TDS in quote currency
         """
-        if self.trade_type != TradeType.SELL:
-            return s_decimal_0
         total_tds = s_decimal_0
         for trade_update in self.order_fills.values():
-            sell_value = trade_update.fill_base_amount * trade_update.fill_price
-            total_tds += sell_value * tds_rate
+            total_tds += trade_update.tds_amount
         return total_tds
 
-    def total_deductions_quote(self, tds_rate: Decimal = Decimal("0.01"),
-                               exchange: Optional['ExchangeBase'] = None) -> Decimal:
+    def total_deductions_quote(self, exchange: Optional['ExchangeBase'] = None) -> Decimal:
         """
-        Returns the total deductions (exchange fees + TDS) in quote currency.
+        Returns total deductions (exchange fees + TDS) in quote currency.
 
-        :param tds_rate: TDS rate (default 1%)
         :param exchange: Optional exchange for rate lookups
         :return: Total deductions in quote currency
         """
         fee_in_quote = self.cumulative_fee_paid(self.quote_asset, exchange=exchange)
-        tds = self.total_tds_paid(tds_rate)
+        tds = self.total_tds_paid()
         return fee_in_quote + tds
 
-    def net_value_received_quote(self, tds_rate: Decimal = Decimal("0.01"),
-                                 exchange: Optional['ExchangeBase'] = None) -> Decimal:
+    def net_value_received_quote(self, exchange: Optional['ExchangeBase'] = None) -> Decimal:
         """
         Returns the net value received after all deductions (fees + TDS) in quote currency.
         For buy orders: -(executed_quote + fees)
         For sell orders: executed_quote - fees - TDS
 
-        :param tds_rate: TDS rate (default 1%)
         :param exchange: Optional exchange for rate lookups
         :return: Net value in quote currency
         """
-        deductions = self.total_deductions_quote(tds_rate, exchange)
+        deductions = self.total_deductions_quote(exchange)
         if self.trade_type == TradeType.SELL:
             return self.executed_amount_quote - deductions
         else:
-            return self.executed_amount_quote + self.cumulative_fee_paid(self.quote_asset, exchange=exchange)
+            return -(self.executed_amount_quote + deductions)
 
     def update_with_order_update(self, order_update: OrderUpdate) -> bool:
         """

@@ -23,7 +23,7 @@ from hummingbot.core.event.events import OrderCancelledEvent, OrderEditedEvent, 
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 
 
-class OrderEditExampleConfig(BaseClientModel):
+class EditOrderConfig(BaseClientModel):
     """Configuration for the Order Edit Example script."""
     script_file_name: str = os.path.basename(__file__)
 
@@ -64,7 +64,7 @@ class OrderEditExampleConfig(BaseClientModel):
     )
 
 
-class OrderEditExample(ScriptStrategyBase):
+class EditOrder(ScriptStrategyBase):
     """
     A script that places a BUY order and edits its price.
 
@@ -82,10 +82,10 @@ class OrderEditExample(ScriptStrategyBase):
     _post_edit_cooldown_until: Optional[float] = None
 
     @classmethod
-    def init_markets(cls, config: OrderEditExampleConfig):
+    def init_markets(cls, config: EditOrderConfig):
         cls.markets = {config.exchange: {config.trading_pair}}
 
-    def __init__(self, connectors: Dict[str, ConnectorBase], config: OrderEditExampleConfig):
+    def __init__(self, connectors: Dict[str, ConnectorBase], config: EditOrderConfig):
         super().__init__(connectors)
         self.config = config
         self._last_check_timestamp = 0

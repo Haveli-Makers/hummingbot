@@ -26,9 +26,11 @@ class CoinswitchAuth(AuthBase):
                     f"CoinSwitch API secret must be a 32-byte (64 hex character) Ed25519 private key, "
                     f"got {len(secret_key_bytes)} bytes ({len(secret_key)} hex characters)."
                 )
+            self.private_key = ed25519.Ed25519PrivateKey.from_private_bytes(secret_key_bytes)
+        else:
+            self.private_key = None
         self.api_key = api_key
         self.secret_key = secret_key
-        self.private_key = ed25519.Ed25519PrivateKey.from_private_bytes(secret_key_bytes)
         self._time_provider = time_provider
         self._nonce_lock = asyncio.Lock()
         self._last_timestamp = 0

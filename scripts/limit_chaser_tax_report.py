@@ -8,7 +8,7 @@ from pydantic import Field
 from hummingbot.client.config.config_data_types import BaseClientModel
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.core.data_type.common import PriceType, TradeType
-from hummingbot.core.data_type.india_crypto_tax import MarketType, calculate_profit_tax, calculate_tds
+from hummingbot.core.data_type.india_crypto_tax import MarketType, calculate_profit_tax, calculate_tds, get_market_type
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 from hummingbot.strategy_v2.executors.order_executor.data_types import (
     ExecutionStrategy,
@@ -246,13 +246,13 @@ class LimitChaserTaxReportScript(ScriptStrategyBase):
                 avg_price = order.average_executed_price
                 price = avg_price if avg_price else order.price
                 amount = order.executed_amount_base if order.executed_amount_base > Decimal("0") else self.config.amount
-                return price, amount, order.total_tds_paid()
+                return price, amount, Decimal("0")
 
             buy_price, buy_amount, buy_tds = _order_info(buy_exec)
             sell_price, sell_amount, sell_tds = _order_info(sell_exec)
 
             _, quote = self.config.trading_pair.split("-")
-            market_type = MarketType.INR if quote.upper() == "INR" else MarketType.CRYPTO_CRYPTO
+            market_type = get_market_type(self.config.trading_pair)
 
             buy_fill_value = buy_price * buy_amount
             sell_fill_value = sell_price * sell_amount

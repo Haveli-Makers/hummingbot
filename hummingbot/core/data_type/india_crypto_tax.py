@@ -149,3 +149,9 @@ def calculate_profit_tax(taxable_profit: Decimal,
         tds_already_paid=tds_already_paid,
         additional_tax_due=additional_tax_due,
     )
+
+
+def get_market_type(trading_pair: str) -> MarketType:
+    """Return MarketType based on the quote currency of *trading_pair* (e.g. 'BTC-INR')."""
+    quote = trading_pair.split("-")[-1].upper()
+    return MarketType.INR if quote == "INR" else MarketType.CRYPTO_CRYPTO

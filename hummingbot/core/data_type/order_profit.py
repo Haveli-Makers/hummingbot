@@ -3,6 +3,7 @@ from decimal import Decimal
 from typing import Optional
 
 from hummingbot.core.data_type.india_crypto_tax import (
+    S_DECIMAL_0,
     IndiaCryptoTaxConfig,
     MarketType,
     ProfitTaxResult,
@@ -10,8 +11,6 @@ from hummingbot.core.data_type.india_crypto_tax import (
     calculate_profit_tax,
     calculate_tds,
 )
-
-S_DECIMAL_0 = Decimal("0")
 
 
 @dataclass
@@ -29,7 +28,7 @@ class OrderProfitResult:
     profit_after_fees: Decimal          # gross_profit - total_fees
     profit_tax: ProfitTaxResult
     net_profit_post_tax: Decimal        # profit_after_fees - tax_liability
-    effective_tax_rate_pct: Decimal     # (total_fees + tax_liability) / gross_profit × 100
+    effective_tax_rate_pct: Decimal     # (total_fees + tax_liability) / gross_profit × 100; 0% when loss (no 30% tax applies) but TDS was still paid — see total_tds_quote
     net_return_pct: Decimal             # net_profit / total_cost × 100
 
 
@@ -127,7 +126,9 @@ def format_profit_report(result: OrderProfitResult, quote_currency: str = "INR")
          if result.profit_tax.additional_tax_due <= S_DECIMAL_0 else
          f"  Additional Tax Due:  {result.profit_tax.additional_tax_due:.2f} {quote_currency}"),
         f"  Net Profit (Post-Tax): {result.net_profit_post_tax:.2f} {quote_currency}",
-        f"  Effective Tax Rate:  {result.effective_tax_rate_pct:.1f}%",
+        (f"  Effective Tax Rate:  {result.effective_tax_rate_pct:.1f}%  (loss trade — 0% income tax, but TDS of {result.total_tds_quote:.2f} {quote_currency} was deducted; claimable at ITR)"
+         if result.gross_profit_quote <= S_DECIMAL_0 else
+         f"  Effective Tax Rate:  {result.effective_tax_rate_pct:.1f}%"),
         f"  Net Return:          {result.net_return_pct:.2f}%",
     ]
     return "\n".join(lines)

@@ -56,7 +56,6 @@ class TradeUpdate(NamedTuple):
     fill_quote_amount: Decimal
     fee: TradeFeeBase
     is_taker: bool = True  # CEXs deliver trade events from the taker's perspective
-    tds_amount: Decimal = Decimal("0")
 
     @property
     def fee_asset(self):
@@ -74,7 +73,6 @@ class TradeUpdate(NamedTuple):
             fill_base_amount=Decimal(data["fill_base_amount"]),
             fill_quote_amount=Decimal(data["fill_quote_amount"]),
             fee=TradeFeeBase.from_json(data["fee"]),
-            tds_amount=Decimal(data.get("tds_amount", "0")),
         )
 
         return instance
@@ -86,7 +84,6 @@ class TradeUpdate(NamedTuple):
             "fill_base_amount": str(self.fill_base_amount),
             "fill_quote_amount": str(self.fill_quote_amount),
             "fee": self.fee.to_json(),
-            "tds_amount": str(self.tds_amount),
         })
         return json_dict
 
@@ -329,17 +326,6 @@ class InFlightOrder:
         except Exception as e:
             self.logger().error(f"Error calculating fee paid in {token}: {e}")
         return total_fee_in_token
-
-    def total_tds_paid(self) -> Decimal:
-        """
-        Returns total TDS paid across all trade fills for this order.
-
-        :return: Total TDS in quote currency
-        """
-        total_tds = s_decimal_0
-        for trade_update in self.order_fills.values():
-            total_tds += trade_update.tds_amount
-        return total_tds
 
     def update_with_order_update(self, order_update: OrderUpdate) -> bool:
         """

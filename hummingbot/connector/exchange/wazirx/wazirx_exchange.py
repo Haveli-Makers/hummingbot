@@ -113,6 +113,26 @@ class WazirxExchange(ExchangePyBase):
         pairs_prices = await self._api_get(path_url=CONSTANTS.TICKERS_PATH_URL)
         return pairs_prices
 
+    async def get_all_24h_volume_tickers(self, trading_pairs: Optional[List[str]] = None) -> List[Dict[str, str]]:
+        if not trading_pairs:
+            return await self._api_get(path_url=CONSTANTS.TICKERS_PATH_URL)
+        results = []
+        for tp in trading_pairs:
+            base, quote = tp.split("-", 1)
+            symbol = f"{base.lower()}{quote.lower()}"
+            try:
+                resp = await self._api_get(
+                    path_url=CONSTANTS.TICKER_24HR_PATH_URL,
+                    params={"symbol": symbol},
+                )
+                if isinstance(resp, dict):
+                    results.append(resp)
+                elif isinstance(resp, list):
+                    results.extend(resp)
+            except Exception:
+                self.logger().warning(f"Skipping {tp}: symbol not found on {self.name}")
+        return results
+
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
         error_msg = str(request_exception)
         return "2098" in error_msg or "out of receiving window" in error_msg.lower()

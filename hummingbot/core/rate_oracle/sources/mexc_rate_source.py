@@ -11,10 +11,6 @@ if TYPE_CHECKING:
 
 
 class MexcRateSource(RateSourceBase):
-    def __init__(self):
-        super().__init__()
-        self._mexc_exchange: Optional[MexcExchange] = None  # delayed because of circular reference
-
     @property
     def name(self) -> str:
         return "mexc"
@@ -24,7 +20,7 @@ class MexcRateSource(RateSourceBase):
         self._ensure_exchanges()
         results = {}
         tasks = [
-            self._get_mexc_prices(exchange=self._mexc_exchange, quote_token=quote_token),
+            self._get_mexc_prices(exchange=self._exchange, quote_token=quote_token),
         ]
         task_results = await safe_gather(*tasks, return_exceptions=True)
         for task_result in task_results:
@@ -49,7 +45,7 @@ class MexcRateSource(RateSourceBase):
         self._ensure_exchanges()
         results = {}
         tasks = [
-            self._get_mexc_bid_ask_prices(exchange=self._mexc_exchange, quote_token=quote_token),
+            self._get_mexc_bid_ask_prices(exchange=self._exchange, quote_token=quote_token),
         ]
         task_results = await safe_gather(*tasks, return_exceptions=True)
         for task_result in task_results:
@@ -62,10 +58,6 @@ class MexcRateSource(RateSourceBase):
             else:
                 results.update(task_result)
         return results
-
-    def _ensure_exchanges(self):
-        if self._mexc_exchange is None:
-            self._mexc_exchange = self._build_mexc_connector_without_private_keys()
 
     @staticmethod
     async def _get_mexc_prices(exchange: 'MexcExchange', quote_token: str = None) -> Dict[str, Decimal]:
@@ -128,8 +120,7 @@ class MexcRateSource(RateSourceBase):
 
         return results
 
-    @staticmethod
-    def _build_mexc_connector_without_private_keys() -> 'MexcExchange':
+    def _build_exchange(self) -> 'MexcExchange':
         from hummingbot.connector.exchange.mexc.mexc_exchange import MexcExchange
 
         return MexcExchange(

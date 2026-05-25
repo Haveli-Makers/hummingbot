@@ -56,7 +56,7 @@ class CoinDCXSpotCandles(CandlesBase):
 
     @property
     def rate_limits(self):
-        return CONSTANTS.RATE_LIMITS
+        return []
 
     @property
     def intervals(self):

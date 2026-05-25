@@ -74,6 +74,7 @@ RATE_LIMITS = [
     RateLimit(limit_id=ACTIVE_ORDERS_PATH_URL, limit=300, time_interval=ONE_MINUTE),
     RateLimit(limit_id=TRADE_HISTORY_ACCOUNT_PATH_URL, limit=2000, time_interval=ONE_MINUTE),
     RateLimit(limit_id=ORDER_EDIT_PATH_URL, limit=2000, time_interval=ONE_MINUTE),
+    RateLimit(limit_id=TICKER_PATH_URL, limit=2000, time_interval=ONE_MINUTE),
 ]
 
 ORDER_NOT_EXIST_ERROR_CODE = 404

@@ -203,6 +203,17 @@ class CoindcxExchange(ExchangePyBase):
         pairs_prices = await self._api_get(path_url=CONSTANTS.TICKER_PATH_URL)
         return pairs_prices
 
+    async def get_all_24h_volume_tickers(self, trading_pairs: Optional[List[str]] = None) -> List[Dict[str, str]]:
+        all_tickers = await self.get_all_pairs_prices()
+        if not trading_pairs:
+            return all_tickers
+        filter_symbols = {tp.replace("-", "").upper() for tp in trading_pairs}
+        found = {item.get("market", "").upper() for item in all_tickers if isinstance(item, dict)}
+        for sym in filter_symbols:
+            if sym not in found:
+                self.logger().warning(f"Skipping {sym}: symbol not found on {self.name}")
+        return [item for item in all_tickers if isinstance(item, dict) and item.get("market", "").upper() in filter_symbols]
+
     async def get_markets_details(self) -> List[Dict[str, Any]]:
         """
         Returns markets details (metadata) for all trading pairs.

@@ -114,6 +114,21 @@ class KucoinExchange(ExchangePyBase):
         pairs_prices = await self._api_get(path_url=CONSTANTS.ALL_TICKERS_PATH_URL)
         return pairs_prices
 
+    async def get_all_24h_volume_tickers(self, trading_pairs: Optional[List[str]] = None):
+        resp = await self.get_all_pairs_prices()
+        if not trading_pairs:
+            return resp
+        filter_symbols = {tp.upper() for tp in trading_pairs}
+        tickers = resp.get("data", {}).get("ticker", [])
+        found = {item.get("symbol", "").upper() for item in tickers if isinstance(item, dict)}
+        for sym in filter_symbols:
+            if sym not in found:
+                self.logger().warning(f"Skipping {sym}: symbol not found on {self.name}")
+        filtered = [item for item in tickers if isinstance(item, dict) and item.get("symbol", "").upper() in filter_symbols]
+        filtered_resp = dict(resp)
+        filtered_resp["data"] = {**resp.get("data", {}), "ticker": filtered}
+        return filtered_resp
+
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
         error_description = str(request_exception)
         return CONSTANTS.RET_CODE_AUTH_TIMESTAMP_ERROR in error_description and CONSTANTS.RET_MSG_AUTH_TIMESTAMP_ERROR in error_description

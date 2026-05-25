@@ -510,17 +510,15 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
                 'trading_pair': 'BTC-USDT',
                 'best_bid': 200.0,
                 'best_ask': 202.0,
-                # mid_price and spread not provided
             }
         ]
         recorder.store_market_data(market_data_list2)
         with self.manager.get_new_session() as session:
             market_data = session.query(MarketData).all()
         self.assertEqual(2, len(market_data))
-        # Check the second one
         self.assertEqual(201.0, market_data[1].mid_price)  # (200+202)/2
-        expected_spread = ((202.0 - 200.0) / 201.0) * 100
-        self.assertAlmostEqual(expected_spread, float(market_data[1].spread), places=5)
+        expected_spread_pct = ((202.0 - 200.0) / 201.0) * 100
+        self.assertAlmostEqual(expected_spread_pct, float(market_data[1].spread), places=5)
 
     def test_update_or_store_position(self):
         recorder = MarketsRecorder(

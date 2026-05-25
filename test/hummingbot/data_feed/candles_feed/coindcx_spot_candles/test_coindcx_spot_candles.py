@@ -91,7 +91,7 @@ class TestCoinDCXSpotCandles(TestCandlesBase):
     def _success_subscription_mock():
         """WebSocket not supported for CoinDCX."""
         return {}
-    
+
     async def test_listen_for_subscriptions_subscribes_to_klines(self):
         with self.assertRaises(NotImplementedError):
             self.data_feed.ws_subscription_payload()
@@ -131,7 +131,7 @@ class TestCoinDCXSpotCandles(TestCandlesBase):
         task = asyncio.get_event_loop().create_task(
             self.data_feed.listen_for_subscriptions()
         )
-        await asyncio.sleep(0)  
+        await asyncio.sleep(0)
         task.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await task
@@ -244,7 +244,7 @@ class TestCoinDCXSpotCandles(TestCandlesBase):
         self.assertAlmostEqual(first[2], 16823.63)   # high
         self.assertAlmostEqual(first[3], 16792.12)   # low
         self.assertAlmostEqual(first[4], 16810.18)   # close
-        self.assertAlmostEqual(first[5], 6230.44034) # volume
+        self.assertAlmostEqual(first[5], 6230.44034)  # volume
         self.assertEqual(first[6], 0.0)
         self.assertEqual(first[7], 0.0)
         self.assertEqual(first[8], 0.0)
@@ -282,7 +282,7 @@ class TestCoinDCXSpotCandles(TestCandlesBase):
 
     def test_fill_gaps_and_append_with_gap_inserts_heartbeats(self):
         first = [1672992000.0, 100, 110, 90, 105, 1000, 0, 0, 0, 0]
-        new_candle = [1672992180.0, 106, 120, 104, 115, 2000, 0, 0, 0, 0]  
+        new_candle = [1672992180.0, 106, 120, 104, 115, 2000, 0, 0, 0, 0]
         self.data_feed._candles.append(first)
         self.data_feed._fill_gaps_and_append(new_candle)
 
@@ -309,10 +309,10 @@ class TestCoinDCXSpotCandles(TestCandlesBase):
         self.data_feed._fill_gaps_and_append(next_candle)
 
         heartbeat = self.data_feed._candles[1]
-        self.assertEqual(heartbeat[1], 99.5) 
-        self.assertEqual(heartbeat[2], 99.5)  
-        self.assertEqual(heartbeat[3], 99.5)  
-        self.assertEqual(heartbeat[4], 99.5)  
+        self.assertEqual(heartbeat[1], 99.5)
+        self.assertEqual(heartbeat[2], 99.5)
+        self.assertEqual(heartbeat[3], 99.5)
+        self.assertEqual(heartbeat[4], 99.5)
 
     async def test_check_network_success(self):
         mock_rest = MagicMock()
@@ -408,9 +408,9 @@ class TestCoinDCXSpotCandles(TestCandlesBase):
             await self.data_feed._poll_and_update()
 
         self.assertEqual(len(self.data_feed._candles), 4)
-        self.assertEqual(self.data_feed._candles[1][5], 0.0)  
-        self.assertGreater(self.data_feed._candles[2][5], 0.0)  
-        self.assertGreater(self.data_feed._candles[3][5], 0.0)  
+        self.assertEqual(self.data_feed._candles[1][5], 0.0)
+        self.assertGreater(self.data_feed._candles[2][5], 0.0)
+        self.assertGreater(self.data_feed._candles[3][5], 0.0)
 
     @patch("hummingbot.data_feed.candles_feed.coindcx_spot_candles.coindcx_spot_candles.safe_ensure_future")
     async def test_initialize_candles_triggers_backfill(self, mock_safe_ensure_future):
@@ -426,7 +426,7 @@ class TestCoinDCXSpotCandles(TestCandlesBase):
         call_arg = mock_safe_ensure_future.call_args[0][0]
         import inspect
         self.assertTrue(inspect.iscoroutine(call_arg))
-        call_arg.close()  
+        call_arg.close()
 
     async def test_listen_for_subscriptions_delegates_to_polling_task(self):
         """listen_for_subscriptions waits on _polling_task (no WS involved)."""
@@ -438,9 +438,9 @@ class TestCoinDCXSpotCandles(TestCandlesBase):
         listen_task = asyncio.get_event_loop().create_task(
             self.data_feed.listen_for_subscriptions()
         )
-        await asyncio.sleep(0)  
+        await asyncio.sleep(0)
         done_event.set()
-        await listen_task 
+        await listen_task
         self.data_feed._polling_task = None
 
     async def test_initialize_exchange_data_reraises_on_error(self):

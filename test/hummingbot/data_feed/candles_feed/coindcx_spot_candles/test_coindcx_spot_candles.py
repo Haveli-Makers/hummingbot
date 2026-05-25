@@ -91,9 +91,8 @@ class TestCoinDCXSpotCandles(TestCandlesBase):
     def _success_subscription_mock():
         """WebSocket not supported for CoinDCX."""
         return {}
-
+    
     async def test_listen_for_subscriptions_subscribes_to_klines(self):
-        """CoinDCX uses polling; WebSocket is not supported."""
         with self.assertRaises(NotImplementedError):
             self.data_feed.ws_subscription_payload()
 
@@ -123,9 +122,25 @@ class TestCoinDCXSpotCandles(TestCandlesBase):
             self.data_feed.ws_subscription_payload()
 
     async def test_listen_for_subscriptions_raises_cancel_exception(self):
-        """CoinDCX uses polling; WebSocket is not supported."""
-        with self.assertRaises(NotImplementedError):
-            self.data_feed.ws_subscription_payload()
+        """CoinDCX listen_for_subscriptions propagates CancelledError."""
+        self.data_feed._is_running = True
+        done_event = asyncio.Event()
+        self.data_feed._polling_task = asyncio.get_event_loop().create_task(
+            done_event.wait()
+        )
+        task = asyncio.get_event_loop().create_task(
+            self.data_feed.listen_for_subscriptions()
+        )
+        await asyncio.sleep(0)  
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.data_feed._polling_task.cancel()
+        try:
+            await self.data_feed._polling_task
+        except asyncio.CancelledError:
+            pass
+        self.data_feed._polling_task = None
 
     async def test_listen_for_subscriptions_logs_exception_details(self):
         """CoinDCX uses polling; error logging tested via _poll_and_update."""
@@ -170,8 +185,6 @@ class TestCoinDCXSpotCandles(TestCandlesBase):
             CONSTANTS.MAX_RESULTS_PER_CANDLESTICK_REST_REQUEST,
         )
 
-    # ── get_exchange_trading_pair ─────────────────────────────────────────
-
     def test_get_exchange_trading_pair_btc_usdt(self):
         self.assertEqual(
             self.data_feed.get_exchange_trading_pair("BTC-USDT"), "B-BTC_USDT"
@@ -180,6 +193,17 @@ class TestCoinDCXSpotCandles(TestCandlesBase):
     def test_get_exchange_trading_pair_eth_usdt(self):
         self.assertEqual(
             self.data_feed.get_exchange_trading_pair("ETH-USDT"), "B-ETH_USDT"
+        )
+
+    def test_get_exchange_trading_pair_btc_inr(self):
+        """INR markets use the I- prefix, not B-."""
+        self.assertEqual(
+            self.data_feed.get_exchange_trading_pair("BTC-INR"), "I-BTC_INR"
+        )
+
+    def test_get_exchange_trading_pair_eth_inr(self):
+        self.assertEqual(
+            self.data_feed.get_exchange_trading_pair("ETH-INR"), "I-ETH_INR"
         )
 
     def test_get_rest_candles_params_no_times(self):
@@ -316,16 +340,21 @@ class TestCoinDCXSpotCandles(TestCandlesBase):
         self.assertEqual(resp.shape[0], len(self.get_fetch_candles_data_mock()))
         self.assertEqual(resp.shape[1], 10)
 
-    def test_rate_limits_has_root_raw_entry(self):
+    def test_rate_limits_has_root_raw_entries(self):
         root_ids = {r.limit_id for r in CONSTANTS.RATE_LIMITS}
-        self.assertIn("raw", root_ids)
+        self.assertIn("raw_public", root_ids)
+        self.assertIn("raw_api", root_ids)
+        self.assertNotIn("raw", root_ids, "Generic 'raw' pool must not exist")
 
-    def test_rate_limits_linked_to_raw(self):
-        non_root = [r for r in CONSTANTS.RATE_LIMITS if r.limit_id != "raw"]
-        for rate_limit in non_root:
-            linked_ids = [ll.limit_id for ll in rate_limit.linked_limits]
-            self.assertIn("raw", linked_ids,
-                          f"{rate_limit.limit_id} should be linked to 'raw'")
+    def test_rate_limits_each_endpoint_linked_to_correct_pool(self):
+        limit_map = {r.limit_id: r for r in CONSTANTS.RATE_LIMITS}
+        candles_linked = [ll.limit_id for ll in limit_map[CONSTANTS.CANDLES_ENDPOINT].linked_limits]
+        self.assertIn("raw_public", candles_linked)
+        self.assertNotIn("raw_api", candles_linked)
+        for ep in [CONSTANTS.HEALTH_CHECK_ENDPOINT, CONSTANTS.MARKETS_DETAILS_ENDPOINT]:
+            linked = [ll.limit_id for ll in limit_map[ep].linked_limits]
+            self.assertIn("raw_api", linked)
+            self.assertNotIn("raw_public", linked)
 
     def test_intervals_contains_standard_values(self):
         for iv in ["1m", "5m", "15m", "1h", "4h", "1d"]:
@@ -333,3 +362,111 @@ class TestCoinDCXSpotCandles(TestCandlesBase):
 
     def test_interval_in_seconds_for_1m(self):
         self.assertEqual(self.data_feed.interval_in_seconds, 60)
+
+    async def test_poll_and_update_processes_all_candles(self):
+        """All candles returned by the API are processed, not just the last one."""
+        mock_rest = MagicMock()
+        base_ts = 1672992000.0
+        self.data_feed._candles.append(
+            [base_ts, 100.0, 110.0, 90.0, 105.0, 1000.0, 0.0, 0.0, 0.0, 0.0]
+        )
+        mock_rest.execute_request = AsyncMock(
+            return_value=[
+                {"time": int((base_ts + 120) * 1000), "open": "112", "high": "115",
+                 "low": "110", "close": "113", "volume": "300"},
+                {"time": int((base_ts + 60) * 1000), "open": "106", "high": "108",
+                 "low": "104", "close": "107", "volume": "200"},
+                {"time": int(base_ts * 1000), "open": "100", "high": "110",
+                 "low": "90", "close": "105", "volume": "1000"},
+            ]
+        )
+        with patch.object(self.data_feed._api_factory, "get_rest_assistant",
+                          return_value=mock_rest):
+            await self.data_feed._poll_and_update()
+
+        self.assertEqual(len(self.data_feed._candles), 3)
+        self.assertAlmostEqual(self.data_feed._candles[1][0], base_ts + 60)
+        self.assertAlmostEqual(self.data_feed._candles[2][0], base_ts + 120)
+
+    async def test_poll_and_update_does_not_drop_candle_on_gap(self):
+        """With a 2-interval gap, both real candles should be appended (no silent drop)."""
+        mock_rest = MagicMock()
+        base_ts = 1672992000.0
+        self.data_feed._candles.append(
+            [base_ts, 100.0, 110.0, 90.0, 105.0, 1000.0, 0.0, 0.0, 0.0, 0.0]
+        )
+        mock_rest.execute_request = AsyncMock(
+            return_value=[
+                {"time": int((base_ts + 180) * 1000), "open": "115", "high": "120",
+                 "low": "113", "close": "118", "volume": "400"},
+                {"time": int((base_ts + 120) * 1000), "open": "108", "high": "112",
+                 "low": "106", "close": "110", "volume": "350"},
+            ]
+        )
+        with patch.object(self.data_feed._api_factory, "get_rest_assistant",
+                          return_value=mock_rest):
+            await self.data_feed._poll_and_update()
+
+        self.assertEqual(len(self.data_feed._candles), 4)
+        self.assertEqual(self.data_feed._candles[1][5], 0.0)  
+        self.assertGreater(self.data_feed._candles[2][5], 0.0)  
+        self.assertGreater(self.data_feed._candles[3][5], 0.0)  
+
+    @patch("hummingbot.data_feed.candles_feed.coindcx_spot_candles.coindcx_spot_candles.safe_ensure_future")
+    async def test_initialize_candles_triggers_backfill(self, mock_safe_ensure_future):
+        """_initialize_candles must schedule fill_historical_candles."""
+        import numpy as np
+
+        mock_candles = np.array(self.get_fetch_candles_data_mock())
+        with patch.object(self.data_feed, "fetch_candles",
+                          new=AsyncMock(return_value=mock_candles)):
+            await self.data_feed._initialize_candles()
+
+        mock_safe_ensure_future.assert_called_once()
+        call_arg = mock_safe_ensure_future.call_args[0][0]
+        import inspect
+        self.assertTrue(inspect.iscoroutine(call_arg))
+        call_arg.close()  
+
+    async def test_listen_for_subscriptions_delegates_to_polling_task(self):
+        """listen_for_subscriptions waits on _polling_task (no WS involved)."""
+        done_event = asyncio.Event()
+        self.data_feed._is_running = True
+        self.data_feed._polling_task = asyncio.get_event_loop().create_task(
+            done_event.wait()
+        )
+        listen_task = asyncio.get_event_loop().create_task(
+            self.data_feed.listen_for_subscriptions()
+        )
+        await asyncio.sleep(0)  
+        done_event.set()
+        await listen_task 
+        self.data_feed._polling_task = None
+
+    async def test_initialize_exchange_data_reraises_on_error(self):
+        mock_rest = MagicMock()
+        mock_rest.execute_request = AsyncMock(side_effect=Exception("network timeout"))
+        with patch.object(self.data_feed._api_factory, "get_rest_assistant",
+                          return_value=mock_rest):
+            with self.assertRaises(Exception) as ctx:
+                await self.data_feed.initialize_exchange_data()
+        self.assertIn("network timeout", str(ctx.exception))
+
+    def test_parse_rest_candles_skips_malformed_candle(self):
+        """A bad row is logged and skipped; the rest of the candles are parsed."""
+        data = [
+            {"time": 1672992000000, "open": "100", "high": "110",
+             "low": "90", "close": "105", "volume": "1000"},
+            {"time": 1672992060000, "open": "BAD_VALUE", "high": "115",
+             "low": "99", "close": "108", "volume": "200"},
+            {"time": 1672992120000, "open": "108", "high": "120",
+             "low": "106", "close": "115", "volume": "500"},
+        ]
+        result = self.data_feed._parse_rest_candles(data)
+        self.assertEqual(len(result), 2, "Malformed row should be skipped, not drop all")
+        self.assertAlmostEqual(result[0][0], 1672992000.0)
+        self.assertAlmostEqual(result[1][0], 1672992120.0)
+        self.assertTrue(
+            any("error parsing candle row" in str(r.getMessage()).lower()
+                for r in self.log_records if r.levelname == "ERROR")
+        )

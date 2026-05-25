@@ -32,23 +32,24 @@ MAX_RESULTS_PER_CANDLESTICK_REST_REQUEST = 1000
 POLL_INTERVAL = 5.0
 
 RATE_LIMITS = [
-    RateLimit(limit_id="raw", limit=2000, time_interval=60),
+    RateLimit(limit_id="raw_public", limit=2000, time_interval=60),  
+    RateLimit(limit_id="raw_api", limit=2000, time_interval=60),    
     RateLimit(
         limit_id=CANDLES_ENDPOINT,
         limit=2000,
         time_interval=60,
-        linked_limits=[LinkedLimitWeightPair("raw", 1)],
+        linked_limits=[LinkedLimitWeightPair("raw_public", 1)],
     ),
     RateLimit(
         limit_id=HEALTH_CHECK_ENDPOINT,
         limit=2000,
         time_interval=60,
-        linked_limits=[LinkedLimitWeightPair("raw", 1)],
+        linked_limits=[LinkedLimitWeightPair("raw_api", 1)],
     ),
     RateLimit(
         limit_id=MARKETS_DETAILS_ENDPOINT,
         limit=2000,
         time_interval=60,
-        linked_limits=[LinkedLimitWeightPair("raw", 1)],
+        linked_limits=[LinkedLimitWeightPair("raw_api", 1)],
     ),
 ]

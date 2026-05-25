@@ -72,7 +72,9 @@ class CoinDCXSpotCandles(CandlesBase):
         return NetworkStatus.CONNECTED
 
     def get_exchange_trading_pair(self, trading_pair: str) -> str:
-        return hb_pair_to_coindcx_pair(trading_pair, ecode="B")
+        _, quote = trading_pair.split("-")
+        ecode = "I" if quote.upper() == "INR" else "B"
+        return hb_pair_to_coindcx_pair(trading_pair, ecode=ecode)
 
     async def initialize_exchange_data(self):
         try:
@@ -102,6 +104,7 @@ class CoinDCXSpotCandles(CandlesBase):
                 f"Error initialising CoinDCX exchange data for {self._trading_pair}: {e}",
                 exc_info=True,
             )
+            raise
 
     async def start_network(self):
         await self.stop_network()
@@ -150,23 +153,36 @@ class CoinDCXSpotCandles(CandlesBase):
 
         candles = []
         for row in data:
-            timestamp = self.ensure_timestamp_in_seconds(row["time"])
-            if end_time and timestamp > end_time:
-                continue
-            candles.append([
-                timestamp,
-                float(row["open"]),
-                float(row["high"]),
-                float(row["low"]),
-                float(row["close"]),
-                float(row["volume"]),
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-            ])
+            try:
+                timestamp = self.ensure_timestamp_in_seconds(row["time"])
+                if end_time and timestamp > end_time:
+                    continue
+                candles.append([
+                    timestamp,
+                    float(row["open"]),
+                    float(row["high"]),
+                    float(row["low"]),
+                    float(row["close"]),
+                    float(row["volume"]),
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ])
+            except Exception as e:
+                self.logger().error(f"CoinDCX: error parsing candle row {row}: {e}")
         candles.sort(key=lambda x: x[0])
         return candles
+
+    async def listen_for_subscriptions(self):
+        if not self._is_running:
+            await self.start_network()
+        if self._polling_task:
+            try:
+                await self._polling_task
+            except asyncio.CancelledError:
+                self.logger().info("CoinDCX candles subscription cancelled.")
+                raise
 
     def ws_subscription_payload(self):
         raise NotImplementedError("WebSocket not supported for CoinDCX candles; polling is used instead.")
@@ -207,17 +223,17 @@ class CoinDCXSpotCandles(CandlesBase):
 
     async def _initialize_candles(self):
         try:
-            end_time = int(time.time())
             candles = await self.fetch_candles(
-                end_time=end_time,
-                limit=self._candles.maxlen,
+                end_time=int(time.time()),
+                limit=10,
             )
             if candles.size > 0:
                 self._candles.extend(candles)
                 self._ws_candle_available.set()
+                safe_ensure_future(self.fill_historical_candles())
                 self.logger().info(
-                    f"CoinDCX candles initialised: {len(self._candles)} candles "
-                    f"for {self._trading_pair} [{self.interval}]"
+                    f"CoinDCX candles seeded with {len(self._candles)} recent candles "
+                    f"for {self._trading_pair} [{self.interval}]; backfill scheduled."
                 )
         except Exception as e:
             self.logger().error(
@@ -254,7 +270,7 @@ class CoinDCXSpotCandles(CandlesBase):
                 params={
                     "pair": self._ex_trading_pair,
                     "interval": self.interval,
-                    "limit": 2,
+                    "limit": 10,
                 },
                 method=self._rest_method,
             )
@@ -263,21 +279,19 @@ class CoinDCXSpotCandles(CandlesBase):
             if not candles:
                 return
 
-            latest = candles[-1]
-
             if not self._candles:
-                self._candles.append(latest)
+                self._candles.append(candles[-1])
                 self._ws_candle_available.set()
                 safe_ensure_future(self.fill_historical_candles())
                 return
 
-            last_ts = self._candles[-1][0]
-            latest_ts = latest[0]
-
-            if latest_ts > last_ts:
-                self._fill_gaps_and_append(latest)
-            elif latest_ts == last_ts:
-                self._candles[-1] = latest
+            for candle in candles:
+                candle_ts = candle[0]
+                last_ts = self._candles[-1][0]
+                if candle_ts > last_ts:
+                    self._fill_gaps_and_append(candle)
+                elif candle_ts == last_ts:
+                    self._candles[-1] = candle
 
         except Exception as e:
             self.logger().error(f"CoinDCX candles poll error: {e}", exc_info=True)

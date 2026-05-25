@@ -36,7 +36,7 @@ class CoinDCXSpotCandles(CandlesBase):
 
     @property
     def wss_url(self):
-        return CONSTANTS.WSS_URL  
+        return CONSTANTS.WSS_URL
 
     @property
     def health_check_url(self) -> str:
@@ -56,12 +56,12 @@ class CoinDCXSpotCandles(CandlesBase):
 
     @property
     def rate_limits(self):
-        return []
+        return CONSTANTS.RATE_LIMITS
 
     @property
     def intervals(self):
         return CONSTANTS.INTERVALS
-    
+
     async def check_network(self) -> NetworkStatus:
         rest_assistant = await self._api_factory.get_rest_assistant()
         await rest_assistant.execute_request(
@@ -137,9 +137,9 @@ class CoinDCXSpotCandles(CandlesBase):
             "limit": limit or CONSTANTS.MAX_RESULTS_PER_CANDLESTICK_REST_REQUEST,
         }
         if start_time:
-            params["startTime"] = int(start_time * 1000)  
+            params["startTime"] = int(start_time * 1000)
         if end_time:
-            params["endTime"] = int(end_time * 1000)  
+            params["endTime"] = int(end_time * 1000)
         return params
 
     def _parse_rest_candles(
@@ -160,18 +160,18 @@ class CoinDCXSpotCandles(CandlesBase):
                 float(row["low"]),
                 float(row["close"]),
                 float(row["volume"]),
-                0.0, 
-                0.0,  
-                0.0, 
-                0.0, 
+                0.0,
+                0.0,
+                0.0,
+                0.0,
             ])
         candles.sort(key=lambda x: x[0])
         return candles
 
-    def ws_subscription_payload(self):  
+    def ws_subscription_payload(self):
         return {}
 
-    def _parse_websocket_message(self, data: dict):  
+    def _parse_websocket_message(self, data: dict):
         return None
 
     async def _polling_loop(self):

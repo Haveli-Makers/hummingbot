@@ -3,6 +3,7 @@ import logging
 import time
 from typing import List, Optional
 
+from hummingbot.connector.exchange.coindcx.coindcx_utils import hb_pair_to_coindcx_pair
 from hummingbot.core.network_iterator import NetworkStatus
 from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod
@@ -71,8 +72,7 @@ class CoinDCXSpotCandles(CandlesBase):
         return NetworkStatus.CONNECTED
 
     def get_exchange_trading_pair(self, trading_pair: str) -> str:
-        base, quote = trading_pair.split("-")
-        return f"KC-{base}_{quote}"
+        return hb_pair_to_coindcx_pair(trading_pair, ecode="B")
 
     async def initialize_exchange_data(self):
         try:
@@ -169,10 +169,10 @@ class CoinDCXSpotCandles(CandlesBase):
         return candles
 
     def ws_subscription_payload(self):
-        return {}
+        raise NotImplementedError("WebSocket not supported for CoinDCX candles; polling is used instead.")
 
     def _parse_websocket_message(self, data: dict):
-        return None
+        raise NotImplementedError("WebSocket not supported for CoinDCX candles; polling is used instead.")
 
     async def _polling_loop(self):
         try:
@@ -225,6 +225,26 @@ class CoinDCXSpotCandles(CandlesBase):
                 exc_info=True,
             )
 
+    def _fill_gaps_and_append(self, new_candle: List[float]) -> None:
+        """Insert heartbeat candles for any skipped intervals then append new_candle."""
+        if not self._candles:
+            self._candles.append(new_candle)
+            return
+
+        last_ts = self._candles[-1][0]
+        new_ts = new_candle[0]
+        next_ts = last_ts + self.interval_in_seconds
+
+        while next_ts < new_ts:
+            prev = self._candles[-1]
+            close_price = prev[4]
+            heartbeat = [next_ts, close_price, close_price, close_price, close_price, 0.0, 0.0, 0.0, 0.0, 0.0]
+            self._candles.append(heartbeat)
+            self.logger().debug(f"CoinDCX: inserted heartbeat candle at {next_ts}")
+            next_ts += self.interval_in_seconds
+
+        self._candles.append(new_candle)
+
     async def _poll_and_update(self):
         try:
             rest_assistant = await self._api_factory.get_rest_assistant()
@@ -255,7 +275,7 @@ class CoinDCXSpotCandles(CandlesBase):
             latest_ts = latest[0]
 
             if latest_ts > last_ts:
-                self._candles.append(latest)
+                self._fill_gaps_and_append(latest)
             elif latest_ts == last_ts:
                 self._candles[-1] = latest
 

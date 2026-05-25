@@ -32,6 +32,7 @@ MAX_RESULTS_PER_CANDLESTICK_REST_REQUEST = 1000
 POLL_INTERVAL = 5.0
 
 RATE_LIMITS = [
+    RateLimit(limit_id="raw", limit=2000, time_interval=60),
     RateLimit(
         limit_id=CANDLES_ENDPOINT,
         limit=2000,

@@ -79,7 +79,7 @@ def calculate_order_profit(
 
     net_profit_post_tax = profit_after_fees - profit_tax.tax_liability
 
-    total_cost = buy_value_quote + buy_fee_quote
+    total_cost = buy_value_quote + buy_fee_quote + buy_tds_quote
     if gross_profit > S_DECIMAL_0:
         effective_tax_rate = ((total_fees + profit_tax.tax_liability) / gross_profit) * Decimal("100")
     else:

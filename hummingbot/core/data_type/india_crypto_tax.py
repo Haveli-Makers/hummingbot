@@ -19,9 +19,15 @@ References:
   WazirX: https://support.wazirx.com/hc/en-us/articles/4701662097050-TDS-on-Crypto-Trades
   CoinDCX: https://coindcx.com/calculators/crypto-tax-calculator/
 """
+import logging
+from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum
+from typing import TYPE_CHECKING, Dict
+
+if TYPE_CHECKING:
+    from hummingbot.core.data_type.common import TradeType
 
 S_DECIMAL_0 = Decimal("0")
 
@@ -31,15 +37,6 @@ DEFAULT_PROFIT_TAX_RATE = Decimal("0.30")   # 30% flat tax (Section 115BBH)
 
 
 class MarketType(Enum):
-    """
-    Determines which sides of a trade owe TDS (Section 194S).
-
-    INR:           Quote currency is INR (e.g., BTC-INR).
-                   Only the SELLER pays TDS on their INR proceeds.
-    CRYPTO_CRYPTO: Quote currency is a crypto asset (USDT, BTC, ETH, etc.).
-                   BOTH buyer and seller pay 1% TDS on the fill value in
-                   the quote asset.
-    """
     INR = "inr"
     CRYPTO_CRYPTO = "crypto_crypto"
 
@@ -76,23 +73,6 @@ def calculate_tds(
     market_type: MarketType = MarketType.CRYPTO_CRYPTO,
     config: IndiaCryptoTaxConfig = None,
 ) -> TDSResult:
-    """
-    Calculate TDS for a single trade fill (Section 194S).
-
-    INR markets (quote = INR):
-      - SELLER: TDS = fill_value × 1%   (seller receives 1% less INR)
-      - BUYER:  TDS = 0                  (buyers in INR markets are exempt)
-
-    Crypto-Crypto markets (quote = USDT / BTC / ETH / etc.):
-      - SELLER: TDS = fill_value × 1%   (seller receives 1% less quote asset)
-      - BUYER:  TDS = fill_value × 1%   (buyer pays 1% extra in quote asset)
-
-    :param fill_value_quote: fill_amount × fill_price in the quote currency
-    :param is_buyer: True for the buy side, False for the sell side
-    :param market_type: INR or CRYPTO_CRYPTO (default CRYPTO_CRYPTO for safety)
-    :param config: tax rates config (uses defaults if None)
-    :return: TDSResult; tds_amount_quote == 0 when is_applicable is False
-    """
     if config is None:
         config = IndiaCryptoTaxConfig()
 
@@ -116,22 +96,6 @@ def calculate_tds(
 def calculate_profit_tax(taxable_profit: Decimal,
                          tds_already_paid: Decimal = S_DECIMAL_0,
                          config: IndiaCryptoTaxConfig = None) -> ProfitTaxResult:
-    """
-    Calculate 30% income tax on crypto profit (Section 115BBH).
-
-    Tax base is the gross transfer gain (sell value minus cost of acquisition).
-    Under s.115BBH(2)(b) no deduction for exchange fees or any other expenditure
-    is permitted — only the cost of acquisition may be subtracted.
-
-    If taxable_profit > 0: tax = taxable_profit × 30%, additional_due = tax - tds_paid
-    If taxable_profit <= 0: tax = 0; TDS already paid is claimable as refund at ITR.
-
-    :param taxable_profit: Gross transfer gain (sell_value - buy_value), fees excluded
-    :param tds_already_paid: Total TDS deducted at source — include BOTH buy-side
-                             and sell-side TDS for crypto-crypto markets
-    :param config: Tax config with rates (uses defaults if None)
-    :return: ProfitTaxResult with full tax breakdown
-    """
     if config is None:
         config = IndiaCryptoTaxConfig()
 
@@ -155,3 +119,143 @@ def get_market_type(trading_pair: str) -> MarketType:
     """Return MarketType based on the quote currency of *trading_pair* (e.g. 'BTC-INR')."""
     quote = trading_pair.split("-")[-1].upper()
     return MarketType.INR if quote == "INR" else MarketType.CRYPTO_CRYPTO
+
+
+class IndiaCryptoTaxTracker:
+    """
+    Encapsulates all India crypto tax tracking state and logic for a single exchange connector.
+
+    Use via composition: each connector holds ``self._tax = IndiaCryptoTaxTracker()``.
+    """
+
+    def __init__(self) -> None:
+        self.tax_config: IndiaCryptoTaxConfig = IndiaCryptoTaxConfig()
+        self._pending_buy_fills: Dict[str, deque] = {}
+        self._tds_by_trade_id: Dict[str, Decimal] = {}
+
+    def record_tds(self, trade_id: str, amount: Decimal) -> None:
+        """Store the pre-computed TDS amount for *trade_id*."""
+        self._tds_by_trade_id[trade_id] = amount
+
+    def get_tds(self, trade_id: str) -> Decimal:
+        """Retrieve the stored TDS for *trade_id*, defaulting to 0."""
+        return self._tds_by_trade_id.get(trade_id, Decimal("0"))
+
+    def calc_and_record_tds(
+        self,
+        trade_id: str,
+        fill_value_quote: Decimal,
+        is_buyer: bool,
+        trading_pair: str,
+    ) -> Decimal:
+        """Calculate TDS for a fill, store it by trade_id, and return the amount."""
+        tds_amount = calculate_tds(
+            fill_value_quote=fill_value_quote,
+            is_buyer=is_buyer,
+            market_type=get_market_type(trading_pair),
+            config=self.tax_config,
+        ).tds_amount_quote
+        self.record_tds(trade_id, tds_amount)
+        return tds_amount
+
+    def track_and_log(
+        self,
+        trade_type: "TradeType",
+        trading_pair: str,
+        fill_base: Decimal,
+        fill_value: Decimal,
+        fee_amount: Decimal,
+        tds_amount: Decimal,
+        quote: str,
+        logger: logging.Logger,
+    ) -> None:
+        """Record a fill in the FIFO inventory and emit a tax log entry."""
+        from hummingbot.core.data_type.common import TradeType
+        from hummingbot.core.data_type.order_profit import calculate_order_profit, format_profit_report
+
+        if trade_type == TradeType.BUY:
+            if trading_pair not in self._pending_buy_fills:
+                self._pending_buy_fills[trading_pair] = deque()
+            self._pending_buy_fills[trading_pair].append(
+                (fill_base, fill_value, fee_amount, tds_amount)
+            )
+            total_cost = fill_value + fee_amount + tds_amount
+            mtype = get_market_type(trading_pair)
+            tds_note = (
+                "(1% on crypto-crypto buy)"
+                if mtype == MarketType.CRYPTO_CRYPTO
+                else "(not applicable on INR-market buy)"
+            )
+            logger.info(
+                f"Tax Report ({trading_pair}) - Buy Fill:\n"
+                f"  Buy Value:  {fill_value:.2f} {quote}\n"
+                f"  Trade Fee:  {fee_amount:.2f} {quote}\n"
+                f"  TDS {tds_note}: {tds_amount:.2f} {quote}\n"
+                f"  Total Cost: {total_cost:.2f} {quote}"
+            )
+            return
+
+        pending_buys = self._pending_buy_fills.get(trading_pair, deque())
+        if not pending_buys:
+            logger.info(
+                f"Tax Report ({trading_pair}) - Sell Fill:\n"
+                f"  Sell Value:  {fill_value:.2f} {quote}\n"
+                f"  Sell Fee:    {fee_amount:.2f} {quote}\n"
+                f"  TDS (1%):    {tds_amount:.2f} {quote}\n"
+                f"  Net Received: {fill_value - fee_amount - tds_amount:.2f} {quote}\n"
+                f"  (No matching buy orders tracked yet for profit calculation)"
+            )
+            return
+
+        remaining_sell_base = fill_base
+        total_buy_value = Decimal("0")
+        total_buy_fee = Decimal("0")
+        total_buy_tds = Decimal("0")
+
+        while remaining_sell_base > Decimal("0") and pending_buys:
+            buy_base, buy_val, buy_fee, buy_tds = pending_buys[0]
+            if buy_base <= remaining_sell_base:
+                pending_buys.popleft()
+                total_buy_value += buy_val
+                total_buy_fee += buy_fee
+                total_buy_tds += buy_tds
+                remaining_sell_base -= buy_base
+            else:
+                ratio = remaining_sell_base / buy_base
+                total_buy_value += buy_val * ratio
+                total_buy_fee += buy_fee * ratio
+                total_buy_tds += buy_tds * ratio
+                pending_buys[0] = (
+                    buy_base - remaining_sell_base,
+                    buy_val * (1 - ratio),
+                    buy_fee * (1 - ratio),
+                    buy_tds * (1 - ratio),
+                )
+                remaining_sell_base = Decimal("0")
+
+        matched_sell_base = fill_base - remaining_sell_base
+        if remaining_sell_base > Decimal("0") and fill_base > Decimal("0"):
+            matched_ratio = matched_sell_base / fill_base
+            logger.warning(
+                f"Tax Report ({trading_pair}) - Sell Fill partially unmatched:\n"
+                f"  Sold {fill_base} but only {matched_sell_base} matched tracked buys "
+                f"({remaining_sell_base} excess — pre-existing inventory or post-restart sells).\n"
+                f"  Profit/tax calculated only for the matched {matched_sell_base} portion."
+            )
+            matched_sell_value = fill_value * matched_ratio
+            matched_sell_fee = fee_amount * matched_ratio
+        else:
+            matched_sell_value = fill_value
+            matched_sell_fee = fee_amount
+
+        result = calculate_order_profit(
+            buy_value_quote=total_buy_value,
+            sell_value_quote=matched_sell_value,
+            buy_fee_quote=total_buy_fee,
+            sell_fee_quote=matched_sell_fee,
+            buy_tds_quote=total_buy_tds,
+            market_type=get_market_type(trading_pair),
+            tax_config=self.tax_config,
+        )
+        report = format_profit_report(result, quote_currency=quote)
+        logger.info(f"Tax & Profit Report ({trading_pair}):\n{report}")

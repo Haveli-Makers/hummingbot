@@ -1,6 +1,5 @@
 import asyncio
 import json
-from collections import deque
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -20,9 +19,8 @@ from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate, TradeUpdate
-from hummingbot.core.data_type.india_crypto_tax import IndiaCryptoTaxConfig, MarketType, calculate_tds, get_market_type
+from hummingbot.core.data_type.india_crypto_tax import IndiaCryptoTaxTracker
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
-from hummingbot.core.data_type.order_profit import calculate_order_profit, format_profit_report
 from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
 from hummingbot.core.utils.async_utils import safe_ensure_future
@@ -54,10 +52,7 @@ class CoindcxExchange(ExchangePyBase):
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
         self._last_trades_poll_coindcx_timestamp = 1.0
-        self._tax_config = IndiaCryptoTaxConfig()  # rates owned by india_crypto_tax.py
-        # FIFO queue of buy fills awaiting a sell: {trading_pair: deque[(order_id, base, value, fee, tds)]}
-        self._pending_buy_fills: Dict[str, deque] = {}
-        self._tds_by_trade_id: Dict[str, Decimal] = {}
+        self._tax = IndiaCryptoTaxTracker()
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     @staticmethod
@@ -640,13 +635,12 @@ class CoindcxExchange(ExchangePyBase):
         fill_value = fill_amount * fill_price
         fee_amount = Decimal(str(raw_trade.get("fee_amount", 0)))
         trade_id = str(raw_trade.get("id", ""))
-        tds_amount = calculate_tds(
+        self._tax.calc_and_record_tds(
+            trade_id=trade_id,
             fill_value_quote=fill_value,
             is_buyer=tracked_order.trade_type == TradeType.BUY,
-            market_type=get_market_type(trading_pair),
-            config=self._tax_config,
-        ).tds_amount_quote
-        self._tds_by_trade_id[trade_id] = tds_amount
+            trading_pair=trading_pair,
+        )
         fee = TradeFeeBase.new_spot_fee(
             fee_schema=self.trade_fee_schema(),
             trade_type=tracked_order.trade_type,
@@ -673,88 +667,17 @@ class CoindcxExchange(ExchangePyBase):
         fee_amount = trade_update.fee.flat_fees[0].amount if trade_update.fee.flat_fees else Decimal("0")
         trading_pair = tracked_order.trading_pair
         _, quote = trading_pair.split("-")
-        tds_amount = self._tds_by_trade_id.get(trade_update.trade_id, Decimal("0"))
-        self._track_and_log_tax(
+        tds_amount = self._tax.get_tds(trade_update.trade_id)
+        self._tax.track_and_log(
             trade_type=tracked_order.trade_type,
             trading_pair=trading_pair,
-            client_order_id=tracked_order.client_order_id,
             fill_base=trade_update.fill_base_amount,
             fill_value=trade_update.fill_base_amount * trade_update.fill_price,
             fee_amount=fee_amount,
             tds_amount=tds_amount,
             quote=quote,
+            logger=self.logger(),
         )
-
-    def _track_and_log_tax(self, trade_type: TradeType, trading_pair: str,
-                           client_order_id: str, fill_base: Decimal, fill_value: Decimal,
-                           fee_amount: Decimal, tds_amount: Decimal, quote: str):
-        if trade_type == TradeType.BUY:
-            if trading_pair not in self._pending_buy_fills:
-                self._pending_buy_fills[trading_pair] = deque()
-            self._pending_buy_fills[trading_pair].append(
-                (client_order_id, fill_base, fill_value, fee_amount, tds_amount)
-            )
-            total_cost = fill_value + fee_amount + tds_amount
-            mtype = get_market_type(trading_pair)
-            tds_note = "(1% on crypto-crypto buy)" if mtype == MarketType.CRYPTO_CRYPTO else "(not applicable on INR-market buy)"
-            self.logger().info(
-                f"Tax Report ({trading_pair}) - Buy Fill:\n"
-                f"  Buy Value:  {fill_value:.2f} {quote}\n"
-                f"  Trade Fee:  {fee_amount:.2f} {quote}\n"
-                f"  TDS {tds_note}: {tds_amount:.2f} {quote}\n"
-                f"  Total Cost: {total_cost:.2f} {quote}"
-            )
-        else:
-            pending_buys = self._pending_buy_fills.get(trading_pair, deque())
-            if not pending_buys:
-                self.logger().info(
-                    f"Tax Report ({trading_pair}) - Sell Fill:\n"
-                    f"  Sell Value:  {fill_value:.2f} {quote}\n"
-                    f"  Sell Fee:    {fee_amount:.2f} {quote}\n"
-                    f"  TDS (1%):    {tds_amount:.2f} {quote}\n"
-                    f"  Net Received: {fill_value - fee_amount - tds_amount:.2f} {quote}\n"
-                    f"  (No matching buy orders tracked yet for profit calculation)"
-                )
-                return
-
-            remaining_sell_base = fill_base
-            total_buy_value = Decimal("0")
-            total_buy_fee = Decimal("0")
-            total_buy_tds = Decimal("0")
-
-            while remaining_sell_base > Decimal("0") and pending_buys:
-                buy_coid, buy_base, buy_val, buy_fee, buy_tds = pending_buys[0]
-                if buy_base <= remaining_sell_base:
-                    pending_buys.popleft()
-                    total_buy_value += buy_val
-                    total_buy_fee += buy_fee
-                    total_buy_tds += buy_tds
-                    remaining_sell_base -= buy_base
-                else:
-                    ratio = remaining_sell_base / buy_base
-                    total_buy_value += buy_val * ratio
-                    total_buy_fee += buy_fee * ratio
-                    total_buy_tds += buy_tds * ratio
-                    pending_buys[0] = (
-                        buy_coid,
-                        buy_base - remaining_sell_base,
-                        buy_val * (1 - ratio),
-                        buy_fee * (1 - ratio),
-                        buy_tds * (1 - ratio),
-                    )
-                    remaining_sell_base = Decimal("0")
-
-            result = calculate_order_profit(
-                buy_value_quote=total_buy_value,
-                sell_value_quote=fill_value,
-                buy_fee_quote=total_buy_fee,
-                sell_fee_quote=fee_amount,
-                buy_tds_quote=total_buy_tds,
-                market_type=get_market_type(trading_pair),
-                tax_config=self._tax_config,
-            )
-            report = format_profit_report(result, quote_currency=quote)
-            self.logger().info(f"Tax & Profit Report ({trading_pair}):\n{report}")
 
     def _process_balance_update(self, balance_data: Dict[str, Any]):
         """

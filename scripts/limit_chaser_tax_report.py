@@ -239,17 +239,16 @@ class LimitChaserTaxReportScript(ScriptStrategyBase):
                 sell_exec, buy_exec = self._leg1_executor, self._executor
 
             def _order_info(exec_: Optional[OrderExecutor]):
-                """Return (fill_price, base_amount, tds_paid) for a closed executor."""
                 if not exec_ or not exec_._order or not exec_._order.order:
-                    return Decimal("0"), self.config.amount, Decimal("0")
+                    return Decimal("0"), self.config.amount
                 order = exec_._order.order
                 avg_price = order.average_executed_price
                 price = avg_price if avg_price else order.price
                 amount = order.executed_amount_base if order.executed_amount_base > Decimal("0") else self.config.amount
-                return price, amount, Decimal("0")
+                return price, amount
 
-            buy_price, buy_amount, buy_tds = _order_info(buy_exec)
-            sell_price, sell_amount, sell_tds = _order_info(sell_exec)
+            buy_price, buy_amount = _order_info(buy_exec)
+            sell_price, sell_amount = _order_info(sell_exec)
 
             _, quote = self.config.trading_pair.split("-")
             market_type = get_market_type(self.config.trading_pair)
@@ -257,16 +256,53 @@ class LimitChaserTaxReportScript(ScriptStrategyBase):
             buy_fill_value = buy_price * buy_amount
             sell_fill_value = sell_price * sell_amount
 
-            if buy_tds == Decimal("0") and sell_tds == Decimal("0"):
-                buy_tds = calculate_tds(buy_fill_value, is_buyer=True, market_type=market_type).tds_amount_quote
-                sell_tds = calculate_tds(sell_fill_value, is_buyer=False, market_type=market_type).tds_amount_quote
+            buy_tds = calculate_tds(buy_fill_value, is_buyer=True, market_type=market_type).tds_amount_quote
+            sell_tds = calculate_tds(sell_fill_value, is_buyer=False, market_type=market_type).tds_amount_quote
 
             total_tds = buy_tds + sell_tds
-            gross_profit = sell_fill_value - buy_fill_value
-            tax = calculate_profit_tax(gross_profit, tds_already_paid=total_tds)
 
             sep = "=" * 62
             base, _ = self.config.trading_pair.split("-")
+
+            if self._sides[0] == TradeType.SELL:
+                self.logger().info(sep)
+                self.logger().info("  INDIA CRYPTO TAX REPORT — Round-Trip (SELL-first)")
+                self.logger().info(sep)
+                self.logger().info(f"  Pair  : {self.config.trading_pair}  |  Market type: {market_type.value.upper()}")
+                self.logger().info(
+                    f"  LEG 1 SELL: {sell_amount:.4f} {base} @ {sell_price:.4f} {quote}"
+                    f" = {sell_fill_value:.4f} {quote}"
+                )
+                self.logger().info(
+                    f"  LEG 2 BUY : {buy_amount:.4f} {base} @ {buy_price:.4f} {quote}"
+                    f" = {buy_fill_value:.4f} {quote}"
+                )
+                self.logger().info(
+                    f"  TDS on SELL (Sec 194S): {sell_tds:.4f} {quote}  [1%]"
+                )
+                self.logger().info(
+                    f"  TDS on BUY  (Sec 194S): {buy_tds:.4f} {quote}"
+                    + ("  [exempt — INR buyer]" if market_type == MarketType.INR else "  [1%]")
+                )
+                self.logger().info(f"  Total TDS paid        : {total_tds:.4f} {quote}")
+                self.logger().info(
+                    "  Gross Profit / Tax    : N/A — SELL-first round-trip."
+                )
+                self.logger().info(
+                    "  The sold asset's cost basis comes from pre-existing inventory"
+                )
+                self.logger().info(
+                    "  (not tracked in this session). Consult your actual purchase"
+                )
+                self.logger().info(
+                    "  records and apply FIFO/actual-cost rules for tax filing."
+                )
+                self.logger().info(sep)
+                return
+
+            gross_profit = sell_fill_value - buy_fill_value
+            tax = calculate_profit_tax(gross_profit, tds_already_paid=total_tds)
+
             self.logger().info(sep)
             self.logger().info("  INDIA CRYPTO TAX REPORT — Round-Trip")
             self.logger().info(sep)

@@ -477,19 +477,19 @@ class TestCoinDCXSpotCandles(TestCandlesBase):
         """The first active market with the matching ecode prefix is chosen;
         wrong-ecode and inactive markets are skipped."""
         mock_markets = [
-            { 
+            {
                 "pair": "I-BTC_USDT",
                 "target_currency_short_name": "BTC",
                 "base_currency_short_name": "USDT",
                 "status": "active",
             },
-            {  
+            {
                 "pair": "B-BTC_USDT",
                 "target_currency_short_name": "BTC",
                 "base_currency_short_name": "USDT",
                 "status": "inactive",
             },
-            {  
+            {
                 "pair": "B-BTC_USDT",
                 "target_currency_short_name": "BTC",
                 "base_currency_short_name": "USDT",
@@ -534,8 +534,8 @@ class TestCoinDCXSpotCandles(TestCandlesBase):
         self.assertEqual(len(self.data_feed._candles), 3)
         self.assertAlmostEqual(self.data_feed._candles[1][0], base_ts + 60)
         self.assertAlmostEqual(self.data_feed._candles[2][0], base_ts + 120)
-        self.assertEqual(self.data_feed._candles[1][1], 105.0)  
-        self.assertEqual(self.data_feed._candles[1][5], 0.0)  
+        self.assertEqual(self.data_feed._candles[1][1], 105.0)
+        self.assertEqual(self.data_feed._candles[1][5], 0.0)
 
     def test_ensure_heartbeats_to_current_time_no_op_when_empty(self):
         """Should be a no-op when no candles have been seeded yet."""
@@ -564,3 +564,91 @@ class TestCoinDCXSpotCandles(TestCandlesBase):
         self.assertGreater(len(self.data_feed._candles), 1)
         self.assertAlmostEqual(self.data_feed._candles[1][0], base_ts + 60)
         self.assertEqual(self.data_feed._candles[1][5], 0.0)  # heartbeat volume = 0
+
+    def test_fill_historical_gaps_with_heartbeats_all_heartbeats_when_no_real_candles(self):
+        """When the REST page returns no candles, every slot is a heartbeat
+        priced at the oldest real candle already in the deque."""
+        base_ts = 1672992000.0
+        self.data_feed._candles.append(
+            [base_ts, 100.0, 110.0, 90.0, 99.0, 1000.0, 0.0, 0.0, 0.0, 0.0]
+        )
+        start = base_ts - 180.0
+        end = base_ts - 60.0
+        result = self.data_feed._fill_historical_gaps_with_heartbeats([], start, end)
+        self.assertEqual(len(result), 3)
+        for candle in result:
+            self.assertEqual(candle[5], 0.0, "heartbeat volume must be 0")
+            self.assertEqual(candle[1], 99.0, "heartbeat open must equal fallback close")
+            self.assertEqual(candle[4], 99.0, "heartbeat close must equal fallback close")
+
+    def test_fill_historical_gaps_with_heartbeats_fills_gaps_between_real_candles(self):
+        """Gaps between real candles get heartbeat candles; each heartbeat
+        carries the close of the preceding real candle."""
+        base_ts = 1672992000.0
+        self.data_feed._candles.append(
+            [base_ts, 100.0, 110.0, 90.0, 50.0, 1000.0, 0.0, 0.0, 0.0, 0.0]
+        )
+        start = base_ts - 240.0
+        end = base_ts - 60.0
+        real_candles = [
+            [base_ts - 240, 80.0, 85.0, 78.0, 82.0, 500.0, 0.0, 0.0, 0.0, 0.0],
+            [base_ts - 120, 90.0, 95.0, 88.0, 93.0, 700.0, 0.0, 0.0, 0.0, 0.0],
+        ]
+        result = self.data_feed._fill_historical_gaps_with_heartbeats(real_candles, start, end)
+        self.assertEqual(len(result), 4)
+        self.assertEqual(result[0][4], 82.0)
+        self.assertGreater(result[0][5], 0.0)
+        self.assertEqual(result[1][5], 0.0)
+        self.assertEqual(result[1][1], 82.0)
+        self.assertEqual(result[2][4], 93.0)
+        self.assertGreater(result[2][5], 0.0)
+        self.assertEqual(result[3][5], 0.0)
+        self.assertEqual(result[3][1], 93.0)
+
+    async def test_fill_historical_candles_prepends_with_heartbeats_for_gaps(self):
+        """fill_historical_candles must reach max_records by prepending heartbeat-filled
+        pages even when the API only returns sparse real candles."""
+        import numpy as np
+
+        max_records = 5
+        base_ts = 1672992000.0
+        data_feed = CoinDCXSpotCandles(
+            trading_pair=self.trading_pair,
+            interval=self.interval,
+            max_records=max_records,
+        )
+        data_feed._ex_trading_pair = self.ex_trading_pair
+
+        data_feed._candles.append(
+            [base_ts, 100.0, 110.0, 90.0, 105.0, 1000.0, 0.0, 0.0, 0.0, 0.0]
+        )
+        data_feed._ws_candle_available.set()
+
+        sparse_page = np.array([
+            [base_ts - 240, 80.0, 85.0, 78.0, 82.0, 500.0, 0.0, 0.0, 0.0, 0.0],
+            [base_ts - 120, 90.0, 95.0, 88.0, 93.0, 700.0, 0.0, 0.0, 0.0, 0.0],
+        ])
+
+        with patch.object(data_feed, "fetch_candles", new=AsyncMock(return_value=sparse_page)):
+            with patch.object(data_feed, "_sleep", new=AsyncMock()):
+                await data_feed.fill_historical_candles()
+
+        self.assertEqual(len(data_feed._candles), max_records)
+        timestamps = [c[0] for c in data_feed._candles]
+        diffs = [timestamps[i + 1] - timestamps[i] for i in range(len(timestamps) - 1)]
+        self.assertTrue(all(d == 60.0 for d in diffs), f"Non-equidistant gaps: {diffs}")
+        ts_set = set(timestamps)
+        self.assertIn(base_ts - 240, ts_set)
+        self.assertIn(base_ts - 120, ts_set)
+        hb_slots = {base_ts - 180, base_ts - 60}
+        for candle in data_feed._candles:
+            if candle[0] in hb_slots:
+                self.assertEqual(candle[5], 0.0, f"Expected heartbeat at {candle[0]}")
+
+    async def test_fill_historical_candles_guard_prevents_reentrance(self):
+        """A second concurrent call to fill_historical_candles returns immediately."""
+        self.data_feed._historical_fill_in_progress = True
+        self.data_feed._ws_candle_available.set()
+        with patch.object(self.data_feed, "fetch_candles", new=AsyncMock()) as mock_fetch:
+            await self.data_feed.fill_historical_candles()
+        mock_fetch.assert_not_called()

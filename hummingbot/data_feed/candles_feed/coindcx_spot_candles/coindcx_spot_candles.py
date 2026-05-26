@@ -26,6 +26,7 @@ class CoinDCXSpotCandles(CandlesBase):
         self._polling_task: Optional[asyncio.Task] = None
         self._is_running = False
         self._shutdown_event = asyncio.Event()
+        self._historical_fill_in_progress = False
 
     @property
     def name(self) -> str:
@@ -109,6 +110,81 @@ class CoinDCXSpotCandles(CandlesBase):
                 exc_info=True,
             )
             raise
+
+    async def fill_historical_candles(self):
+        if self._historical_fill_in_progress:
+            return
+        self._historical_fill_in_progress = True
+        try:
+            await self._ws_candle_available.wait()
+            iteration = 0
+            max_iterations = 20
+            while not self.ready and len(self._candles) > 0 and iteration < max_iterations:
+                iteration += 1
+                try:
+                    oldest_timestamp = self._candles[0][0]
+                    missing_records = self._candles.maxlen - len(self._candles)
+                    if missing_records <= 0:
+                        break
+                    end_timestamp = oldest_timestamp - self.interval_in_seconds
+                    start_timestamp = end_timestamp - (missing_records * self.interval_in_seconds)
+                    candles_np = await self.fetch_candles(
+                        start_time=start_timestamp,
+                        end_time=end_timestamp + self.interval_in_seconds,
+                    )
+                    real_candles = candles_np.tolist() if candles_np.size > 0 else []
+                    filled = self._fill_historical_gaps_with_heartbeats(
+                        real_candles, start_timestamp, end_timestamp
+                    )
+                    if not filled:
+                        break
+                    candles_to_add = (
+                        filled[-missing_records:]
+                        if len(filled) > missing_records
+                        else filled
+                    )
+                    for candle in reversed(candles_to_add):
+                        self._candles.appendleft(candle)
+                    await self._sleep(0.1)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    self.logger().exception(
+                        f"Error during historical fill iteration {iteration}: {e}"
+                    )
+                    await self._sleep(1.0)
+        finally:
+            self._historical_fill_in_progress = False
+
+    def _fill_historical_gaps_with_heartbeats(
+        self, candles: List[List[float]], start_timestamp: float, end_timestamp: float
+    ) -> List[List[float]]:
+        fallback_close = self._candles[0][4] if self._candles else 0.0
+
+        candle_map = {
+            self._round_timestamp_to_interval_multiple(c[0]): c
+            for c in candles
+        }
+
+        result: List[List[float]] = []
+        current_ts = float(self._round_timestamp_to_interval_multiple(start_timestamp))
+        prev_close = fallback_close
+        interval_count = 0
+
+        while current_ts <= end_timestamp and interval_count < 1000:
+            if current_ts in candle_map:
+                candle = candle_map[current_ts]
+                result.append(candle)
+                prev_close = candle[4]
+            else:
+                result.append(
+                    [current_ts, prev_close, prev_close, prev_close, prev_close,
+                     0.0, 0.0, 0.0, 0.0, 0.0]
+                )
+            current_ts += self.interval_in_seconds
+            interval_count += 1
+
+        return result
 
     async def start_network(self):
         await self.stop_network()

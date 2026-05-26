@@ -380,9 +380,10 @@ class TestCoinDCXSpotCandles(TestCandlesBase):
                  "low": "90", "close": "105", "volume": "1000"},
             ]
         )
-        with patch.object(self.data_feed._api_factory, "get_rest_assistant",
-                          return_value=mock_rest):
-            await self.data_feed._poll_and_update()
+        with patch.object(self.data_feed, "_time", return_value=base_ts + 150):
+            with patch.object(self.data_feed._api_factory, "get_rest_assistant",
+                              return_value=mock_rest):
+                await self.data_feed._poll_and_update()
 
         self.assertEqual(len(self.data_feed._candles), 3)
         self.assertAlmostEqual(self.data_feed._candles[1][0], base_ts + 60)
@@ -403,9 +404,10 @@ class TestCoinDCXSpotCandles(TestCandlesBase):
                  "low": "106", "close": "110", "volume": "350"},
             ]
         )
-        with patch.object(self.data_feed._api_factory, "get_rest_assistant",
-                          return_value=mock_rest):
-            await self.data_feed._poll_and_update()
+        with patch.object(self.data_feed, "_time", return_value=base_ts + 210):
+            with patch.object(self.data_feed._api_factory, "get_rest_assistant",
+                              return_value=mock_rest):
+                await self.data_feed._poll_and_update()
 
         self.assertEqual(len(self.data_feed._candles), 4)
         self.assertEqual(self.data_feed._candles[1][5], 0.0)
@@ -470,3 +472,95 @@ class TestCoinDCXSpotCandles(TestCandlesBase):
             any("error parsing candle row" in str(r.getMessage()).lower()
                 for r in self.log_records if r.levelname == "ERROR")
         )
+
+    async def test_initialize_exchange_data_selects_active_correct_ecode(self):
+        """The first active market with the matching ecode prefix is chosen;
+        wrong-ecode and inactive markets are skipped."""
+        mock_markets = [
+            { 
+                "pair": "I-BTC_USDT",
+                "target_currency_short_name": "BTC",
+                "base_currency_short_name": "USDT",
+                "status": "active",
+            },
+            {  
+                "pair": "B-BTC_USDT",
+                "target_currency_short_name": "BTC",
+                "base_currency_short_name": "USDT",
+                "status": "inactive",
+            },
+            {  
+                "pair": "B-BTC_USDT",
+                "target_currency_short_name": "BTC",
+                "base_currency_short_name": "USDT",
+                "status": "active",
+            },
+        ]
+        mock_rest = MagicMock()
+        mock_rest.execute_request = AsyncMock(return_value=mock_markets)
+        with patch.object(self.data_feed._api_factory, "get_rest_assistant",
+                          return_value=mock_rest):
+            await self.data_feed.initialize_exchange_data()
+        self.assertEqual(self.data_feed._ex_trading_pair, "B-BTC_USDT")
+
+    async def test_initialize_exchange_data_rejects_wrong_ecode_warns(self):
+        """When only wrong-ecode markets exist, _ex_trading_pair is unchanged and a warning is logged."""
+        original_pair = self.data_feed._ex_trading_pair
+        mock_markets = [
+            {
+                "pair": "I-BTC_USDT",
+                "target_currency_short_name": "BTC",
+                "base_currency_short_name": "USDT",
+                "status": "active",
+            },
+        ]
+        mock_rest = MagicMock()
+        mock_rest.execute_request = AsyncMock(return_value=mock_markets)
+        with patch.object(self.data_feed._api_factory, "get_rest_assistant",
+                          return_value=mock_rest):
+            await self.data_feed.initialize_exchange_data()
+        self.assertEqual(self.data_feed._ex_trading_pair, original_pair)
+        self.assertTrue(any(r.levelname == "WARNING" for r in self.log_records))
+
+    def test_ensure_heartbeats_to_current_time_fills_complete_intervals(self):
+        """Complete intervals between last candle and current time get heartbeats;
+        the current (incomplete) interval is NOT filled."""
+        base_ts = 1672992000.0
+        self.data_feed._candles.append(
+            [base_ts, 100.0, 110.0, 90.0, 105.0, 1000.0, 0.0, 0.0, 0.0, 0.0]
+        )
+        with patch.object(self.data_feed, "_time", return_value=base_ts + 210):
+            self.data_feed._ensure_heartbeats_to_current_time()
+        self.assertEqual(len(self.data_feed._candles), 3)
+        self.assertAlmostEqual(self.data_feed._candles[1][0], base_ts + 60)
+        self.assertAlmostEqual(self.data_feed._candles[2][0], base_ts + 120)
+        self.assertEqual(self.data_feed._candles[1][1], 105.0)  
+        self.assertEqual(self.data_feed._candles[1][5], 0.0)  
+
+    def test_ensure_heartbeats_to_current_time_no_op_when_empty(self):
+        """Should be a no-op when no candles have been seeded yet."""
+        with patch.object(self.data_feed, "_time", return_value=1672992000.0):
+            self.data_feed._ensure_heartbeats_to_current_time()
+        self.assertEqual(len(self.data_feed._candles), 0)
+
+    async def test_poll_and_update_advances_stream_on_quiet_market(self):
+        """When the API keeps returning the same completed candle, heartbeats
+        are still inserted so the candle stream does not stall."""
+        base_ts = 1672992000.0
+        self.data_feed._candles.append(
+            [base_ts, 100.0, 110.0, 90.0, 105.0, 1000.0, 0.0, 0.0, 0.0, 0.0]
+        )
+        mock_rest = MagicMock()
+        mock_rest.execute_request = AsyncMock(
+            return_value=[
+                {"time": int(base_ts * 1000), "open": "100", "high": "110",
+                 "low": "90", "close": "105", "volume": "1000"},
+            ]
+        )
+        with patch.object(self.data_feed, "_time", return_value=base_ts + 150):
+            with patch.object(self.data_feed._api_factory, "get_rest_assistant",
+                              return_value=mock_rest):
+                await self.data_feed._poll_and_update()
+        self.assertGreater(len(self.data_feed._candles), 1)
+        self.assertAlmostEqual(self.data_feed._candles[1][0], base_ts + 60)
+        self.assertEqual(self.data_feed._candles[1][5], 0.0)  # heartbeat volume = 0

@@ -86,9 +86,13 @@ class CoinDCXSpotCandles(CandlesBase):
             )
 
             base, quote = self._trading_pair.split("-")
+            expected_ecode = "I" if quote.upper() == "INR" else "B"
+            ecode_prefix = f"{expected_ecode}-"
             for market in markets:
                 if (market.get("target_currency_short_name") == base
-                        and market.get("base_currency_short_name") == quote):
+                        and market.get("base_currency_short_name") == quote
+                        and market.get("status") == "active"
+                        and market.get("pair", "").startswith(ecode_prefix)):
                     self._ex_trading_pair = market["pair"]
                     self.logger().info(
                         f"CoinDCX candles pair resolved: {self._trading_pair} → {self._ex_trading_pair}"
@@ -261,6 +265,19 @@ class CoinDCXSpotCandles(CandlesBase):
 
         self._candles.append(new_candle)
 
+    def _ensure_heartbeats_to_current_time(self) -> None:
+        if not self._candles:
+            return
+        current_interval_ts = self._round_timestamp_to_interval_multiple(self._time())
+        next_ts = self._candles[-1][0] + self.interval_in_seconds
+        while next_ts < current_interval_ts:
+            prev_close = self._candles[-1][4]
+            heartbeat = [next_ts, prev_close, prev_close, prev_close, prev_close,
+                         0.0, 0.0, 0.0, 0.0, 0.0]
+            self._candles.append(heartbeat)
+            self.logger().debug(f"CoinDCX: heartbeat candle inserted at {next_ts}")
+            next_ts += self.interval_in_seconds
+
     async def _poll_and_update(self):
         try:
             rest_assistant = await self._api_factory.get_rest_assistant()
@@ -276,13 +293,12 @@ class CoinDCXSpotCandles(CandlesBase):
             )
 
             candles = self._parse_rest_candles(data)
-            if not candles:
-                return
 
             if not self._candles:
-                self._candles.append(candles[-1])
-                self._ws_candle_available.set()
-                safe_ensure_future(self.fill_historical_candles())
+                if candles:
+                    self._candles.append(candles[-1])
+                    self._ws_candle_available.set()
+                    safe_ensure_future(self.fill_historical_candles())
                 return
 
             for candle in candles:
@@ -292,6 +308,8 @@ class CoinDCXSpotCandles(CandlesBase):
                     self._fill_gaps_and_append(candle)
                 elif candle_ts == last_ts:
                     self._candles[-1] = candle
+
+            self._ensure_heartbeats_to_current_time()
 
         except Exception as e:
             self.logger().error(f"CoinDCX candles poll error: {e}", exc_info=True)

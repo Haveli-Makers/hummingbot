@@ -13,6 +13,8 @@ from hummingbot.core.rate_oracle.sources.binance_us_rate_source import BinanceUS
 from hummingbot.core.rate_oracle.sources.coin_cap_rate_source import CoinCapRateSource
 from hummingbot.core.rate_oracle.sources.coin_gecko_rate_source import CoinGeckoRateSource
 from hummingbot.core.rate_oracle.sources.coinbase_advanced_trade_rate_source import CoinbaseAdvancedTradeRateSource
+from hummingbot.core.rate_oracle.sources.coindcx_rate_source import CoindcxRateSource
+from hummingbot.core.rate_oracle.sources.coinswitch_rate_source import CoinswitchRateSource
 from hummingbot.core.rate_oracle.sources.cube_rate_source import CubeRateSource
 from hummingbot.core.rate_oracle.sources.derive_rate_source import DeriveRateSource
 from hummingbot.core.rate_oracle.sources.dexalot_rate_source import DexalotRateSource
@@ -21,6 +23,7 @@ from hummingbot.core.rate_oracle.sources.hyperliquid_rate_source import Hyperliq
 from hummingbot.core.rate_oracle.sources.kucoin_rate_source import KucoinRateSource
 from hummingbot.core.rate_oracle.sources.mexc_rate_source import MexcRateSource
 from hummingbot.core.rate_oracle.sources.rate_source_base import RateSourceBase
+from hummingbot.core.rate_oracle.sources.wazirx_rate_source import WazirxRateSource
 from hummingbot.core.rate_oracle.utils import find_rate
 from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.logger import HummingbotLogger
@@ -30,6 +33,8 @@ RATE_ORACLE_SOURCES = {
     "binance_us": BinanceUSRateSource,
     "coin_gecko": CoinGeckoRateSource,
     "coin_cap": CoinCapRateSource,
+    "coin_switch": CoinswitchRateSource,
+    "coindcx": CoindcxRateSource,
     "kucoin": KucoinRateSource,
     "ascend_ex": AscendExRateSource,
     "gate_io": GateIoRateSource,
@@ -39,6 +44,7 @@ RATE_ORACLE_SOURCES = {
     "hyperliquid": HyperliquidRateSource,
     "derive": DeriveRateSource,
     "mexc": MexcRateSource,
+    "wazirx": WazirxRateSource,
 }
 
 

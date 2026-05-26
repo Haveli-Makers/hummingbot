@@ -667,7 +667,7 @@ class CoindcxExchange(ExchangePyBase):
         fee_amount = trade_update.fee.flat_fees[0].amount if trade_update.fee.flat_fees else Decimal("0")
         trading_pair = tracked_order.trading_pair
         _, quote = trading_pair.split("-")
-        tds_amount = self._tax.get_tds(trade_update.trade_id)
+        tds_amount = self._tax.pop_tds(trade_update.trade_id)
         self._tax.track_and_log(
             trade_type=tracked_order.trade_type,
             trading_pair=trading_pair,

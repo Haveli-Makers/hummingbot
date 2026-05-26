@@ -499,10 +499,9 @@ class WazirxExchange(ExchangePyBase):
             return
         self._order_tracker.process_trade_update(trade_update)
         base, quote = tracked_order.trading_pair.split("-")
-        tds_amount = self._tax.get_tds(trade_update.trade_id)
-        # Convert fee to quote currency. WazirX can charge fees in the base asset,
-        # WRX, or another token. Mixing units here would corrupt the tax report.
+        tds_amount = self._tax.pop_tds(trade_update.trade_id)
         fee_in_quote = Decimal("0")
+        fee_approx_note = ""
         if trade_update.fee.flat_fees:
             fee_flat = trade_update.fee.flat_fees[0]
             if fee_flat.token == quote:
@@ -510,9 +509,12 @@ class WazirxExchange(ExchangePyBase):
             elif fee_flat.token == base:
                 fee_in_quote = fee_flat.amount * trade_update.fill_price
             else:
+                fee_approx_note = (
+                    f"APPROXIMATE: fee charged in {fee_flat.token} "
+                    f"(not {quote} or {base}); excluded \u2014 net profit overstated"
+                )
                 self.logger().warning(
-                    f"Trade {trade_update.trade_id}: fee charged in {fee_flat.token} "
-                    f"(not {quote} or {base}); excluding from quote-denominated tax report."
+                    f"Trade {trade_update.trade_id}: {fee_approx_note}."
                 )
         self._tax.track_and_log(
             trade_type=tracked_order.trade_type,
@@ -523,6 +525,7 @@ class WazirxExchange(ExchangePyBase):
             tds_amount=tds_amount,
             quote=quote,
             logger=self.logger(),
+            approximate_note=fee_approx_note,
         )
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:

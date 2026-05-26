@@ -141,6 +141,10 @@ class IndiaCryptoTaxTracker:
         """Retrieve the stored TDS for *trade_id*, defaulting to 0."""
         return self._tds_by_trade_id.get(trade_id, Decimal("0"))
 
+    def pop_tds(self, trade_id: str) -> Decimal:
+        """Consume and return the stored TDS for *trade_id* (removes the entry)."""
+        return self._tds_by_trade_id.pop(trade_id, Decimal("0"))
+
     def calc_and_record_tds(
         self,
         trade_id: str,
@@ -168,6 +172,7 @@ class IndiaCryptoTaxTracker:
         tds_amount: Decimal,
         quote: str,
         logger: logging.Logger,
+        approximate_note: str = "",
     ) -> None:
         """Record a fill in the FIFO inventory and emit a tax log entry."""
         from hummingbot.core.data_type.common import TradeType
@@ -236,10 +241,13 @@ class IndiaCryptoTaxTracker:
         matched_sell_base = fill_base - remaining_sell_base
         if remaining_sell_base > Decimal("0") and fill_base > Decimal("0"):
             matched_ratio = matched_sell_base / fill_base
+            matched_sell_tds = tds_amount * matched_ratio
             logger.warning(
                 f"Tax Report ({trading_pair}) - Sell Fill partially unmatched:\n"
                 f"  Sold {fill_base} but only {matched_sell_base} matched tracked buys "
-                f"({remaining_sell_base} excess — pre-existing inventory or post-restart sells).\n"
+                f"({remaining_sell_base} excess \u2014 pre-existing inventory or post-restart sells).\n"
+                f"  Actual TDS withheld on full sell:      {tds_amount:.2f} {quote}\n"
+                f"  Matched-portion TDS in profit report:  {matched_sell_tds:.2f} {quote}\n"
                 f"  Profit/tax calculated only for the matched {matched_sell_base} portion."
             )
             matched_sell_value = fill_value * matched_ratio
@@ -258,4 +266,6 @@ class IndiaCryptoTaxTracker:
             tax_config=self.tax_config,
         )
         report = format_profit_report(result, quote_currency=quote)
+        if approximate_note:
+            report += f"\n  \u26a0 {approximate_note}"
         logger.info(f"Tax & Profit Report ({trading_pair}):\n{report}")

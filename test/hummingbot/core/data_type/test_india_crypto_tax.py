@@ -141,7 +141,7 @@ class TestIndiaCryptoTaxTrackerTdsStore(unittest.TestCase):
             is_buyer=True,
             trading_pair="ETH-USDT",
         )
-        self.assertEqual(amount, Decimal("1"))  
+        self.assertEqual(amount, Decimal("1"))
 
 
 class TestIndiaCryptoTaxTrackerTrackAndLog(unittest.TestCase):
@@ -295,7 +295,7 @@ class TestIndiaCryptoTaxTrackerTrackAndLog(unittest.TestCase):
             logger=self.logger,
         )
         self.logger.reset_mock()
-        actual_tds = Decimal("40000")  
+        actual_tds = Decimal("40000")
         self.tracker.track_and_log(
             trade_type=TradeType.SELL,
             trading_pair="BTC-INR",

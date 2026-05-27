@@ -19,9 +19,11 @@ from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate, TradeUpdate
+from hummingbot.core.data_type.india_crypto_tax import IndiaCryptoTaxTracker
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
+from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
 
@@ -50,6 +52,7 @@ class CoindcxExchange(ExchangePyBase):
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
         self._last_trades_poll_coindcx_timestamp = 1.0
+        self._tax = IndiaCryptoTaxTracker()
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     @staticmethod
@@ -283,9 +286,13 @@ class CoindcxExchange(ExchangePyBase):
                  is_maker: Optional[bool] = None) -> TradeFeeBase:
         """
         Calculate the trading fee for an order.
+        Returns a DeductedFromReturnsTradeFee using the maker/taker fee percentage.
+        TDS is tracked separately in _track_and_log_tax.
         """
         is_maker = order_type is OrderType.LIMIT_MAKER
-        return DeductedFromReturnsTradeFee(percent=self.estimate_fee_pct(is_maker))
+        fee_pct = self.estimate_fee_pct(is_maker)
+
+        return DeductedFromReturnsTradeFee(percent=fee_pct, flat_fees=[])
 
     async def _place_order(self,
                            order_id: str,
@@ -552,6 +559,7 @@ class CoindcxExchange(ExchangePyBase):
     async def _process_order_update(self, order_data: Dict[str, Any]):
         """
         Processes an order update message from the user stream.
+        When an order transitions to FILLED, immediately fetches trade fills and logs tax.
         """
         if not isinstance(order_data, dict):
             return
@@ -573,45 +581,103 @@ class CoindcxExchange(ExchangePyBase):
             )
             self._order_tracker.process_order_update(order_update=order_update)
 
+            if new_state == CONSTANTS.ORDER_STATE.get("filled"):
+                safe_ensure_future(self._fetch_fills_and_log_tax(tracked_order))
+
+    async def _fetch_fills_and_log_tax(self, tracked_order: InFlightOrder):
+        """
+        Immediately fetch trade fills for a completed order and log tax.
+        Retries briefly if fills aren't available yet.
+        """
+        for attempt in range(3):
+            try:
+                trade_updates = await self._all_trade_updates_for_order(tracked_order)
+                if not trade_updates:
+                    await self._sleep(2.0)
+                    continue
+                for trade_update in trade_updates:
+                    if trade_update.trade_id in tracked_order.order_fills:
+                        continue
+                    self._apply_trade_update(trade_update, tracked_order)
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.logger().warning(f"Attempt {attempt + 1}/3 to fetch fills for {tracked_order.client_order_id}: {e}")
+                if attempt < 2:
+                    await self._sleep(2.0)
+
     async def _process_trade_update(self, trade_data: Dict[str, Any]):
         """
         Processes a trade update message from the user stream.
+        Tracks buy costs and logs tax calculations on sell fills.
         """
         if not isinstance(trade_data, dict):
             return
-
         client_order_id = trade_data.get("client_order_id", "")
-        exchange_order_id = str(trade_data.get("order_id", ""))
-
         tracked_order = self._order_tracker.all_fillable_orders.get(client_order_id)
         if tracked_order is not None:
-            fee_amount = Decimal(str(trade_data.get("fee_amount", 0)))
+            trade_update = self._build_trade_update_with_tds(trade_data, tracked_order)
+            self._apply_trade_update(trade_update, tracked_order)
 
-            trading_pair = tracked_order.trading_pair
-            base, quote = trading_pair.split("-")
-            fee_token = quote
+    def _build_trade_update_with_tds(
+        self,
+        raw_trade: Dict[str, Any],
+        tracked_order: InFlightOrder,
+    ) -> TradeUpdate:
+        """
+        Construct a TradeUpdate and record TDS separately in _tds_by_trade_id.
+        """
+        trading_pair = tracked_order.trading_pair
+        _, quote = trading_pair.split("-")
+        fill_price = Decimal(str(raw_trade.get("price", 0)))
+        fill_amount = Decimal(str(raw_trade.get("quantity", 0)))
+        fill_value = fill_amount * fill_price
+        fee_amount = Decimal(str(raw_trade.get("fee_amount", 0)))
+        trade_id = str(raw_trade.get("id", ""))
+        self._tax.calc_and_record_tds(
+            trade_id=trade_id,
+            fill_value_quote=fill_value,
+            is_buyer=tracked_order.trade_type == TradeType.BUY,
+            trading_pair=trading_pair,
+        )
+        fee = TradeFeeBase.new_spot_fee(
+            fee_schema=self.trade_fee_schema(),
+            trade_type=tracked_order.trade_type,
+            flat_fees=[TokenAmount(amount=fee_amount, token=quote)],
+        )
+        ts = raw_trade.get("timestamp", self._time_synchronizer.time() * 1000) / 1000
+        return TradeUpdate(
+            trade_id=trade_id,
+            client_order_id=tracked_order.client_order_id,
+            exchange_order_id=str(raw_trade.get("order_id") or tracked_order.exchange_order_id or ""),
+            trading_pair=trading_pair,
+            fee=fee,
+            fill_base_amount=fill_amount,
+            fill_quote_amount=fill_value,
+            fill_price=fill_price,
+            fill_timestamp=ts,
+        )
 
-            fee = TradeFeeBase.new_spot_fee(
-                fee_schema=self.trade_fee_schema(),
-                trade_type=tracked_order.trade_type,
-                flat_fees=[TokenAmount(amount=fee_amount, token=fee_token)]
-            )
-
-            fill_price = Decimal(str(trade_data.get("price", 0)))
-            fill_amount = Decimal(str(trade_data.get("quantity", 0)))
-
-            trade_update = TradeUpdate(
-                trade_id=str(trade_data.get("id", "")),
-                client_order_id=client_order_id,
-                exchange_order_id=exchange_order_id,
-                trading_pair=tracked_order.trading_pair,
-                fee=fee,
-                fill_base_amount=fill_amount,
-                fill_quote_amount=fill_amount * fill_price,
-                fill_price=fill_price,
-                fill_timestamp=trade_data.get("timestamp", self._time_synchronizer.time() * 1000) / 1000,
-            )
-            self._order_tracker.process_trade_update(trade_update)
+    def _apply_trade_update(self, trade_update: TradeUpdate, tracked_order: InFlightOrder):
+        """Register a TradeUpdate with the order tracker and log the tax breakdown."""
+        if trade_update.trade_id in tracked_order.order_fills:
+            return
+        self._order_tracker.process_trade_update(trade_update)
+        fee_amount = trade_update.fee.flat_fees[0].amount if trade_update.fee.flat_fees else Decimal("0")
+        trading_pair = tracked_order.trading_pair
+        _, quote = trading_pair.split("-")
+        tds_amount = self._tax.pop_tds(trade_update.trade_id)
+        self._tax.track_and_log(
+            trade_type=tracked_order.trade_type,
+            trading_pair=trading_pair,
+            fill_base=trade_update.fill_base_amount,
+            fill_value=trade_update.fill_base_amount * trade_update.fill_price,
+            fee_amount=fee_amount,
+            tds_amount=tds_amount,
+            quote=quote,
+            logger=self.logger(),
+        )
 
     def _process_balance_update(self, balance_data: Dict[str, Any]):
         """
@@ -644,47 +710,21 @@ class CoindcxExchange(ExchangePyBase):
             self._last_trades_poll_coindcx_timestamp = self._time_synchronizer.time()
 
             try:
-                trade_history_params = {
-                    "limit": 100
-                }
-
                 trades = await self._api_post(
                     path_url=CONSTANTS.TRADE_HISTORY_ACCOUNT_PATH_URL,
-                    data=trade_history_params,
+                    data={"limit": 100},
                     is_auth_required=True
                 )
-
                 if trades:
-                    trades_by_order_id = {}
-                    for trade in trades:
-                        order_id = str(trade.get("order_id", ""))
-                        trades_by_order_id[order_id] = trade
-
+                    trades_by_order_id = {str(t.get("order_id", "")): t for t in trades}
                     for tracked_order in self._order_tracker.all_fillable_orders.values():
-                        if tracked_order.exchange_order_id in trades_by_order_id:
-                            trade = trades_by_order_id[tracked_order.exchange_order_id]
-                            fee_amount = Decimal(str(trade.get("fee_amount", 0)))
-                            trading_pair = tracked_order.trading_pair
-                            base, quote = trading_pair.split("-")
-
-                            fee = TradeFeeBase.new_spot_fee(
-                                fee_schema=self.trade_fee_schema(),
-                                trade_type=tracked_order.trade_type,
-                                flat_fees=[TokenAmount(amount=fee_amount, token=quote)]
-                            )
-
-                            trade_update = TradeUpdate(
-                                trade_id=str(trade.get("id", "")),
-                                client_order_id=tracked_order.client_order_id,
-                                exchange_order_id=tracked_order.exchange_order_id,
-                                trading_pair=trading_pair,
-                                fee=fee,
-                                fill_base_amount=Decimal(str(trade.get("quantity", 0))),
-                                fill_quote_amount=Decimal(str(trade.get("quantity", 0))) * Decimal(str(trade.get("price", 0))),
-                                fill_price=Decimal(str(trade.get("price", 0))),
-                                fill_timestamp=trade.get("timestamp", self._time_synchronizer.time() * 1000) / 1000,
-                            )
-                            self._order_tracker.process_trade_update(trade_update)
+                        trade = trades_by_order_id.get(tracked_order.exchange_order_id)
+                        if trade is None:
+                            continue
+                        if str(trade.get("id", "")) in tracked_order.order_fills:
+                            continue
+                        trade_update = self._build_trade_update_with_tds(trade, tracked_order)
+                        self._apply_trade_update(trade_update, tracked_order)
 
             except Exception as e:
                 self.logger().error(f"Error fetching trade history: {e}")
@@ -694,48 +734,21 @@ class CoindcxExchange(ExchangePyBase):
         Retrieves all trade updates for a specific order.
         """
         trade_updates = []
-
         if order.exchange_order_id is not None:
             try:
-                trade_history_params = {
-                    "symbol": await self.exchange_symbol_associated_to_pair(trading_pair=order.trading_pair),
-                    "limit": 100
-                }
-
                 all_fills_response = await self._api_post(
                     path_url=CONSTANTS.TRADE_HISTORY_ACCOUNT_PATH_URL,
-                    data=trade_history_params,
+                    data={
+                        "symbol": await self.exchange_symbol_associated_to_pair(trading_pair=order.trading_pair),
+                        "limit": 100,
+                    },
                     is_auth_required=True
                 )
-
                 for trade in all_fills_response:
                     if str(trade.get("order_id", "")) == order.exchange_order_id:
-                        fee_amount = Decimal(str(trade.get("fee_amount", 0)))
-                        trading_pair = order.trading_pair
-                        base, quote = trading_pair.split("-")
-
-                        fee = TradeFeeBase.new_spot_fee(
-                            fee_schema=self.trade_fee_schema(),
-                            trade_type=order.trade_type,
-                            flat_fees=[TokenAmount(amount=fee_amount, token=quote)]
-                        )
-
-                        trade_update = TradeUpdate(
-                            trade_id=str(trade.get("id", "")),
-                            client_order_id=order.client_order_id,
-                            exchange_order_id=order.exchange_order_id,
-                            trading_pair=trading_pair,
-                            fee=fee,
-                            fill_base_amount=Decimal(str(trade.get("quantity", 0))),
-                            fill_quote_amount=Decimal(str(trade.get("quantity", 0))) * Decimal(str(trade.get("price", 0))),
-                            fill_price=Decimal(str(trade.get("price", 0))),
-                            fill_timestamp=trade.get("timestamp", self._time_synchronizer.time() * 1000) / 1000,
-                        )
-                        trade_updates.append(trade_update)
-
+                        trade_updates.append(self._build_trade_update_with_tds(trade, order))
             except Exception as e:
                 self.logger().error(f"Error fetching trades for order: {e}")
-
         return trade_updates
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:

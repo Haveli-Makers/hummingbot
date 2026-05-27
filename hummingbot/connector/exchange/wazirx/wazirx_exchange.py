@@ -15,6 +15,7 @@ from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
+from hummingbot.core.data_type.india_crypto_tax import IndiaCryptoTaxTracker
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
@@ -48,6 +49,7 @@ class WazirxExchange(ExchangePyBase):
         self._domain = domain
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
+        self._tax = IndiaCryptoTaxTracker()
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
         if trading_required and trading_pairs:
@@ -406,6 +408,44 @@ class WazirxExchange(ExchangePyBase):
                 self.logger().error("Unexpected error in user stream listener loop.", exc_info=True)
                 await self._sleep(5.0)
 
+    def _build_trade_update_with_tds(self, trade: Dict[str, Any], order: InFlightOrder) -> TradeUpdate:
+        """
+        Build a TradeUpdate from a WazirX REST trade record and store its TDS in _tds_by_trade_id.
+        """
+        trading_pair = order.trading_pair
+        _, quote = trading_pair.split("-")
+        fill_price = Decimal(trade.get("price", "0"))
+        fill_base = Decimal(trade.get("qty", "0"))
+        fill_value = Decimal(trade.get("quoteQty", "0")) or fill_base * fill_price
+        fee_token = trade.get("feeCurrency", trade.get("commissionAsset", "")).upper() or quote
+        fee_amount = Decimal(trade.get("fee", trade.get("commission", "0")))
+        trade_id = str(trade.get("id", ""))
+
+        self._tax.calc_and_record_tds(
+            trade_id=trade_id,
+            fill_value_quote=fill_value,
+            is_buyer=order.trade_type == TradeType.BUY,
+            trading_pair=trading_pair,
+        )
+
+        fee = TradeFeeBase.new_spot_fee(
+            fee_schema=self.trade_fee_schema(),
+            trade_type=order.trade_type,
+            percent_token=fee_token,
+            flat_fees=[TokenAmount(amount=fee_amount, token=fee_token)],
+        )
+        return TradeUpdate(
+            trade_id=trade_id,
+            client_order_id=order.client_order_id,
+            exchange_order_id=str(trade.get("orderId", "")),
+            trading_pair=trading_pair,
+            fee=fee,
+            fill_base_amount=fill_base,
+            fill_quote_amount=fill_value,
+            fill_price=fill_price,
+            fill_timestamp=trade.get("time", 0) / 1000,
+        )
+
     async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
         trade_updates: List[TradeUpdate] = []
 
@@ -428,32 +468,8 @@ class WazirxExchange(ExchangePyBase):
                 )
 
                 trades = resp if isinstance(resp, list) else resp.get("trades", [])
-
                 for trade in trades:
-                    fee = TradeFeeBase.new_spot_fee(
-                        fee_schema=self.trade_fee_schema(),
-                        trade_type=order.trade_type,
-                        percent_token=trade.get("feeCurrency", trade.get("commissionAsset", "")),
-                        flat_fees=[
-                            TokenAmount(
-                                amount=Decimal(trade.get("fee", trade.get("commission", "0"))),
-                                token=trade.get("feeCurrency", trade.get("commissionAsset", "")),
-                            )
-                        ],
-                    )
-
-                    trade_update = TradeUpdate(
-                        trade_id=str(trade.get("id", "")),
-                        client_order_id=order.client_order_id,
-                        exchange_order_id=str(trade.get("orderId", "")),
-                        trading_pair=order.trading_pair,
-                        fee=fee,
-                        fill_base_amount=Decimal(trade.get("qty", "0")),
-                        fill_quote_amount=Decimal(trade.get("quoteQty", "0")),
-                        fill_price=Decimal(trade.get("price", "0")),
-                        fill_timestamp=trade.get("time", 0) / 1000,
-                    )
-                    trade_updates.append(trade_update)
+                    trade_updates.append(self._build_trade_update_with_tds(trade, order))
             except Exception as e:
                 error_msg = str(e)
                 if "429" in error_msg or "Too many" in error_msg:
@@ -462,6 +478,55 @@ class WazirxExchange(ExchangePyBase):
                     self.logger().error(f"Error fetching trade updates for order {order.client_order_id}: {e}")
 
         return trade_updates
+
+    async def _update_orders_fills(self, orders: List[InFlightOrder]):
+        for order in orders:
+            try:
+                trade_updates = await self._all_trade_updates_for_order(order=order)
+                for trade_update in trade_updates:
+                    self._apply_trade_update(trade_update, order)
+            except asyncio.CancelledError:
+                raise
+            except Exception as request_error:
+                self.logger().warning(
+                    f"Failed to fetch trade updates for order {order.client_order_id}. Error: {request_error}",
+                    exc_info=request_error,
+                )
+
+    def _apply_trade_update(self, trade_update: TradeUpdate, tracked_order: InFlightOrder):
+        """Register a TradeUpdate and log the India crypto tax breakdown. Skips duplicates."""
+        if trade_update.trade_id in tracked_order.order_fills:
+            return
+        self._order_tracker.process_trade_update(trade_update)
+        base, quote = tracked_order.trading_pair.split("-")
+        tds_amount = self._tax.pop_tds(trade_update.trade_id)
+        fee_in_quote = Decimal("0")
+        fee_approx_note = ""
+        if trade_update.fee.flat_fees:
+            fee_flat = trade_update.fee.flat_fees[0]
+            if fee_flat.token == quote:
+                fee_in_quote = fee_flat.amount
+            elif fee_flat.token == base:
+                fee_in_quote = fee_flat.amount * trade_update.fill_price
+            else:
+                fee_approx_note = (
+                    f"APPROXIMATE: fee charged in {fee_flat.token} "
+                    f"(not {quote} or {base}); excluded \u2014 net profit overstated"
+                )
+                self.logger().warning(
+                    f"Trade {trade_update.trade_id}: {fee_approx_note}."
+                )
+        self._tax.track_and_log(
+            trade_type=tracked_order.trade_type,
+            trading_pair=tracked_order.trading_pair,
+            fill_base=trade_update.fill_base_amount,
+            fill_value=trade_update.fill_base_amount * trade_update.fill_price,
+            fee_amount=fee_in_quote,
+            tds_amount=tds_amount,
+            quote=quote,
+            logger=self.logger(),
+            approximate_note=fee_approx_note,
+        )
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
         if tracked_order.current_state in [OrderState.FAILED, OrderState.CANCELED]:

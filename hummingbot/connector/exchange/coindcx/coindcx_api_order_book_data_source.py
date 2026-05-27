@@ -209,7 +209,9 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 try:
                     trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=pair_symbol)
                 except Exception:
-                    trading_pair = None
+                    trading_pair = coindcx_pair_to_hb_pair(pair_symbol)
+                    if trading_pair not in self._trading_pairs:
+                        return
             else:
                 channel = raw_message.get("channel", "")
                 if "@orderbook" in channel:

@@ -537,6 +537,58 @@ def assert_sufficient_balance(
             )
 
 
+async def _poll_balance_increase(
+    cx: ConnectorWrapper,
+    token: str,
+    baseline: Decimal,
+    target_delta: Decimal,
+    timeout: int = 30,
+) -> Decimal:
+    """
+    Poll get_available_balance(token) until it exceeds baseline + target_delta.
+
+    Returns the actual delta observed (may be less than target_delta on timeout).
+
+    WHY balance polling instead of fill events:
+      connector.buy() schedules _create_order via safe_ensure_future — it returns
+      the order_id BEFORE _create_order has run, so in_flight_orders is still empty
+      on the very first poll.  Additionally, WazirX fires MarketEvent.OrderFilled
+      only from the WebSocket user stream (not from the REST create-order response),
+      so collected_fills is empty even when the order is already done.  Balance
+      updates arrive via WebSocket balanceUpdate events and are reliable.
+    """
+    deadline = time.monotonic() + timeout
+    delta = Decimal("0")
+    while time.monotonic() < deadline:
+        await asyncio.sleep(1)
+        avail = cx.connector.get_available_balance(token)
+        delta = avail - baseline
+        if delta >= target_delta:
+            break
+    return delta
+
+
+async def _poll_balance_decrease(
+    cx: ConnectorWrapper,
+    token: str,
+    baseline: Decimal,
+    threshold_fraction: Decimal = Decimal("0.1"),
+    timeout: int = 30,
+) -> bool:
+    """
+    Poll until get_available_balance(token) drops below baseline * threshold_fraction.
+
+    Returns True when the balance has fallen far enough (i.e. taker sell filled).
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        await asyncio.sleep(1)
+        avail = cx.connector.get_available_balance(token)
+        if avail < baseline * threshold_fraction:
+            return True
+    return False
+
+
 def _rejection_msg(cx: ConnectorWrapper, client_id: str, timeout: int) -> str:
     order = cx.connector.in_flight_orders.get(client_id)
     if order is not None:
@@ -1131,6 +1183,18 @@ class TestConnectorE2E:
             await ensure_order_closed(cx, edited_id)
 
     # ── 7. Balance → limit sell → balance check ───────────────────────────────
+    #
+    # Three phases:
+    #   Phase 1 — Setup buy  : if base-token balance < sell amount, buy at best_ask
+    #                          (taker, fills immediately). Fill confirmed by polling
+    #                          the balance, not by fill events — connector.buy()
+    #                          schedules _create_order async so in_flight_orders is
+    #                          empty on the first poll, and WazirX fires OrderFilled
+    #                          only via WebSocket, not the REST response.
+    #   Phase 2 — Sell test  : place sell far above market, assert balance locked,
+    #                          cancel, assert balance recovered.
+    #   Phase 3 — Cleanup sell: sell back what Phase 1 bought so the account is
+    #                           left as found. Always runs (inside finally).
 
     async def test_07_balance_then_limit_sell_check_balance(self, cx: ConnectorWrapper):
         cx.log_section("TEST_07: balance_sell")
@@ -1139,35 +1203,84 @@ class TestConnectorE2E:
         cx.log_value("base_token", base_token)
         cx.log_value("quote_token", quote_token)
 
-        avail_before = cx.connector.get_available_balance(base_token)
-        cx.log_value("avail_before", str(avail_before))
+        # ── Phase 1: acquire base token if the account doesn't have enough ────
+        setup_buy_id: Optional[str] = None
+        avail_base = cx.connector.get_available_balance(base_token)
+        cx.log_value("avail_base_initial", str(avail_base))
+
+        if avail_base < cx.cfg.limit_sell_amount:
+            cx.log(
+                f"Insufficient {base_token} ({avail_base}) — "
+                f"need {cx.cfg.limit_sell_amount}. "
+                f"Placing near-market BUY to acquire it using {quote_token}."
+            )
+            _, asks = get_orderbook_snapshot(cx)
+            assert asks, f"Ask side empty for {cx.cfg.trading_pair} — cannot place setup buy"
+
+            # Buy at best_ask + 0.1 % → taker order that fills immediately.
+            setup_buy_price = round(Decimal(str(asks[0].price)) * Decimal("1.001"), 8)
+            cx.log_value("setup_buy_price", setup_buy_price)
+            cx.log_value("setup_buy_amount", cx.cfg.limit_sell_amount)
+
+            assert_sufficient_balance(cx, TradeType.BUY, cx.cfg.limit_sell_amount, setup_buy_price)
+
+            baseline_base = cx.connector.get_available_balance(base_token)
+            setup_buy_id = cx.connector.buy(
+                cx.cfg.trading_pair,
+                cx.cfg.limit_sell_amount,
+                OrderType.LIMIT,
+                setup_buy_price,
+            )
+            cx.log_value("setup_buy_id", setup_buy_id)
+
+            # Poll balance: WazirX sends balanceUpdate via WebSocket within ~1 s.
+            target = cx.cfg.limit_sell_amount * Decimal("0.99")
+            acquired = await _poll_balance_increase(cx, base_token, baseline_base, target, timeout=30)
+            cx.log_check(
+                "setup_buy_balance_delta",
+                actual=f"+{acquired} {base_token}",
+                expected=f">= {target} {base_token}",
+            )
+            if acquired < target:
+                await ensure_order_cancelled(cx, setup_buy_id)
+                pytest.skip(
+                    f"[{cx.cfg.connector_name}] Setup BUY did not appear in {base_token} "
+                    f"balance within 30 s (acquired {acquired}, need {target}). "
+                    "Try again or fund the account with BTC directly."
+                )
+            cx.log(f"Setup BUY confirmed — acquired {acquired} {base_token}.")
+
+        # ── Phase 2: sell test ─────────────────────────────────────────────────
+        sell_id: Optional[str] = None
 
         mid = get_mid_price(cx)
         sell_price = round(mid * Decimal(str(cx.cfg.sell_price_offset)), 8)
+        avail_before = cx.connector.get_available_balance(base_token)
+        cx.log_value("avail_before_sell_test", str(avail_before))
         cx.log_value("mid_price", mid)
         cx.log_value("sell_offset", cx.cfg.sell_price_offset)
         cx.log_value("sell_price", sell_price)
 
-        # Pre-check: skip with a clear message instead of cryptic "order never appeared"
-        assert_sufficient_balance(cx, TradeType.SELL, cx.cfg.limit_sell_amount, sell_price)
-
-        sell_id = place_limit_sell(cx, sell_price)
-        cx.log_value("placed_sell_id", sell_id)
-
         try:
+            assert_sufficient_balance(cx, TradeType.SELL, cx.cfg.limit_sell_amount, sell_price)
+
+            sell_id = place_limit_sell(cx, sell_price)
+            cx.log_value("placed_sell_id", sell_id)
+
             sell_order = await wait_for_order_open(cx, sell_id)
             cx.log_check("sell order acknowledged", actual=sell_order is not None, expected=True)
             assert sell_order is not None, _rejection_msg(cx, sell_id, cx.order_wait)
 
             cx.log_value("sell_order_state", str(sell_order.current_state))
 
-            # Allow connector to update its balance cache after order is live
             await asyncio.sleep(3)
 
             avail_after = cx.connector.get_available_balance(base_token)
-            cx.log_check(f"{base_token} avail_after <= avail_before",
-                         actual=str(avail_after), expected=f"<= {avail_before}",
-                         note=f"delta={avail_before - avail_after}")
+            cx.log_check(
+                f"{base_token} avail_after <= avail_before",
+                actual=str(avail_after), expected=f"<= {avail_before}",
+                note=f"delta={avail_before - avail_after}",
+            )
             assert avail_after <= avail_before, (
                 f"[{cx.cfg.connector_name}] {base_token} balance INCREASED after sell: "
                 f"{avail_before} → {avail_after}"
@@ -1179,10 +1292,16 @@ class TestConnectorE2E:
             await asyncio.sleep(4)
 
             avail_recovered = cx.connector.get_available_balance(base_token)
-            deviation_pct = abs(avail_recovered - avail_before) / max(avail_before, Decimal("1e-8")) * 100
-            cx.log_check("balance_recovered",
-                         actual=str(avail_recovered), expected=f"~{avail_before}",
-                         note=f"deviation={float(deviation_pct):.4f}%  threshold=1%")
+            deviation_pct = (
+                abs(avail_recovered - avail_before)
+                / max(avail_before, Decimal("1e-8"))
+                * 100
+            )
+            cx.log_check(
+                "balance_recovered",
+                actual=str(avail_recovered), expected=f"~{avail_before}",
+                note=f"deviation={float(deviation_pct):.4f}%  threshold=1%",
+            )
             assert deviation_pct < Decimal("1"), (
                 f"[{cx.cfg.connector_name}] {base_token} balance did not recover after cancel: "
                 f"before={avail_before}  after_sell={avail_after}  "
@@ -1193,6 +1312,50 @@ class TestConnectorE2E:
 
         finally:
             await ensure_order_closed(cx, sell_id)
+
+            # ── Phase 3: sell off the base token we bought in Phase 1 ─────────
+            if setup_buy_id is not None:
+                cx.log("Cleanup: converting acquired BTC back to INR via near-market sell.")
+                avail_cleanup = cx.connector.get_available_balance(base_token)
+                cx.log_value("avail_for_cleanup_sell", str(avail_cleanup))
+
+                if avail_cleanup > Decimal("0"):
+                    bids, _ = get_orderbook_snapshot(cx)
+                    if not bids:
+                        cx.log(
+                            f"Bid side empty — cannot place cleanup sell. "
+                            f"~{avail_cleanup} {base_token} remains in account.",
+                            "warning",
+                        )
+                    else:
+                        # Sell at best_bid - 0.1 % → taker, fills immediately.
+                        cleanup_sell_price = round(
+                            Decimal(str(bids[0].price)) * Decimal("0.999"), 8
+                        )
+                        cx.log_value("cleanup_sell_price", cleanup_sell_price)
+                        cleanup_sell_id = cx.connector.sell(
+                            cx.cfg.trading_pair,
+                            avail_cleanup,
+                            OrderType.LIMIT,
+                            cleanup_sell_price,
+                        )
+                        cx.log_value("cleanup_sell_id", cleanup_sell_id)
+                        sold = await _poll_balance_decrease(
+                            cx, base_token, avail_cleanup, timeout=30
+                        )
+                        cx.log_check("cleanup_sell_filled", actual=sold, expected=True)
+                        if sold:
+                            cx.log(
+                                f"Cleanup SELL confirmed — "
+                                f"{base_token} converted back to {quote_token}."
+                            )
+                        else:
+                            await ensure_order_cancelled(cx, cleanup_sell_id)
+                            cx.log(
+                                f"Cleanup SELL did not fill in 30 s — order cancelled. "
+                                f"~{avail_cleanup} {base_token} remains in account.",
+                                "warning",
+                            )
 
     # ── 8. Trade fills — validate OrderFilledEvent structure ──────────────────
 

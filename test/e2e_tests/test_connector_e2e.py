@@ -174,15 +174,7 @@ class _FillCollector:
 
 
 class _FailCollector:
-    """
-    Listens for MarketEvent.OrderFailure so we can detect fast-rejected orders.
-
-    When an order is rejected by the exchange (wrong credentials, insufficient
-    balance, trading rule violation), the connector fires OrderFailure and then
-    moves the order to FAILED state, removing it from in_flight_orders.  This
-    can happen within milliseconds — faster than our 200 ms polling interval —
-    so without this listener the order appears to have "never existed."
-    """
+    """Collects MarketEvent.OrderFailure events to detect fast-rejected orders."""
 
     def __init__(self) -> None:
         self._failed_ids: set = set()
@@ -297,23 +289,7 @@ def cancel_order(cx: ConnectorWrapper, client_id: str) -> None:
 
 
 def _is_order_open(order) -> bool:
-    """
-    Return True ONLY when the exchange has actually acknowledged the order.
-
-    We gate on exchange_order_id — not on is_open or the state enum — because:
-
-      • Some connectors (e.g. older WazirX style) set is_open=True even for
-        PENDING_CREATE orders, before the exchange has replied at all.
-        Trusting is_open would make tests pass while the order is completely
-        unacknowledged (and the account may have zero balance).
-
-      • The exchange assigns an exchange_order_id only when it accepts the order.
-        Until then exchange_order_id is None.  This is the definitive signal:
-
-            PENDING_CREATE  → exchange_order_id = None  → return False  ✓
-            Exchange acked  → exchange_order_id = "123" → return True   ✓
-            Wrong creds     → order stays PENDING/is_done → return False ✓
-    """
+    """True only when the exchange has acknowledged the order (exchange_order_id set and not done)."""
     exchange_id = getattr(order, "exchange_order_id", None)
     if not exchange_id:
         return False          # No exchange ID = exchange has not acknowledged yet
@@ -326,23 +302,9 @@ async def wait_for_order_open(
     timeout: Optional[int] = None,
 ) -> Optional[object]:
     """
-    Poll until the order is exchange-acknowledged (OPEN / PARTIALLY_FILLED).
-
-    Returns InFlightOrder only when is_open is True.
-    Returns None when:
-      - The exchange rejected the order (is_done becomes True)
-      - Timeout expired with the order still in PENDING_CREATE or absent
-
-    WHY we do NOT fall back to returning PENDING_CREATE at timeout:
-      A PENDING_CREATE order that never transitions to OPEN means the exchange
-      never acknowledged it.  This happens when:
-        • credentials are wrong (API returns 4xx, connector may silently swallow
-          the error and leave the order stuck in PENDING_CREATE)
-        • account has insufficient balance
-        • the connector has a bug that ignores API errors
-      Accepting PENDING_CREATE at timeout would make tests pass falsely.
-      Instead: return None and let the caller fail with a clear message.
-      If your exchange is slow, increase ORDER_PROPAGATION_WAIT in .env.
+    Poll until the exchange acknowledges the order (exchange_order_id set).
+    Returns the InFlightOrder on success, or None if rejected / timed out.
+    PENDING_CREATE at timeout is treated as rejection — never returns an unacknowledged order.
     """
     timeout = timeout or cx.order_wait
     start = time.monotonic()
@@ -352,12 +314,7 @@ async def wait_for_order_open(
     await asyncio.sleep(0)
 
     while time.monotonic() < deadline:
-        # Fast-rejection check: the order may have been placed, immediately
-        # rejected by the exchange (insufficient balance / auth error / trading
-        # rule violation), and removed from in_flight_orders all within the
-        # first polling interval.  The OrderFailure event is fired before the
-        # order disappears, so _failure_collector catches it even when we miss
-        # the FAILED state in in_flight_orders.
+        # Fast-rejection: exchange may reject and remove the order before our first poll.
         if cx._failure_collector.has_failed(client_id):
             cx.log(
                 f"Order {client_id} received OrderFailure event — exchange rejected it. "
@@ -497,14 +454,7 @@ def assert_sufficient_balance(
     amount: Decimal,
     price: Decimal,
 ) -> None:
-    """
-    Skip the current test with a clear message if the account lacks funds.
-
-    Called BEFORE place_limit_buy / place_limit_sell so we get an actionable
-    skip reason rather than a cryptic "order never appeared in in_flight_orders"
-    (which happens because the exchange rejects the order in < 200 ms and it
-    disappears from in_flight_orders before our first poll).
-    """
+    """Skip the test with a clear message if the account lacks funds for the order."""
     base, quote = cx.cfg.trading_pair.split("-")
     if trade_type == TradeType.BUY:
         required = amount * price
@@ -546,21 +496,8 @@ async def _poll_balance_increase(
 ) -> Decimal:
     """
     Poll get_available_balance(token) until it exceeds baseline + target_delta.
-
-    Returns the actual delta observed (may be less than target_delta on timeout).
-
-    WHY balance polling instead of fill events:
-      connector.buy() schedules _create_order via safe_ensure_future — it returns
-      the order_id BEFORE _create_order has run, so in_flight_orders is still empty
-      on the very first poll.  Additionally, WazirX fires MarketEvent.OrderFilled
-      only from the WebSocket user stream (not from the REST create-order response),
-      so collected_fills is empty even when the order is already done.
-
-    WHY _update_balances() is called every 5 s:
-      WazirX's WebSocket balanceUpdate events are unreliable for tokens whose
-      cached balance starts at zero (newly-acquired coins).  The REST /v1/funds
-      endpoint always returns the current balance, so we force a refresh every 5 s
-      to ensure the cache reflects reality even when WebSocket events are missed.
+    Returns the actual delta (may be less than target_delta on timeout).
+    Calls _update_balances() every 5 s to keep the cache current via REST.
     """
     update_fn = getattr(cx.connector, "_update_balances", None)
     deadline = time.monotonic() + timeout
@@ -588,12 +525,8 @@ async def _poll_balance_decrease(
     threshold_fraction: Decimal = Decimal("0.1"),
     timeout: int = 30,
 ) -> bool:
-    """
-    Poll until get_available_balance(token) drops below baseline * threshold_fraction.
-
-    Returns True when the balance has fallen far enough (i.e. taker sell filled).
-    Also calls _update_balances() every 5 s to keep the cache current.
-    """
+    """Poll until get_available_balance(token) drops below baseline * threshold_fraction.
+    Returns True when balance has fallen far enough. Refreshes cache via REST every 5 s."""
     update_fn = getattr(cx.connector, "_update_balances", None)
     deadline = time.monotonic() + timeout
     next_refresh = time.monotonic()
@@ -703,26 +636,12 @@ async def cx(request) -> ConnectorWrapper:
     elapsed_ready = cfg.ready_timeout - (ready_deadline - time.monotonic())
     _log.info(f"[{cfg.connector_name}] connector.ready=True after {elapsed_ready:.1f}s")
 
-    # ── Authentication verification ────────────────────────────────────────────
-    # connector.ready can become True from the public order-book subscription
-    # alone, even when API credentials are wrong.  We additionally verify auth
-    # by explicitly calling _update_balances() and checking for non-zero values.
-    #
-    # WHY explicit call instead of passive wait:
-    #   Some connectors (WazirX included) pre-fill _account_available_balances
-    #   with Decimal("0") for every asset in the trading pair RIGHT IN __init__,
-    #   before any network call.  A passive poll would see that pre-filled dict
-    #   immediately and report "still zero" even if the background task hasn't
-    #   run yet.  Calling _update_balances() ourselves forces the REST request
-    #   synchronously so the balance dict reflects the actual exchange response.
-    #
-    # WHY check for non-zero (not just any value):
-    #   Some exchanges (WazirX included) respond with HTTP 200 + zero amounts
-    #   when credentials are wrong — they never return HTTP 401/403.  After the
-    #   connector marks itself "authenticated" we still can't trust all-zero
-    #   balances; we need at least one positive value to confirm the key works.
+    # ── Authentication verification ──────────────────────────────────────────────
+    # connector.ready can go True from public WS alone even with wrong creds.
+    # Step 1: check status_dict flags. Step 2: call _update_balances() and confirm
+    # at least one non-zero balance (wrong keys return HTTP 200 with all-zeros).
 
-    # Step 1 — status_dict (quick flag check, not the definitive auth gate)
+    # Step 1 — status_dict flag check
     status = getattr(connector, "status_dict", {})
     _log.info(f"[{cfg.connector_name}] status_dict: {status}")
 
@@ -739,22 +658,8 @@ async def cx(request) -> ConnectorWrapper:
             f"{failing_auth_flags}. Verify API credentials in .env."
         )
 
-    # Step 2 — balance check (REST + WebSocket fallback)
-    #
-    # WHY two paths:
-    #   Some connectors (WazirX) populate _account_available_balances from the
-    #   WebSocket user-stream (balanceUpdate events) rather than from a REST call.
-    #   For those connectors _update_balances() may fail silently, and the real
-    #   balance data only arrives once the WS user-stream sends events.
-    #
-    #   Strategy:
-    #     a) Call _update_balances() once immediately — covers REST-based connectors.
-    #     b) If still zero, poll for up to 45 s — covers WS-based connectors that
-    #        push balance snapshots after connection.  Re-call _update_balances()
-    #        every 10 s as a REST retry.
-    #   A genuine all-zero account is rare for an active trader; if we see all-zero
-    #   after 45 s we treat it as a credential failure.
-
+    # Step 2 — balance check: immediate REST call, then wait up to 45 s for WS events.
+    # All-zero after 45 s is treated as a credential failure.
     _update_fn = getattr(connector, "_update_balances", None)
     non_zero: Dict[str, str] = {}
 
@@ -817,8 +722,6 @@ async def cx(request) -> ConnectorWrapper:
     if non_zero:
         _log.info(f"[{cfg.connector_name}] Auth confirmed — non-zero balances: {non_zero}")
     else:
-        raw = getattr(connector, "_account_available_balances", {})
-        all_bal = {k: str(v) for k, v in raw.items()}
         _log.error(
             f"[{cfg.connector_name}] AUTHENTICATION FAILED — all balances zero after 45s. "
             f"Balance dict: {all_bal}"
@@ -867,19 +770,7 @@ async def cx(request) -> ConnectorWrapper:
 
 @pytest.mark.asyncio(loop_scope="module")
 class TestConnectorE2E:
-    """
-    Generic E2E test suite running directly against Hummingbot connectors.
-
-    Key design rules applied to every order-placing test:
-      • wait_for_order_open() — only returns when the exchange acknowledges
-        (OPEN state).  PENDING_CREATE at timeout is treated as rejection.
-        This catches wrong-credential scenarios where the connector silently
-        ignores API errors and leaves orders stuck in PENDING_CREATE.
-      • ensure_order_closed() in every finally block — cancels the order,
-        waits for confirmation, then reverses if it somehow got filled.
-      • Log actual values before each assertion so you can verify what was
-        compared without rerunning.  Log file: test/e2e_tests/logs/
-    """
+    """Generic E2E test suite for Hummingbot connectors. Log file: test/e2e_tests/logs/"""
 
     # ── 1. Order book ──────────────────────────────────────────────────────────
 
@@ -1064,8 +955,6 @@ class TestConnectorE2E:
 
             cx.log_value("pre_cancel_state", str(order.current_state))
             cancel_order(cx, client_id)
-            cx.log_value("cancel_sent", True)
-
             gone = await wait_until_not_active(cx, client_id)
             post_state = cx.connector.in_flight_orders.get(client_id)
 
@@ -1094,13 +983,6 @@ class TestConnectorE2E:
         cx.log_value("mid_price", mid)
         cx.log_value("order_prices", [str(p) for p in prices])
 
-        # Pre-check: need enough quote balance for 3 simultaneous buy orders
-        total_needed = cx.cfg.limit_buy_amount * sum(prices) / len(prices) * 3
-        _, quote = cx.cfg.trading_pair.split("-")
-        available_quote = cx.connector.get_available_balance(quote)
-        cx.log_check(f"{quote}_balance_for_3_buys",
-                     actual=f"{available_quote:.4f}", expected=f">= ~{total_needed:.4f}")
-        # Individual check (sufficient for each order at its price)
         for p in prices:
             assert_sufficient_balance(cx, TradeType.BUY, cx.cfg.limit_buy_amount, p)
 
@@ -1115,7 +997,6 @@ class TestConnectorE2E:
                 cx.log_check(f"order {oid[:20]}... acknowledged", actual=order is not None, expected=True)
                 assert order is not None, _rejection_msg(cx, oid, cx.order_wait)
 
-            cx.log_value("calling_cancel_all", True)
             await cx.connector.cancel_all(timeout_seconds=cx.cancel_wait)
             await asyncio.sleep(cx.cancel_wait)
 
@@ -1205,25 +1086,13 @@ class TestConnectorE2E:
             await ensure_order_closed(cx, edited_id)
 
     # ── 7. Balance → limit sell → balance check ───────────────────────────────
-    #
-    # Three phases:
-    #   Phase 1 — Setup buy  : if base-token balance < sell amount, buy at best_ask
-    #                          (taker, fills immediately). Fill confirmed by polling
-    #                          the balance, not by fill events — connector.buy()
-    #                          schedules _create_order async so in_flight_orders is
-    #                          empty on the first poll, and WazirX fires OrderFilled
-    #                          only via WebSocket, not the REST response.
-    #   Phase 2 — Sell test  : place sell far above market, assert balance locked,
-    #                          cancel, assert balance recovered.
-    #   Phase 3 — Cleanup sell: sell back what Phase 1 bought so the account is
-    #                           left as found. Always runs (inside finally).
+    # Phase 1: buy base token if needed. Phase 2: place/cancel sell, check balance.
+    # Phase 3 (finally): sell back the base token to leave the account as found.
 
     async def test_07_balance_then_limit_sell_check_balance(self, cx: ConnectorWrapper):
         cx.log_section("TEST_07: balance_sell")
 
         base_token, quote_token = cx.cfg.trading_pair.split("-")
-        cx.log_value("base_token", base_token)
-        cx.log_value("quote_token", quote_token)
 
         # ── Phase 1: acquire base token if the account doesn't have enough ────
         setup_buy_id: Optional[str] = None
@@ -1350,7 +1219,6 @@ class TestConnectorE2E:
 
             cancel_order(cx, sell_id)
             await wait_until_not_active(cx, sell_id)
-            cx.log_value("sell_cancelled", True)
             await asyncio.sleep(4)
 
             avail_recovered = cx.connector.get_available_balance(base_token)

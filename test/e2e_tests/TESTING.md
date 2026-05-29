@@ -8,6 +8,17 @@ would, and asserts on real exchange state (order book, in-flight orders, balance
 trade history).
 
 ---
+## Table of Contents
+- [Prerequisites](#prerequisites)
+- [Configuration](#configuration)
+- [Running the Tests](#running-the-tests)
+- [The 8 Tests](#the-8-tests)
+- [Adding a New Exchange](#adding-a-new-exchange)
+- [How It Works Internally](#how-it-works-internally)
+- [Troubleshooting](#troubleshooting)
+- [CI Integration](#ci-integration)
+
+---
 
 ## Prerequisites
 

@@ -554,13 +554,26 @@ async def _poll_balance_increase(
       the order_id BEFORE _create_order has run, so in_flight_orders is still empty
       on the very first poll.  Additionally, WazirX fires MarketEvent.OrderFilled
       only from the WebSocket user stream (not from the REST create-order response),
-      so collected_fills is empty even when the order is already done.  Balance
-      updates arrive via WebSocket balanceUpdate events and are reliable.
+      so collected_fills is empty even when the order is already done.
+
+    WHY _update_balances() is called every 5 s:
+      WazirX's WebSocket balanceUpdate events are unreliable for tokens whose
+      cached balance starts at zero (newly-acquired coins).  The REST /v1/funds
+      endpoint always returns the current balance, so we force a refresh every 5 s
+      to ensure the cache reflects reality even when WebSocket events are missed.
     """
+    update_fn = getattr(cx.connector, "_update_balances", None)
     deadline = time.monotonic() + timeout
+    next_refresh = time.monotonic()
     delta = Decimal("0")
     while time.monotonic() < deadline:
         await asyncio.sleep(1)
+        if update_fn is not None and time.monotonic() >= next_refresh:
+            try:
+                await update_fn()
+            except Exception:
+                pass
+            next_refresh = time.monotonic() + 5
         avail = cx.connector.get_available_balance(token)
         delta = avail - baseline
         if delta >= target_delta:
@@ -579,10 +592,19 @@ async def _poll_balance_decrease(
     Poll until get_available_balance(token) drops below baseline * threshold_fraction.
 
     Returns True when the balance has fallen far enough (i.e. taker sell filled).
+    Also calls _update_balances() every 5 s to keep the cache current.
     """
+    update_fn = getattr(cx.connector, "_update_balances", None)
     deadline = time.monotonic() + timeout
+    next_refresh = time.monotonic()
     while time.monotonic() < deadline:
         await asyncio.sleep(1)
+        if update_fn is not None and time.monotonic() >= next_refresh:
+            try:
+                await update_fn()
+            except Exception:
+                pass
+            next_refresh = time.monotonic() + 5
         avail = cx.connector.get_available_balance(token)
         if avail < baseline * threshold_fraction:
             return True
@@ -1205,6 +1227,9 @@ class TestConnectorE2E:
 
         # ── Phase 1: acquire base token if the account doesn't have enough ────
         setup_buy_id: Optional[str] = None
+        # True when Phase 3 should sell back the base token (whether we bought
+        # it here or re-used a pre-existing balance for the sell test).
+        should_cleanup_sell = False
         avail_base = cx.connector.get_available_balance(base_token)
         cx.log_value("avail_base_initial", str(avail_base))
 
@@ -1217,8 +1242,11 @@ class TestConnectorE2E:
             _, asks = get_orderbook_snapshot(cx)
             assert asks, f"Ask side empty for {cx.cfg.trading_pair} — cannot place setup buy"
 
-            # Buy at best_ask + 0.1 % → taker order that fills immediately.
-            setup_buy_price = round(Decimal(str(asks[0].price)) * Decimal("1.001"), 8)
+            # Buy at best_ask + 1 % — generous taker premium so the order still
+            # crosses the spread even if the market moves a fraction between the
+            # order-book snapshot and the REST call landing on WazirX.
+            # (The order fills at the actual ask price, not at our limit price.)
+            setup_buy_price = round(Decimal(str(asks[0].price)) * Decimal("1.01"), 8)
             cx.log_value("setup_buy_price", setup_buy_price)
             cx.log_value("setup_buy_amount", cx.cfg.limit_sell_amount)
 
@@ -1233,7 +1261,20 @@ class TestConnectorE2E:
             )
             cx.log_value("setup_buy_id", setup_buy_id)
 
-            # Poll balance: WazirX sends balanceUpdate via WebSocket within ~1 s.
+            # Yield so _create_order runs.  If the exchange rejects the order
+            # immediately (min-size violation, bad price precision, etc.) it fires
+            # OrderFailure within the first second — catch that early to avoid
+            # waiting the full poll timeout.
+            await asyncio.sleep(0)
+            await asyncio.sleep(1)
+            if cx._failure_collector.has_failed(setup_buy_id):
+                pytest.skip(
+                    f"[{cx.cfg.connector_name}] Setup BUY was rejected by the exchange. "
+                    f"Check that {cx.cfg.limit_sell_amount} {base_token} meets the minimum "
+                    "order size and that the price is valid."
+                )
+
+            # Poll balance: WazirX sends balanceUpdate via WebSocket within ~1 s of fill.
             target = cx.cfg.limit_sell_amount * Decimal("0.99")
             acquired = await _poll_balance_increase(cx, base_token, baseline_base, target, timeout=30)
             cx.log_check(
@@ -1242,13 +1283,34 @@ class TestConnectorE2E:
                 expected=f">= {target} {base_token}",
             )
             if acquired < target:
+                order_state = cx.connector.in_flight_orders.get(setup_buy_id)
+                state_str = str(order_state.current_state) if order_state else "removed"
                 await ensure_order_cancelled(cx, setup_buy_id)
+                if order_state is not None and not order_state.is_done:
+                    reason = (
+                        f"Order was still OPEN after 30 s (state={state_str}) — "
+                        "it became a maker order because the market moved above the buy price. "
+                        "The 1 % premium should prevent this; if it happens again the market "
+                        "is unusually fast-moving right now."
+                    )
+                else:
+                    reason = (
+                        f"acquired {acquired}, need {target}. "
+                        "Try again or fund the account with BTC directly."
+                    )
                 pytest.skip(
                     f"[{cx.cfg.connector_name}] Setup BUY did not appear in {base_token} "
-                    f"balance within 30 s (acquired {acquired}, need {target}). "
-                    "Try again or fund the account with BTC directly."
+                    f"balance within 30 s. {reason}"
                 )
             cx.log(f"Setup BUY confirmed — acquired {acquired} {base_token}.")
+            should_cleanup_sell = True
+        else:
+            cx.log(
+                f"Sufficient {base_token} already available ({avail_base}) — "
+                f"skipping setup buy. Will sell {cx.cfg.limit_sell_amount} {base_token} "
+                f"back to {quote_token} in Phase 3 cleanup."
+            )
+            should_cleanup_sell = True
 
         # ── Phase 2: sell test ─────────────────────────────────────────────────
         sell_id: Optional[str] = None
@@ -1313,29 +1375,40 @@ class TestConnectorE2E:
         finally:
             await ensure_order_closed(cx, sell_id)
 
-            # ── Phase 3: sell off the base token we bought in Phase 1 ─────────
-            if setup_buy_id is not None:
-                cx.log("Cleanup: converting acquired BTC back to INR via near-market sell.")
+            # ── Phase 3: sell off the base token used for this test ──────────
+            # Runs when Phase 1 acquired BTC OR when pre-existing BTC was used
+            # for Phase 2 — in both cases we sell it back to leave the account
+            # in the same INR-only state it started in.
+            if should_cleanup_sell:
                 avail_cleanup = cx.connector.get_available_balance(base_token)
                 cx.log_value("avail_for_cleanup_sell", str(avail_cleanup))
 
-                if avail_cleanup > Decimal("0"):
+                # Cap at the test amount so we never sell more than what the
+                # test consumed (guards against the user having extra holdings).
+                amount_to_sell = min(avail_cleanup, cx.cfg.limit_sell_amount)
+
+                if amount_to_sell > Decimal("0"):
+                    cx.log(
+                        f"Cleanup: selling {amount_to_sell} {base_token} back "
+                        f"to {quote_token} via near-market sell."
+                    )
                     bids, _ = get_orderbook_snapshot(cx)
                     if not bids:
                         cx.log(
                             f"Bid side empty — cannot place cleanup sell. "
-                            f"~{avail_cleanup} {base_token} remains in account.",
+                            f"~{amount_to_sell} {base_token} remains in account.",
                             "warning",
                         )
                     else:
-                        # Sell at best_bid - 0.1 % → taker, fills immediately.
+                        # Sell at best_bid - 1 % → generous taker premium, fills
+                        # immediately even if the market dips slightly.
                         cleanup_sell_price = round(
-                            Decimal(str(bids[0].price)) * Decimal("0.999"), 8
+                            Decimal(str(bids[0].price)) * Decimal("0.99"), 8
                         )
                         cx.log_value("cleanup_sell_price", cleanup_sell_price)
                         cleanup_sell_id = cx.connector.sell(
                             cx.cfg.trading_pair,
-                            avail_cleanup,
+                            amount_to_sell,
                             OrderType.LIMIT,
                             cleanup_sell_price,
                         )
@@ -1353,7 +1426,7 @@ class TestConnectorE2E:
                             await ensure_order_cancelled(cx, cleanup_sell_id)
                             cx.log(
                                 f"Cleanup SELL did not fill in 30 s — order cancelled. "
-                                f"~{avail_cleanup} {base_token} remains in account.",
+                                f"~{amount_to_sell} {base_token} remains in account.",
                                 "warning",
                             )
 

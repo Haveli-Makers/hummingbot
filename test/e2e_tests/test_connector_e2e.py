@@ -370,16 +370,40 @@ async def wait_for_order_open(
     return None
 
 
+async def _drive_order_status(cx: ConnectorWrapper) -> None:
+    """Force the connector to refresh tracked-order state from the exchange.
+
+    Like balances, order-status updates are normally driven by the connector's
+    Clock-ticked polling loop, which this fixture never runs (no Clock attached).
+    Critically, some exchanges (e.g. CoinSwitch) cancel orders ASYNCHRONOUSLY:
+    the DELETE only acknowledges receipt (the order still reads 'OPEN' in the
+    response) and the order transitions to CANCELLED a moment later, observable
+    only via the order-status poll.  Calling _update_order_status() ourselves
+    replicates the tick a Clock would have fired so the cancel is actually seen.
+    """
+    update_fn = getattr(cx.connector, "_update_order_status", None)
+    if update_fn is None:
+        return
+    try:
+        await update_fn()
+    except Exception:
+        pass
+
+
 async def wait_until_not_active(
     cx: ConnectorWrapper,
     client_id: str,
     timeout: Optional[int] = None,
 ) -> bool:
     deadline = time.monotonic() + (timeout or cx.cancel_wait)
+    next_refresh = time.monotonic()
     while time.monotonic() < deadline:
         order = cx.connector.in_flight_orders.get(client_id)
         if order is None or order.is_done:
             return True
+        if time.monotonic() >= next_refresh:
+            await _drive_order_status(cx)
+            next_refresh = time.monotonic() + 1.5
         await asyncio.sleep(0.3)
     return False
 
@@ -618,10 +642,27 @@ async def cx(request) -> ConnectorWrapper:
     _log.info(f"[{cfg.connector_name}] start_network() called")
 
     # Wait for connector.ready
+    #
+    # WHY we drive _update_balances() ourselves here:
+    #   The connector's status-polling loop only calls _update_balances() when
+    #   its _poll_notifier fires, and that notifier is set exclusively by tick(),
+    #   which a Hummingbot Clock calls.  This fixture starts the connector with
+    #   start_network() but never attaches it to a Clock, so the polling loop
+    #   blocks forever and the account_balance status flag never flips True.
+    #   Connectors whose user-stream pushes a balance snapshot on connect (e.g.
+    #   WazirX) become ready anyway; connectors that only fetch balances via REST
+    #   (e.g. CoinSwitch) would otherwise time out.  Calling _update_balances()
+    #   on each wait iteration replicates what a Clock tick would have triggered.
+    _ready_update_fn = getattr(connector, "_update_balances", None)
     ready_deadline = time.monotonic() + cfg.ready_timeout
     while time.monotonic() < ready_deadline:
         if connector.ready:
             break
+        if _ready_update_fn is not None:
+            try:
+                await _ready_update_fn()
+            except Exception:
+                pass
         await asyncio.sleep(1)
 
     if not connector.ready:
@@ -998,7 +1039,21 @@ class TestConnectorE2E:
                 assert order is not None, _rejection_msg(cx, oid, cx.order_wait)
 
             await cx.connector.cancel_all(timeout_seconds=cx.cancel_wait)
-            await asyncio.sleep(cx.cancel_wait)
+
+            # Drive order-status polling until every order reaches a terminal
+            # state. cancel_all() sends the cancel requests but, on exchanges
+            # with asynchronous cancels (e.g. CoinSwitch), the orders only flip
+            # to CANCELLED on a later status poll — which no Clock fires here.
+            cancel_deadline = time.monotonic() + cx.cancel_wait
+            while time.monotonic() < cancel_deadline:
+                await _drive_order_status(cx)
+                if all(
+                    (cx.connector.in_flight_orders.get(oid) is None
+                     or cx.connector.in_flight_orders.get(oid).is_done)
+                    for oid in order_ids
+                ):
+                    break
+                await asyncio.sleep(1.5)
 
             for oid in order_ids:
                 o = cx.connector.in_flight_orders.get(oid)

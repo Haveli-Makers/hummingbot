@@ -46,7 +46,12 @@ class CsxConfigMap(BaseConnectorConfigMap):
                 "(e.g. socks5://user:pass@host:1080), or leave blank to connect directly"
             ),
             "is_secure": True,
-            "is_connect_key": False,
+            # MUST be True: only is_connect_key fields are passed to the connector
+            # by Security.api_keys() (api_keys_from_connector_config_map). With
+            # False the proxy URL is saved but never reaches CsxExchange, so CSX
+            # traffic goes direct and gets blocked (HTTP 403) on whitelisted IPs.
+            # The field stays optional because it has a default of "".
+            "is_connect_key": True,
             "prompt_on_new": True,
         },
     )

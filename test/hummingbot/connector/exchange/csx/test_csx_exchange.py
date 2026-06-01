@@ -192,15 +192,22 @@ class CsxExchangeOrderTests(IsolatedAsyncioWrapperTestCase):
         cls.exchange._set_trading_pair_symbol_map(bidict({"BTC/INR": "BTC-INR"}))
 
     async def test_place_order(self):
+        # CSX wraps the create-order response under "data".
         order_resp = {
-            "orderId": "order-uuid-123",
-            "status": "OPEN",
-            "createdAt": 1_725_010_288,
+            "data": {
+                "orderId": "order-uuid-123",
+                "status": "OPEN",
+                "createdAt": 1_725_010_288,
+            },
+            "message": "Order created",
         }
+        # Pre-seed the cached username so _place_order does not make a real
+        # GET /api/v1/me/ call to resolve it.
+        self.exchange._username = "test_user"
         with patch.object(self.exchange, "_api_post", new_callable=AsyncMock) as mock_post:
             mock_post.return_value = order_resp
             oid, ts = await self.exchange._place_order(
-                order_id="x-CSX-test",
+                order_id="xCSXtest",
                 trading_pair="BTC-INR",
                 amount=Decimal("0.001"),
                 trade_type=TradeType.BUY,
@@ -215,6 +222,37 @@ class CsxExchangeOrderTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual("BTC/INR", body["instrument"])
         self.assertEqual("BUY", body["side"])
         self.assertEqual("LIMIT", body["type"])
+        self.assertEqual("test_user", body["username"])
+        # clientOrderId must NOT be sent — CSX requires a UUID and rejects others.
+        self.assertNotIn("clientOrderId", body)
+
+    async def test_place_order_handles_top_level_response(self):
+        # Also accept an un-wrapped response shape for robustness.
+        order_resp = {"orderId": "oid-top", "createdAt": 1_725_010_288}
+        self.exchange._username = "test_user"
+        with patch.object(self.exchange, "_api_post", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = order_resp
+            oid, ts = await self.exchange._place_order(
+                order_id="xCSXtest",
+                trading_pair="BTC-INR",
+                amount=Decimal("0.001"),
+                trade_type=TradeType.SELL,
+                order_type=OrderType.LIMIT,
+                price=Decimal("3000000"),
+            )
+        self.assertEqual("oid-top", oid)
+
+    async def test_get_username_caches_profile_lookup(self):
+        self.exchange._username = None  # reset shared class-level cache
+        profile_resp = {"data": {"userName": "HaveliMakers4"}, "message": "ok"}
+        with patch.object(self.exchange, "_api_get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = profile_resp
+            first = await self.exchange._get_username()
+            second = await self.exchange._get_username()
+        self.assertEqual("HaveliMakers4", first)
+        self.assertEqual("HaveliMakers4", second)
+        # Cached: only one network call despite two invocations
+        self.assertEqual(1, mock_get.call_count)
 
     async def test_place_cancel_success(self):
         tracked = InFlightOrder(
@@ -227,9 +265,27 @@ class CsxExchangeOrderTests(IsolatedAsyncioWrapperTestCase):
             price=Decimal("3000000"),
             creation_timestamp=1_725_010_288.0,
         )
+        # CSX cancel response is wrapped: {"data": {"cancelled": true}, "message": ...}
+        with patch.object(self.exchange, "_api_delete", new_callable=AsyncMock) as mock_del:
+            mock_del.return_value = {"data": {"cancelled": True, "info": {"message": "Order Cancelled"}},
+                                     "message": "Order cancelled"}
+            result = await self.exchange._place_cancel("x-CSX-test", tracked)
+        self.assertTrue(result)
+
+    async def test_place_cancel_handles_status_shape(self):
+        tracked = InFlightOrder(
+            client_order_id="xCSXtest",
+            exchange_order_id="order-uuid-123",
+            trading_pair="BTC-INR",
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY,
+            amount=Decimal("0.001"),
+            price=Decimal("3000000"),
+            creation_timestamp=1_725_010_288.0,
+        )
         with patch.object(self.exchange, "_api_delete", new_callable=AsyncMock) as mock_del:
             mock_del.return_value = {"status": "CANCELLED"}
-            result = await self.exchange._place_cancel("x-CSX-test", tracked)
+            result = await self.exchange._place_cancel("xCSXtest", tracked)
         self.assertTrue(result)
 
     async def test_request_order_status_filled(self):

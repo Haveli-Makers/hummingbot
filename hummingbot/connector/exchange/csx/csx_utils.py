@@ -67,11 +67,13 @@ def parse_balance_response(response: Dict[str, Any]) -> Dict[str, Dict[str, Deci
     """
     Parse GET /api/v2/me/balance/ response.
 
-    Expected shape:
-      {"Available": {"BTC": "0.5", "INR": "50000"}, "Locked": {"BTC": "0.1"}}
+    CSX wraps the payload under a "data" key:
+      {"data": {"Available": {"BTC": "0.5", ...}, "Locked": {"BTC": "0.1"}}, "message": "..."}
+    A pre-unwrapped dict ({"Available": ..., "Locked": ...}) is also accepted.
     """
-    available = response.get("Available") or {}
-    locked = response.get("Locked") or {}
+    inner = response.get("data", response) if isinstance(response, dict) else {}
+    available = inner.get("Available") or {}
+    locked = inner.get("Locked") or {}
     all_assets = set(available.keys()) | set(locked.keys())
     result: Dict[str, Dict[str, Decimal]] = {}
     for asset in all_assets:

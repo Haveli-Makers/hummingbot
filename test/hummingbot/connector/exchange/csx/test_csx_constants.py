@@ -9,8 +9,11 @@ class CsxConstantsTests(unittest.TestCase):
         self.assertTrue(CONSTANTS.REST_URL.startswith("https://"))
 
     def test_all_order_states_are_mapped(self):
-        required = {"OPEN", "PARTIALLY_FILLED", "FILLED", "CANCELLED", "REJECTED"}
-        self.assertEqual(required, set(CONSTANTS.ORDER_STATE.keys()))
+        # CSX uses "FULFILLED" terminology; the map must at least cover these,
+        # and may include extra aliases (FILLED, CANCELED, etc.).
+        required = {"OPEN", "PARTIALLY_FULFILLED", "FULFILLED", "CANCELLED", "REJECTED"}
+        self.assertTrue(required <= set(CONSTANTS.ORDER_STATE.keys()),
+                        f"missing: {required - set(CONSTANTS.ORDER_STATE.keys())}")
 
     def test_rate_limits_list_not_empty(self):
         self.assertGreater(len(CONSTANTS.RATE_LIMITS), 0)
@@ -22,7 +25,9 @@ class CsxConstantsTests(unittest.TestCase):
         self.assertIn(CONSTANTS.TICKER_V2_PATH_URL, ids)
 
     def test_hbot_prefix(self):
-        self.assertTrue(CONSTANTS.HBOT_ORDER_ID_PREFIX.startswith("x-"))
+        # CSX rejects dashes in client order IDs, so the prefix must be alphanumeric.
+        self.assertTrue(CONSTANTS.HBOT_ORDER_ID_PREFIX.isalnum(),
+                        f"prefix must be alphanumeric (no dashes), got {CONSTANTS.HBOT_ORDER_ID_PREFIX!r}")
 
     def test_max_order_id_len(self):
         self.assertGreaterEqual(CONSTANTS.MAX_ORDER_ID_LEN, 36)

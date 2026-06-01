@@ -61,18 +61,16 @@ class CsxAPIUserStreamDataSource(UserStreamTrackerDataSource):
                     self.logger().warning(f"CSX balance poll error: {exc}")
 
                 # ── Open orders update ─────────────────────────────────────
+                # CSX requires both `onlyOpen` and `type` query parameters.
+                # The connector only places LIMIT orders, so we filter on LIMIT.
                 try:
                     orders_resp = await self._connector._api_get(
                         path_url=CONSTANTS.ME_ORDERS_PATH_URL,
-                        params={"status": "in:OPEN,PARTIALLY_FILLED"},
+                        params={"onlyOpen": "true", "type": CONSTANTS.ORDER_TYPE_LIMIT},
                         is_auth_required=True,
                     )
                     self._last_recv_time = time.time()
-                    orders = (
-                        orders_resp
-                        if isinstance(orders_resp, list)
-                        else orders_resp.get("orders", orders_resp.get("data", []))
-                    )
+                    orders = self._extract_orders(orders_resp)
                     if orders:
                         await output.put({"event": "order_update", "data": orders})
                 except Exception as exc:
@@ -87,6 +85,29 @@ class CsxAPIUserStreamDataSource(UserStreamTrackerDataSource):
                     "Unexpected error in CSX user-stream polling. Retrying in 5 s …"
                 )
                 await asyncio.sleep(5.0)
+
+    @staticmethod
+    def _extract_orders(orders_resp) -> list:
+        """
+        Normalise the open-orders response into a flat list of order dicts.
+
+        CSX wraps payloads in "data"; the orders may sit directly in that list
+        or under a nested "orders" key:
+          [{...}, {...}]                          → as-is
+          {"data": [{...}, ...]}                   → data
+          {"data": {"orders": [{...}, ...]}}       → data.orders
+        """
+        if isinstance(orders_resp, list):
+            return orders_resp
+        if not isinstance(orders_resp, dict):
+            return []
+        data = orders_resp.get("data", orders_resp)
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            orders = data.get("orders", data.get("data", []))
+            return orders if isinstance(orders, list) else []
+        return []
 
     # These are no-ops for REST-polling sources
     async def _subscribe_to_user_stream(self) -> None:

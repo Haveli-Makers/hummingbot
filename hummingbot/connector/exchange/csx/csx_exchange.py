@@ -78,6 +78,7 @@ class CsxExchange(ExchangePyBase):
         self._trading_pairs = trading_pairs
         self._proxy_url = csx_proxy_url or ""
         self._last_trades_poll_timestamp = 1.0
+        self._username: Optional[str] = None  # cached from GET /api/v1/me/ for order placement
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     # ── Static helpers ─────────────────────────────────────────────────────────
@@ -353,6 +354,30 @@ class CsxExchange(ExchangePyBase):
         return [t for t in tickers
                 if (t.get("Instrument") or t.get("instrument") or "").upper() in requested]
 
+    # ── Account profile ────────────────────────────────────────────────────────
+
+    async def _get_username(self) -> str:
+        """
+        Fetch and cache the account username from GET /api/v1/me/.
+
+        CSX requires a `username` field in the create-order body; its value is
+        the `userName` returned by the profile endpoint. Cached after the first
+        successful lookup since it does not change for the lifetime of the keys.
+        """
+        if self._username:
+            return self._username
+        response = await self._api_get(
+            path_url=CONSTANTS.PROFILE_PATH_URL,
+            is_auth_required=True,
+        )
+        data = response.get("data", response) if isinstance(response, dict) else {}
+        self._username = data.get("userName") or data.get("username") or ""
+        if not self._username:
+            self.logger().warning(
+                f"Could not determine CSX username from profile response: {response}"
+            )
+        return self._username
+
     # ── Order placement & cancellation ────────────────────────────────────────
 
     async def _place_order(
@@ -370,14 +395,20 @@ class CsxExchange(ExchangePyBase):
         except KeyError:
             instrument = trading_pair.replace("-", "/")
 
+        username = await self._get_username()
+
+        # NOTE: CSX requires clientOrderId to be a UUID (32-hex or 36-char canonical)
+        # and rejects any other format with "Invalid ClientOrderId". hummingbot's
+        # client order IDs are not UUIDs, so we OMIT clientOrderId entirely (which
+        # CSX accepts) and correlate via the server-assigned orderId returned below.
         payload: Dict[str, Any] = {
-            "clientOrderId": order_id,
             "instrument": instrument,
             "limitPrice": str(price),
             "quantity": str(amount),
             "quantityType": CONSTANTS.QUANTITY_TYPE_BASE,
             "side": CONSTANTS.SIDE_BUY if trade_type == TradeType.BUY else CONSTANTS.SIDE_SELL,
             "type": CONSTANTS.ORDER_TYPE_LIMIT,
+            "username": username,
         }
 
         result = await self._api_post(
@@ -386,8 +417,18 @@ class CsxExchange(ExchangePyBase):
             is_auth_required=True,
         )
 
-        exchange_order_id = str(result.get("orderId", result.get("order_id", "")))
-        created_at = float(result.get("createdAt", result.get("created_at", 0)))
+        # CSX wraps the payload under "data": {"data": {"orderId": "...", "createdAt": ...}}
+        data = result.get("data", result) if isinstance(result, dict) else {}
+        exchange_order_id = str(
+            data.get("orderId") or data.get("order_id")
+            or (result.get("orderId") if isinstance(result, dict) else "") or ""
+        )
+        created_at = float(
+            data.get("createdAt") or data.get("created_at")
+            or (result.get("createdAt") if isinstance(result, dict) else 0) or 0
+        )
+        if created_at == 0:
+            created_at = self._time_synchronizer.time()
         return exchange_order_id, created_at
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder) -> bool:
@@ -396,8 +437,12 @@ class CsxExchange(ExchangePyBase):
             limit_id=CONSTANTS.ORDER_BY_ID_PATH_URL,
             is_auth_required=True,
         )
-        status = (result.get("status") or "").upper()
-        return result.get("success") is True or status == "CANCELLED" or status == "CANCELED"
+        # CSX cancel response: {"data": {"cancelled": true, "info": {...}}, "message": "..."}
+        data = result.get("data", result) if isinstance(result, dict) else {}
+        if data.get("cancelled") is True or data.get("canceled") is True:
+            return True
+        status = (data.get("status") or result.get("status") or "").upper()
+        return result.get("success") is True or status in ("CANCELLED", "CANCELED")
 
     # ── Order & trade status ───────────────────────────────────────────────────
 
@@ -488,7 +533,9 @@ class CsxExchange(ExchangePyBase):
                 is_auth_required=True,
             )
 
-            balance_data = response if isinstance(response, dict) else {}
+            # CSX wraps the payload in a "data" key:
+            #   {"data": {"Available": {...}, "Locked": {...}}, "message": "..."}
+            balance_data = response.get("data", response) if isinstance(response, dict) else {}
             available = balance_data.get("Available") or {}
             locked = balance_data.get("Locked") or {}
             all_assets = set(available.keys()) | set(locked.keys())
@@ -540,6 +587,8 @@ class CsxExchange(ExchangePyBase):
 
                 if event_type == "balance_update":
                     balance_data = event.get("data") or {}
+                    # Unwrap CSX's "data" envelope if the raw response was forwarded
+                    balance_data = balance_data.get("data", balance_data) if isinstance(balance_data, dict) else {}
                     available = balance_data.get("Available") or {}
                     locked = balance_data.get("Locked") or {}
                     all_assets = set(available.keys()) | set(locked.keys())
@@ -556,7 +605,17 @@ class CsxExchange(ExchangePyBase):
                         exchange_order_id = str(order_data.get("orderId", order_data.get("order_id", "")))
                         status_str = (order_data.get("status") or "").upper()
 
-                        tracked = self._order_tracker.all_updatable_orders.get(client_order_id)
+                        # We omit clientOrderId on placement (CSX requires UUIDs),
+                        # so match primarily by the exchange orderId; fall back to
+                        # clientOrderId if the exchange happens to echo one.
+                        tracked = None
+                        if client_order_id:
+                            tracked = self._order_tracker.all_updatable_orders.get(client_order_id)
+                        if tracked is None and exchange_order_id:
+                            for o in self._order_tracker.all_updatable_orders.values():
+                                if o.exchange_order_id == exchange_order_id:
+                                    tracked = o
+                                    break
                         if tracked is None:
                             continue
 
@@ -568,7 +627,7 @@ class CsxExchange(ExchangePyBase):
                             trading_pair=tracked.trading_pair,
                             update_timestamp=float(order_data.get("updatedAt", 0)),
                             new_state=new_state,
-                            client_order_id=client_order_id,
+                            client_order_id=tracked.client_order_id,
                             exchange_order_id=exchange_order_id,
                         )
                         self._order_tracker.process_order_update(order_update=order_update)

@@ -103,19 +103,24 @@ class CoinswitchExchange(ExchangePyBase):
             params=params,
             is_auth_required=True,
         )
-        if response and "data" in response:
+        raw_data = response.get("data", {}) if isinstance(response, dict) else {}
+        if not isinstance(raw_data, dict):
+            # Guard: some response shapes wrap data in a list — not supported here
+            return results
+
+        if raw_data:
             if trading_pairs:
                 requested = {f"{tp.split('-', 1)[0]}/{tp.split('-', 1)[1]}".upper() for tp in trading_pairs}
-                found = {symbol.upper() for symbol in response["data"]}
+                found = {symbol.upper() for symbol in raw_data}
                 for sym in requested:
                     if sym not in found:
                         self.logger().warning(f"Skipping {sym}: symbol not found on {self.name}")
-                for symbol, ticker in response["data"].items():
+                for symbol, ticker in raw_data.items():
                     if symbol.upper() in requested:
                         ticker["symbol"] = symbol
                         results.append(ticker)
             else:
-                for symbol, ticker in response["data"].items():
+                for symbol, ticker in raw_data.items():
                     ticker["symbol"] = symbol
                     results.append(ticker)
 
@@ -307,43 +312,36 @@ class CoinswitchExchange(ExchangePyBase):
 
     async def _get_last_traded_prices(self, trading_pairs: List[str]) -> Dict[str, float]:
         """
-        Get last traded prices for trading pairs.
-        Args:
-            trading_pairs: List of trading pairs
-        Returns:
-            Dictionary mapping trading pair to price
+        Get last traded prices for all requested trading pairs in a single batch request
+        using the all-tickers endpoint, then filter down to the requested pairs.
         """
         prices = {}
+        try:
+            response = await self._api_get(
+                path_url=CONSTANTS.TICKER_ALL_PATH_URL,
+                params={"exchange": self._exchange},
+                is_auth_required=True,
+            )
+            ticker_map = response.get("data", {}) if isinstance(response, dict) else {}
+            if not isinstance(ticker_map, dict):
+                ticker_map = {}
 
-        # TODO: Optimize this by fetching all tickers and extracting prices for requested trading pairs instead of making individual requests for each pair
-        for trading_pair in trading_pairs:
-            try:
+            # Build reverse lookup: hb_pair → exchange_symbol
+            for trading_pair in trading_pairs:
                 try:
                     symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
                 except KeyError:
                     symbol = trading_pair.replace("-", "/")
-                params = {
-                    "exchange": self._exchange,
-                    "symbol": symbol
-                }
 
-                response = await self._api_get(
-                    path_url=CONSTANTS.TICKER_PATH_URL,
-                    params=params,
-                    is_auth_required=True,
-                )
-
-                if response and "data" in response:
-                    ticker_data = response.get("data", {})
-                    ticker_key = symbol.upper()
-                    if ticker_key in ticker_data:
-                        ticker = ticker_data[ticker_key]
-                        price = float(ticker.get("lastPrice", 0))
-                        prices[trading_pair] = price
-
-            except Exception as e:
-                self.logger().warning(f"Error fetching price for {trading_pair}: {e}")
-
+                ticker = ticker_map.get(symbol) or ticker_map.get(symbol.upper())
+                if ticker and isinstance(ticker, dict):
+                    raw = ticker.get("lastPrice") or ticker.get("last_price") or ticker.get("last") or 0
+                    try:
+                        prices[trading_pair] = float(str(raw))
+                    except (ValueError, TypeError):
+                        pass
+        except Exception as e:
+            self.logger().error(f"Error fetching last traded prices: {e}")
         return prices
 
     async def _place_order(self, order_id: str, trading_pair: str, amount: Decimal, trade_type: TradeType, order_type: OrderType, price: Decimal, **kwargs) -> Tuple[str, float]:
@@ -522,13 +520,32 @@ class CoinswitchExchange(ExchangePyBase):
 
                 if event_type == CONSTANTS.BALANCE_UPDATE_EVENT_TYPE:
                     balance_data = event_message.get("data", [])
+
+                    # Normalise: dict-of-assets → list, matching _update_balances logic
+                    if isinstance(balance_data, dict):
+                        balance_data = [
+                            {"currency": k, **v} if isinstance(v, dict)
+                            else {"currency": k, "main_balance": v}
+                            for k, v in balance_data.items()
+                        ]
+
+                    seen_assets: set = set()
                     for asset_data in balance_data:
-                        asset = asset_data.get("currency", "").upper()
-                        free = Decimal(str(asset_data.get("main_balance", 0)))
-                        locked = Decimal(str(asset_data.get("blocked_balance_order", 0)))
-                        total = free + locked
-                        self._account_balances[asset] = total
+                        if not isinstance(asset_data, dict):
+                            continue
+                        asset = asset_data.get("currency", asset_data.get("coin", "")).upper()
+                        if not asset:
+                            continue
+                        free = Decimal(str(asset_data.get("main_balance", asset_data.get("free", 0))))
+                        locked = Decimal(str(asset_data.get("blocked_balance_order", asset_data.get("locked", 0))))
+                        self._account_balances[asset] = free + locked
                         self._account_available_balances[asset] = free
+                        seen_assets.add(asset)
+
+                    # Remove assets that are no longer present (e.g. fully withdrawn)
+                    for stale in set(self._account_balances.keys()) - seen_assets:
+                        del self._account_balances[stale]
+                        del self._account_available_balances[stale]
 
                 elif event_type == CONSTANTS.ORDER_UPDATE_EVENT_TYPE:
                     orders_data = event_message.get("data", [])
@@ -571,9 +588,9 @@ class CoinswitchExchange(ExchangePyBase):
             for symbol, info in exchange_data.items():
                 try:
                     if "/" in symbol:
-                        base, quote = symbol.split("/")
+                        base, quote = symbol.split("/", 1)
                     elif "-" in symbol:
-                        base, quote = symbol.split("-")
+                        base, quote = symbol.split("-", 1)
                     else:
                         continue
 
@@ -638,16 +655,20 @@ class CoinswitchExchange(ExchangePyBase):
                                 token=trade.get("fee_asset", "")
                             )]
                         )
+                        fill_qty = Decimal(str(
+                            trade.get("qty") or trade.get("quantity") or trade.get("filled_qty") or 0
+                        ))
+                        fill_price = Decimal(str(trade.get("price", 0)))
                         trade_update = TradeUpdate(
-                            trade_id=str(trade.get("trade_id", "")),
+                            trade_id=str(trade.get("trade_id") or trade.get("id") or ""),
                             client_order_id=order.client_order_id,
                             exchange_order_id=str(order.exchange_order_id),
                             trading_pair=order.trading_pair,
                             fee=fee,
-                            fill_base_amount=Decimal(str(trade.get("qty", 0))),
-                            fill_quote_amount=Decimal(str(trade.get("qty", 0))) * Decimal(str(trade.get("price", 0))),
-                            fill_price=Decimal(str(trade.get("price", 0))),
-                            fill_timestamp=float(trade.get("time", 0)) / 1000.0,
+                            fill_base_amount=fill_qty,
+                            fill_quote_amount=fill_qty * fill_price,
+                            fill_price=fill_price,
+                            fill_timestamp=float(trade.get("time") or trade.get("timestamp") or 0) / 1000.0,
                         )
                         trade_updates.append(trade_update)
 

@@ -472,13 +472,25 @@ async def cancel_all_open_orders(cx: ConnectorWrapper) -> int:
     return len(open_ids)
 
 
-def assert_sufficient_balance(
+async def assert_sufficient_balance(
     cx: ConnectorWrapper,
     trade_type,
     amount: Decimal,
     price: Decimal,
 ) -> None:
-    """Skip the test with a clear message if the account lacks funds for the order."""
+    """Skip the test with a clear message if the account lacks funds for the order.
+
+    Refreshes balances via REST first: with no Clock attached the connector
+    never re-polls on its own, and a stale (or connector-corrupted) in-memory
+    cache would make every balance check read the wrong number — e.g. a balance
+    that never recovers after a previous test placed and cancelled an order.
+    """
+    update_fn = getattr(cx.connector, "_update_balances", None)
+    if update_fn is not None:
+        try:
+            await update_fn()
+        except Exception:
+            pass
     base, quote = cx.cfg.trading_pair.split("-")
     if trade_type == TradeType.BUY:
         required = amount * price
@@ -890,7 +902,7 @@ class TestConnectorE2E:
         cx.log_value("buy_price", buy_price)
         cx.log_value("order_amount", cx.cfg.limit_buy_amount)
 
-        assert_sufficient_balance(cx, TradeType.BUY, cx.cfg.limit_buy_amount, buy_price)
+        await assert_sufficient_balance(cx, TradeType.BUY, cx.cfg.limit_buy_amount, buy_price)
 
         client_id = place_limit_buy(cx, buy_price)
         cx.log_value("placed_order_client_id", client_id)
@@ -942,7 +954,7 @@ class TestConnectorE2E:
         cx.log_value("mid_price", mid)
         cx.log_value("buy_price", buy_price)
 
-        assert_sufficient_balance(cx, TradeType.BUY, cx.cfg.limit_buy_amount, buy_price)
+        await assert_sufficient_balance(cx, TradeType.BUY, cx.cfg.limit_buy_amount, buy_price)
 
         client_id = place_limit_buy(cx, buy_price)
         cx.log_value("placed_order_client_id", client_id)
@@ -983,7 +995,7 @@ class TestConnectorE2E:
         cx.log_value("mid_price", mid)
         cx.log_value("buy_price", buy_price)
 
-        assert_sufficient_balance(cx, TradeType.BUY, cx.cfg.limit_buy_amount, buy_price)
+        await assert_sufficient_balance(cx, TradeType.BUY, cx.cfg.limit_buy_amount, buy_price)
 
         client_id = place_limit_buy(cx, buy_price)
         cx.log_value("placed_order_client_id", client_id)
@@ -1025,7 +1037,7 @@ class TestConnectorE2E:
         cx.log_value("order_prices", [str(p) for p in prices])
 
         for p in prices:
-            assert_sufficient_balance(cx, TradeType.BUY, cx.cfg.limit_buy_amount, p)
+            await assert_sufficient_balance(cx, TradeType.BUY, cx.cfg.limit_buy_amount, p)
 
         order_ids: List[str] = []
         for price in prices:
@@ -1092,8 +1104,8 @@ class TestConnectorE2E:
             "adjust them in .env."
         )
 
-        assert_sufficient_balance(cx, TradeType.BUY, cx.cfg.limit_buy_amount, price_a)
-        assert_sufficient_balance(cx, TradeType.BUY, cx.cfg.limit_buy_amount, price_b)
+        await assert_sufficient_balance(cx, TradeType.BUY, cx.cfg.limit_buy_amount, price_a)
+        await assert_sufficient_balance(cx, TradeType.BUY, cx.cfg.limit_buy_amount, price_b)
 
         original_id = place_limit_buy(cx, price_a)
         cx.log_value("original_order_id", original_id)
@@ -1174,7 +1186,7 @@ class TestConnectorE2E:
             cx.log_value("setup_buy_price", setup_buy_price)
             cx.log_value("setup_buy_amount", cx.cfg.limit_sell_amount)
 
-            assert_sufficient_balance(cx, TradeType.BUY, cx.cfg.limit_sell_amount, setup_buy_price)
+            await assert_sufficient_balance(cx, TradeType.BUY, cx.cfg.limit_sell_amount, setup_buy_price)
 
             baseline_base = cx.connector.get_available_balance(base_token)
             setup_buy_id = cx.connector.buy(
@@ -1248,7 +1260,7 @@ class TestConnectorE2E:
         cx.log_value("sell_price", sell_price)
 
         try:
-            assert_sufficient_balance(cx, TradeType.SELL, cx.cfg.limit_sell_amount, sell_price)
+            await assert_sufficient_balance(cx, TradeType.SELL, cx.cfg.limit_sell_amount, sell_price)
 
             sell_id = place_limit_sell(cx, sell_price)
             cx.log_value("placed_sell_id", sell_id)

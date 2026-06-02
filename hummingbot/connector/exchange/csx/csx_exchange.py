@@ -23,6 +23,40 @@ from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFa
 _logger = logging.getLogger(__name__)
 
 
+def _resolve_proxy_url(explicit: str = "") -> str:
+    """
+    Resolve the proxy URL for a CSX connector instance.
+
+    CSX enforces IP whitelisting on EVERY endpoint — including public ones like
+    the ticker — so every CsxExchange instance needs the proxy or it gets HTTP
+    403. Some hummingbot components (rate oracle, volume oracle, trading-pair
+    fetcher) build throwaway connectors WITHOUT passing the proxy, so we resolve
+    it centrally here.
+
+    Precedence:
+      1. explicit value (the CLI `connect csx` config, passed to __init__)
+      2. CSX_PROXY_URL environment variable (handy for scripts / tests)
+      3. the saved CSX connector config via Security (so the oracle sources and
+         trading-pair fetcher pick up the same proxy you configured in the CLI)
+    """
+    if explicit:
+        return explicit
+
+    import os
+    env_proxy = os.environ.get("CSX_PROXY_URL", "")
+    if env_proxy:
+        return env_proxy
+
+    # Lazy, defensive lookup of the saved connector config. Returns "" if the
+    # config does not exist or the keystore has not been decrypted yet.
+    try:
+        from hummingbot.client.config.security import Security
+        keys = Security.api_keys("csx") or {}
+        return keys.get("csx_proxy_url", "") or ""
+    except Exception:
+        return ""
+
+
 def _extract_instruments_list(response: Any) -> list:
     """
     Navigate the CSX instruments response to a flat list of instrument objects.
@@ -76,7 +110,10 @@ class CsxExchange(ExchangePyBase):
         self._domain = domain
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
-        self._proxy_url = csx_proxy_url or ""
+        # Resolve the proxy from the explicit arg, env var, or saved config so
+        # oracle/trading-pair-fetcher instances (which don't pass one) still
+        # route through the whitelisted IP. CSX 403s without it on all endpoints.
+        self._proxy_url = _resolve_proxy_url(csx_proxy_url or "")
         self._last_trades_poll_timestamp = 1.0
         self._username: Optional[str] = None  # cached from GET /api/v1/me/ for order placement
         super().__init__(balance_asset_limit, rate_limits_share_pct)
@@ -281,18 +318,22 @@ class CsxExchange(ExchangePyBase):
 
                     trading_pair = f"{base.upper()}-{quote.upper()}"
 
-                    # CSX precision fields: basePrecision=step, quotePrecision=tick
+                    # CSX instrument precision fields (confirmed live):
+                    #   basePrecision  → base-asset quantity step  (e.g. "0.000001" BTC)
+                    #   limitPrecision → LIMIT PRICE tick           (e.g. "1" → integer INR price)
+                    #   quotePrecision → quote-amount precision     (e.g. "0.01" INR)
+                    # Using quotePrecision as the price tick is WRONG and triggers
+                    # "Limit Price Precision is not correct" — the tick is limitPrecision.
                     step = Decimal(str(
                         info.get("basePrecision") or info.get("stepSize")
                         or info.get("step_size") or "0.0001"))
                     tick = Decimal(str(
-                        info.get("quotePrecision") or info.get("tickSize")
+                        info.get("limitPrecision") or info.get("tickSize")
                         or info.get("tick_size") or "0.01"))
-                    min_qty = step   # min order size == one step
+                    min_qty = step   # min order size == one base step
                     max_qty = Decimal(str(info.get("maxQuantity") or info.get("max_quantity") or "1000000"))
                     min_notional = Decimal(str(
-                        info.get("limitPrecision") or info.get("minNotional")
-                        or info.get("min_notional") or "1"))
+                        info.get("minNotional") or info.get("min_notional") or "1"))
 
                     trading_rules.append(
                         TradingRule(

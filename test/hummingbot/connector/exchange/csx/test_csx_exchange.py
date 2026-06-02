@@ -147,6 +147,30 @@ class CsxExchangeTradingRulesTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(Decimal("0.0001"), rule.min_order_size)
         self.assertEqual(Decimal("1"), rule.min_price_increment)
 
+    async def test_format_trading_rules_from_csx_native_fields(self):
+        # Real CSX instrument schema: basePrecision / quotePrecision / limitPrecision.
+        # limitPrecision is the PRICE tick (1 → integer prices for BTC/INR).
+        info = {
+            "data": {
+                "instruments": [
+                    {
+                        "instrument": "BTC/INR",
+                        "basePrecision": "0.000001",
+                        "quotePrecision": "0.01",
+                        "limitPrecision": "1",
+                    }
+                ]
+            }
+        }
+        rules = await self.exchange._format_trading_rules(info)
+        self.assertEqual(1, len(rules))
+        rule = rules[0]
+        self.assertEqual("BTC-INR", rule.trading_pair)
+        # price tick must come from limitPrecision, NOT quotePrecision (0.01)
+        self.assertEqual(Decimal("1"), rule.min_price_increment)
+        self.assertEqual(Decimal("0.000001"), rule.min_base_amount_increment)
+        self.assertEqual(Decimal("0.000001"), rule.min_order_size)
+
     async def test_format_trading_rules_empty_input(self):
         rules = await self.exchange._format_trading_rules([])
         self.assertEqual([], rules)

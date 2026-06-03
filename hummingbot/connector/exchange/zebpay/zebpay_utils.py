@@ -62,6 +62,28 @@ def unwrap_data(response: Any) -> Any:
     return response
 
 
+def raise_for_status(response: Any) -> Any:
+    """
+    Raise an IOError if a Zebpay response envelope signals a business error.
+
+    Zebpay returns HTTP 200 even for rejected requests, putting the real code in
+    `statusCode` (e.g. 77 for "Rate should be in the range …") and the reason in
+    `statusDescription`. Without this check, callers see `data: null` and silently
+    treat a rejection as success (e.g. an order that never gets an exchange id).
+    """
+    if isinstance(response, dict):
+        sc = response.get("statusCode")
+        if sc is not None:
+            try:
+                sc_int = int(sc)
+            except (ValueError, TypeError):
+                sc_int = None
+            if sc_int is not None and sc_int not in (200, 201):
+                reason = response.get("statusDescription") or response.get("message") or response
+                raise IOError(f"Zebpay API error (statusCode {sc}): {reason}")
+    return response
+
+
 def parse_balance_response(response: Any) -> Dict[str, Dict[str, Decimal]]:
     """
     Parse GET /api/v2/account/balance into {ASSET: {free, locked, total}}.

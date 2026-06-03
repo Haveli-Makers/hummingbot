@@ -123,6 +123,27 @@ class ZebpayExchangeOrderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("3000000", body["price"])
         self.assertEqual("0.001", body["amount"])
 
+    async def test_place_order_rejection_raises(self):
+        # Zebpay rejects with HTTP 200 + statusCode 77 (price out of band) → must raise.
+        rejected = {"data": None, "statusCode": 77,
+                    "statusDescription": "Rate should be in the range of 5694116 - 7703804"}
+        with patch.object(self.exchange, "_api_post", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = rejected
+            with self.assertRaises(IOError):
+                await self.exchange._place_order(
+                    order_id="ZEBtest", trading_pair="BTC-INR", amount=Decimal("0.001"),
+                    trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("3000000"),
+                )
+
+    async def test_place_order_missing_orderid_raises(self):
+        with patch.object(self.exchange, "_api_post", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = {"data": {}, "statusCode": 200}
+            with self.assertRaises(IOError):
+                await self.exchange._place_order(
+                    order_id="ZEBtest", trading_pair="BTC-INR", amount=Decimal("0.001"),
+                    trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("3000000"),
+                )
+
     async def test_place_cancel_success(self):
         tracked = InFlightOrder(
             client_order_id="ZEBtest", exchange_order_id="ord-1", trading_pair="BTC-INR",

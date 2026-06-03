@@ -10,7 +10,7 @@ from hummingbot.connector.exchange.zebpay import zebpay_constants as CONSTANTS, 
 from hummingbot.connector.exchange.zebpay.zebpay_api_order_book_data_source import ZebpayAPIOrderBookDataSource
 from hummingbot.connector.exchange.zebpay.zebpay_api_user_stream_data_source import ZebpayAPIUserStreamDataSource
 from hummingbot.connector.exchange.zebpay.zebpay_auth import ZebpayAuth
-from hummingbot.connector.exchange.zebpay.zebpay_utils import str_to_decimal, unwrap_data
+from hummingbot.connector.exchange.zebpay.zebpay_utils import raise_for_status, str_to_decimal, unwrap_data
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
@@ -328,12 +328,19 @@ class ZebpayExchange(ExchangePyBase):
             is_auth_required=True,
         )
 
+        # Zebpay returns HTTP 200 even when it rejects an order (e.g. price outside
+        # the allowed band → statusCode 77, data=null). Surface it as a failure so
+        # the order is not left silently OPEN with an empty exchange order id.
+        raise_for_status(result)
+
         data = unwrap_data(result)
         if isinstance(data, list) and data:
             data = data[0]
         data = data if isinstance(data, dict) else {}
 
         exchange_order_id = str(data.get("orderId") or data.get("id") or "")
+        if not exchange_order_id:
+            raise IOError(f"Zebpay accepted the request but returned no orderId: {result}")
         ts_raw = data.get("timestamp") or data.get("createdAt") or 0
         transact_time = float(ts_raw) / 1000.0 if ts_raw else self._time_synchronizer.time()
         return exchange_order_id, transact_time
@@ -344,13 +351,15 @@ class ZebpayExchange(ExchangePyBase):
             params={"orderId": tracked_order.exchange_order_id},
             is_auth_required=True,
         )
+        # Raise on a business error (e.g. order already gone) so the cancel flow's
+        # not-found classification can handle it instead of reporting a false cancel.
+        raise_for_status(result)
         data = unwrap_data(result)
         if isinstance(data, dict):
             status = str(data.get("status") or "").upper()
             if status in ("CANCELLED", "CANCELED") or data.get("cancelled") is True:
                 return True
-        # A bare success envelope is also treated as a successful cancel.
-        return bool(result) and not (isinstance(result, dict) and result.get("statusCode", 200) >= 400)
+        return bool(result)
 
     # ── Order & trade status ───────────────────────────────────────────────────
 
@@ -360,6 +369,7 @@ class ZebpayExchange(ExchangePyBase):
             params={"orderId": tracked_order.exchange_order_id},
             is_auth_required=True,
         )
+        raise_for_status(result)
         data = unwrap_data(result)
         if isinstance(data, list) and data:
             data = data[0]

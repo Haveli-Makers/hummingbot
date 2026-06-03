@@ -4,6 +4,7 @@ from decimal import Decimal
 from hummingbot.connector.exchange.zebpay.zebpay_utils import (
     ZebpayConfigMap,
     parse_balance_response,
+    raise_for_status,
     str_to_decimal,
     unwrap_data,
 )
@@ -40,6 +41,17 @@ class ZebpayUtilsTests(unittest.TestCase):
 
     def test_parse_balance_response_empty(self):
         self.assertEqual({}, parse_balance_response({"data": []}))
+
+    def test_raise_for_status_ok(self):
+        ok = {"data": {"orderId": "1"}, "statusCode": 200}
+        self.assertIs(ok, raise_for_status(ok))  # no raise, returns input
+        self.assertEqual([1], raise_for_status([1]))  # non-dict passes through
+
+    def test_raise_for_status_error(self):
+        rejected = {"data": None, "statusCode": 77,
+                    "statusDescription": "Rate should be in the range of 5694116 - 7703804"}
+        with self.assertRaises(IOError):
+            raise_for_status(rejected)
 
 
 class ZebpayConfigMapTests(unittest.TestCase):

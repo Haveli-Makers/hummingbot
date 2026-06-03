@@ -6,6 +6,13 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 from hummingbot.core.web_assistant.auth import AuthBase
 from hummingbot.core.web_assistant.connections.data_types import RESTRequest, WSRequest
 
+# CSX rejects any request whose timestamp is in the future ("Request cannot be for
+# a future time"). Since the connector signs with the local clock (CSX has no
+# server-time endpoint), even ~1s of client-clock-ahead skew causes intermittent
+# rejections. Back-date the signed timestamp by this many seconds so it is never
+# in the future, while staying comfortably inside CSX's (generous) staleness window.
+REQUEST_TIME_BUFFER_S = 2
+
 
 class CsxAuth(AuthBase):
     """
@@ -61,7 +68,7 @@ class CsxAuth(AuthBase):
         if not self.api_key or not self._private_key:
             return request
 
-        timestamp = str(int(self._time_provider.time()))
+        timestamp = str(int(self._time_provider.time()) - REQUEST_TIME_BUFFER_S)
 
         method_str = request.method.name if hasattr(request.method, "name") else str(request.method).upper()
 

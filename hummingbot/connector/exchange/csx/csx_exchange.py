@@ -216,7 +216,8 @@ class CsxExchange(ExchangePyBase):
     # ── Exception classification ───────────────────────────────────────────────
 
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception) -> bool:
-        return "timestamp" in str(request_exception).lower()
+        msg = str(request_exception).lower()
+        return "timestamp" in msg or "future time" in msg or "stale request" in msg
 
     def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
         msg = str(status_update_exception).lower()

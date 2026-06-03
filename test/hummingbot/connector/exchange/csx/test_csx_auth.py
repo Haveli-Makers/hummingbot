@@ -44,7 +44,10 @@ class CsxAuthSignatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("CSX-ACCESS-KEY", result.headers)
         self.assertIn("CSX-SIGNATURE", result.headers)
         self.assertIn("CSX-ACCESS-TIMESTAMP", result.headers)
-        self.assertEqual("1725010288", result.headers["CSX-ACCESS-TIMESTAMP"])
+        # Timestamp is back-dated by REQUEST_TIME_BUFFER_S to avoid "future time" rejections.
+        from hummingbot.connector.exchange.csx.csx_auth import REQUEST_TIME_BUFFER_S
+        self.assertEqual(str(1725010288 - REQUEST_TIME_BUFFER_S),
+                         result.headers["CSX-ACCESS-TIMESTAMP"])
 
     async def test_rest_authenticate_post_sorts_body(self):
         import json

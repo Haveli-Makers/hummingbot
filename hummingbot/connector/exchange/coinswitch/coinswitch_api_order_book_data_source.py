@@ -69,22 +69,14 @@ class CoinswitchAPIOrderBookDataSource(OrderBookTrackerDataSource):
     async def _order_book_snapshot(self, trading_pair: str) -> OrderBookMessage:
         snapshot_response = await self._request_order_book_snapshot(trading_pair)
         snapshot_timestamp = self._time()
-
-        # Unwrap response defensively — some API shapes nest the order book inside
-        # {"data": {...}} or {"data": [{...}]} (list with one element)
-        raw = snapshot_response.get("data", snapshot_response)
-        if isinstance(raw, list) and raw:
-            raw = raw[0]
-        if not isinstance(raw, dict):
-            raw = {}
-
+        snapshot_data = snapshot_response.get("data", {})
         return OrderBookMessage(
             message_type=OrderBookMessageType.SNAPSHOT,
             content={
                 "trading_pair": trading_pair,
                 "update_id": int(snapshot_timestamp * 1000),
-                "bids": raw.get("bids", []),
-                "asks": raw.get("asks", []),
+                "bids": snapshot_data.get("bids", []),
+                "asks": snapshot_data.get("asks", []),
             },
             timestamp=snapshot_timestamp,
         )

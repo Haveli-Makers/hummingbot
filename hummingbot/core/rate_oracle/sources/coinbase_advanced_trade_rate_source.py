@@ -17,7 +17,6 @@ if TYPE_CHECKING:
 class CoinbaseAdvancedTradeRateSource(RateSourceBase):
     def __init__(self, use_auth_for_public_endpoints: bool = False):
         super().__init__()
-        self._coinbase_exchange: CoinbaseAdvancedTradeExchange | None = None  # delayed because of circular reference
         self._use_auth_for_public_endpoints = use_auth_for_public_endpoints
 
     @property
@@ -32,7 +31,7 @@ class CoinbaseAdvancedTradeRateSource(RateSourceBase):
         self._ensure_exchanges()
         results = {}
         tasks = [
-            self._get_coinbase_prices(exchange=self._coinbase_exchange, quote_token=quote_token),
+            self._get_coinbase_prices(exchange=self._exchange, quote_token=quote_token),
         ]
         task_results = await safe_gather(*tasks, return_exceptions=True)
         for task_result in task_results:
@@ -45,10 +44,6 @@ class CoinbaseAdvancedTradeRateSource(RateSourceBase):
             else:
                 results |= {f"{k}-{quote_token}": v for k, v in task_result.items()}
         return results
-
-    def _ensure_exchanges(self):
-        if self._coinbase_exchange is None:
-            self._coinbase_exchange = self._build_coinbase_connector(domain="com")
 
     async def _get_coinbase_prices(
             self,
@@ -66,7 +61,7 @@ class CoinbaseAdvancedTradeRateSource(RateSourceBase):
         self.logger().debug(f"   {token_price.get('ATOM')} {quote_token} for 1 ATOM")
         return {token: Decimal(1.0) / Decimal(price) for token, price in token_price.items() if Decimal(price) != 0}
 
-    def _build_coinbase_connector(self, domain: str = DEFAULT_DOMAIN) -> 'CoinbaseAdvancedTradeExchange':
+    def _build_exchange(self) -> 'CoinbaseAdvancedTradeExchange':
         from hummingbot.client.settings import AllConnectorSettings
         from hummingbot.connector.exchange.coinbase_advanced_trade.coinbase_advanced_trade_exchange import (
             CoinbaseAdvancedTradeExchange,
@@ -84,5 +79,5 @@ class CoinbaseAdvancedTradeRateSource(RateSourceBase):
             coinbase_advanced_trade_api_secret=api_secret,
             trading_pairs=[],
             trading_required=False,
-            domain=domain,
+            domain=DEFAULT_DOMAIN,
         )

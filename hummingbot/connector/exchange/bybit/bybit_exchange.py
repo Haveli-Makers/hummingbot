@@ -116,6 +116,30 @@ class BybitExchange(ExchangePyBase):
     def supported_order_types(self):
         return [OrderType.MARKET, OrderType.LIMIT, OrderType.LIMIT_MAKER]
 
+    async def get_all_24h_volume_tickers(self, category: str = None, trading_pairs: Optional[List[str]] = None) -> Dict[str, Any]:
+        if not trading_pairs:
+            return await self._api_get(
+                path_url=CONSTANTS.LAST_TRADED_PRICE_PATH,
+                params={"category": category or CONSTANTS.TRADE_CATEGORY},
+            )
+        all_items = []
+        for tp in trading_pairs:
+            base, quote = tp.split("-", 1)
+            symbol = f"{base}{quote}"
+            try:
+                resp = await self._api_get(
+                    path_url=CONSTANTS.LAST_TRADED_PRICE_PATH,
+                    params={"category": category or CONSTANTS.TRADE_CATEGORY, "symbol": symbol},
+                )
+                all_items.extend(resp.get("result", {}).get("list", []))
+            except IOError as e:
+                err = str(e)
+                if "HTTP status is 400" in err or "HTTP status is 404" in err:
+                    self.logger().warning(f"Skipping {tp}: symbol not found on {self.name}")
+                else:
+                    raise
+        return {"result": {"list": all_items}}
+
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
         error_description = str(request_exception)
         is_time_synchronizer_related = ("-1021" in error_description

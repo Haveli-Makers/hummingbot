@@ -1030,7 +1030,7 @@ class TestConnectorE2E:
 
         mid = get_mid_price(cx)
         prices = [
-            round(mid * Decimal(str(cx.cfg.buy_price_offset - 0.02 * i)), 8)
+            round(mid * Decimal(str(cx.cfg.buy_price_offset + 0.002 * i)), 8)
             for i in range(3)
         ]
         cx.log_value("mid_price", mid)

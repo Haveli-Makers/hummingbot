@@ -29,6 +29,10 @@ ORDER_FILLS_PATH_URL = "/api/v2/ex/order/fills"
 # Used as a stable network/health check (public, cheap).
 PING_PATH_URL = ALL_TICKERS_PATH_URL
 
+# Observed live: INR pairs require >= 99 INR
+MIN_NOTIONAL_BY_QUOTE = {"INR": "99"}
+DEFAULT_MIN_NOTIONAL = "1"
+
 SIDE_BUY = "BUY"
 SIDE_SELL = "SELL"
 

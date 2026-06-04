@@ -73,6 +73,16 @@ class ZebpayExchangeTradingPairTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("BTC-INR", rule.trading_pair)
         self.assertEqual(Decimal("1"), rule.min_price_increment)
         self.assertEqual(Decimal("0.000001"), rule.min_base_amount_increment)
+        # exchangeInfo has no minNotional → INR pairs fall back to the known 99 INR floor.
+        self.assertEqual(Decimal("99"), rule.min_notional_size)
+
+    async def test_format_trading_rules_uses_api_min_notional_when_present(self):
+        info = {"data": [{
+            "symbol": "BTC-INR", "baseAsset": "BTC", "quoteAsset": "INR",
+            "tickSz": "1", "lotSz": "0.000001", "minNotional": "150",
+        }]}
+        rules = await self.exchange._format_trading_rules(info)
+        self.assertEqual(Decimal("150"), rules[0].min_notional_size)
 
 
 class ZebpayExchangeBalanceTests(unittest.IsolatedAsyncioTestCase):

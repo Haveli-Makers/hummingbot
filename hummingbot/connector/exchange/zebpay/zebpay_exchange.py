@@ -237,7 +237,17 @@ class ZebpayExchange(ExchangePyBase):
                     else (Decimal(10) ** -int(qty_prec) if qty_prec is not None else Decimal("0.0001"))
                 )
                 min_order_size = str_to_decimal(item.get("minSize", item.get("minQty", lot))) or min_base_increment
-                min_notional = str_to_decimal(item.get("minNotional", item.get("minQuoteSize", "1"))) or Decimal("1")
+
+                # Zebpay doesn't publish a min order value in exchangeInfo, but it
+                # enforces one server-side (INR pairs: 99 INR).
+                quote_asset = (quote or (trading_pair.split("-")[1] if "-" in trading_pair else "")).upper()
+                api_min_notional = item.get("minNotional", item.get("minQuoteSize"))
+                if api_min_notional not in (None, ""):
+                    min_notional = str_to_decimal(api_min_notional)
+                else:
+                    min_notional = str_to_decimal(
+                        CONSTANTS.MIN_NOTIONAL_BY_QUOTE.get(quote_asset, CONSTANTS.DEFAULT_MIN_NOTIONAL)
+                    )
 
                 trading_rules.append(
                     TradingRule(

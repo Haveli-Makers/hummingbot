@@ -83,6 +83,7 @@ class ExchangePyBase(ExchangeBase, ABC):
         self._trading_rules_polling_task: Optional[asyncio.Task] = None
         self._trading_fees_polling_task: Optional[asyncio.Task] = None
         self._lost_orders_update_task: Optional[asyncio.Task] = None
+        self._orders_pending_edit_recovery: set = set()
 
         self._time_synchronizer = TimeSynchronizer()
         self._throttler = AsyncThrottler(
@@ -520,7 +521,8 @@ class ExchangePyBase(ExchangeBase, ABC):
                 )
         except OrderEditError as e:
             self.logger().error(f"Order edit failed for {client_order_id}: {e}")
-            recoverable = not isinstance(e, (OrderEditBalanceTimeout, OrderEditReplacementFailed))
+            recovery_in_progress = client_order_id in self._orders_pending_edit_recovery
+            recoverable = recovery_in_progress or not isinstance(e, (OrderEditBalanceTimeout, OrderEditReplacementFailed))
             self._emit_order_edit_failed_event(tracked_order, str(e), recoverable=recoverable)
             return None
         except Exception as e:
@@ -533,7 +535,6 @@ class ExchangePyBase(ExchangeBase, ABC):
         editable_states = {
             OrderState.OPEN,
             OrderState.PARTIALLY_FILLED,
-            OrderState.PENDING_CREATE,
         }
         return order.current_state in editable_states
 
@@ -667,6 +668,7 @@ class ExchangePyBase(ExchangeBase, ABC):
                 f"CRITICAL: Order {tracked_order.client_order_id} cancelled but replacement failed: {e}. "
                 f"Starting recovery attempt..."
             )
+            self._orders_pending_edit_recovery.add(tracked_order.client_order_id)
             safe_ensure_future(self._attempt_edit_recovery(context, e))
             raise
 
@@ -698,6 +700,8 @@ class ExchangePyBase(ExchangeBase, ABC):
                         raise OrderEditCancelFailed(
                             f"Cannot edit: Order {order.client_order_id} already filled"
                         )
+                except OrderEditCancelFailed:
+                    raise
                 except Exception:
                     pass
             raise OrderEditCancelFailed(f"Cancel failed: {e}")
@@ -849,6 +853,7 @@ class ExchangePyBase(ExchangeBase, ABC):
                 await self._update_all_balances()
                 new_order_id = await self._place_replacement_order(context)
 
+                self._orders_pending_edit_recovery.discard(order.client_order_id)
                 self.logger().info(
                     f"Edit recovery successful! Replacement order {new_order_id} "
                     f"placed for cancelled order {order.client_order_id}"
@@ -869,6 +874,7 @@ class ExchangePyBase(ExchangeBase, ABC):
                     f"Edit recovery attempt {attempt + 1}/{max_recovery_attempts} failed: {e}"
                 )
 
+        self._orders_pending_edit_recovery.discard(order.client_order_id)
         self.logger().error(
             f"FAILED TO RECOVER from edit failure for order {order.client_order_id}. "
             f"Funds may be unallocated. Please check exchange manually."

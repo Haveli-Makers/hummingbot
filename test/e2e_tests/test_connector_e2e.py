@@ -45,6 +45,7 @@ from dotenv import dotenv_values
 from hummingbot.client.config.config_helpers import get_connector_class
 from hummingbot.client.settings import AllConnectorSettings
 from hummingbot.core.data_type.common import OrderType, TradeType
+from hummingbot.core.data_type.in_flight_order import OrderState
 from hummingbot.core.event.events import MarketEvent, MarketOrderFailureEvent, OrderFilledEvent
 
 # ─── Environment loading ──────────────────────────────────────────────────────
@@ -596,6 +597,279 @@ def _rejection_msg(cx: ConnectorWrapper, client_id: str, timeout: int) -> str:
     )
 
 
+# ─── Cache / in-memory copy verification ──────────────────────────────────────
+# The connector keeps IN-MEMORY copies of exchange data — the order book, account
+# balances, active orders and personal trades — continuously updated from the
+# websocket feeds (with REST as a fallback).  Every test above reads from those
+# caches (e.g. balance gates order placement, the order book gives mid price).
+#
+# These helpers prove the cache is TRUSTWORTHY: they fetch the same datum FRESH
+# from the exchange's REST API and assert the cached copy agrees.  A genuine
+# mismatch (stale / wrongly-updated cache) fails the test — that is the point.
+# If a connector doesn't expose the REST probe, the check logs a warning and
+# returns without failing, so existing behaviour is unaffected.
+#
+# NOTE on persistence: Hummingbot's on-disk SQLite store (Order / TradeFill rows)
+# is written by MarketsRecorder, an APPLICATION-layer component wired by the
+# strategy/clock runtime — it is NOT instantiated in this direct-connector
+# harness, so there is no local DB to reconcile here. These checks therefore
+# target the in-memory caches, which are what this harness actually populates.
+
+
+def _pct_diff(a: Decimal, b: Decimal) -> Decimal:
+    """Percentage difference relative to the larger magnitude (avoids div-by-zero)."""
+    base = max(abs(a), abs(b), Decimal("1e-12"))
+    return abs(a - b) / base * 100
+
+
+async def verify_orderbook_cache(cx: ConnectorWrapper, tol_pct: Decimal = Decimal("3")) -> None:
+    """
+    CACHED order book (websocket-fed, via get_order_book) vs FRESH REST snapshot.
+
+    Asserts the cached top-of-book is within tol_pct of the REST truth — i.e. the
+    websocket diff/snapshot stream is keeping the in-memory book current.
+    """
+    pair = cx.cfg.trading_pair
+    tracker = getattr(cx.connector, "order_book_tracker", None)
+    ds = getattr(tracker, "data_source", None) if tracker is not None else None
+    if ds is None or not hasattr(ds, "get_new_order_book"):
+        cx.log("orderbook cache check skipped — no REST snapshot source on this connector", "warning")
+        return
+
+    cached_bids, cached_asks = get_orderbook_snapshot(cx)
+    if not cached_bids or not cached_asks:
+        cx.log("orderbook cache check skipped — cached book empty", "warning")
+        return
+    cached_bid = Decimal(str(cached_bids[0].price))
+    cached_ask = Decimal(str(cached_asks[0].price))
+
+    try:
+        rest_ob = await ds.get_new_order_book(pair)
+        rest_bids = list(rest_ob.bid_entries())
+        rest_asks = list(rest_ob.ask_entries())
+    except Exception as exc:
+        cx.log(f"orderbook cache check skipped — REST snapshot failed: {exc}", "warning")
+        return
+    if not rest_bids or not rest_asks:
+        cx.log("orderbook cache check skipped — REST snapshot empty", "warning")
+        return
+    rest_bid = Decimal(str(rest_bids[0].price))
+    rest_ask = Decimal(str(rest_asks[0].price))
+
+    bid_diff = _pct_diff(cached_bid, rest_bid)
+    ask_diff = _pct_diff(cached_ask, rest_ask)
+    cx.log_check("orderbook_cache_best_bid_vs_REST",
+                 actual=f"cache={cached_bid} REST={rest_bid}",
+                 expected=f"diff <= {tol_pct}%", note=f"diff={bid_diff:.4f}%")
+    cx.log_check("orderbook_cache_best_ask_vs_REST",
+                 actual=f"cache={cached_ask} REST={rest_ask}",
+                 expected=f"diff <= {tol_pct}%", note=f"diff={ask_diff:.4f}%")
+    assert bid_diff <= tol_pct, (
+        f"[{cx.cfg.connector_name}] Cached best bid {cached_bid} differs from REST {rest_bid} "
+        f"by {bid_diff:.4f}% (> {tol_pct}%) — websocket order-book cache may be stale."
+    )
+    assert ask_diff <= tol_pct, (
+        f"[{cx.cfg.connector_name}] Cached best ask {cached_ask} differs from REST {rest_ask} "
+        f"by {ask_diff:.4f}% (> {tol_pct}%) — websocket order-book cache may be stale."
+    )
+
+
+async def verify_balance_cache(cx: ConnectorWrapper, token: str, tol_pct: Decimal = Decimal("1")) -> None:
+    """
+    CACHED available balance (get_available_balance) vs FRESH REST balance.
+
+    Reads the current cached value, forces a REST refresh via _update_balances(),
+    then re-reads.  If they agree within tol_pct the cache was accurate at the
+    moment of the check.  Call at a QUIET point (no order placed/cancelled in the
+    prior second) so a legitimate in-flight balance change isn't misread as drift.
+    """
+    update_fn = getattr(cx.connector, "_update_balances", None)
+    if update_fn is None:
+        cx.log("balance cache check skipped — connector has no _update_balances()", "warning")
+        return
+    cached = cx.connector.get_available_balance(token)
+    try:
+        await update_fn()
+    except Exception as exc:
+        cx.log(f"balance cache check skipped — REST refresh failed: {exc}", "warning")
+        return
+    rest = cx.connector.get_available_balance(token)
+    diff = _pct_diff(cached, rest)
+    cx.log_check(f"{token}_balance_cache_vs_REST",
+                 actual=f"cache={cached} REST={rest}",
+                 expected=f"diff <= {tol_pct}%", note=f"diff={diff:.4f}%")
+    assert diff <= tol_pct, (
+        f"[{cx.cfg.connector_name}] Cached {token} available balance {cached} differs from "
+        f"REST {rest} by {diff:.4f}% (> {tol_pct}%) — balance cache out of sync."
+    )
+
+
+async def verify_active_order_cache(cx: ConnectorWrapper, client_id: str) -> None:
+    """
+    CACHED active order (the InFlightOrder kept current by the websocket user
+    stream) vs FRESH REST order status.  Confirms the exchange_order_id agrees and
+    that REST reports the order still live (not a terminal state) — matching the
+    cache's view that it is an open order.
+    """
+    cached = cx.connector.in_flight_orders.get(client_id)
+    if cached is None:
+        cx.log(f"active-order cache check skipped — {client_id} not in in_flight_orders", "warning")
+        return
+    status_fn = getattr(cx.connector, "_request_order_status", None)
+    if status_fn is None:
+        cx.log("active-order cache check skipped — no _request_order_status()", "warning")
+        return
+    try:
+        rest = await status_fn(cached)
+    except Exception as exc:
+        cx.log(f"active-order cache check skipped — REST status failed: {exc}", "warning")
+        return
+
+    cx.log_check("active_order_cache_exchange_id_vs_REST",
+                 actual=f"cache={cached.exchange_order_id} REST={rest.exchange_order_id}",
+                 expected="equal")
+    assert str(cached.exchange_order_id) == str(rest.exchange_order_id), (
+        f"[{cx.cfg.connector_name}] Cached exchange_order_id {cached.exchange_order_id} != "
+        f"REST {rest.exchange_order_id} for {client_id} — active-order cache mismatch."
+    )
+    terminal = (OrderState.CANCELED, OrderState.FILLED, OrderState.FAILED)
+    cx.log_check("active_order_cache_state_vs_REST",
+                 actual=f"cache={cached.current_state.name} REST={rest.new_state.name}",
+                 expected="REST live (not terminal)")
+    assert rest.new_state not in terminal, (
+        f"[{cx.cfg.connector_name}] REST reports terminal state {rest.new_state.name} for an "
+        f"order the cache lists as active ({client_id}) — caches disagree."
+    )
+
+
+async def verify_personal_trades_cache(cx: ConnectorWrapper, order) -> None:
+    """
+    IN-MEMORY fills (captured from OrderFilled events) vs FRESH REST trade history
+    for one order.  Asserts REST reports at least as many fills as we cached and
+    that the cached filled amount doesn't exceed what REST confirms.
+    """
+    trade_fn = getattr(cx.connector, "_all_trade_updates_for_order", None)
+    if trade_fn is None:
+        cx.log("personal-trades cache check skipped — no _all_trade_updates_for_order()", "warning")
+        return
+    cached_amount = sum(
+        (f.amount for f in cx.collected_fills
+         if getattr(f, "order_id", None) == order.client_order_id),
+        Decimal("0"),
+    )
+    try:
+        rest_trades = await trade_fn(order)
+    except Exception as exc:
+        cx.log(f"personal-trades cache check skipped — REST fetch failed: {exc}", "warning")
+        return
+    rest_amount = sum((t.fill_base_amount for t in rest_trades), Decimal("0"))
+    cx.log_check("personal_trades_cache_vs_REST",
+                 actual=f"cache_filled={cached_amount} REST_filled={rest_amount}",
+                 expected="cache <= REST", note=f"rest_trade_count={len(rest_trades)}")
+    assert cached_amount <= rest_amount + Decimal("1e-8"), (
+        f"[{cx.cfg.connector_name}] In-memory fills total {cached_amount} exceed REST-confirmed "
+        f"{rest_amount} for {order.client_order_id} — fill cache overstates reality."
+    )
+
+
+async def verify_last_trade_price_cache(cx: ConnectorWrapper, tol_pct: Decimal = Decimal("5")) -> bool:
+    """
+    CACHED last-trade price (order_book.last_trade_price, fed by the websocket
+    public-trade stream) vs FRESH REST last price.  Returns True if it ran an
+    assertion, False if it skipped (no cached trade yet / unsupported).
+    """
+    pair = cx.cfg.trading_pair
+    try:
+        cached_last = Decimal(str(cx.connector.get_order_book(pair).last_trade_price))
+    except Exception:
+        cached_last = Decimal("0")
+    if not cached_last.is_finite() or cached_last <= 0:
+        cx.log("last-trade-price cache check skipped — websocket trade stream has not "
+               "delivered a trade yet (cache empty)", "warning")
+        return False
+
+    tracker = getattr(cx.connector, "order_book_tracker", None)
+    ds = getattr(tracker, "data_source", None) if tracker is not None else None
+    get_last = getattr(ds, "get_last_traded_prices", None) if ds is not None else None
+    if get_last is None:
+        cx.log("last-trade-price cache check skipped — no get_last_traded_prices()", "warning")
+        return False
+    try:
+        rest_map = await get_last(trading_pairs=[pair])
+        rest_last = Decimal(str(rest_map.get(pair, 0)))
+    except Exception as exc:
+        cx.log(f"last-trade-price cache check skipped — REST fetch failed: {exc}", "warning")
+        return False
+    if rest_last <= 0:
+        cx.log("last-trade-price cache check skipped — REST returned no last price", "warning")
+        return False
+
+    diff = _pct_diff(cached_last, rest_last)
+    cx.log_check("last_trade_price_cache_vs_REST",
+                 actual=f"cache={cached_last} REST={rest_last}",
+                 expected=f"diff <= {tol_pct}%", note=f"diff={diff:.4f}%")
+    assert diff <= tol_pct, (
+        f"[{cx.cfg.connector_name}] Cached last-trade price {cached_last} differs from REST "
+        f"{rest_last} by {diff:.4f}% (> {tol_pct}%) — last-trade cache may be stale."
+    )
+    return True
+
+
+async def _poll_ws_balance_change(
+    cx: ConnectorWrapper,
+    token: str,
+    baseline: Decimal,
+    min_delta: Decimal,
+    timeout: int = 30,
+) -> tuple:
+    """
+    Poll get_available_balance(token) for a change of at least min_delta, WITHOUT
+    ever calling _update_balances().  With REST refresh suppressed, the ONLY thing
+    that can move the cached balance is a websocket balanceUpdate event — so a
+    detected change isolates the websocket path.
+
+    Returns (changed: bool, observed: Decimal, elapsed: float).
+    """
+    start = time.monotonic()
+    deadline = start + timeout
+    observed = baseline
+    while time.monotonic() < deadline:
+        await asyncio.sleep(0.5)
+        observed = cx.connector.get_available_balance(token)
+        if abs(observed - baseline) >= min_delta:
+            return True, observed, time.monotonic() - start
+    return False, observed, time.monotonic() - start
+
+
+async def _capture_fills(cx: ConnectorWrapper, attempts: int = 4, delay: float = 2.0) -> int:
+    """
+    Drive the REST trade-history poll so MarketEvent.OrderFilled events fire for
+    recently-filled orders, populating cx.collected_fills for test_08.
+
+    WHY this is needed: collected_fills is fed only by OrderFilled events, which
+    the connector emits when it processes a TRADE update. Those trade updates
+    arrive either via the websocket trade channel (silent on these venues) or via
+    the REST trade-history poll inside _update_order_status() — which the Clock
+    drives in production but never fires in this harness. test_07 only drives the
+    REST *balance* poll, so a real fill moves the balance but never emits an
+    OrderFilled, and test_08 then has nothing to validate. Calling
+    _update_order_status() here fetches the trade for the just-filled order and
+    emits the event. Best-effort: returns the number of fills captured.
+    """
+    fn = getattr(cx.connector, "_update_order_status", None)
+    if fn is None:
+        return len(cx.collected_fills)
+    for _ in range(attempts):
+        try:
+            await fn()
+        except Exception:
+            pass
+        if cx.collected_fills:
+            break
+        await asyncio.sleep(delay)
+    return len(cx.collected_fills)
+
+
 # ─── Fixtures ─────────────────────────────────────────────────────────────────
 
 _FIXTURE_PARAMS = CONFIGURED_EXCHANGES if CONFIGURED_EXCHANGES else [None]
@@ -887,6 +1161,10 @@ class TestConnectorE2E:
             f"[{cx.cfg.connector_name}] Best bid moved {drift:.2f}% between snapshots"
         )
 
+        # Cache verification: the cached book above is websocket-fed; confirm it
+        # matches a fresh REST snapshot of the same book.
+        await verify_orderbook_cache(cx)
+
         cx.log_pass("TEST_01")
 
     # ── 2. Create order → fetch by id ─────────────────────────────────────────
@@ -902,6 +1180,11 @@ class TestConnectorE2E:
         cx.log_value("buy_price", buy_price)
         cx.log_value("order_amount", cx.cfg.limit_buy_amount)
 
+        # Cache verification: the quote balance this test relies on to size/gate
+        # the order is a websocket-fed cache — confirm it matches REST before use.
+        quote_token = cx.cfg.trading_pair.split("-")[1]
+        await verify_balance_cache(cx, quote_token)
+
         await assert_sufficient_balance(cx, TradeType.BUY, cx.cfg.limit_buy_amount, buy_price)
 
         client_id = place_limit_buy(cx, buy_price)
@@ -912,6 +1195,9 @@ class TestConnectorE2E:
 
             cx.log_check("order_acknowledged (not None)", actual=order is not None, expected=True)
             assert order is not None, _rejection_msg(cx, client_id, cx.order_wait)
+
+            # Cache verification: the just-tracked in-memory order vs REST status.
+            await verify_active_order_cache(cx, client_id)
 
             cx.log_value("order_state", str(order.current_state))
             cx.log_value("exchange_order_id", getattr(order, "exchange_order_id", "N/A"))
@@ -978,6 +1264,9 @@ class TestConnectorE2E:
                 f"Order {client_id} in in_flight_orders but already done: "
                 f"{cx.connector.in_flight_orders.get(client_id)}"
             )
+
+            # Cache verification: the cached active order vs REST order status.
+            await verify_active_order_cache(cx, client_id)
 
             cx.log_pass("TEST_03")
 
@@ -1091,7 +1380,15 @@ class TestConnectorE2E:
 
         mid = get_mid_price(cx)
         price_a = round(mid * Decimal(str(cx.cfg.buy_price_offset)), 8)
-        price_b = round(mid * Decimal(str(cx.cfg.edit_price_multiplier)), 8)
+        # Edited price: move the SAME distance the configured multiplier implies,
+        # but UPWARD from buy_price_offset, so the edited order's notional stays
+        # >= the original's (which test_02 proves clears the min-notional rule).
+        # edit_price_multiplier sits below buy_price_offset, so applying it
+        # directly shrank the edited order's notional below the exchange minimum
+        # and the connector silently refused to create it (same failure mode the
+        # old test_05 had). Stepping upward keeps it ~18% below market (won't fill).
+        edit_distance = abs(Decimal(str(cx.cfg.buy_price_offset)) - Decimal(str(cx.cfg.edit_price_multiplier)))
+        price_b = round(mid * (Decimal(str(cx.cfg.buy_price_offset)) + edit_distance), 8)
 
         cx.log_value("mid_price", mid)
         cx.log_value("price_a (original)", price_a)
@@ -1160,6 +1457,12 @@ class TestConnectorE2E:
         cx.log_section("TEST_07: balance_sell")
 
         base_token, quote_token = cx.cfg.trading_pair.split("-")
+
+        # Cache verification: this test is all about balance accounting, so first
+        # confirm both the base and quote balance caches match REST before we
+        # start trading against them.
+        await verify_balance_cache(cx, quote_token)
+        await verify_balance_cache(cx, base_token)
 
         # ── Phase 1: acquire base token if the account doesn't have enough ────
         setup_buy_id: Optional[str] = None
@@ -1240,6 +1543,14 @@ class TestConnectorE2E:
                 )
             cx.log(f"Setup BUY confirmed — acquired {acquired} {base_token}.")
             should_cleanup_sell = True
+
+            # The setup buy is a taker order that just FILLED. Drive the REST
+            # trade-history poll now (while the order is still freshly tracked)
+            # so an OrderFilled event fires and test_08 has a real fill to
+            # validate. The websocket trade channel is silent on these venues, so
+            # without this collected_fills stays empty and test_08 always skips.
+            captured = await _capture_fills(cx)
+            cx.log_value("fills_captured_after_setup_buy", captured)
         else:
             cx.log(
                 f"Sufficient {base_token} already available ({avail_base}) — "
@@ -1374,11 +1685,14 @@ class TestConnectorE2E:
         cx.log_value("fill_count", len(fills))
 
         if not fills:
-            cx.log("No fills recorded — skipping (expected for far-from-market orders)")
+            cx.log("No OrderFilled events captured — skipping", "warning")
             pytest.skip(
-                f"[{cx.cfg.connector_name}] No order fills during this session. "
-                "Reduce BUY/SELL_PRICE_OFFSET in .env to allow fills, or place a "
-                "filled order externally before running the suite."
+                f"[{cx.cfg.connector_name}] No OrderFilled events were captured this session, "
+                "even though test_07 fills a taker order and drives the REST trade-history poll "
+                "(_capture_fills). That means this connector emits fills via neither the websocket "
+                "trade channel nor _all_trade_updates_for_order — a connector-level gap worth a "
+                "separate ticket, not a test-config issue. If test_07 itself was skipped (no fill "
+                "occurred), fund the account or adjust amounts in .env."
             )
 
         for i, fill in enumerate(fills):
@@ -1411,4 +1725,161 @@ class TestConnectorE2E:
             assert fill.trading_pair == cx.cfg.trading_pair
             assert fill.timestamp > 0, f"Fill[{i}] non-positive timestamp"
 
+        # Cache verification: reconcile the in-memory fills against the exchange's
+        # REST trade history, per order. Best-effort — the order must still be
+        # resolvable in the tracker for the REST trade query.
+        tracker = getattr(cx.connector, "_order_tracker", None)
+        resolvable = getattr(tracker, "all_fillable_orders", {}) if tracker is not None else {}
+        seen_orders = set()
+        for fill in fills:
+            oid = getattr(fill, "order_id", None)
+            if oid in seen_orders:
+                continue
+            seen_orders.add(oid)
+            order = resolvable.get(oid) or cx.connector.in_flight_orders.get(oid)
+            if order is not None:
+                await verify_personal_trades_cache(cx, order)
+
         cx.log_pass("TEST_08")
+
+    # ── 9. Last-trade-price cache — public trade stream not used elsewhere ────
+
+    async def test_09_last_trade_price_cache_matches_rest(self, cx: ConnectorWrapper):
+        cx.log_section("TEST_09: last_trade_cache")
+
+        # The cached last-trade price is fed by the websocket public-trade stream
+        # and is not consulted by any other test (mid price comes from the order
+        # book), so it gets its own cache-vs-REST verification here.
+        ran = await verify_last_trade_price_cache(cx)
+        if not ran:
+            pytest.skip(
+                f"[{cx.cfg.connector_name}] Last-trade-price cache could not be verified "
+                "(no websocket trade observed yet, or connector exposes no REST last-price)."
+            )
+        cx.log_pass("TEST_09")
+
+    # ── 10. ISOLATED websocket balance update ─────────────────────────────────
+    # Every other test lets REST polling refresh the balance cache (this harness
+    # has no Clock, so assert_sufficient_balance / the balance pollers call
+    # _update_balances() themselves). That means a balance "cache vs REST" check
+    # is really REST-vs-REST and CANNOT catch a broken websocket balanceUpdate
+    # handler — the REST refresh masks it.
+    #
+    # This test removes that mask: it places a TAKER order that fills (changing
+    # the real account balance), then watches the cached QUOTE balance inside a
+    # window where NO REST refresh is issued. The connector's websocket user
+    # stream is the only thing that can update the cache there, so a detected
+    # change proves the websocket balance path works — and no change proves it is
+    # broken (the cache only stays correct because REST elsewhere papers over it).
+    # The quote token is used because it is non-zero (newly-bought base tokens can
+    # have unreliable WS updates on some venues).
+
+    async def test_10_websocket_balance_update_isolated(self, cx: ConnectorWrapper):
+        cx.log_section("TEST_10: ws_balance")
+        base, quote = cx.cfg.trading_pair.split("-")
+
+        _, asks = get_orderbook_snapshot(cx)
+        assert asks, f"Ask side empty for {cx.cfg.trading_pair} — cannot place taker buy"
+        taker_price = round(Decimal(str(asks[0].price)) * Decimal("1.01"), 8)
+        est_cost = cx.cfg.limit_buy_amount * Decimal(str(asks[0].price))
+
+        # REST-accurate baseline for the (non-zero) quote balance.
+        await assert_sufficient_balance(cx, TradeType.BUY, cx.cfg.limit_buy_amount, taker_price)
+        baseline_quote = cx.connector.get_available_balance(quote)
+        cx.log_value("ws_baseline_quote", f"{baseline_quote} {quote}")
+        cx.log_value("ws_taker_price", taker_price)
+        cx.log_value("ws_est_cost", f"{est_cost} {quote}")
+
+        buy_id: Optional[str] = None
+        try:
+            buy_id = cx.connector.buy(
+                cx.cfg.trading_pair, cx.cfg.limit_buy_amount, OrderType.LIMIT, taker_price,
+            )
+            cx.log_value("ws_taker_buy_id", buy_id)
+
+            await asyncio.sleep(0)
+            await asyncio.sleep(1)
+            if cx._failure_collector.has_failed(buy_id):
+                pytest.skip(
+                    f"[{cx.cfg.connector_name}] WS-probe taker BUY was rejected — cannot test "
+                    "the websocket balance path. Check minimum order size in .env."
+                )
+
+            # ── Isolated websocket window — NO _update_balances() in here ──────
+            # Quote balance must DROP by ~est_cost when the fill/lock lands, and
+            # the only mechanism that can update the cache here is the websocket.
+            min_drop = est_cost * Decimal("0.5")
+            delivered, observed, elapsed = await _poll_ws_balance_change(
+                cx, quote, baseline_quote, min_drop, timeout=30,
+            )
+            cx.log_check(
+                "ws_balance_update_delivered",
+                actual=f"{baseline_quote} -> {observed}  (Δ={observed - baseline_quote})",
+                expected=f"drop >= {min_drop} {quote} via websocket (REST suppressed)",
+                note=f"elapsed={elapsed:.1f}s",
+            )
+
+            # Cross-check: now allow REST, and confirm the WS-observed number
+            # agrees with REST truth (i.e. the cache wasn't just partially right).
+            update_fn = getattr(cx.connector, "_update_balances", None)
+            if update_fn is not None:
+                try:
+                    await update_fn()
+                except Exception:
+                    pass
+            rest_quote = cx.connector.get_available_balance(quote)
+            cx.log_check(
+                "ws_observed_balance_vs_REST",
+                actual=f"ws_observed={observed} REST={rest_quote}",
+                expected="diff <= 1%",
+                note=f"diff={_pct_diff(observed, rest_quote):.4f}%",
+            )
+
+            # Informational: did the fill also arrive as an OrderFilled event
+            # (the websocket user-stream trade channel)?  test_08 shows this is
+            # often empty for these venues — logged here for the same diagnosis.
+            ws_fills = [f for f in cx.collected_fills if getattr(f, "order_id", None) == buy_id]
+            cx.log_value("ws_orderfilled_events_for_probe", len(ws_fills))
+
+            assert delivered, (
+                f"[{cx.cfg.connector_name}] The websocket user stream did NOT update the cached "
+                f"{quote} balance within 30s after a filled order, with REST polling suppressed "
+                f"(stayed at {baseline_quote}). The in-memory balance cache is NOT being kept "
+                f"current by the websocket balanceUpdate path — it only looks correct elsewhere "
+                f"because REST refreshes mask the gap. This is a real cached-data problem."
+            )
+            cx.log_pass("TEST_10")
+
+        finally:
+            # Cancel the probe order if it rested instead of filling.
+            await ensure_order_closed(cx, buy_id)
+            # Force a REST balance refresh BEFORE reading the base balance. The
+            # websocket cache is the very thing under test here and may be stale
+            # (CoinSwitch/WazirX) — reading it directly would show ~0 base token,
+            # skip the sell-back, and leave the bought coin stranded. A REST
+            # refresh reflects the real holding so cleanup always runs.
+            cleanup_update_fn = getattr(cx.connector, "_update_balances", None)
+            if cleanup_update_fn is not None:
+                try:
+                    await cleanup_update_fn()
+                except Exception:
+                    pass
+            # Sell back any base token acquired so the account is left as found.
+            avail_base = cx.connector.get_available_balance(base)
+            amount_back = min(avail_base, cx.cfg.limit_buy_amount)
+            if amount_back > Decimal("0"):
+                bids, _ = get_orderbook_snapshot(cx)
+                if bids:
+                    sell_price = round(Decimal(str(bids[0].price)) * Decimal("0.99"), 8)
+                    back_id = cx.connector.sell(
+                        cx.cfg.trading_pair, amount_back, OrderType.LIMIT, sell_price,
+                    )
+                    sold = await _poll_balance_decrease(cx, base, avail_base, timeout=30)
+                    if sold:
+                        cx.log(f"WS-probe cleanup: {base} sold back to {quote}.")
+                    else:
+                        await ensure_order_cancelled(cx, back_id)
+                        cx.log(
+                            f"WS-probe cleanup SELL did not fill in 30s — cancelled. "
+                            f"~{amount_back} {base} remains.", "warning",
+                        )

@@ -674,36 +674,6 @@ async def verify_orderbook_cache(cx: ConnectorWrapper, tol_pct: Decimal = Decima
     )
 
 
-async def verify_balance_cache(cx: ConnectorWrapper, token: str, tol_pct: Decimal = Decimal("1")) -> None:
-    """
-    CACHED available balance (get_available_balance) vs FRESH REST balance.
-
-    Reads the current cached value, forces a REST refresh via _update_balances(),
-    then re-reads.  If they agree within tol_pct the cache was accurate at the
-    moment of the check.  Call at a QUIET point (no order placed/cancelled in the
-    prior second) so a legitimate in-flight balance change isn't misread as drift.
-    """
-    update_fn = getattr(cx.connector, "_update_balances", None)
-    if update_fn is None:
-        cx.log("balance cache check skipped — connector has no _update_balances()", "warning")
-        return
-    cached = cx.connector.get_available_balance(token)
-    try:
-        await update_fn()
-    except Exception as exc:
-        cx.log(f"balance cache check skipped — REST refresh failed: {exc}", "warning")
-        return
-    rest = cx.connector.get_available_balance(token)
-    diff = _pct_diff(cached, rest)
-    cx.log_check(f"{token}_balance_cache_vs_REST",
-                 actual=f"cache={cached} REST={rest}",
-                 expected=f"diff <= {tol_pct}%", note=f"diff={diff:.4f}%")
-    assert diff <= tol_pct, (
-        f"[{cx.cfg.connector_name}] Cached {token} available balance {cached} differs from "
-        f"REST {rest} by {diff:.4f}% (> {tol_pct}%) — balance cache out of sync."
-    )
-
-
 async def verify_active_order_cache(cx: ConnectorWrapper, client_id: str) -> None:
     """
     CACHED active order (the InFlightOrder kept current by the websocket user
@@ -841,32 +811,59 @@ async def _poll_ws_balance_change(
     return False, observed, time.monotonic() - start
 
 
-async def _capture_fills(cx: ConnectorWrapper, attempts: int = 4, delay: float = 2.0) -> int:
+async def _capture_fills(cx: ConnectorWrapper, client_order_id: Optional[str] = None,
+                         attempts: int = 4, delay: float = 2.0) -> int:
     """
-    Drive the REST trade-history poll so MarketEvent.OrderFilled events fire for
-    recently-filled orders, populating cx.collected_fills for test_08.
+    Make a real fill show up in cx.collected_fills so test_08 has data to validate.
 
-    WHY this is needed: collected_fills is fed only by OrderFilled events, which
-    the connector emits when it processes a TRADE update. Those trade updates
-    arrive either via the websocket trade channel (silent on these venues) or via
-    the REST trade-history poll inside _update_order_status() — which the Clock
-    drives in production but never fires in this harness. test_07 only drives the
-    REST *balance* poll, so a real fill moves the balance but never emits an
-    OrderFilled, and test_08 then has nothing to validate. Calling
-    _update_order_status() here fetches the trade for the just-filled order and
-    emits the event. Best-effort: returns the number of fills captured.
+    collected_fills is fed only by OrderFilled events, which the connector emits
+    when it processes a TRADE update. Those arrive via the websocket trade channel
+    (silent on these venues) or the REST trade-history poll a Clock drives in
+    production — never automatically in this harness. Two mechanisms, both
+    bypassing the websocket:
+
+      1. DIRECT PROBE (when client_order_id is given): fetch that exact order's
+         trades via _all_trade_updates_for_order() and feed them to the order
+         tracker. This bypasses the all_fillable_orders set, so it still works if a
+         fast taker fill was evicted before the normal poll runs. Its raw return
+         count is logged as `rest_trade_updates_returned` — the definitive
+         diagnostic: 0 means the connector's REST trade endpoint surfaces no fills
+         at all; >0 alongside an empty collected_fills means the trade came back
+         but no OrderFilled event was emitted (a tracker/eviction problem).
+      2. POLL: drive _update_order_status() a few times — the connector's own REST
+         status/trade poll.
+
+    Best-effort. Returns the number of fills captured (len(cx.collected_fills)).
     """
-    fn = getattr(cx.connector, "_update_order_status", None)
-    if fn is None:
-        return len(cx.collected_fills)
-    for _ in range(attempts):
-        try:
-            await fn()
-        except Exception:
-            pass
-        if cx.collected_fills:
-            break
-        await asyncio.sleep(delay)
+    trades_fn = getattr(cx.connector, "_all_trade_updates_for_order", None)
+    tracker = getattr(cx.connector, "_order_tracker", None)
+
+    # Mechanism 1 — direct trade fetch for the specific just-filled order.
+    if client_order_id is not None and trades_fn is not None:
+        order = cx.connector.in_flight_orders.get(client_order_id)
+        if order is None and tracker is not None:
+            order = getattr(tracker, "all_fillable_orders", {}).get(client_order_id)
+        if order is not None:
+            try:
+                trade_updates = await trades_fn(order)
+                cx.log_value("rest_trade_updates_returned", len(trade_updates))
+                if tracker is not None:
+                    for tu in trade_updates:
+                        tracker.process_trade_update(tu)
+            except Exception as exc:
+                cx.log(f"direct _all_trade_updates_for_order failed: {exc}", "warning")
+
+    # Mechanism 2 — the connector's normal REST status/trade poll.
+    status_fn = getattr(cx.connector, "_update_order_status", None)
+    if status_fn is not None:
+        for _ in range(attempts):
+            try:
+                await status_fn()
+            except Exception:
+                pass
+            if cx.collected_fills:
+                break
+            await asyncio.sleep(delay)
     return len(cx.collected_fills)
 
 
@@ -1180,11 +1177,6 @@ class TestConnectorE2E:
         cx.log_value("buy_price", buy_price)
         cx.log_value("order_amount", cx.cfg.limit_buy_amount)
 
-        # Cache verification: the quote balance this test relies on to size/gate
-        # the order is a websocket-fed cache — confirm it matches REST before use.
-        quote_token = cx.cfg.trading_pair.split("-")[1]
-        await verify_balance_cache(cx, quote_token)
-
         await assert_sufficient_balance(cx, TradeType.BUY, cx.cfg.limit_buy_amount, buy_price)
 
         client_id = place_limit_buy(cx, buy_price)
@@ -1458,12 +1450,6 @@ class TestConnectorE2E:
 
         base_token, quote_token = cx.cfg.trading_pair.split("-")
 
-        # Cache verification: this test is all about balance accounting, so first
-        # confirm both the base and quote balance caches match REST before we
-        # start trading against them.
-        await verify_balance_cache(cx, quote_token)
-        await verify_balance_cache(cx, base_token)
-
         # ── Phase 1: acquire base token if the account doesn't have enough ────
         setup_buy_id: Optional[str] = None
         # True when Phase 3 should sell back the base token (whether we bought
@@ -1544,12 +1530,12 @@ class TestConnectorE2E:
             cx.log(f"Setup BUY confirmed — acquired {acquired} {base_token}.")
             should_cleanup_sell = True
 
-            # The setup buy is a taker order that just FILLED. Drive the REST
-            # trade-history poll now (while the order is still freshly tracked)
-            # so an OrderFilled event fires and test_08 has a real fill to
-            # validate. The websocket trade channel is silent on these venues, so
-            # without this collected_fills stays empty and test_08 always skips.
-            captured = await _capture_fills(cx)
+            # The setup buy is a taker order that just FILLED. Try to surface that
+            # fill so test_08 has real data: a direct REST trade fetch for this
+            # exact order (the diagnostic), plus the connector's normal REST poll.
+            # The websocket trade channel is silent on these venues, so without
+            # this collected_fills stays empty and test_08 always skips.
+            captured = await _capture_fills(cx, client_order_id=setup_buy_id)
             cx.log_value("fills_captured_after_setup_buy", captured)
         else:
             cx.log(

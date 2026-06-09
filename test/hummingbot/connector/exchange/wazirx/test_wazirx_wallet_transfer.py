@@ -1,4 +1,5 @@
 import json
+import re
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 
@@ -36,10 +37,20 @@ class WazirxWalletTransferTest(IsolatedAsyncioWrapperTestCase):
     def _transfer_url(self):
         return CONSTANTS.REST_URL + CONSTANTS.SUB_ACCOUNT_FUND_TRANSFER_PATH_URL
 
+    def _transfer_url_pattern(self):
+        # Params are sent verbatim in the query string, so match the endpoint regardless of query.
+        return re.compile(re.escape(self._transfer_url()) + r".*")
+
+    def _history_url(self):
+        return CONSTANTS.REST_URL + CONSTANTS.SUB_ACCOUNT_FUND_TRANSFER_HISTORY_PATH_URL
+
+    def _history_url_pattern(self):
+        return re.compile(re.escape(self._history_url()) + r".*")
+
     @aioresponses()
     async def test_sub_to_master_transfer_success(self, mock_api):
         mock_api.get(self._server_time_url(), body=json.dumps({"serverTime": 1700000000000}), repeat=True)
-        mock_api.post(self._transfer_url(), body=json.dumps({"status": "success", "txnId": 163}))
+        mock_api.post(self._transfer_url_pattern(), body=json.dumps({"status": "success", "txnId": 163}))
 
         transfer = WalletTransfer(
             client_transfer_id="t1",
@@ -59,7 +70,8 @@ class WazirxWalletTransferTest(IsolatedAsyncioWrapperTestCase):
     @aioresponses()
     async def test_sub_to_master_transfer_failure(self, mock_api):
         mock_api.get(self._server_time_url(), body=json.dumps({"serverTime": 1700000000000}), repeat=True)
-        mock_api.post(self._transfer_url(), status=400, body=json.dumps({"code": 2136, "message": "Invalid transfer"}))
+        mock_api.post(self._transfer_url_pattern(), status=400,
+                      body=json.dumps({"code": 2136, "message": "Invalid transfer"}))
 
         transfer = WalletTransfer(
             client_transfer_id="t2",
@@ -88,3 +100,32 @@ class WazirxWalletTransferTest(IsolatedAsyncioWrapperTestCase):
     def test_withdrawal_not_supported(self):
         with self.assertRaises(NotImplementedError):
             self.exchange.withdraw_to_address(asset="USDT", amount=Decimal("5"), address="0xabc")
+
+    @aioresponses()
+    async def test_get_sub_account_transfer_history(self, mock_api):
+        mock_api.get(self._server_time_url(), body=json.dumps({"serverTime": 1700000000000}), repeat=True)
+        history_records = [
+            {
+                "id": 163,
+                "asset": "usdt",
+                "fromEmail": "sub@example.com",
+                "toEmail": "master@example.com",
+                "amount": "5",
+                "status": "success",
+            }
+        ]
+        mock_api.get(self._history_url_pattern(), body=json.dumps(history_records))
+
+        result = await self.exchange.get_sub_account_transfer_history(limit=10)
+        self.assertEqual(history_records, result)
+
+    async def test_transfer_history_requires_master_credentials(self):
+        exchange = WazirxExchange(
+            wazirx_api_key="k",
+            wazirx_api_secret="s",
+            trading_pairs=["BTC-INR"],
+            trading_required=False,
+            domain=CONSTANTS.DEFAULT_DOMAIN,
+        )
+        with self.assertRaises(ValueError):
+            await exchange.get_sub_account_transfer_history()

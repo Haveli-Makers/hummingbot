@@ -5,6 +5,7 @@ from urllib.parse import urlencode
 
 import aiohttp
 from bidict import bidict
+from yarl import URL
 
 from hummingbot.connector.constants import s_decimal_NaN
 from hummingbot.connector.exchange.wazirx import wazirx_constants as CONSTANTS, wazirx_web_utils as web_utils
@@ -193,12 +194,19 @@ class WazirxExchange(WalletTransferExecutorMixin, ExchangePyBase):
         params: Optional[Dict[str, Any]] = None,
         is_auth_required: bool = False,
         auth: Optional[WazirxAuth] = None,
+        params_in_query: bool = False,
     ) -> Dict[str, Any]:
         """
         Make an authenticated or unauthenticated request to the WazirX API.
 
         :param auth: authenticator to sign the request with; defaults to the connector's own
             credentials. Pass the master authenticator for sub-account/master transfers.
+        :param params_in_query: when True, signed params are sent in the URL query string instead
+            of the request body. WazirX validates the signature against the query string exactly as
+            received, so the URL must be sent verbatim (``encoded=True``) to keep percent-encoded
+            values such as ``%2B`` (a ``+`` in a sub-account email) intact. Required for the
+            sub-account fund-transfer endpoint, which rejects body-form params with
+            "Signature is incorrect" (code 2005).
         """
         url = f"{CONSTANTS.REST_URL}{path}"
         params = params or {}
@@ -208,15 +216,25 @@ class WazirxExchange(WalletTransferExecutorMixin, ExchangePyBase):
                 auth: WazirxAuth = auth or self._auth
                 _, query_string = await auth.add_auth_params(params)
                 headers = auth.get_headers()
+                method_upper = method.upper()
 
-                if method.upper() == "GET":
-                    full_url = f"{url}?{query_string}"
-                    async with session.get(full_url, headers=headers) as response:
+                # GET always carries params in the (verbatim-encoded) query string.
+                if method_upper == "GET" or params_in_query:
+                    signed_url = URL(f"{url}?{query_string}", encoded=True)
+                    if method_upper == "GET":
+                        request_ctx = session.get(signed_url, headers=headers)
+                    elif method_upper == "POST":
+                        request_ctx = session.post(signed_url, headers=headers)
+                    elif method_upper == "DELETE":
+                        request_ctx = session.delete(signed_url, headers=headers)
+                    else:
+                        raise ValueError(f"Unsupported HTTP method: {method}")
+                    async with request_ctx as response:
                         return await self._handle_response(response, method, url)
-                elif method.upper() == "POST":
+                elif method_upper == "POST":
                     async with session.post(url, data=query_string, headers=headers) as response:
                         return await self._handle_response(response, method, url)
-                elif method.upper() == "DELETE":
+                elif method_upper == "DELETE":
                     async with session.delete(url, data=query_string, headers=headers) as response:
                         return await self._handle_response(response, method, url)
                 else:
@@ -285,6 +303,7 @@ class WazirxExchange(WalletTransferExecutorMixin, ExchangePyBase):
             params=params,
             is_auth_required=True,
             auth=self._master_authenticator,
+            params_in_query=True,
         )
 
         status = str(resp.get("status", "")).lower()
@@ -297,6 +316,23 @@ class WazirxExchange(WalletTransferExecutorMixin, ExchangePyBase):
             new_state=TransferState.COMPLETED,
             update_timestamp=self.current_timestamp,
             exchange_transfer_id=str(txn_id) if txn_id is not None else None,
+        )
+
+    async def get_sub_account_transfer_history(self, **query_params: Any) -> Any:
+        """
+        Fetch the sub-account fund-transfer history from WazirX. Requires master credentials.
+
+        Any WazirX-supported filters (e.g. ``limit``) can be passed as keyword arguments; the
+        ``timestamp``/``recvWindow``/``signature`` params are added automatically by the
+        authenticator. Returns the raw response (a list of transfer records).
+        """
+        self._verify_master_credentials()
+        return await self._wazirx_request(
+            method="GET",
+            path=CONSTANTS.SUB_ACCOUNT_FUND_TRANSFER_HISTORY_PATH_URL,
+            params=dict(query_params),
+            is_auth_required=True,
+            auth=self._master_authenticator,
         )
 
     def _get_fee(self,

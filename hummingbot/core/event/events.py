@@ -27,6 +27,9 @@ class MarketEvent(Enum):
     SellOrderCreated = 201
     FundingPaymentCompleted = 202
     FundingInfo = 203
+    WalletTransferCreated = 210
+    WalletTransferCompleted = 211
+    WalletTransferFailed = 212
     RangePositionLiquidityAdded = 300
     RangePositionLiquidityRemoved = 301
     RangePositionUpdate = 302
@@ -245,6 +248,40 @@ class SellOrderCreatedEvent:
     exchange_order_id: Optional[str] = None
     leverage: Optional[int] = 1
     position: Optional[str] = PositionAction.NIL.value
+
+
+@dataclass
+class WalletTransferCreatedEvent:
+    timestamp: float
+    transfer_id: str
+    transfer_type: str
+    asset: str
+    amount: Decimal
+    source: Optional[str] = None
+    destination: Optional[str] = None
+    exchange_transfer_id: Optional[str] = None
+
+
+@dataclass
+class WalletTransferCompletedEvent:
+    timestamp: float
+    transfer_id: str
+    transfer_type: str
+    asset: str
+    amount: Decimal
+    source: Optional[str] = None
+    destination: Optional[str] = None
+    exchange_transfer_id: Optional[str] = None
+    tx_hash: Optional[str] = None
+
+
+@dataclass
+class WalletTransferFailedEvent:
+    timestamp: float
+    transfer_id: str
+    transfer_type: str
+    error_message: Optional[str] = None
+    error_type: Optional[str] = None
 
 
 @dataclass

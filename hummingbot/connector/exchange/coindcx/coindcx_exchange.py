@@ -17,15 +17,22 @@ from hummingbot.connector.exchange.coindcx.coindcx_auth import CoinDCXAuth
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
+from hummingbot.connector.wallet_transfer.wallet_transfer_data_types import (
+    TransferState,
+    TransferUpdate,
+    WalletTransfer,
+)
+from hummingbot.connector.wallet_transfer.wallet_transfer_executor import WalletTransferExecutorMixin
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
+from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
 
-class CoindcxExchange(ExchangePyBase):
+class CoindcxExchange(WalletTransferExecutorMixin, ExchangePyBase):
     """
     CoinDCX exchange connector implementation.
     Supports spot trading on CoinDCX exchange.
@@ -35,9 +42,15 @@ class CoindcxExchange(ExchangePyBase):
 
     web_utils = web_utils
 
+    # Wallet-transfer capabilities (see WalletTransferExecutorMixin)
+    supports_sub_to_master_transfer = True
+    supports_withdrawal = False  # CoinDCX does not expose an external withdrawal endpoint
+
     def __init__(self,
                  coindcx_api_key: str,
                  coindcx_api_secret: str,
+                 coindcx_master_api_key: Optional[str] = None,
+                 coindcx_master_api_secret: Optional[str] = None,
                  balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
                  rate_limits_share_pct: Decimal = Decimal("100"),
                  trading_pairs: Optional[List[str]] = None,
@@ -46,6 +59,10 @@ class CoindcxExchange(ExchangePyBase):
                  ):
         self.api_key = coindcx_api_key
         self.secret_key = coindcx_api_secret
+        self._master_api_key = coindcx_master_api_key or None
+        self._master_api_secret = coindcx_master_api_secret or None
+        self._master_account_id: Optional[str] = None
+        self._master_web_assistants_factory: Optional[WebAssistantsFactory] = None
         self._domain = domain
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
@@ -271,6 +288,80 @@ class CoindcxExchange(ExchangePyBase):
             connector=self,
             api_factory=self._web_assistants_factory,
             domain=self.domain,
+        )
+
+    # ------------------------------------------------------------------
+    # Wallet transfer support
+    # ------------------------------------------------------------------
+    @property
+    def _master_authenticator(self) -> CoinDCXAuth:
+        return CoinDCXAuth(
+            api_key=self._master_api_key,
+            secret_key=self._master_api_secret,
+            time_provider=self._time_synchronizer,
+        )
+
+    @property
+    def _master_web_factory(self) -> WebAssistantsFactory:
+        if self._master_web_assistants_factory is None:
+            self._master_web_assistants_factory = web_utils.build_api_factory(
+                throttler=self._throttler,
+                time_synchronizer=self._time_synchronizer,
+                domain=self._domain,
+                auth=self._master_authenticator,
+            )
+        return self._master_web_assistants_factory
+
+    def _verify_master_credentials(self) -> None:
+        if not self._master_api_key or not self._master_api_secret:
+            raise ValueError(
+                "CoinDCX master account API key and secret are required for sub-account to master "
+                "transfers. Configure coindcx_master_api_key and coindcx_master_api_secret."
+            )
+
+    async def _master_post(self, path_url: str, data: Dict[str, Any]) -> Any:
+        """POST to a private endpoint signed with the master-account credentials."""
+        rest_assistant = await self._master_web_factory.get_rest_assistant()
+        url = web_utils.private_rest_url(path_url, domain=self._domain)
+        return await rest_assistant.execute_request(
+            url=url,
+            data=data,
+            method=RESTMethod.POST,
+            is_auth_required=True,
+            throttler_limit_id=path_url,
+        )
+
+    async def _get_master_account_id(self) -> str:
+        if self._master_account_id is None:
+            user_info = await self._master_post(CONSTANTS.USER_INFO_PATH_URL, data={})
+            record = user_info[0] if isinstance(user_info, list) else user_info
+            self._master_account_id = str(record.get("coindcx_id"))
+        return self._master_account_id
+
+    async def _place_internal_transfer(self, transfer: WalletTransfer, **kwargs) -> TransferUpdate:
+        """
+        Transfer funds from a sub-account to the master account using master credentials.
+        CoinDCX identifies accounts by coindcx_id; the destination defaults to the master account.
+        """
+        to_account_id = transfer.destination or await self._get_master_account_id()
+        transfer.destination = to_account_id
+
+        data = {
+            "from_account_id": transfer.source,
+            "to_account_id": to_account_id,
+            "currency_short_name": transfer.asset.upper(),
+            "amount": float(transfer.amount),
+        }
+        resp = await self._master_post(CONSTANTS.SUB_ACCOUNT_TRANSFER_PATH_URL, data=data)
+
+        status = str(resp.get("status", "")).lower() if isinstance(resp, dict) else ""
+        if status and status != "success":
+            raise IOError(f"CoinDCX rejected the transfer: {resp}")
+
+        return TransferUpdate(
+            client_transfer_id=transfer.client_transfer_id,
+            new_state=TransferState.COMPLETED,
+            update_timestamp=self.current_timestamp,
         )
 
     def _get_fee(self,

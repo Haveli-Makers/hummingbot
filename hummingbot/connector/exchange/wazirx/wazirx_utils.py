@@ -1,4 +1,5 @@
 from decimal import Decimal
+from typing import Optional
 
 from pydantic import ConfigDict, Field, SecretStr
 
@@ -88,6 +89,35 @@ class WazirxConfigMap(BaseConnectorConfigMap):
             "is_secure": True,
             "is_connect_key": True,
             "prompt_on_new": True,
+        }
+    )
+    # Optional master-account credentials, used only for sub-account -> master transfers.
+    # Leave blank if you do not use wallet transfers.
+    wazirx_master_api_key: Optional[SecretStr] = Field(
+        default=None,
+        json_schema_extra={
+            "prompt": lambda cm: "Enter your WazirX MASTER account API key (optional, for transfers)",
+            "is_secure": True,
+            "is_connect_key": True,
+            "prompt_on_new": False,
+        }
+    )
+    wazirx_master_api_secret: Optional[SecretStr] = Field(
+        default=None,
+        json_schema_extra={
+            "prompt": lambda cm: "Enter your WazirX MASTER account API secret (optional, for transfers)",
+            "is_secure": True,
+            "is_connect_key": True,
+            "prompt_on_new": False,
+        }
+    )
+    wazirx_master_email: Optional[SecretStr] = Field(
+        default=None,
+        json_schema_extra={
+            "prompt": lambda cm: "Enter your WazirX MASTER account email (optional, for transfers)",
+            "is_secure": False,
+            "is_connect_key": True,
+            "prompt_on_new": False,
         }
     )
     model_config = ConfigDict(title="wazirx")

@@ -25,6 +25,14 @@ OPEN_ORDERS_PATH_URL = "/v1/openOrders"
 MY_TRADES_PATH_URL = "/v1/myTrades"
 CREATE_AUTH_TOKEN_PATH_URL = "/v1/create_auth_token"
 
+# Wallet transfer endpoints
+SUB_ACCOUNT_FUND_TRANSFER_PATH_URL = "/v1/sub_account/fund_transfer"
+SUB_ACCOUNT_FUND_TRANSFER_HISTORY_PATH_URL = "/v1/sub_account/fund_transfer/history"
+SUB_ACCOUNT_ACCOUNTS_PATH_URL = "/v1/sub_account/accounts"
+# Reserved for future external withdrawal support
+CRYPTO_WITHDRAWS_PATH_URL = "/v1/crypto/withdraws"
+COINS_PATH_URL = "/v1/coins"
+
 WS_HEARTBEAT_TIME_INTERVAL = 30
 
 SIDE_BUY = "BUY"
@@ -57,4 +65,9 @@ RATE_LIMITS = [
     RateLimit(limit_id=OPEN_ORDERS_PATH_URL, limit=1, time_interval=ONE_SECOND),
     RateLimit(limit_id=MY_TRADES_PATH_URL, limit=2, time_interval=ONE_SECOND),
     RateLimit(limit_id=CREATE_AUTH_TOKEN_PATH_URL, limit=1, time_interval=ONE_SECOND),
+    RateLimit(limit_id=SUB_ACCOUNT_FUND_TRANSFER_PATH_URL, limit=1, time_interval=ONE_SECOND),
+    RateLimit(limit_id=SUB_ACCOUNT_FUND_TRANSFER_HISTORY_PATH_URL, limit=1, time_interval=ONE_SECOND),
+    RateLimit(limit_id=SUB_ACCOUNT_ACCOUNTS_PATH_URL, limit=1, time_interval=ONE_SECOND),
+    RateLimit(limit_id=CRYPTO_WITHDRAWS_PATH_URL, limit=1, time_interval=ONE_SECOND),
+    RateLimit(limit_id=COINS_PATH_URL, limit=1, time_interval=ONE_SECOND),
 ]

@@ -96,28 +96,28 @@ class WazirxConfigMap(BaseConnectorConfigMap):
     wazirx_master_api_key: Optional[SecretStr] = Field(
         default=None,
         json_schema_extra={
-            "prompt": lambda cm: "Enter your WazirX MASTER account API key (optional, for transfers)",
+            "prompt": lambda cm: "Enter your WazirX MASTER account API key (optional, leave blank if unused)",
             "is_secure": True,
             "is_connect_key": True,
-            "prompt_on_new": False,
+            "prompt_on_new": True,
         }
     )
     wazirx_master_api_secret: Optional[SecretStr] = Field(
         default=None,
         json_schema_extra={
-            "prompt": lambda cm: "Enter your WazirX MASTER account API secret (optional, for transfers)",
+            "prompt": lambda cm: "Enter your WazirX MASTER account API secret (optional, leave blank if unused)",
             "is_secure": True,
             "is_connect_key": True,
-            "prompt_on_new": False,
+            "prompt_on_new": True,
         }
     )
     wazirx_master_email: Optional[SecretStr] = Field(
         default=None,
         json_schema_extra={
-            "prompt": lambda cm: "Enter your WazirX MASTER account email (optional, for transfers)",
+            "prompt": lambda cm: "Enter your WazirX MASTER account email (optional, leave blank if unused)",
             "is_secure": False,
             "is_connect_key": True,
-            "prompt_on_new": False,
+            "prompt_on_new": True,
         }
     )
     model_config = ConfigDict(title="wazirx")

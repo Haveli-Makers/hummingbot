@@ -17,12 +17,16 @@ class WalletTransferConfig(BaseClientModel):
     connector: str = Field("wazirx")
     # A trading pair is only needed so the connector initializes and reports "ready".
     trading_pair: str = Field("BTC-INR")
-    # Asset and amount to move from the sub-account to the master account.
+    # Asset and amount to move between the accounts.
     asset: str = Field("USDT")
     amount: Decimal = Field(Decimal("1"))
-    # Sub-account identifier: email for WazirX, coindcx_id for CoinDCX.
+    # Transfer direction: "sub_to_master" or "master_to_sub".
+    direction: str = Field("sub_to_master")
+    # Account identifiers: email for WazirX, coindcx_id for CoinDCX. The master side may be left
+    # blank to use the connector's configured master account.
+    # - sub_to_master: from_account = sub (required), to_account = master (optional)
+    # - master_to_sub: to_account = sub (required), from_account = master (optional)
     from_account: str = Field("sub-account@example.com")
-    # Master-account identifier (email/id). Leave blank to use the connector's configured master.
     to_account: str = Field("")
 
 
@@ -59,17 +63,27 @@ class WalletTransferExample(ScriptStrategyBase):
         self._transfer_started = True
 
         connector = self.connectors[self.config.connector]
+        from_account = self.config.from_account or None
         to_account = self.config.to_account or None
         try:
-            self._transfer_id = connector.transfer_to_master(
-                asset=self.config.asset,
-                amount=self.config.amount,
-                from_account=self.config.from_account,
-                to_account=to_account,
-            )
+            if self.config.direction == "master_to_sub":
+                self._transfer_id = connector.transfer_to_sub(
+                    asset=self.config.asset,
+                    amount=self.config.amount,
+                    to_account=to_account,
+                    from_account=from_account,
+                )
+            else:
+                self._transfer_id = connector.transfer_to_master(
+                    asset=self.config.asset,
+                    amount=self.config.amount,
+                    from_account=from_account,
+                    to_account=to_account,
+                )
             self.logger().info(
-                f"Submitted transfer {self._transfer_id}: {self.config.amount} {self.config.asset} "
-                f"from {self.config.from_account} to master on {self.config.connector}."
+                f"Submitted {self.config.direction} transfer {self._transfer_id}: "
+                f"{self.config.amount} {self.config.asset} from {from_account or 'master'} "
+                f"to {to_account or 'master'} on {self.config.connector}."
             )
         except Exception as exception:
             self.logger().error(f"Failed to start transfer: {exception}")

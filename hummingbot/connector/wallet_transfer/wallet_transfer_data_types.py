@@ -11,6 +11,7 @@ class TransferType(Enum):
     New transfer kinds can be added here as more exchanges/operations are supported.
     """
     SUB_TO_MASTER = "sub_to_master"  # internal transfer from a sub-account to the master account
+    MASTER_TO_SUB = "master_to_sub"  # internal transfer from the master account to a sub-account
     WITHDRAWAL = "withdrawal"  # external withdrawal to a wallet address
 
 

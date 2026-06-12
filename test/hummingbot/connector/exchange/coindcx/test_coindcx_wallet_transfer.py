@@ -88,3 +88,108 @@ class CoindcxWalletTransferTest(IsolatedAsyncioWrapperTestCase):
     def test_withdrawal_not_supported(self):
         with self.assertRaises(NotImplementedError):
             self.exchange.withdraw_to_address(asset="USDT", amount=Decimal("5"), address="0xabc")
+
+    @aioresponses()
+    async def test_get_user_info(self, mock_api):
+        record = {
+            "coindcx_id": "master-123",
+            "first_name": "First",
+            "last_name": "Last",
+            "email": "user@example.com",
+            "mobile_number": "000",
+        }
+        mock_api.post(self._user_info_url(), body=json.dumps([record]), repeat=True)
+
+        info = await self.exchange.get_user_info(use_master=True)
+        self.assertEqual(record, info)
+
+        info_primary = await self.exchange.get_user_info()
+        self.assertEqual(record, info_primary)
+
+    @aioresponses()
+    async def test_sub_to_master_transfer_success_with_live_response_shape(self, mock_api):
+        # The live API returns {'message': 'success', 'status': 200, 'code': 200}
+        # (status/message swapped relative to the docs).
+        mock_api.post(self._user_info_url(), body=json.dumps([{"coindcx_id": "master-123"}]))
+        mock_api.post(self._transfer_url(), body=json.dumps({"message": "success", "status": 200, "code": 200}))
+
+        transfer = WalletTransfer(
+            client_transfer_id="t-live",
+            transfer_type=TransferType.SUB_TO_MASTER,
+            asset="INR",
+            amount=Decimal("10"),
+            creation_timestamp=1000.0,
+            source="sub-456",
+        )
+        await self.exchange._create_transfer(transfer)
+
+        self.assertEqual(1, len(self.completed_logger.event_log))
+        self.assertEqual(0, len(self.failed_logger.event_log))
+        self.assertEqual(TransferState.COMPLETED, self.exchange.get_transfer("t-live").state)
+
+    @aioresponses()
+    async def test_master_to_sub_transfer_success(self, mock_api):
+        mock_api.post(self._user_info_url(), body=json.dumps([{"coindcx_id": "master-123"}]))
+        mock_api.post(self._transfer_url(), body=json.dumps({"message": "success", "status": 200, "code": 200}))
+
+        transfer = WalletTransfer(
+            client_transfer_id="t-m2s",
+            transfer_type=TransferType.MASTER_TO_SUB,
+            asset="INR",
+            amount=Decimal("10"),
+            creation_timestamp=1000.0,
+            destination="sub-456",
+        )
+        await self.exchange._create_transfer(transfer)
+
+        self.assertEqual(1, len(self.completed_logger.event_log))
+        completed_transfer = self.exchange.get_transfer("t-m2s")
+        self.assertEqual(TransferState.COMPLETED, completed_transfer.state)
+        # The master side (source) defaults to the id resolved from the master credentials.
+        self.assertEqual("master-123", completed_transfer.source)
+        self.assertEqual("sub-456", completed_transfer.destination)
+
+    @aioresponses()
+    async def test_sub_to_master_transfer_rejected_body(self, mock_api):
+        # HTTP 200 but a body that does not indicate success must be treated as a failure.
+        mock_api.post(self._user_info_url(), body=json.dumps([{"coindcx_id": "master-123"}]))
+        mock_api.post(self._transfer_url(), body=json.dumps({"message": "Insufficient funds", "status": "error"}))
+
+        transfer = WalletTransfer(
+            client_transfer_id="t-rejected",
+            transfer_type=TransferType.SUB_TO_MASTER,
+            asset="INR",
+            amount=Decimal("10"),
+            creation_timestamp=1000.0,
+            source="sub-456",
+        )
+        await self.exchange._create_transfer(transfer)
+
+        self.assertEqual(1, len(self.failed_logger.event_log))
+        self.assertEqual(TransferState.FAILED, self.exchange.get_transfer("t-rejected").state)
+
+    @aioresponses()
+    async def test_get_balances(self, mock_api):
+        url = web_utils.private_rest_url(CONSTANTS.USER_BALANCES_PATH_URL, domain=self.exchange._domain)
+        records = [
+            {"currency": "USDT", "balance": 10.5, "locked_balance": 0},
+            {"currency": "BTC", "balance": 0, "locked_balance": 0},
+        ]
+        mock_api.post(url, body=json.dumps(records), repeat=True)
+
+        non_zero = await self.exchange.get_balances(use_master=True)
+        self.assertEqual(["USDT"], [b["currency"] for b in non_zero])
+
+        all_balances = await self.exchange.get_balances(non_zero_only=False)
+        self.assertEqual(2, len(all_balances))
+
+    async def test_get_user_info_with_master_requires_master_creds(self):
+        exchange = CoindcxExchange(
+            coindcx_api_key="k",
+            coindcx_api_secret="s",
+            trading_pairs=["BTC-USDT"],
+            trading_required=False,
+            domain=CONSTANTS.DEFAULT_DOMAIN,
+        )
+        with self.assertRaises(ValueError):
+            await exchange.get_user_info(use_master=True)

@@ -86,6 +86,55 @@ class WazirxWalletTransferTest(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(1, len(self.failed_logger.event_log))
         self.assertEqual(TransferState.FAILED, self.exchange.get_transfer("t2").state)
 
+    @aioresponses()
+    async def test_master_to_sub_transfer_success(self, mock_api):
+        mock_api.get(self._server_time_url(), body=json.dumps({"serverTime": 1700000000000}), repeat=True)
+        mock_api.post(self._transfer_url_pattern(), body=json.dumps({"status": "success", "txnId": 164}))
+
+        transfer = WalletTransfer(
+            client_transfer_id="t-m2s",
+            transfer_type=TransferType.MASTER_TO_SUB,
+            asset="INR",
+            amount=Decimal("20"),
+            creation_timestamp=1000.0,
+            destination="sub@example.com",
+        )
+        await self.exchange._create_transfer(transfer)
+
+        self.assertEqual(1, len(self.completed_logger.event_log))
+        completed_transfer = self.exchange.get_transfer("t-m2s")
+        self.assertEqual(TransferState.COMPLETED, completed_transfer.state)
+        # The master side (source) defaults to the configured master email.
+        self.assertEqual("master@example.com", completed_transfer.source)
+        self.assertEqual("sub@example.com", completed_transfer.destination)
+
+    async def test_master_to_sub_without_master_email_or_from_account_fails(self):
+        exchange = WazirxExchange(
+            wazirx_api_key="k",
+            wazirx_api_secret="s",
+            wazirx_master_api_key="mk",
+            wazirx_master_api_secret="ms",
+            trading_pairs=["BTC-INR"],
+            trading_required=False,
+            domain=CONSTANTS.DEFAULT_DOMAIN,
+        )
+        exchange._set_current_timestamp(1000)
+        failed_logger = EventLogger()
+        exchange.add_listener(MarketEvent.WalletTransferFailed, failed_logger)
+
+        transfer = WalletTransfer(
+            client_transfer_id="t-noemail",
+            transfer_type=TransferType.MASTER_TO_SUB,
+            asset="INR",
+            amount=Decimal("20"),
+            creation_timestamp=1000.0,
+            destination="sub@example.com",
+        )
+        await exchange._create_transfer(transfer)
+
+        self.assertEqual(1, len(failed_logger.event_log))
+        self.assertEqual(TransferState.FAILED, exchange.get_transfer("t-noemail").state)
+
     def test_missing_master_credentials_raises(self):
         exchange = WazirxExchange(
             wazirx_api_key="k",

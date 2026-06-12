@@ -30,6 +30,7 @@ class WalletTransferExecutorMixin:
 
     # Capability flags - connectors override to advertise what they support.
     supports_sub_to_master_transfer: bool = False
+    supports_master_to_sub_transfer: bool = False
     supports_withdrawal: bool = False
 
     # Confirmation polling configuration (used for withdrawals).
@@ -64,12 +65,48 @@ class WalletTransferExecutorMixin:
         """
         if not self.supports_sub_to_master_transfer:
             raise NotImplementedError(f"{self.name} does not support sub-account to master transfers.")
+        if not from_account:
+            raise ValueError("from_account (the sub-account identifier) is required for a sub-to-master transfer.")
         self._verify_master_credentials()
 
         transfer_id = self._generate_transfer_id(TransferType.SUB_TO_MASTER)
         transfer = WalletTransfer(
             client_transfer_id=transfer_id,
             transfer_type=TransferType.SUB_TO_MASTER,
+            asset=asset,
+            amount=amount,
+            creation_timestamp=self.current_timestamp,
+            source=from_account,
+            destination=to_account,
+        )
+        safe_ensure_future(self._create_transfer(transfer, **kwargs))
+        return transfer_id
+
+    def transfer_to_sub(
+        self,
+        asset: str,
+        amount: Decimal,
+        to_account: str,
+        from_account: Optional[str] = None,
+        **kwargs,
+    ) -> str:
+        """
+        Transfer ``amount`` of ``asset`` from the master account to a sub-account.
+
+        :param to_account: sub-account identifier (email for WazirX, account id for CoinDCX)
+        :param from_account: master-account identifier; defaults to the connector's configured master
+        :return: the client transfer id
+        """
+        if not self.supports_master_to_sub_transfer:
+            raise NotImplementedError(f"{self.name} does not support master to sub-account transfers.")
+        if not to_account:
+            raise ValueError("to_account (the sub-account identifier) is required for a master-to-sub transfer.")
+        self._verify_master_credentials()
+
+        transfer_id = self._generate_transfer_id(TransferType.MASTER_TO_SUB)
+        transfer = WalletTransfer(
+            client_transfer_id=transfer_id,
+            transfer_type=TransferType.MASTER_TO_SUB,
             asset=asset,
             amount=amount,
             creation_timestamp=self.current_timestamp,

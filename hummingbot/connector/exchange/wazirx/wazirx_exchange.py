@@ -16,6 +16,7 @@ from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.wallet_transfer.wallet_transfer_data_types import (
     TransferState,
+    TransferType,
     TransferUpdate,
     WalletTransfer,
 )
@@ -40,6 +41,7 @@ class WazirxExchange(WalletTransferExecutorMixin, ExchangePyBase):
 
     # Wallet-transfer capabilities (see WalletTransferExecutorMixin)
     supports_sub_to_master_transfer = True
+    supports_master_to_sub_transfer = True
     supports_withdrawal = False  # WazirX does not expose an external withdrawal endpoint
 
     def __init__(self,
@@ -279,23 +281,29 @@ class WazirxExchange(WalletTransferExecutorMixin, ExchangePyBase):
 
     async def _place_internal_transfer(self, transfer: WalletTransfer, **kwargs) -> TransferUpdate:
         """
-        Transfer funds from a sub-account to the master account using the master account API key.
-        WazirX identifies accounts by email; the master key may only move funds between its own
-        sub-accounts and itself.
+        Transfer funds between the master account and a sub-account (either direction) using the
+        master account API key. WazirX identifies accounts by email and only allows moves between
+        the master and its own sub-accounts (sub->sub is rejected).
         """
-        to_email = transfer.destination or self._master_email
-        if not to_email:
+        if transfer.transfer_type == TransferType.MASTER_TO_SUB:
+            # The sub-account email is the destination; the master side defaults from config.
+            transfer.source = transfer.source or self._master_email
+            missing_side = "from_account" if not transfer.source else None
+        else:
+            # SUB_TO_MASTER: the sub-account email is the source; master side defaults from config.
+            transfer.destination = transfer.destination or self._master_email
+            missing_side = "to_account" if not transfer.destination else None
+        if missing_side:
             raise ValueError(
-                "A WazirX master account email is required (set wazirx_master_email or pass "
-                "to_account) to transfer to the master account."
+                f"A WazirX master account email is required (set wazirx_master_email or pass "
+                f"{missing_side}) for {transfer.transfer_type.value} transfers."
             )
-        transfer.destination = to_email
 
         params = {
             "currency": transfer.asset.lower(),
             "amount": f"{transfer.amount:f}",
             "fromEmail": transfer.source,
-            "toEmail": to_email,
+            "toEmail": transfer.destination,
         }
         resp = await self._wazirx_request(
             method="POST",

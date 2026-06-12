@@ -19,6 +19,7 @@ from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
 from hummingbot.connector.wallet_transfer.wallet_transfer_data_types import (
     TransferState,
+    TransferType,
     TransferUpdate,
     WalletTransfer,
 )
@@ -44,6 +45,7 @@ class CoindcxExchange(WalletTransferExecutorMixin, ExchangePyBase):
 
     # Wallet-transfer capabilities (see WalletTransferExecutorMixin)
     supports_sub_to_master_transfer = True
+    supports_master_to_sub_transfer = True
     supports_withdrawal = False  # CoinDCX does not expose an external withdrawal endpoint
 
     def __init__(self,
@@ -331,32 +333,86 @@ class CoindcxExchange(WalletTransferExecutorMixin, ExchangePyBase):
             throttler_limit_id=path_url,
         )
 
+    async def get_user_info(self, use_master: bool = False) -> Dict[str, Any]:
+        """
+        Fetch the account profile from POST /exchange/v1/users/info
+        (coindcx_id, first_name, last_name, email, mobile_number).
+
+        :param use_master: sign with the master credentials instead of the primary ones
+        """
+        if use_master:
+            self._verify_master_credentials()
+            response = await self._master_post(CONSTANTS.USER_INFO_PATH_URL, data={})
+        else:
+            response = await self._api_post(
+                path_url=CONSTANTS.USER_INFO_PATH_URL,
+                data={},
+                is_auth_required=True,
+            )
+        return response[0] if isinstance(response, list) else response
+
+    async def get_balances(self, use_master: bool = False, non_zero_only: bool = True) -> List[Dict[str, Any]]:
+        """
+        Fetch wallet balances from POST /exchange/v1/users/balances as a raw list of
+        ``{"currency", "balance", "locked_balance"}`` records.
+
+        :param use_master: sign with the master credentials instead of the primary ones
+        :param non_zero_only: drop assets whose free and locked balances are both zero
+        """
+        if use_master:
+            self._verify_master_credentials()
+            response = await self._master_post(CONSTANTS.USER_BALANCES_PATH_URL, data={})
+        else:
+            response = await self._api_post(
+                path_url=CONSTANTS.USER_BALANCES_PATH_URL,
+                data={},
+                is_auth_required=True,
+            )
+        balances = response if isinstance(response, list) else response.get("balances", [])
+        if non_zero_only:
+            balances = [
+                entry for entry in balances
+                if Decimal(str(entry.get("balance", 0))) != 0 or Decimal(str(entry.get("locked_balance", 0))) != 0
+            ]
+        return balances
+
     async def _get_master_account_id(self) -> str:
         if self._master_account_id is None:
-            user_info = await self._master_post(CONSTANTS.USER_INFO_PATH_URL, data={})
-            record = user_info[0] if isinstance(user_info, list) else user_info
+            record = await self.get_user_info(use_master=True)
             self._master_account_id = str(record.get("coindcx_id"))
         return self._master_account_id
 
     async def _place_internal_transfer(self, transfer: WalletTransfer, **kwargs) -> TransferUpdate:
         """
-        Transfer funds from a sub-account to the master account using master credentials.
-        CoinDCX identifies accounts by coindcx_id; the destination defaults to the master account.
+        Transfer funds between the master account and a sub-account (either direction) using
+        master credentials. CoinDCX identifies accounts by coindcx_id; the master side of the
+        transfer defaults to the account id resolved from the master credentials.
         """
-        to_account_id = transfer.destination or await self._get_master_account_id()
-        transfer.destination = to_account_id
+        if transfer.transfer_type == TransferType.MASTER_TO_SUB:
+            transfer.source = transfer.source or await self._get_master_account_id()
+        else:
+            transfer.destination = transfer.destination or await self._get_master_account_id()
 
         data = {
             "from_account_id": transfer.source,
-            "to_account_id": to_account_id,
+            "to_account_id": transfer.destination,
             "currency_short_name": transfer.asset.upper(),
             "amount": float(transfer.amount),
         }
         resp = await self._master_post(CONSTANTS.SUB_ACCOUNT_TRANSFER_PATH_URL, data=data)
 
-        status = str(resp.get("status", "")).lower() if isinstance(resp, dict) else ""
-        if status and status != "success":
-            raise IOError(f"CoinDCX rejected the transfer: {resp}")
+        # The docs describe {"status": "success", "message": 200} but the live API swaps the
+        # fields ({"message": "success", "status": 200}), so accept "success" in either one,
+        # or any 2xx numeric status/code.
+        if isinstance(resp, dict):
+            indicators = {str(resp.get(key, "")).strip().lower() for key in ("status", "message")}
+            numeric_codes = [
+                int(value) for value in (resp.get("status"), resp.get("code"))
+                if isinstance(value, int) or (isinstance(value, str) and value.isdigit())
+            ]
+            is_success = "success" in indicators or any(200 <= code < 300 for code in numeric_codes)
+            if not is_success:
+                raise IOError(f"CoinDCX rejected the transfer: {resp}")
 
         return TransferUpdate(
             client_transfer_id=transfer.client_transfer_id,

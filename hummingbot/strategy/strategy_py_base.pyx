@@ -17,7 +17,9 @@ from hummingbot.core.event.events import (
     RangePositionUpdateEvent,
     RangePositionUpdateFailureEvent,
     RangePositionFeeCollectedEvent,
-    RangePositionClosedEvent
+    RangePositionClosedEvent,
+    OrderEditedEvent,
+    OrderEditFailedEvent
 )
 
 
@@ -80,6 +82,18 @@ cdef class StrategyPyBase(StrategyBase):
         self.did_expire_order(expired_event)
 
     def did_expire_order(self, expired_event: OrderExpiredEvent):
+        pass
+
+    cdef c_did_edit_order(self, object order_edited_event):
+        self.did_edit_order(order_edited_event)
+
+    def did_edit_order(self, order_edited_event: OrderEditedEvent):
+        pass
+
+    cdef c_did_fail_order_edit(self, object order_edit_failed_event):
+        self.did_fail_order_edit(order_edit_failed_event)
+
+    def did_fail_order_edit(self, order_edit_failed_event: OrderEditFailedEvent):
         pass
 
     cdef c_did_complete_buy_order(self, object order_completed_event):

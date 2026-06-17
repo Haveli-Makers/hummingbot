@@ -38,6 +38,18 @@ class DeltaPerpetualConfigMap(BaseConnectorConfigMap):
             "prompt_on_new": True,
         },
     )
+    delta_perpetual_proxy_url: SecretStr = Field(
+        default=SecretStr(""),  # empty = no proxy (direct connection)
+        json_schema_extra={
+            "prompt": lambda cm: (
+                "Enter a proxy URL to route Delta traffic through a whitelisted IP "
+                "(e.g. socks5://user:pass@host:1080), or leave blank to connect directly"
+            ),
+            "is_secure": True,        # stored encrypted in conf/connectors/delta_perpetual.yml
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        },
+    )
     model_config = ConfigDict(title="delta_perpetual")
 
 

@@ -201,6 +201,39 @@ class DeltaPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(555, captured["id"])
         self.assertEqual(27, captured["product_id"])
 
+    async def test_stop_network_closes_proxy_factory(self):
+        # With a proxy configured, stop_network must close the dedicated session.
+        c = DeltaPerpetualDerivative(
+            delta_perpetual_api_key="k", delta_perpetual_api_secret="s",
+            delta_perpetual_proxy_url="socks5://user:pass@host:1080",
+            trading_pairs=[self.trading_pair], trading_required=False,
+        )
+        self.assertEqual("socks5://user:pass@host:1080", c._proxy_url)
+        c._web_assistants_factory.close = AsyncMock()
+        await c.stop_network()
+        c._web_assistants_factory.close.assert_awaited_once()
+
+    async def test_stop_network_without_proxy_keeps_shared_factory(self):
+        # Without a proxy the connections factory is a shared singleton — never close it.
+        self.connector._web_assistants_factory.close = AsyncMock()
+        await self.connector.stop_network()
+        self.connector._web_assistants_factory.close.assert_not_called()
+
+    async def test_place_cancel_pending_order_without_exchange_id(self):
+        # An order still pending creation has no exchange_order_id; cancelling it
+        # must not crash on int(None) — it returns False so the framework retries.
+        self._bootstrap_symbol_map()
+        order = InFlightOrder(
+            client_order_id="DLTA-4b", trading_pair=self.trading_pair, order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY, amount=Decimal("0.001"), price=Decimal("50000"),
+            creation_timestamp=1700000000.0,
+        )
+        self.assertIsNone(order.exchange_order_id)
+        self.connector._api_delete = AsyncMock(side_effect=AssertionError("should not call the API"))
+        ok = await self.connector._place_cancel("DLTA-4b", order)
+        self.assertFalse(ok)
+        self.connector._api_delete.assert_not_called()
+
     async def test_request_order_status_maps_state(self):
         self._bootstrap_symbol_map()
         order = InFlightOrder(
@@ -263,6 +296,30 @@ class DeltaPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
         )
         await self.connector._update_positions()
         self.assertEqual(0, len(self.connector.account_positions))
+
+    async def test_update_positions_resolves_by_product_id(self):
+        # /v2/positions/margined may omit product_symbol — fall back to product_id.
+        self._bootstrap_symbol_map()
+        captured = {}
+        self.connector._api_get = AsyncMock(
+            side_effect=lambda path_url, **kw: captured.update(path=path_url) or _wrap([
+                {"product_id": 27, "size": -3, "entry_price": "50000"}
+            ])
+        )
+        await self.connector._update_positions()
+        # Uses the all-positions endpoint, not the filtered /v2/positions.
+        self.assertEqual(CONSTANTS.POSITIONS_MARGINED_PATH_URL, captured["path"])
+        positions = self.connector.account_positions
+        self.assertEqual(1, len(positions))
+        pos = list(positions.values())[0]
+        self.assertEqual(PositionSide.SHORT, pos.position_side)
+        self.assertEqual(Decimal("-0.003"), pos.amount)  # -3 contracts * 0.001
+
+    def test_symbol_for_product_id(self):
+        self._bootstrap_symbol_map()
+        self.assertEqual(self.symbol, self.connector._symbol_for_product_id(27))
+        self.assertIsNone(self.connector._symbol_for_product_id(999999))
+        self.assertIsNone(self.connector._symbol_for_product_id(None))
 
     async def test_set_leverage(self):
         self._bootstrap_symbol_map()

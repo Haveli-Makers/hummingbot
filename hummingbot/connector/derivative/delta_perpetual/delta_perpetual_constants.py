@@ -26,7 +26,12 @@ ORDER_BOOK_PATH_URL = "/v2/l2orderbook/{symbol}"
 # ── Private REST endpoints ─────────────────────────────────────────────────────
 ORDERS_PATH_URL = "/v2/orders"                     # POST place, DELETE cancel, PUT edit, GET list
 ORDER_BY_ID_PATH_URL = "/v2/orders/{order_id}"     # GET single order
+# NOTE: GET /v2/positions returns a SINGLE position and REQUIRES a product_id /
+# underlying_asset_symbol filter (else HTTP 400 bad_schema).
+
+# To poll ALL open positions in one call, use /v2/positions/margined.
 POSITIONS_PATH_URL = "/v2/positions"
+POSITIONS_MARGINED_PATH_URL = "/v2/positions/margined"
 WALLET_PATH_URL = "/v2/wallet/balances"
 SET_LEVERAGE_PATH_URL = "/v2/products/{product_id}/orders/leverage"
 
@@ -80,8 +85,8 @@ MAX_REQUESTS = 6000
 
 _ALL_PATHS = [
     PRODUCTS_PATH_URL, TICKERS_PATH_URL, TICKER_PATH_URL, ORDER_BOOK_PATH_URL,
-    ORDERS_PATH_URL, ORDER_BY_ID_PATH_URL, POSITIONS_PATH_URL, WALLET_PATH_URL,
-    SET_LEVERAGE_PATH_URL,
+    ORDERS_PATH_URL, ORDER_BY_ID_PATH_URL, POSITIONS_PATH_URL, POSITIONS_MARGINED_PATH_URL,
+    WALLET_PATH_URL, SET_LEVERAGE_PATH_URL,
 ]
 
 RATE_LIMITS = [RateLimit(limit_id=GLOBAL_LIMIT_ID, limit=MAX_REQUESTS, time_interval=ONE_MINUTE)]

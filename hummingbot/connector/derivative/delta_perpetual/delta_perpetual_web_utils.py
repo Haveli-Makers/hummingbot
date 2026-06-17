@@ -23,6 +23,7 @@ def build_api_factory(
         domain: str = CONSTANTS.DEFAULT_DOMAIN,
         time_provider: Optional[Callable] = None,
         auth: Optional[AuthBase] = None,
+        proxy_url: Optional[str] = None,
 ) -> WebAssistantsFactory:
     throttler = throttler or create_throttler()
     time_synchronizer = time_synchronizer or TimeSynchronizer()
@@ -30,10 +31,26 @@ def build_api_factory(
     return WebAssistantsFactory(
         throttler=throttler,
         auth=auth,
+        connections_factory=_build_connections_factory(proxy_url),
         rest_pre_processors=[
             TimeSynchronizerRESTPreProcessor(synchronizer=time_synchronizer, time_provider=time_provider),
         ],
     )
+
+
+def _build_connections_factory(proxy_url: Optional[str]):
+    """
+    Return a ProxyConnectionsFactory when a proxy URL is provided (routes both
+    REST and WebSocket traffic through a whitelisted IP), otherwise fall back to
+    the default singleton ConnectionsFactory. The proxy import is lazy so the
+    aiohttp_socks dependency is only loaded when a proxy is actually configured.
+    """
+    if proxy_url:
+        from hummingbot.core.web_assistant.connections.proxy_connections_factory import ProxyConnectionsFactory
+        return ProxyConnectionsFactory(proxy_url=proxy_url)
+
+    from hummingbot.core.web_assistant.connections.connections_factory import ConnectionsFactory
+    return ConnectionsFactory()
 
 
 def build_api_factory_without_time_synchronizer_pre_processor(throttler: AsyncThrottler) -> WebAssistantsFactory:

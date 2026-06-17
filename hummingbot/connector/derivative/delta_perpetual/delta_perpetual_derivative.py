@@ -53,6 +53,7 @@ class DeltaPerpetualDerivative(PerpetualDerivativePyBase):
         self,
         delta_perpetual_api_key: str,
         delta_perpetual_api_secret: str,
+        delta_perpetual_proxy_url: str = "",
         balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
         rate_limits_share_pct: Decimal = Decimal("100"),
         trading_pairs: Optional[List[str]] = None,
@@ -61,6 +62,8 @@ class DeltaPerpetualDerivative(PerpetualDerivativePyBase):
     ):
         self.api_key = delta_perpetual_api_key
         self.secret_key = delta_perpetual_api_secret
+        # Optional proxy: route REST + WS traffic through a whitelisted IP. Empty = direct.
+        self._proxy_url = delta_perpetual_proxy_url or ""
         self._domain = domain
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
@@ -149,6 +152,7 @@ class DeltaPerpetualDerivative(PerpetualDerivativePyBase):
             time_synchronizer=self._time_synchronizer,
             domain=self._domain,
             auth=self._auth,
+            proxy_url=self._proxy_url or None,
         )
 
     def _create_order_book_data_source(self) -> OrderBookTrackerDataSource:
@@ -167,6 +171,18 @@ class DeltaPerpetualDerivative(PerpetualDerivativePyBase):
             api_factory=self._web_assistants_factory,
             domain=self._domain,
         )
+
+    async def stop_network(self):
+        await super().stop_network()
+        # When a proxy is configured, the web-assistants factory owns a dedicated,
+        # per-connector aiohttp session (ProxyConnectionsFactory). Close it on
+        # shutdown so it doesn't leak ("Unclosed client session"). The default
+        # ConnectionsFactory is a shared singleton, so it's deliberately left alone.
+        if self._proxy_url:
+            try:
+                await self._web_assistants_factory.close()
+            except Exception:
+                self.logger().debug("Error closing proxy connections factory on stop_network.", exc_info=True)
 
     # ── Exception classification ───────────────────────────────────────────────
 
@@ -199,6 +215,15 @@ class DeltaPerpetualDerivative(PerpetualDerivativePyBase):
     async def _product_id_for_pair(self, trading_pair: str) -> Optional[int]:
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
         return self._product_id_by_symbol.get(symbol)
+
+    def _symbol_for_product_id(self, product_id) -> Optional[str]:
+        """Reverse-lookup an exchange symbol from a Delta numeric product id."""
+        if product_id is None:
+            return None
+        for symbol, pid in self._product_id_by_symbol.items():
+            if pid == product_id:
+                return symbol
+        return None
 
     # ── Trading-pair initialisation ────────────────────────────────────────────
 
@@ -351,6 +376,16 @@ class DeltaPerpetualDerivative(PerpetualDerivativePyBase):
         return exchange_order_id, transact_time
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder) -> bool:
+        # The order may still be pending creation (no exchange id assigned yet).
+        # Delta cancels by numeric order id, so without one there is nothing to
+        # cancel server-side; report "not cancelled" so the framework retries
+        # once the creation response arrives, rather than crashing on int(None).
+        if tracked_order.exchange_order_id is None:
+            self.logger().warning(
+                f"Cannot cancel {order_id} yet: the exchange order id is not available "
+                f"(order still pending creation). Will retry."
+            )
+            return False
         product_id = await self._product_id_for_pair(tracked_order.trading_pair)
         payload = {"id": int(tracked_order.exchange_order_id), "product_id": product_id}
         response = await self._api_delete(
@@ -429,11 +464,12 @@ class DeltaPerpetualDerivative(PerpetualDerivativePyBase):
     # ── Positions / leverage / funding ─────────────────────────────────────────
 
     async def _update_positions(self):
-        response = await self._api_get(path_url=CONSTANTS.POSITIONS_PATH_URL, is_auth_required=True)
+        # /v2/positions needs a product filter; /v2/positions/margined returns all open positions.
+        response = await self._api_get(path_url=CONSTANTS.POSITIONS_MARGINED_PATH_URL, is_auth_required=True)
         for position in _result(response) or []:
             if not isinstance(position, dict):
                 continue
-            ex_symbol = position.get("product_symbol")
+            ex_symbol = position.get("product_symbol") or self._symbol_for_product_id(position.get("product_id"))
             try:
                 hb_pair = await self.trading_pair_associated_to_exchange_symbol(ex_symbol)
             except KeyError:

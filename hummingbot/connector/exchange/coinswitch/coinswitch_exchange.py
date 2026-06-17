@@ -521,34 +521,76 @@ class CoinswitchExchange(ExchangePyBase):
                 event_type = event_message.get("event")
 
                 if event_type == CONSTANTS.BALANCE_UPDATE_EVENT_TYPE:
-                    balance_data = event_message.get("data", [])
-                    for asset_data in balance_data:
-                        asset = asset_data.get("currency", "").upper()
-                        free = Decimal(str(asset_data.get("main_balance", 0)))
-                        locked = Decimal(str(asset_data.get("blocked_balance_order", 0)))
-                        total = free + locked
-                        self._account_balances[asset] = total
+                    # FETCH_BALANCE_UPDATES pushes a dict keyed by lowercase asset:
+                    #   {"btc": {"free_balance": .., "locked_balance": ..}, "inr": {..}}
+                    # (the subscribe-ack frame {"success", "message"} is skipped by
+                    # the isinstance check below).
+                    for asset_key, asset_val in event_message.items():
+                        if asset_key == "event" or not isinstance(asset_val, dict):
+                            continue
+                        asset = asset_key.upper()
+                        free = Decimal(str(asset_val.get("free_balance", 0)))
+                        locked = Decimal(str(asset_val.get("locked_balance", 0)))
                         self._account_available_balances[asset] = free
+                        self._account_balances[asset] = free + locked
 
                 elif event_type == CONSTANTS.ORDER_UPDATE_EVENT_TYPE:
-                    orders_data = event_message.get("data", [])
-                    for order_data in orders_data:
-                        client_order_id = order_data.get("client_order_id")
-                        exchange_order_id = str(order_data.get("order_id", ""))
-                        status = order_data.get("status", "")
+                    # FETCH_ORDER_UPDATES pushes a SINGLE order frame (not a list,
+                    # no "data" wrapper, no client id): X=status, i=orderId,
+                    # z=cumulative filled base, v=avg exec price, p=limit price,
+                    # O=updated time, E=event time.
+                    status = event_message.get("X")
+                    exchange_order_id = str(event_message.get("i", ""))
+                    new_state = CONSTANTS.ORDER_STATE.get(status) if status else None
+                    if new_state is None or not exchange_order_id:
+                        continue  # subscribe ack / unknown status
 
-                        tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
-                        if tracked_order is not None:
-                            new_state = CONSTANTS.ORDER_STATE.get(status)
-                            if new_state is not None:
-                                order_update = OrderUpdate(
-                                    trading_pair=tracked_order.trading_pair,
-                                    update_timestamp=float(order_data.get("updated_time", 0)) / 1000.0,
-                                    new_state=new_state,
-                                    client_order_id=client_order_id,
-                                    exchange_order_id=exchange_order_id,
-                                )
-                                self._order_tracker.process_order_update(order_update=order_update)
+                    # WS carries no client order id — match by exchange order id.
+                    tracked_order = next(
+                        (o for o in self._order_tracker.all_updatable_orders.values()
+                         if o.exchange_order_id == exchange_order_id),
+                        None,
+                    )
+                    if tracked_order is None:
+                        continue
+
+                    update_ts = float(event_message.get("O") or event_message.get("E") or 0) / 1000.0
+
+                    # CoinSwitch has no separate trade stream — synthesize the fill
+                    # from the cumulative executed qty (z), emitting only the new
+                    # delta vs what's already recorded. Process the fill BEFORE the
+                    # order state so a terminal (EXECUTED) update isn't completed
+                    # with "incomplete information".
+                    filled_total = Decimal(str(event_message.get("z", "0")))
+                    delta = filled_total - tracked_order.executed_amount_base
+                    if delta > Decimal("0"):
+                        avg_price = Decimal(str(
+                            event_message.get("v") or event_message.get("p") or "0"))
+                        fee = TradeFeeBase.new_spot_fee(
+                            fee_schema=self.trade_fee_schema(),
+                            trade_type=tracked_order.trade_type,
+                        )
+                        trade_update = TradeUpdate(
+                            trade_id=f"{exchange_order_id}-{filled_total}",
+                            client_order_id=tracked_order.client_order_id,
+                            exchange_order_id=exchange_order_id,
+                            trading_pair=tracked_order.trading_pair,
+                            fee=fee,
+                            fill_base_amount=delta,
+                            fill_quote_amount=delta * avg_price,
+                            fill_price=avg_price,
+                            fill_timestamp=update_ts,
+                        )
+                        self._order_tracker.process_trade_update(trade_update)
+
+                    order_update = OrderUpdate(
+                        trading_pair=tracked_order.trading_pair,
+                        update_timestamp=update_ts,
+                        new_state=new_state,
+                        client_order_id=tracked_order.client_order_id,
+                        exchange_order_id=exchange_order_id,
+                    )
+                    self._order_tracker.process_order_update(order_update=order_update)
 
             except asyncio.CancelledError:
                 raise

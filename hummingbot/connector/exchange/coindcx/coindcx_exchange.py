@@ -686,7 +686,8 @@ class CoindcxExchange(ExchangePyBase):
 
             try:
                 trade_history_params = {
-                    "limit": 100
+                    "limit": 100,
+                    "sort": "desc"
                 }
 
                 trades = await self._api_post(
@@ -740,7 +741,8 @@ class CoindcxExchange(ExchangePyBase):
             try:
                 trade_history_params = {
                     "symbol": await self.exchange_symbol_associated_to_pair(trading_pair=order.trading_pair),
-                    "limit": 100
+                    "limit": 100,
+                    "sort": "desc"
                 }
 
                 all_fills_response = await self._api_post(

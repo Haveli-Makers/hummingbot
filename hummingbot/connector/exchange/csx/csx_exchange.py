@@ -6,18 +6,26 @@ from typing import Any, Dict, List, Optional, Tuple
 from bidict import bidict
 
 from hummingbot.connector.constants import s_decimal_NaN
-from hummingbot.connector.exchange.csx import csx_constants as CONSTANTS, csx_web_utils as web_utils
+from hummingbot.connector.exchange.csx import csx_constants as CONSTANTS, csx_utils, csx_web_utils as web_utils
 from hummingbot.connector.exchange.csx.csx_api_order_book_data_source import CsxAPIOrderBookDataSource
 from hummingbot.connector.exchange.csx.csx_api_user_stream_data_source import CsxAPIUserStreamDataSource
 from hummingbot.connector.exchange.csx.csx_auth import CsxAuth
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
+from hummingbot.connector.wallet_transfer.wallet_transfer_data_types import (
+    TransferState,
+    TransferType,
+    TransferUpdate,
+    WalletTransfer,
+)
+from hummingbot.connector.wallet_transfer.wallet_transfer_executor import WalletTransferExecutorMixin
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
+from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
 _logger = logging.getLogger(__name__)
@@ -90,14 +98,24 @@ def _extract_instruments_list(response: Any) -> list:
     return []
 
 
-class CsxExchange(ExchangePyBase):
+class CsxExchange(WalletTransferExecutorMixin, ExchangePyBase):
     UPDATE_ORDER_STATUS_MIN_INTERVAL = 10.0
     web_utils = web_utils
+
+    # Wallet-transfer capabilities (see WalletTransferExecutorMixin). CSX moves funds between the
+    # master account and its broker (sub) accounts via /api/v1/master/me/transferFunds, either way.
+    supports_sub_to_master_transfer = True
+    supports_master_to_sub_transfer = True
+    # CSX *does* expose POST /api/v1/me/withdrawal, but external withdrawal is intentionally left
+    # unimplemented for now (kept consistent with the other connectors).
+    supports_withdrawal = False
 
     def __init__(
         self,
         csx_api_key: str,
         csx_api_secret: str,
+        csx_master_api_key: Optional[str] = None,
+        csx_master_api_secret: Optional[str] = None,
         balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
         rate_limits_share_pct: Decimal = Decimal("100"),
         trading_pairs: Optional[List[str]] = None,
@@ -107,6 +125,10 @@ class CsxExchange(ExchangePyBase):
     ):
         self.api_key = csx_api_key
         self.secret_key = csx_api_secret
+        self._master_api_key = csx_master_api_key or None
+        self._master_api_secret = csx_master_api_secret or None
+        self._master_broker_id: Optional[str] = None
+        self._master_web_assistants_factory: Optional[WebAssistantsFactory] = None
         self._domain = domain
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
@@ -419,6 +441,129 @@ class CsxExchange(ExchangePyBase):
                 f"Could not determine CSX username from profile response: {response}"
             )
         return self._username
+
+    # ── Wallet transfer support ────────────────────────────────────────────────
+
+    @property
+    def _master_authenticator(self) -> CsxAuth:
+        return CsxAuth(
+            api_key=self._master_api_key,
+            secret_key=self._master_api_secret,
+            time_provider=self._time_synchronizer,
+        )
+
+    @property
+    def _master_web_factory(self) -> WebAssistantsFactory:
+        if self._master_web_assistants_factory is None:
+            self._master_web_assistants_factory = web_utils.build_api_factory(
+                throttler=self._throttler,
+                time_synchronizer=self._time_synchronizer,
+                domain=self._domain,
+                auth=self._master_authenticator,
+                proxy_url=self._proxy_url or None,  # transfers must use the whitelisted IP too
+            )
+        return self._master_web_assistants_factory
+
+    def _verify_master_credentials(self) -> None:
+        if not self._master_api_key or not self._master_api_secret:
+            raise ValueError(
+                "CSX master account API key and secret are required for wallet transfers. "
+                "Configure csx_master_api_key and csx_master_api_secret."
+            )
+
+    async def _master_request(self, method: RESTMethod, path_url: str, data: Optional[Dict[str, Any]] = None) -> Any:
+        """Call a private endpoint signed with the master-account (Ed25519) credentials."""
+        rest_assistant = await self._master_web_factory.get_rest_assistant()
+        url = web_utils.private_rest_url(path_url, domain=self._domain)
+        # Bound the call so a stalled connection raises instead of hanging the caller forever.
+        return await rest_assistant.execute_request(
+            url=url,
+            data=data,
+            method=method,
+            is_auth_required=True,
+            throttler_limit_id=path_url,
+            timeout=CONSTANTS.MASTER_REQUEST_TIMEOUT,
+        )
+
+    async def get_profile(self, use_master: bool = False) -> Dict[str, Any]:
+        """
+        Fetch the account profile from GET /api/v1/me/ (brokerID, userName, walletAddress).
+
+        :param use_master: sign with the master credentials instead of the primary ones
+        """
+        if use_master:
+            self._verify_master_credentials()
+            response = await self._master_request(RESTMethod.GET, CONSTANTS.PROFILE_PATH_URL)
+        else:
+            response = await self._api_get(path_url=CONSTANTS.PROFILE_PATH_URL, is_auth_required=True)
+        return response.get("data", response) if isinstance(response, dict) else {}
+
+    async def get_balances(self, use_master: bool = False) -> Dict[str, Dict[str, Decimal]]:
+        """
+        Fetch wallet balances as {asset: {free, locked, total}}.
+
+        CSX exposes a separate endpoint family for master accounts: master balances come from
+        GET /api/v1/master/me/getBalance/, while regular/broker accounts use GET /api/v2/me/balance/.
+
+        :param use_master: sign with the master credentials and query the master balance endpoint
+        """
+        if use_master:
+            self._verify_master_credentials()
+            response = await self._master_request(RESTMethod.GET, CONSTANTS.MASTER_BALANCE_PATH_URL)
+        else:
+            response = await self._api_get(path_url=CONSTANTS.BALANCE_V2_PATH_URL, is_auth_required=True)
+        return csx_utils.parse_balance_response(response)
+
+    async def _get_master_broker_id(self) -> str:
+        """
+        Resolve the master account's brokerID.
+
+        A CSX broker (sub) account's profile (GET /api/v1/me/) exposes its parent/master account id
+        as ``parentID``. CSX does not reliably expose /api/v1/me/ for master accounts, so the master
+        id is derived from this connector's own (broker/sub) account profile ``parentID`` rather than
+        from the master's own profile. Falls back to that profile's ``brokerID`` for the case where
+        the configured account is itself the master. Callers can bypass resolution entirely by
+        passing the master id explicitly (the ``master_account`` override on transfer_to_*).
+        """
+        if self._master_broker_id is None:
+            profile = await self.get_profile(use_master=False)
+            broker_id = profile.get("parentID") or profile.get("brokerID") or profile.get("id")
+            if not broker_id:
+                raise IOError(f"Could not determine CSX master brokerID from profile: {profile}")
+            self._master_broker_id = str(broker_id)
+        return self._master_broker_id
+
+    async def _place_internal_transfer(self, transfer: WalletTransfer, **kwargs) -> TransferUpdate:
+        """
+        Move funds between the master account and a broker (sub) account using master credentials.
+        CSX identifies accounts by brokerID; the master side of the transfer defaults to the
+        brokerID resolved from the master credentials, and the broker (sub) side is supplied by
+        the caller.
+        """
+        if transfer.transfer_type == TransferType.MASTER_TO_SUB:
+            transfer.source = transfer.source or await self._get_master_broker_id()
+        else:  # SUB_TO_MASTER
+            transfer.destination = transfer.destination or await self._get_master_broker_id()
+
+        data = {
+            "fromID": transfer.source,
+            "toID": transfer.destination,
+            "assetName": transfer.asset.upper(),
+            "amount": f"{transfer.amount:f}",
+        }
+        resp = await self._master_request(RESTMethod.POST, CONSTANTS.MASTER_TRANSFER_FUNDS_PATH_URL, data=data)
+
+        # CSX returns HTTP 200 with {"message": "Transferred funds successfully ..."} and no status
+        # field (a non-2xx would already have raised). Treat a success-y message as completed.
+        message = str(resp.get("message", "")) if isinstance(resp, dict) else ""
+        if "success" not in message.lower() and "transferred" not in message.lower():
+            raise IOError(f"CSX rejected the transfer: {resp}")
+
+        return TransferUpdate(
+            client_transfer_id=transfer.client_transfer_id,
+            new_state=TransferState.COMPLETED,
+            update_timestamp=self.current_timestamp,
+        )
 
     # ── Order placement & cancellation ────────────────────────────────────────
 

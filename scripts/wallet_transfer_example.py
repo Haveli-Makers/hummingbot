@@ -2,7 +2,7 @@ import os
 from decimal import Decimal
 from typing import Dict
 
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from hummingbot.client.config.config_data_types import BaseClientModel
 from hummingbot.connector.connector_base import ConnectorBase
@@ -10,23 +10,84 @@ from hummingbot.core.event.event_forwarder import EventForwarder
 from hummingbot.core.event.events import MarketEvent, WalletTransferCompletedEvent, WalletTransferFailedEvent
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 
+# Connectors that support the generic wallet-transfer capability (WalletTransferExecutorMixin).
+SUPPORTED_CONNECTORS = ["wazirx", "coindcx", "csx"]
+SUPPORTED_DIRECTIONS = ["sub_to_master", "master_to_sub"]
+
 
 class WalletTransferConfig(BaseClientModel):
-    script_file_name: str = os.path.basename(__file__)
-    # Connector that holds the MASTER account credentials (configure master creds via `connect`).
-    connector: str = Field("wazirx")
-    # A trading pair is only needed so the connector initializes and reports "ready".
-    trading_pair: str = Field("BTC-INR")
-    # Asset and amount to move between the accounts.
-    asset: str = Field("USDT")
-    amount: Decimal = Field(Decimal("1"))
-    # Transfer direction: "sub_to_master" or "master_to_sub".
-    direction: str = Field("sub_to_master")
-    # The sub-account involved (email for WazirX, coindcx_id for CoinDCX). The master side of the
-    # transfer is always the connector's configured master account, so it is not specified here.
-    sub_account: str = Field("sub-account@example.com")
-    # Optional: override the master-account identifier. Leave blank to use the configured master.
-    master_account: str = Field("")
+    script_file_name: str = Field(default_factory=lambda: os.path.basename(__file__))
+    connector: str = Field(
+        default="wazirx",
+        json_schema_extra={
+            "prompt": lambda mi: f"Enter the connector to transfer on ({', '.join(SUPPORTED_CONNECTORS)}): ",
+            "prompt_on_new": True,
+        },
+    )
+    direction: str = Field(
+        default="master_to_sub",
+        json_schema_extra={
+            "prompt": lambda mi: f"Enter the transfer direction ({' / '.join(SUPPORTED_DIRECTIONS)}): ",
+            "prompt_on_new": True,
+        },
+    )
+    sub_account: str = Field(
+        default="",
+        json_schema_extra={
+            "prompt": lambda mi: (
+                "Enter the SUB account identifier "
+                "(email for WazirX, coindcx_id for CoinDCX, brokerID for CSX): "
+            ),
+            "prompt_on_new": True,
+        },
+    )
+    asset: str = Field(
+        default="INR",
+        json_schema_extra={
+            "prompt": lambda mi: "Enter the asset to transfer (e.g. USDT, INR): ",
+            "prompt_on_new": True,
+        },
+    )
+    amount: Decimal = Field(
+        default=Decimal("10"),
+        json_schema_extra={
+            "prompt": lambda mi: "Enter the amount to transfer: ",
+            "prompt_on_new": True,
+        },
+    )
+    master_account: str = Field(
+        default="",
+        json_schema_extra={
+            "prompt": lambda mi: (
+                "Enter the MASTER account identifier to override auto-resolution "
+                "(leave blank to use the connector's configured master): "
+            ),
+            "prompt_on_new": True,
+        },
+    )
+    trading_pair: str = Field(
+        default="BTC-INR",
+        json_schema_extra={
+            "prompt": lambda mi: "Enter a trading pair used only to initialise the connector (e.g. BTC-INR): ",
+            "prompt_on_new": True,
+        },
+    )
+
+    @field_validator("connector", mode="before")
+    @classmethod
+    def _validate_connector(cls, value):
+        value = str(value).strip().lower()
+        if value not in SUPPORTED_CONNECTORS:
+            raise ValueError(f"Connector must be one of: {', '.join(SUPPORTED_CONNECTORS)}")
+        return value
+
+    @field_validator("direction", mode="before")
+    @classmethod
+    def _validate_direction(cls, value):
+        value = str(value).strip().lower()
+        if value not in SUPPORTED_DIRECTIONS:
+            raise ValueError(f"Direction must be one of: {', '.join(SUPPORTED_DIRECTIONS)}")
+        return value
 
 
 class WalletTransferExample(ScriptStrategyBase):

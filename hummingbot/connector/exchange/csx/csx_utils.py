@@ -1,5 +1,5 @@
 from decimal import Decimal, InvalidOperation
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from pydantic import ConfigDict, Field, SecretStr
 
@@ -33,6 +33,26 @@ class CsxConfigMap(BaseConnectorConfigMap):
         default=...,
         json_schema_extra={
             "prompt": lambda cm: "Enter your CoinSwitch Kuber (CSX) API secret (64-char hex Ed25519 key)",
+            "is_secure": True,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        },
+    )
+    # Optional master-account credentials, used only for sub<->master wallet transfers.
+    # Leave blank if you do not use wallet transfers. Same Ed25519 hex format as the primary key.
+    csx_master_api_key: Optional[SecretStr] = Field(
+        default=None,
+        json_schema_extra={
+            "prompt": lambda cm: "Enter your CSX MASTER account API key (optional, leave blank if unused)",
+            "is_secure": True,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        },
+    )
+    csx_master_api_secret: Optional[SecretStr] = Field(
+        default=None,
+        json_schema_extra={
+            "prompt": lambda cm: "Enter your CSX MASTER account API secret (optional, 64-char hex Ed25519 key)",
             "is_secure": True,
             "is_connect_key": True,
             "prompt_on_new": True,

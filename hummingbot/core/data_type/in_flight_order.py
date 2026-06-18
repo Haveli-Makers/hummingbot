@@ -34,6 +34,7 @@ class OrderState(Enum):
     APPROVED = 8
     CREATED = 9
     COMPLETED = 10
+    PENDING_EDIT = 11
 
 
 class OrderUpdate(NamedTuple):
@@ -43,6 +44,8 @@ class OrderUpdate(NamedTuple):
     client_order_id: Optional[str] = None
     exchange_order_id: Optional[str] = None
     misc_updates: Optional[Dict[str, Any]] = None
+    new_price: Optional[Decimal] = None
+    new_amount: Optional[Decimal] = None
 
 
 class TradeUpdate(NamedTuple):
@@ -178,12 +181,17 @@ class InFlightOrder:
         return self.current_state == OrderState.PENDING_CANCEL
 
     @property
+    def is_pending_edit(self) -> bool:
+        return self.current_state == OrderState.PENDING_EDIT
+
+    @property
     def is_open(self) -> bool:
         return self.current_state in {
             OrderState.PENDING_CREATE,
             OrderState.OPEN,
             OrderState.PARTIALLY_FILLED,
-            OrderState.PENDING_CANCEL}
+            OrderState.PENDING_CANCEL,
+            OrderState.PENDING_EDIT}
 
     @property
     def is_done(self) -> bool:
@@ -343,6 +351,11 @@ class InFlightOrder:
 
         self.current_state = order_update.new_state
         self.check_processed_by_exchange_condition()
+
+        if order_update.new_price is not None:
+            self.price = order_update.new_price
+        if order_update.new_amount is not None:
+            self.amount = order_update.new_amount
 
         updated: bool = prev_data != (self.exchange_order_id, self.current_state)
 

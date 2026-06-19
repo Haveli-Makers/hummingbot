@@ -74,6 +74,55 @@ class CoindcxWalletTransferTest(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(1, len(self.failed_logger.event_log))
         self.assertEqual(TransferState.FAILED, self.exchange.get_transfer("t2").state)
 
+    @aioresponses()
+    async def test_sub_to_master_auto_resolves_both_ids(self, mock_api):
+        # With the sub id omitted, the connector resolves the sub id from its own (primary) creds'
+        # users/info and the master id from the master creds' users/info (two signed calls; same
+        # URL, consumed in call order: own first, then master).
+        url = self._user_info_url()
+        mock_api.post(url, body=json.dumps([{"coindcx_id": "sub-self"}]))     # own (primary) call
+        mock_api.post(url, body=json.dumps([{"coindcx_id": "master-123"}]))   # master call
+        mock_api.post(self._transfer_url(), body=json.dumps({"message": "success", "status": 200}))
+
+        transfer = WalletTransfer(
+            client_transfer_id="t-auto",
+            transfer_type=TransferType.SUB_TO_MASTER,
+            asset="USDT",
+            amount=Decimal("5"),
+            creation_timestamp=1000.0,
+            # source (sub) and destination (master) both omitted -> resolved from creds
+        )
+        await self.exchange._create_transfer(transfer)
+
+        self.assertEqual(1, len(self.completed_logger.event_log))
+        completed = self.exchange.get_transfer("t-auto")
+        self.assertEqual("sub-self", completed.source)
+        self.assertEqual("master-123", completed.destination)
+
+    @aioresponses()
+    async def test_master_to_sub_auto_resolves_both_ids(self, mock_api):
+        # MASTER_TO_SUB resolves the master side first, then the sub side.
+        url = self._user_info_url()
+        mock_api.post(url, body=json.dumps([{"coindcx_id": "master-123"}]))   # master call (first)
+        mock_api.post(url, body=json.dumps([{"coindcx_id": "sub-self"}]))     # own (primary) call
+        mock_api.post(self._transfer_url(), body=json.dumps({"message": "success", "status": 200}))
+
+        transfer = WalletTransfer(
+            client_transfer_id="t-auto-m2s",
+            transfer_type=TransferType.MASTER_TO_SUB,
+            asset="USDT",
+            amount=Decimal("5"),
+            creation_timestamp=1000.0,
+        )
+        await self.exchange._create_transfer(transfer)
+
+        completed = self.exchange.get_transfer("t-auto-m2s")
+        self.assertEqual("master-123", completed.source)
+        self.assertEqual("sub-self", completed.destination)
+
+    def test_coindcx_does_not_require_explicit_sub_account(self):
+        self.assertFalse(self.exchange.requires_explicit_sub_account)
+
     def test_missing_master_credentials_raises(self):
         exchange = CoindcxExchange(
             coindcx_api_key="k",

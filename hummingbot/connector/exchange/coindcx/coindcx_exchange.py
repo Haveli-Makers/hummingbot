@@ -46,6 +46,9 @@ class CoindcxExchange(WalletTransferExecutorMixin, ExchangePyBase):
     # Wallet-transfer capabilities (see WalletTransferExecutorMixin)
     supports_sub_to_master_transfer = True
     supports_master_to_sub_transfer = True
+    # The sub/master coindcx_id can be resolved from the configured credentials (users/info), so
+    # callers may omit the sub id — no need to prompt for it.
+    requires_explicit_sub_account = False
     supports_withdrawal = False  # CoinDCX does not expose an external withdrawal endpoint
 
     def __init__(self,
@@ -64,6 +67,7 @@ class CoindcxExchange(WalletTransferExecutorMixin, ExchangePyBase):
         self._master_api_key = coindcx_master_api_key or None
         self._master_api_secret = coindcx_master_api_secret or None
         self._master_account_id: Optional[str] = None
+        self._own_account_id: Optional[str] = None  # this (primary/sub) account's coindcx_id
         self._master_web_assistants_factory: Optional[WebAssistantsFactory] = None
         self._domain = domain
         self._trading_required = trading_required
@@ -377,20 +381,32 @@ class CoindcxExchange(WalletTransferExecutorMixin, ExchangePyBase):
         return balances
 
     async def _get_master_account_id(self) -> str:
+        """Resolve the master account's coindcx_id via users/info signed with the master creds."""
         if self._master_account_id is None:
             record = await self.get_user_info(use_master=True)
             self._master_account_id = str(record.get("coindcx_id"))
         return self._master_account_id
 
+    async def _get_own_account_id(self) -> str:
+        """Resolve this (primary/sub) account's coindcx_id via users/info signed with its own creds."""
+        if self._own_account_id is None:
+            record = await self.get_user_info(use_master=False)
+            self._own_account_id = str(record.get("coindcx_id"))
+        return self._own_account_id
+
     async def _place_internal_transfer(self, transfer: WalletTransfer, **kwargs) -> TransferUpdate:
         """
         Transfer funds between the master account and a sub-account (either direction) using
-        master credentials. CoinDCX identifies accounts by coindcx_id; the master side of the
-        transfer defaults to the account id resolved from the master credentials.
+        master credentials. CoinDCX identifies accounts by coindcx_id. Either side may be omitted:
+        the master side defaults to the id resolved from the master creds (users/info), and the sub
+        side defaults to this connector's own id resolved from its primary creds. Explicitly
+        provided ids always take precedence.
         """
         if transfer.transfer_type == TransferType.MASTER_TO_SUB:
             transfer.source = transfer.source or await self._get_master_account_id()
-        else:
+            transfer.destination = transfer.destination or await self._get_own_account_id()
+        else:  # SUB_TO_MASTER
+            transfer.source = transfer.source or await self._get_own_account_id()
             transfer.destination = transfer.destination or await self._get_master_account_id()
 
         data = {

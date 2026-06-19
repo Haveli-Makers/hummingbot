@@ -33,6 +33,11 @@ class WalletTransferExecutorMixin:
     supports_master_to_sub_transfer: bool = False
     supports_withdrawal: bool = False
 
+    # When False, the connector can resolve the sub-account identifier itself (e.g. from the
+    # credentials supplied at `connect`), so callers may omit it. Connectors that can do this
+    # override this to False and resolve the missing side in `_place_internal_transfer`.
+    requires_explicit_sub_account: bool = True
+
     # Confirmation polling configuration (used for withdrawals).
     TRANSFER_STATUS_POLL_INTERVAL: float = 10.0
     TRANSFER_CONFIRMATION_TIMEOUT: float = 1800.0  # 30 minutes
@@ -52,20 +57,21 @@ class WalletTransferExecutorMixin:
         self,
         asset: str,
         amount: Decimal,
-        from_account: str,
+        from_account: Optional[str] = None,
         to_account: Optional[str] = None,
         **kwargs,
     ) -> str:
         """
         Transfer ``amount`` of ``asset`` from a sub-account to the master account.
 
-        :param from_account: sub-account identifier (email for WazirX, account id for CoinDCX)
+        :param from_account: sub-account identifier (email for WazirX, account id for CoinDCX/CSX);
+            may be omitted on connectors that resolve it from the configured credentials
         :param to_account: master-account identifier; defaults to the connector's configured master
         :return: the client transfer id
         """
         if not self.supports_sub_to_master_transfer:
             raise NotImplementedError(f"{self.name} does not support sub-account to master transfers.")
-        if not from_account:
+        if self.requires_explicit_sub_account and not from_account:
             raise ValueError("from_account (the sub-account identifier) is required for a sub-to-master transfer.")
         self._verify_master_credentials()
 
@@ -86,20 +92,21 @@ class WalletTransferExecutorMixin:
         self,
         asset: str,
         amount: Decimal,
-        to_account: str,
+        to_account: Optional[str] = None,
         from_account: Optional[str] = None,
         **kwargs,
     ) -> str:
         """
         Transfer ``amount`` of ``asset`` from the master account to a sub-account.
 
-        :param to_account: sub-account identifier (email for WazirX, account id for CoinDCX)
+        :param to_account: sub-account identifier (email for WazirX, account id for CoinDCX/CSX);
+            may be omitted on connectors that resolve it from the configured credentials
         :param from_account: master-account identifier; defaults to the connector's configured master
         :return: the client transfer id
         """
         if not self.supports_master_to_sub_transfer:
             raise NotImplementedError(f"{self.name} does not support master to sub-account transfers.")
-        if not to_account:
+        if self.requires_explicit_sub_account and not to_account:
             raise ValueError("to_account (the sub-account identifier) is required for a master-to-sub transfer.")
         self._verify_master_credentials()
 

@@ -106,6 +106,9 @@ class CsxExchange(WalletTransferExecutorMixin, ExchangePyBase):
     # master account and its broker (sub) accounts via /api/v1/master/me/transferFunds, either way.
     supports_sub_to_master_transfer = True
     supports_master_to_sub_transfer = True
+    # The connector's own (primary) profile exposes brokerID (the sub) and parentID (the master),
+    # so both transfer sides can be resolved from the configured credentials — no need to prompt.
+    requires_explicit_sub_account = False
     # CSX *does* expose POST /api/v1/me/withdrawal, but external withdrawal is intentionally left
     # unimplemented for now (kept consistent with the other connectors).
     supports_withdrawal = False
@@ -128,6 +131,7 @@ class CsxExchange(WalletTransferExecutorMixin, ExchangePyBase):
         self._master_api_key = csx_master_api_key or None
         self._master_api_secret = csx_master_api_secret or None
         self._master_broker_id: Optional[str] = None
+        self._own_broker_id: Optional[str] = None  # this (primary/sub) account's brokerID
         self._master_web_assistants_factory: Optional[WebAssistantsFactory] = None
         self._domain = domain
         self._trading_required = trading_required
@@ -514,35 +518,54 @@ class CsxExchange(WalletTransferExecutorMixin, ExchangePyBase):
             response = await self._api_get(path_url=CONSTANTS.BALANCE_V2_PATH_URL, is_auth_required=True)
         return csx_utils.parse_balance_response(response)
 
-    async def _get_master_broker_id(self) -> str:
+    async def _ensure_broker_ids(self) -> None:
         """
-        Resolve the master account's brokerID.
-
-        A CSX broker (sub) account's profile (GET /api/v1/me/) exposes its parent/master account id
-        as ``parentID``. CSX does not reliably expose /api/v1/me/ for master accounts, so the master
-        id is derived from this connector's own (broker/sub) account profile ``parentID`` rather than
-        from the master's own profile. Falls back to that profile's ``brokerID`` for the case where
-        the configured account is itself the master. Callers can bypass resolution entirely by
-        passing the master id explicitly (the ``master_account`` override on transfer_to_*).
+        Resolve and cache both brokerIDs from the connector's own (primary/sub) profile in a single
+        GET /api/v1/me/ call: ``brokerID`` is this account's id (the sub), and ``parentID`` is its
+        parent/master account id. CSX does not reliably expose /api/v1/me/ for master accounts, so
+        the master id is taken from the sub profile's ``parentID`` rather than the master's own
+        profile. When the configured account has no parent (it is itself the master), the master id
+        falls back to that account's own ``brokerID``.
         """
+        if self._own_broker_id is not None and self._master_broker_id is not None:
+            return
+        profile = await self.get_profile(use_master=False)
+        own = profile.get("brokerID") or profile.get("brokerId") or profile.get("id")
+        parent = profile.get("parentID")
+        if self._own_broker_id is None and own:
+            self._own_broker_id = str(own)
         if self._master_broker_id is None:
-            profile = await self.get_profile(use_master=False)
-            broker_id = profile.get("parentID") or profile.get("brokerID") or profile.get("id")
-            if not broker_id:
-                raise IOError(f"Could not determine CSX master brokerID from profile: {profile}")
-            self._master_broker_id = str(broker_id)
+            self._master_broker_id = str(parent or own or "") or None
+        if not self._own_broker_id and not self._master_broker_id:
+            raise IOError(f"Could not determine CSX brokerID(s) from profile: {profile}")
+
+    async def _get_master_broker_id(self) -> str:
+        """Resolve the master account's brokerID (the sub profile's parentID). See _ensure_broker_ids."""
+        await self._ensure_broker_ids()
+        if not self._master_broker_id:
+            raise IOError("Could not determine CSX master brokerID (no parentID on the account profile).")
         return self._master_broker_id
+
+    async def _get_own_broker_id(self) -> str:
+        """Resolve this (primary/sub) account's own brokerID. See _ensure_broker_ids."""
+        await self._ensure_broker_ids()
+        if not self._own_broker_id:
+            raise IOError("Could not determine CSX brokerID for the configured account.")
+        return self._own_broker_id
 
     async def _place_internal_transfer(self, transfer: WalletTransfer, **kwargs) -> TransferUpdate:
         """
         Move funds between the master account and a broker (sub) account using master credentials.
-        CSX identifies accounts by brokerID; the master side of the transfer defaults to the
-        brokerID resolved from the master credentials, and the broker (sub) side is supplied by
-        the caller.
+        CSX identifies accounts by brokerID. Either side may be omitted by the caller: the master
+        side defaults to the brokerID resolved from the sub profile's ``parentID``, and the sub side
+        defaults to this connector's own ``brokerID`` (the account whose primary creds are
+        configured). Explicitly provided ids always take precedence.
         """
         if transfer.transfer_type == TransferType.MASTER_TO_SUB:
             transfer.source = transfer.source or await self._get_master_broker_id()
+            transfer.destination = transfer.destination or await self._get_own_broker_id()
         else:  # SUB_TO_MASTER
+            transfer.source = transfer.source or await self._get_own_broker_id()
             transfer.destination = transfer.destination or await self._get_master_broker_id()
 
         data = {

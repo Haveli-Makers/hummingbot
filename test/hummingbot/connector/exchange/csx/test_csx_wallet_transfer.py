@@ -85,6 +85,53 @@ class CsxWalletTransferTest(IsolatedAsyncioWrapperTestCase):
         self.assertEqual("sub-456", completed.destination)
 
     @aioresponses()
+    async def test_sub_to_master_auto_resolves_both_sides_from_connected_creds(self, mock_api):
+        # With both keys connected, omitting the sub id makes the connector resolve BOTH sides from
+        # its own (primary/sub) profile in a single /me/ call: brokerID = sub, parentID = master.
+        mock_api.get(self._profile_url(),
+                     body=json.dumps({"data": {"brokerID": "sub-self", "parentID": "master-123"}}), repeat=True)
+        mock_api.post(self._transfer_url(), body=json.dumps({"message": "Transferred funds successfully"}))
+
+        transfer = WalletTransfer(
+            client_transfer_id="t-auto",
+            transfer_type=TransferType.SUB_TO_MASTER,
+            asset="INR",
+            amount=Decimal("20"),
+            creation_timestamp=1700000000.0,
+            # source (sub) and destination (master) both omitted -> resolved by the connector
+        )
+        await self.exchange._create_transfer(transfer)
+
+        self.assertEqual(1, len(self.completed_logger.event_log))
+        completed = self.exchange.get_transfer("t-auto")
+        self.assertEqual("sub-self", completed.source)       # own brokerID
+        self.assertEqual("master-123", completed.destination)  # parentID
+
+    @aioresponses()
+    async def test_master_to_sub_auto_resolves_both_sides(self, mock_api):
+        mock_api.get(self._profile_url(),
+                     body=json.dumps({"data": {"brokerID": "sub-self", "parentID": "master-123"}}), repeat=True)
+        mock_api.post(self._transfer_url(), body=json.dumps({"message": "Transferred funds successfully"}))
+
+        transfer = WalletTransfer(
+            client_transfer_id="t-auto-m2s",
+            transfer_type=TransferType.MASTER_TO_SUB,
+            asset="INR",
+            amount=Decimal("20"),
+            creation_timestamp=1700000000.0,
+        )
+        await self.exchange._create_transfer(transfer)
+
+        completed = self.exchange.get_transfer("t-auto-m2s")
+        self.assertEqual("master-123", completed.source)     # parentID
+        self.assertEqual("sub-self", completed.destination)  # own brokerID
+
+    def test_csx_does_not_require_explicit_sub_account(self):
+        # CSX can resolve the sub id from the configured creds, so the public methods must not
+        # demand it (omitting it is allowed; it is resolved in _place_internal_transfer).
+        self.assertFalse(self.exchange.requires_explicit_sub_account)
+
+    @aioresponses()
     async def test_explicit_master_account_skips_resolution(self, mock_api):
         # When the master id is passed explicitly, no profile lookup is needed.
         mock_api.post(self._transfer_url(), body=json.dumps({"message": "Transferred funds successfully"}))

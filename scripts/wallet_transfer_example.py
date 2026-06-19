@@ -36,7 +36,8 @@ class WalletTransferConfig(BaseClientModel):
         json_schema_extra={
             "prompt": lambda mi: (
                 "Enter the SUB account identifier "
-                "(email for WazirX, coindcx_id for CoinDCX, brokerID for CSX): "
+                "(email for WazirX, coindcx_id for CoinDCX, brokerID for CSX; "
+                "leave blank on CoinDCX/CSX to auto-resolve from the connected sub-account creds): "
             ),
             "prompt_on_new": True,
         },
@@ -123,7 +124,8 @@ class WalletTransferExample(ScriptStrategyBase):
         self._transfer_started = True
 
         connector = self.connectors[self.config.connector]
-        sub_account = self.config.sub_account
+        # Blank -> let the connector resolve the id from the configured credentials (e.g. CSX).
+        sub_account = self.config.sub_account or None
         master_account = self.config.master_account or None
         try:
             if self.config.direction == "master_to_sub":
@@ -142,7 +144,7 @@ class WalletTransferExample(ScriptStrategyBase):
                 )
             self.logger().info(
                 f"Submitted {self.config.direction} transfer {self._transfer_id}: "
-                f"{self.config.amount} {self.config.asset} (sub={sub_account}) on {self.config.connector}."
+                f"{self.config.amount} {self.config.asset} (sub={sub_account or 'auto'}) on {self.config.connector}."
             )
         except Exception as exception:
             self.logger().error(f"Failed to start transfer: {exception}")

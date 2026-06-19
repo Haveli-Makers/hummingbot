@@ -1,5 +1,5 @@
 from decimal import Decimal
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from pydantic import ConfigDict, Field, SecretStr
 
@@ -113,6 +113,26 @@ class CoinDCXConfigMap(BaseConnectorConfigMap):
         default=...,
         json_schema_extra={
             "prompt": lambda cm: "Enter your CoinDCX API secret",
+            "is_secure": True,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        }
+    )
+    # Optional master-account credentials, used only for sub-account -> master transfers.
+    # Leave blank if you do not use wallet transfers.
+    coindcx_master_api_key: Optional[SecretStr] = Field(
+        default=None,
+        json_schema_extra={
+            "prompt": lambda cm: "Enter your CoinDCX MASTER account API key (optional, leave blank if unused)",
+            "is_secure": True,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        }
+    )
+    coindcx_master_api_secret: Optional[SecretStr] = Field(
+        default=None,
+        json_schema_extra={
+            "prompt": lambda cm: "Enter your CoinDCX MASTER account API secret (optional, leave blank if unused)",
             "is_secure": True,
             "is_connect_key": True,
             "prompt_on_new": True,

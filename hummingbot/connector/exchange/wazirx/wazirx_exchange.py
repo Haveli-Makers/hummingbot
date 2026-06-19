@@ -5,6 +5,7 @@ from urllib.parse import urlencode
 
 import aiohttp
 from bidict import bidict
+from yarl import URL
 
 from hummingbot.connector.constants import s_decimal_NaN
 from hummingbot.connector.exchange.wazirx import wazirx_constants as CONSTANTS, wazirx_web_utils as web_utils
@@ -13,6 +14,13 @@ from hummingbot.connector.exchange.wazirx.wazirx_api_user_stream_data_source imp
 from hummingbot.connector.exchange.wazirx.wazirx_auth import WazirxAuth
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
+from hummingbot.connector.wallet_transfer.wallet_transfer_data_types import (
+    TransferState,
+    TransferType,
+    TransferUpdate,
+    WalletTransfer,
+)
+from hummingbot.connector.wallet_transfer.wallet_transfer_executor import WalletTransferExecutorMixin
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
@@ -22,7 +30,7 @@ from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
 
-class WazirxExchange(ExchangePyBase):
+class WazirxExchange(WalletTransferExecutorMixin, ExchangePyBase):
     """
     WazirX exchange connector for spot trading.
     """
@@ -31,9 +39,17 @@ class WazirxExchange(ExchangePyBase):
 
     web_utils = web_utils
 
+    # Wallet-transfer capabilities (see WalletTransferExecutorMixin)
+    supports_sub_to_master_transfer = True
+    supports_master_to_sub_transfer = True
+    supports_withdrawal = False  # WazirX does not expose an external withdrawal endpoint
+
     def __init__(self,
                  wazirx_api_key: str,
                  wazirx_api_secret: str,
+                 wazirx_master_api_key: Optional[str] = None,
+                 wazirx_master_api_secret: Optional[str] = None,
+                 wazirx_master_email: Optional[str] = None,
                  balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
                  rate_limits_share_pct: Decimal = Decimal("100"),
                  trading_pairs: Optional[List[str]] = None,
@@ -45,6 +61,10 @@ class WazirxExchange(ExchangePyBase):
         """
         self.api_key = wazirx_api_key
         self.secret_key = wazirx_api_secret
+        self._master_api_key = wazirx_master_api_key or None
+        self._master_api_secret = wazirx_master_api_secret or None
+        self._master_email = wazirx_master_email or None
+        self._master_auth: Optional[WazirxAuth] = None
         self._domain = domain
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
@@ -174,28 +194,49 @@ class WazirxExchange(ExchangePyBase):
         method: str,
         path: str,
         params: Optional[Dict[str, Any]] = None,
-        is_auth_required: bool = False
+        is_auth_required: bool = False,
+        auth: Optional[WazirxAuth] = None,
+        params_in_query: bool = False,
     ) -> Dict[str, Any]:
         """
         Make an authenticated or unauthenticated request to the WazirX API.
+
+        :param auth: authenticator to sign the request with; defaults to the connector's own
+            credentials. Pass the master authenticator for sub-account/master transfers.
+        :param params_in_query: when True, signed params are sent in the URL query string instead
+            of the request body. WazirX validates the signature against the query string exactly as
+            received, so the URL must be sent verbatim (``encoded=True``) to keep percent-encoded
+            values such as ``%2B`` (a ``+`` in a sub-account email) intact. Required for the
+            sub-account fund-transfer endpoint, which rejects body-form params with
+            "Signature is incorrect" (code 2005).
         """
         url = f"{CONSTANTS.REST_URL}{path}"
         params = params or {}
 
         async with aiohttp.ClientSession() as session:
             if is_auth_required:
-                auth: WazirxAuth = self._auth
+                auth: WazirxAuth = auth or self._auth
                 _, query_string = await auth.add_auth_params(params)
                 headers = auth.get_headers()
+                method_upper = method.upper()
 
-                if method.upper() == "GET":
-                    full_url = f"{url}?{query_string}"
-                    async with session.get(full_url, headers=headers) as response:
+                # GET always carries params in the (verbatim-encoded) query string.
+                if method_upper == "GET" or params_in_query:
+                    signed_url = URL(f"{url}?{query_string}", encoded=True)
+                    if method_upper == "GET":
+                        request_ctx = session.get(signed_url, headers=headers)
+                    elif method_upper == "POST":
+                        request_ctx = session.post(signed_url, headers=headers)
+                    elif method_upper == "DELETE":
+                        request_ctx = session.delete(signed_url, headers=headers)
+                    else:
+                        raise ValueError(f"Unsupported HTTP method: {method}")
+                    async with request_ctx as response:
                         return await self._handle_response(response, method, url)
-                elif method.upper() == "POST":
+                elif method_upper == "POST":
                     async with session.post(url, data=query_string, headers=headers) as response:
                         return await self._handle_response(response, method, url)
-                elif method.upper() == "DELETE":
+                elif method_upper == "DELETE":
                     async with session.delete(url, data=query_string, headers=headers) as response:
                         return await self._handle_response(response, method, url)
                 else:
@@ -217,6 +258,90 @@ class WazirxExchange(ExchangePyBase):
             error_text = await response.text()
             raise IOError(f"Error executing request {method} {url}. HTTP status is {response.status}. Error: {error_text}")
         return await response.json()
+
+    # ------------------------------------------------------------------
+    # Wallet transfer support
+    # ------------------------------------------------------------------
+    @property
+    def _master_authenticator(self) -> WazirxAuth:
+        if self._master_auth is None:
+            self._master_auth = WazirxAuth(
+                api_key=self._master_api_key,
+                secret_key=self._master_api_secret,
+                time_provider=self._time_synchronizer,
+            )
+        return self._master_auth
+
+    def _verify_master_credentials(self) -> None:
+        if not self._master_api_key or not self._master_api_secret:
+            raise ValueError(
+                "WazirX master account API key and secret are required for sub-account to master "
+                "transfers. Configure wazirx_master_api_key and wazirx_master_api_secret."
+            )
+
+    async def _place_internal_transfer(self, transfer: WalletTransfer, **kwargs) -> TransferUpdate:
+        """
+        Transfer funds between the master account and a sub-account (either direction) using the
+        master account API key. WazirX identifies accounts by email and only allows moves between
+        the master and its own sub-accounts (sub->sub is rejected).
+        """
+        if transfer.transfer_type == TransferType.MASTER_TO_SUB:
+            # The sub-account email is the destination; the master side defaults from config.
+            transfer.source = transfer.source or self._master_email
+            missing_side = "from_account" if not transfer.source else None
+        else:
+            # SUB_TO_MASTER: the sub-account email is the source; master side defaults from config.
+            transfer.destination = transfer.destination or self._master_email
+            missing_side = "to_account" if not transfer.destination else None
+        if missing_side:
+            raise ValueError(
+                f"A WazirX master account email is required (set wazirx_master_email or pass "
+                f"{missing_side}) for {transfer.transfer_type.value} transfers."
+            )
+
+        params = {
+            "currency": transfer.asset.lower(),
+            "amount": f"{transfer.amount:f}",
+            "fromEmail": transfer.source,
+            "toEmail": transfer.destination,
+        }
+        resp = await self._wazirx_request(
+            method="POST",
+            path=CONSTANTS.SUB_ACCOUNT_FUND_TRANSFER_PATH_URL,
+            params=params,
+            is_auth_required=True,
+            auth=self._master_authenticator,
+            params_in_query=True,
+        )
+
+        status = str(resp.get("status", "")).lower()
+        txn_id = resp.get("txnId")
+        if status and status != "success":
+            raise IOError(f"WazirX rejected the transfer: {resp}")
+
+        return TransferUpdate(
+            client_transfer_id=transfer.client_transfer_id,
+            new_state=TransferState.COMPLETED,
+            update_timestamp=self.current_timestamp,
+            exchange_transfer_id=str(txn_id) if txn_id is not None else None,
+        )
+
+    async def get_sub_account_transfer_history(self, **query_params: Any) -> Any:
+        """
+        Fetch the sub-account fund-transfer history from WazirX. Requires master credentials.
+
+        Any WazirX-supported filters (e.g. ``limit``) can be passed as keyword arguments; the
+        ``timestamp``/``recvWindow``/``signature`` params are added automatically by the
+        authenticator. Returns the raw response (a list of transfer records).
+        """
+        self._verify_master_credentials()
+        return await self._wazirx_request(
+            method="GET",
+            path=CONSTANTS.SUB_ACCOUNT_FUND_TRANSFER_HISTORY_PATH_URL,
+            params=dict(query_params),
+            is_auth_required=True,
+            auth=self._master_authenticator,
+        )
 
     def _get_fee(self,
                  base_currency: str,

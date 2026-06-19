@@ -36,6 +36,9 @@ class CoinexUserStreamDataSourceTests(IsolatedAsyncioWrapperTestCase):
 
     async def test_connect_sends_auth(self):
         ws = AsyncMock()
+        ack = MagicMock()
+        ack.data = {"id": 1, "code": 0, "message": "OK"}   # server.sign ack → _wait_for_auth returns
+        ws.receive = AsyncMock(return_value=ack)
         factory = MagicMock()
         factory.get_ws_assistant = AsyncMock(return_value=ws)
         self.data_source._api_factory = factory

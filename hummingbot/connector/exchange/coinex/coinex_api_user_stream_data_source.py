@@ -1,4 +1,5 @@
 import asyncio
+import time
 from typing import TYPE_CHECKING, List, Optional
 
 from hummingbot.connector.exchange.coinex import coinex_constants as CONSTANTS
@@ -40,12 +41,37 @@ class CoinexAPIUserStreamDataSource(UserStreamTrackerDataSource):
         self._api_factory = api_factory
         self._domain = domain
 
+    _AUTH_ID = 1
+
     async def _connected_websocket_assistant(self) -> WSAssistant:
         ws: WSAssistant = await self._api_factory.get_ws_assistant()
         await ws.connect(ws_url=CONSTANTS.WSS_URL, ping_timeout=CONSTANTS.PING_TIMEOUT)
-        # Authenticate the socket with a single signed `server.sign` message.
-        await ws.send(WSJSONRequest(payload=self._auth.ws_auth_payload(request_id=1)))
+        # Authenticate the socket with a single signed `server.sign` message and WAIT
+        # for its ack before returning — CoinEx rejects channel subscriptions that
+        # arrive before auth is registered ("require auth", code 21001).
+        await ws.send(WSJSONRequest(payload=self._auth.ws_auth_payload(request_id=self._AUTH_ID)))
+        await self._wait_for_auth(ws)
+        # Even after the server.sign ack, CoinEx can reject a subscribe that arrives
+        # in the same instant ("require auth", 21001) — give the session a moment to
+        # register before _subscribe_channels runs.
+        await asyncio.sleep(1.0)
         return ws
+
+    async def _wait_for_auth(self, ws: WSAssistant, timeout: float = 10.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                response = await asyncio.wait_for(ws.receive(), timeout=max(0.1, deadline - time.time()))
+            except asyncio.TimeoutError:
+                break
+            data = response.data if response is not None else None
+            if not isinstance(data, dict) or data.get("id") != self._AUTH_ID:
+                continue
+            if data.get("code") == 0:
+                self.logger().info("CoinEx private WebSocket authenticated (server.sign).")
+                return
+            raise IOError(f"CoinEx WS auth (server.sign) failed: {data}")
+        self.logger().warning("Timed out waiting for CoinEx WS auth ack; subscribing anyway.")
 
     async def _subscribe_channels(self, websocket_assistant: WSAssistant):
         try:

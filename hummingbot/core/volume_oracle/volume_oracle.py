@@ -19,6 +19,7 @@ from hummingbot.core.volume_oracle.sources.hyperliquid_volume_source import Hype
 from hummingbot.core.volume_oracle.sources.kucoin_volume_source import KucoinVolumeSource
 from hummingbot.core.volume_oracle.sources.mexc_volume_source import MexcVolumeSource
 from hummingbot.core.volume_oracle.sources.okx_volume_source import OkxVolumeSource
+from hummingbot.core.volume_oracle.sources.valr_volume_source import ValrVolumeSource
 from hummingbot.core.volume_oracle.sources.volume_source_base import VolumeSourceBase
 from hummingbot.core.volume_oracle.sources.wazirx_volume_source import WazirxVolumeSource
 from hummingbot.logger import HummingbotLogger
@@ -39,6 +40,7 @@ VOLUME_ORACLE_SOURCES = {
     "kucoin": KucoinVolumeSource,
     "mexc": MexcVolumeSource,
     "okx": OkxVolumeSource,
+    "valr": ValrVolumeSource,
     "wazirx": WazirxVolumeSource,
 }
 

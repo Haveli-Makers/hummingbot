@@ -44,15 +44,15 @@ class CsxAPIOrderBookDataSource(OrderBookTrackerDataSource):
     async def get_last_traded_prices(
         self, trading_pairs: List[str], domain: Optional[str] = None
     ) -> Dict[str, float]:
-        prices: Dict[str, float] = {}
-        for tp in trading_pairs:
-            try:
-                price = await self._connector._get_last_traded_price(trading_pair=tp)
-                if price and price > 0:
-                    prices[tp] = price
-            except Exception as exc:
-                self.logger().warning(f"Error fetching last price for {tp}: {exc}")
-        return prices
+        # The connector implements the PLURAL _get_last_traded_prices (a single
+        # ticker call for all pairs). The singular _get_last_traded_price is not
+        # overridden and resolves to ExchangeBase._get_last_traded_price, which
+        # raises NotImplementedError — so calling it returned {} every time.
+        try:
+            return await self._connector._get_last_traded_prices(trading_pairs=trading_pairs)
+        except Exception as exc:
+            self.logger().warning(f"Error fetching last traded prices for {trading_pairs}: {exc}")
+            return {}
 
     # ── Snapshot helpers ───────────────────────────────────────────────────────
 

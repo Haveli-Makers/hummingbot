@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -116,6 +117,13 @@ class CsxExchange(ExchangePyBase):
         self._proxy_url = _resolve_proxy_url(csx_proxy_url or "")
         self._last_trades_poll_timestamp = 1.0
         self._username: Optional[str] = None  # cached from GET /api/v1/me/ for order placement
+        # Built once and cached: rebuilding hex-decodes the secret and reconstructs
+        # the Ed25519 signing key on every access otherwise.
+        self._authenticator: Optional[CsxAuth] = None
+        # Short-lived cache of the raw GET /orders/{id} payload, keyed by exchange
+        # order id, so the fills pass and the state pass of one status cycle can
+        # share a single request instead of issuing 2N per cycle.
+        self._order_status_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     # ── Static helpers ─────────────────────────────────────────────────────────
@@ -131,12 +139,17 @@ class CsxExchange(ExchangePyBase):
     # ── Properties ─────────────────────────────────────────────────────────────
 
     @property
-    def authenticator(self):
-        return CsxAuth(
-            api_key=self.api_key,
-            secret_key=self.secret_key,
-            time_provider=self._time_synchronizer,
-        )
+    def authenticator(self) -> CsxAuth:
+        # Built once and cached. ExchangePyBase reads this during __init__ and it
+        # may be accessed repeatedly afterwards; rebuilding each time re-decodes
+        # the secret and reconstructs the Ed25519 signing key needlessly.
+        if self._authenticator is None:
+            self._authenticator = CsxAuth(
+                api_key=self.api_key,
+                secret_key=self.secret_key,
+                time_provider=self._time_synchronizer,
+            )
+        return self._authenticator
 
     @property
     def name(self) -> str:
@@ -396,6 +409,29 @@ class CsxExchange(ExchangePyBase):
         return [t for t in tickers
                 if (t.get("Instrument") or t.get("instrument") or "").upper() in requested]
 
+    async def get_order_book_snapshot(self, trading_pair: str) -> Dict[str, list]:
+        """
+        REST order-book snapshot for one pair as ``{"bids": [[price, qty], ...],
+        "asks": [...]}``.
+
+        Used by the rate-oracle source for *real* best bid/ask: the CSX ticker
+        carries no top-of-book, so bid/ask must come from the depth endpoint.
+        Reuses the order-book data source's depth parser so the response-shape
+        handling lives in one place.
+        """
+        try:
+            instrument = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+        except KeyError:
+            instrument = trading_pair.replace("-", "/")
+
+        response = await self._api_get(
+            path_url=CONSTANTS.DEPTH_V2_PATH_URL,
+            params={"instrument": instrument},
+            is_auth_required=False,
+        )
+        data = CsxAPIOrderBookDataSource._extract_depth_data(response)
+        return {"bids": data["buy"], "asks": data["sell"]}
+
     # ── Account profile ────────────────────────────────────────────────────────
 
     async def _get_username(self) -> str:
@@ -465,6 +501,11 @@ class CsxExchange(ExchangePyBase):
             data.get("orderId") or data.get("order_id")
             or (result.get("orderId") if isinstance(result, dict) else "") or ""
         )
+        if not exchange_order_id:
+            # Without an exchange order id the order can never be polled or
+            # cancelled (DELETE /orders/ with no id), so fail loudly here instead
+            # of tracking a phantom order with an empty id.
+            raise ValueError(f"CSX create-order response missing orderId: {result}")
         created_at = float(
             data.get("createdAt") or data.get("created_at")
             or (result.get("createdAt") if isinstance(result, dict) else 0) or 0
@@ -488,14 +529,44 @@ class CsxExchange(ExchangePyBase):
 
     # ── Order & trade status ───────────────────────────────────────────────────
 
-    async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
+    # GET /orders/{id} is deduped within one status cycle: the base class runs the
+    # fills pass (_all_trade_updates_for_order) and then the state pass
+    # (_request_order_status) back-to-back, and both need the same payload.
+    _ORDER_STATUS_CACHE_TTL = 5.0  # seconds; bridges the two passes of one cycle
+
+    async def _fetch_order_data(self, exchange_order_id: str) -> Dict[str, Any]:
+        """GET /orders/{id} and unwrap to the order dict (CSX wraps it in 'data')."""
         result = await self._api_get(
-            path_url=f"{CONSTANTS.ORDER_BY_ID_PATH_URL}/{tracked_order.exchange_order_id}",
+            path_url=f"{CONSTANTS.ORDER_BY_ID_PATH_URL}/{exchange_order_id}",
             limit_id=CONSTANTS.ORDER_BY_ID_PATH_URL,
             is_auth_required=True,
         )
+        if not isinstance(result, dict):
+            return {}
+        return result if "orderId" in result else result.get("data", result)
 
-        order_data = result if "orderId" in result else result.get("data", result)
+    def _cache_order_data(self, exchange_order_id: str, order_data: Dict[str, Any]) -> None:
+        now = time.monotonic()
+        # Prune stale entries so the cache cannot grow unbounded over the bot's life.
+        self._order_status_cache = {
+            k: v for k, v in self._order_status_cache.items()
+            if now - v[0] <= self._ORDER_STATUS_CACHE_TTL
+        }
+        self._order_status_cache[exchange_order_id] = (now, order_data)
+
+    def _pop_cached_order_data(self, exchange_order_id: str) -> Optional[Dict[str, Any]]:
+        cached = self._order_status_cache.pop(exchange_order_id, None)
+        if cached is not None and time.monotonic() - cached[0] <= self._ORDER_STATUS_CACHE_TTL:
+            return cached[1]
+        return None
+
+    async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
+        exchange_order_id = str(tracked_order.exchange_order_id)
+        # Reuse the payload the fills pass just fetched this cycle, if present.
+        order_data = self._pop_cached_order_data(exchange_order_id)
+        if order_data is None:
+            order_data = await self._fetch_order_data(exchange_order_id)
+
         status_str = (order_data.get("status") or "").upper()
         new_state = CONSTANTS.ORDER_STATE.get(status_str)
         if new_state is None:
@@ -506,7 +577,7 @@ class CsxExchange(ExchangePyBase):
         update_ts = float(order_data.get("updatedAt", order_data.get("updated_at", 0)))
         return OrderUpdate(
             client_order_id=tracked_order.client_order_id,
-            exchange_order_id=str(tracked_order.exchange_order_id),
+            exchange_order_id=exchange_order_id,
             trading_pair=tracked_order.trading_pair,
             update_timestamp=update_ts,
             new_state=new_state,
@@ -518,26 +589,41 @@ class CsxExchange(ExchangePyBase):
 
         trade_updates: List[TradeUpdate] = []
         try:
-            result = await self._api_get(
-                path_url=f"{CONSTANTS.ORDER_BY_ID_PATH_URL}/{order.exchange_order_id}",
-                limit_id=CONSTANTS.ORDER_BY_ID_PATH_URL,
-                is_auth_required=True,
-            )
+            exchange_order_id = str(order.exchange_order_id)
+            order_data = await self._fetch_order_data(exchange_order_id)
+            # Cache for the state pass that immediately follows this fills pass.
+            self._cache_order_data(exchange_order_id, order_data)
 
-            order_data = result if "orderId" in result else result.get("data", result)
             filled_qty = Decimal(str(order_data.get("filledQuantity", "0")))
-            filled_quote_qty = Decimal(str(order_data.get("filledQuoteQuantity", "0")))
-
             if filled_qty <= 0:
                 return []
 
-            avg_price = (
-                filled_quote_qty / filled_qty
-                if filled_qty > 0
-                else Decimal(str(order_data.get("averagePrice", "0")))
-            )
+            # CSX reports CUMULATIVE fills on every status poll and has no per-fill
+            # trade id. Emit only the increment since the last poll, keyed by a
+            # trade id unique to this cumulative value — otherwise
+            # InFlightOrder.update_with_trade_update dedupes the repeated id and the
+            # order stays permanently under-filled (and may never reach FILLED).
+            incremental_base = filled_qty - order.executed_amount_base
+            if incremental_base <= 0:
+                return []
+
+            filled_quote_qty = Decimal(str(order_data.get("filledQuoteQuantity", "0")))
+            if filled_quote_qty > 0:
+                avg_price = filled_quote_qty / filled_qty
+            else:
+                avg_price = Decimal(str(order_data.get("averagePrice", "0")))
+
+            incremental_quote = filled_quote_qty - order.executed_amount_quote
+            if incremental_quote <= 0:
+                incremental_quote = incremental_base * avg_price
+            fill_price = (incremental_quote / incremental_base) if incremental_quote > 0 else avg_price
 
             is_maker = order.order_type is OrderType.LIMIT_MAKER
+            # makerFee/takerFee are whole-number percents per the CSX docs — e.g.
+            # BTC/INR returns maker 0.02 → 0.02%, taker 0.06 → 0.06% (confirmed via
+            # the GET /v1/me/orders and POST /v2/orders responses). TradeFeeBase.percent
+            # is a fraction, hence the /100. Note maker != taker on the live exchange,
+            # so selecting the correct side (see _get_fee) actually matters.
             fee_pct = Decimal(str(
                 order_data.get("makerFee", 0) if is_maker else order_data.get("takerFee", 0)
             ))
@@ -545,14 +631,14 @@ class CsxExchange(ExchangePyBase):
 
             trade_updates.append(
                 TradeUpdate(
-                    trade_id=str(order.exchange_order_id),
+                    trade_id=f"{exchange_order_id}-{filled_qty}",
                     client_order_id=order.client_order_id,
-                    exchange_order_id=str(order.exchange_order_id),
+                    exchange_order_id=exchange_order_id,
                     trading_pair=order.trading_pair,
                     fee=fee,
-                    fill_base_amount=filled_qty,
-                    fill_quote_amount=filled_quote_qty,
-                    fill_price=avg_price,
+                    fill_base_amount=incremental_base,
+                    fill_quote_amount=incremental_quote,
+                    fill_price=fill_price,
                     fill_timestamp=float(order_data.get("updatedAt", 0)),
                 )
             )
@@ -609,7 +695,9 @@ class CsxExchange(ExchangePyBase):
         price: Decimal = s_decimal_NaN,
         is_maker: Optional[bool] = None,
     ) -> TradeFeeBase:
-        is_maker = is_maker or (order_type is OrderType.LIMIT_MAKER)
+        # Respect an explicit is_maker=False (e.g. a LIMIT_MAKER that crossed and
+        # filled as taker); only infer from the order type when it is unspecified.
+        is_maker = is_maker if is_maker is not None else (order_type is OrderType.LIMIT_MAKER)
         return DeductedFromReturnsTradeFee(percent=self.estimate_fee_pct(is_maker))
 
     async def _update_trading_fees(self):

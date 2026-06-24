@@ -35,6 +35,10 @@ class CsxAPIUserStreamDataSource(UserStreamTrackerDataSource):
         self._api_factory = api_factory
         self._domain = domain
         self._last_recv_time: float = 0.0
+        # Exchange order ids of our in-flight orders seen as OPEN last poll; used
+        # to detect orders that have since settled (and dropped out of the
+        # onlyOpen=true response) so we can emit their terminal state.
+        self._open_order_ids: set = set()
 
     @property
     def last_recv_time(self) -> float:
@@ -71,6 +75,15 @@ class CsxAPIUserStreamDataSource(UserStreamTrackerDataSource):
                     )
                     self._last_recv_time = time.time()
                     orders = self._extract_orders(orders_resp)
+
+                    # `onlyOpen=true` hides an order the moment it reaches a
+                    # terminal state, so a fill/cancel would never surface a
+                    # terminal order_update via the stream — terminal detection
+                    # would fall entirely to the slower status-poll path. Fetch the
+                    # final status of any tracked order that just left the open set
+                    # so terminal states (and final fills) propagate promptly.
+                    orders.extend(await self._fetch_settled_order_updates(orders))
+
                     if orders:
                         await output.put({"event": "order_update", "data": orders})
                 except Exception as exc:
@@ -85,6 +98,48 @@ class CsxAPIUserStreamDataSource(UserStreamTrackerDataSource):
                     "Unexpected error in CSX user-stream polling. Retrying in 5 s …"
                 )
                 await asyncio.sleep(5.0)
+
+    async def _fetch_settled_order_updates(self, open_orders: list) -> list:
+        """
+        Return order dicts for tracked in-flight orders that just left the open
+        set (i.e. settled to a terminal state). Remembers the current open-order
+        ids as a side effect. Empty when nothing settled or no connector attached.
+        """
+        if self._connector is None:
+            return []
+
+        tracked_ids = {
+            str(o.exchange_order_id)
+            for o in self._connector.in_flight_orders.values()
+            if o.exchange_order_id
+        }
+        current_open_ids = {
+            str(order.get("orderId") or order.get("order_id") or "")
+            for order in open_orders
+        }
+        current_open_ids.discard("")
+        current_open_ids &= tracked_ids  # only follow orders we actually own
+
+        settled: list = []
+        for oid in self._open_order_ids - current_open_ids:
+            if oid not in tracked_ids:
+                continue  # already settled in a prior cycle and no longer tracked
+            try:
+                resp = await self._connector._api_get(
+                    path_url=f"{CONSTANTS.ORDER_BY_ID_PATH_URL}/{oid}",
+                    limit_id=CONSTANTS.ORDER_BY_ID_PATH_URL,
+                    is_auth_required=True,
+                )
+                data = resp if isinstance(resp, dict) and "orderId" in resp else (
+                    resp.get("data", resp) if isinstance(resp, dict) else {}
+                )
+                if isinstance(data, dict) and data:
+                    settled.append(data)
+            except Exception as exc:
+                self.logger().warning(f"CSX terminal-status poll error for {oid}: {exc}")
+
+        self._open_order_ids = current_open_ids
+        return settled
 
     @staticmethod
     def _extract_orders(orders_resp) -> list:

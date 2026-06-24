@@ -1,11 +1,14 @@
 import asyncio
 import unittest
-from unittest.mock import MagicMock
+from decimal import Decimal
+from unittest.mock import AsyncMock, MagicMock
 
 from bidict import bidict
 
 from hummingbot.connector.exchange.csx.csx_api_user_stream_data_source import CsxAPIUserStreamDataSource
 from hummingbot.connector.exchange.csx.csx_exchange import CsxExchange
+from hummingbot.core.data_type.common import OrderType, TradeType
+from hummingbot.core.data_type.in_flight_order import InFlightOrder
 
 _VALID_SECRET = "aa" * 32
 
@@ -69,6 +72,54 @@ class CsxUserStreamDataSourceTests(unittest.IsolatedAsyncioTestCase):
 
     def test_last_recv_time_initial_value(self):
         self.assertEqual(0.0, self.source.last_recv_time)
+
+    async def test_terminal_state_fetched_when_order_leaves_open_set(self):
+        # Finding #6: an order that was OPEN last poll but is gone from the
+        # onlyOpen=true response has settled; its terminal status must be fetched
+        # and surfaced, since the stream would otherwise never emit it.
+        order = InFlightOrder(
+            client_order_id="x-CSX-6",
+            exchange_order_id="oid-6",
+            trading_pair="BTC-INR",
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY,
+            amount=Decimal("1"),
+            price=Decimal("100"),
+            creation_timestamp=1.0,
+        )
+        self.connector._order_tracker.start_tracking_order(order)
+        self.source._open_order_ids = {"oid-6"}  # it was open in the prior poll
+
+        self.connector._api_get = AsyncMock(
+            return_value={"orderId": "oid-6", "status": "FULFILLED", "updatedAt": 2})
+
+        # This poll's open-orders list no longer contains oid-6.
+        settled = await self.source._fetch_settled_order_updates(open_orders=[])
+        self.assertEqual(1, len(settled))
+        self.assertEqual("FULFILLED", settled[0]["status"])
+        self.assertNotIn("oid-6", self.source._open_order_ids)
+
+    async def test_no_terminal_fetch_when_order_still_open(self):
+        # An order that is still present in the open list must NOT trigger an
+        # extra per-id status fetch.
+        order = InFlightOrder(
+            client_order_id="x-CSX-7",
+            exchange_order_id="oid-7",
+            trading_pair="BTC-INR",
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY,
+            amount=Decimal("1"),
+            price=Decimal("100"),
+            creation_timestamp=1.0,
+        )
+        self.connector._order_tracker.start_tracking_order(order)
+        self.source._open_order_ids = {"oid-7"}
+        self.connector._api_get = AsyncMock(side_effect=AssertionError("should not fetch"))
+
+        settled = await self.source._fetch_settled_order_updates(
+            open_orders=[{"orderId": "oid-7", "status": "OPEN"}])
+        self.assertEqual([], settled)
+        self.assertIn("oid-7", self.source._open_order_ids)
 
 
 if __name__ == "__main__":

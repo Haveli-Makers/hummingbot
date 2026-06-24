@@ -94,10 +94,13 @@ class CsxOrderBookDataSourceTests(unittest.IsolatedAsyncioTestCase):
             await self.source._connected_websocket_assistant()
 
     async def test_get_last_traded_prices(self):
-        with patch.object(self.connector, "_get_last_traded_price", new_callable=AsyncMock) as mock_price:
-            mock_price.return_value = 3_000_000.0
+        # Must call the PLURAL connector method; the singular one is not
+        # overridden and raises NotImplementedError.
+        with patch.object(self.connector, "_get_last_traded_prices", new_callable=AsyncMock) as mock_price:
+            mock_price.return_value = {"BTC-INR": 3_000_000.0}
             prices = await self.source.get_last_traded_prices(["BTC-INR"])
         self.assertEqual({"BTC-INR": 3_000_000.0}, prices)
+        mock_price.assert_awaited_once_with(trading_pairs=["BTC-INR"])
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ import logging
 from decimal import Decimal
 from typing import Dict, List, Optional
 
+from hummingbot.core.volume_oracle.sources.ajaib_volume_source import AjaibVolumeSource
 from hummingbot.core.volume_oracle.sources.ascend_ex_volume_source import AscendExVolumeSource
 from hummingbot.core.volume_oracle.sources.binance_us_volume_source import BinanceUSVolumeSource
 from hummingbot.core.volume_oracle.sources.binance_volume_source import BinanceVolumeSource
@@ -25,6 +26,7 @@ from hummingbot.core.volume_oracle.sources.wazirx_volume_source import WazirxVol
 from hummingbot.logger import HummingbotLogger
 
 VOLUME_ORACLE_SOURCES = {
+    "ajaib": AjaibVolumeSource,
     "ascend_ex": AscendExVolumeSource,
     "binance": BinanceVolumeSource,
     "binance_us": BinanceUSVolumeSource,

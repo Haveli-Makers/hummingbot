@@ -7,6 +7,7 @@ import hummingbot.client.settings  # noqa
 from hummingbot.connector.utils import combine_to_hb_trading_pair
 from hummingbot.core.network_base import NetworkBase
 from hummingbot.core.network_iterator import NetworkStatus
+from hummingbot.core.rate_oracle.sources.ajaib_rate_source import AjaibRateSource
 from hummingbot.core.rate_oracle.sources.ascend_ex_rate_source import AscendExRateSource
 from hummingbot.core.rate_oracle.sources.binance_rate_source import BinanceRateSource
 from hummingbot.core.rate_oracle.sources.binance_us_rate_source import BinanceUSRateSource
@@ -30,6 +31,7 @@ from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.logger import HummingbotLogger
 
 RATE_ORACLE_SOURCES = {
+    "ajaib": AjaibRateSource,
     "binance": BinanceRateSource,
     "binance_us": BinanceUSRateSource,
     "coin_gecko": CoinGeckoRateSource,

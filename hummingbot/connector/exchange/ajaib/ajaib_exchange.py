@@ -17,12 +17,18 @@ from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
+from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
 
 class AjaibExchange(ExchangePyBase):
     """
-    Ajaib exchange connector implementation.
+    Ajaib (Coin Exchange) Open API connector implementation.
+
+    The Ajaib Open API (https://ajaib.gitbook.io/ajaib-exchange-open-api) is a
+    Binance-style REST + WebSocket API with Ed25519 request signing. Ajaib
+    geo-blocks non-Indonesian IPs, so an Indonesian proxy can be supplied via
+    ``ajaib_proxy_url`` (see ``docs/PROXY_SERVER_GUIDE.md``).
     """
 
     UPDATE_ORDER_STATUS_MIN_INTERVAL = 10.0
@@ -32,6 +38,7 @@ class AjaibExchange(ExchangePyBase):
     def __init__(self,
                  ajaib_api_key: str,
                  ajaib_api_secret: str,
+                 ajaib_proxy_url: str = "",
                  balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
                  rate_limits_share_pct: Decimal = Decimal("100"),
                  trading_pairs: Optional[List[str]] = None,
@@ -40,6 +47,7 @@ class AjaibExchange(ExchangePyBase):
                  ):
         self.api_key = ajaib_api_key
         self.secret_key = ajaib_api_secret
+        self._proxy_url = ajaib_proxy_url or ""
         self._domain = domain
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
@@ -119,7 +127,44 @@ class AjaibExchange(ExchangePyBase):
         return self._trading_required
 
     def supported_order_types(self):
-        return [OrderType.LIMIT, OrderType.LIMIT_MAKER, OrderType.MARKET]
+        # Ajaib MARKET orders are sized by ``quoteOrderQty`` which does not map
+        # cleanly onto Hummingbot's base-amount market orders, so only limit
+        # order types are advertised.
+        return [OrderType.LIMIT, OrderType.LIMIT_MAKER]
+
+    def buy(self,
+            trading_pair: str,
+            amount: Decimal,
+            order_type=OrderType.LIMIT,
+            price: Decimal = s_decimal_NaN,
+            **kwargs) -> str:
+        order_id = ajaib_utils.generate_client_order_id()
+        safe_ensure_future(self._create_order(
+            trade_type=TradeType.BUY,
+            order_id=order_id,
+            trading_pair=trading_pair,
+            amount=amount,
+            order_type=order_type,
+            price=price,
+            **kwargs))
+        return order_id
+
+    def sell(self,
+             trading_pair: str,
+             amount: Decimal,
+             order_type: OrderType = OrderType.LIMIT,
+             price: Decimal = s_decimal_NaN,
+             **kwargs) -> str:
+        order_id = ajaib_utils.generate_client_order_id()
+        safe_ensure_future(self._create_order(
+            trade_type=TradeType.SELL,
+            order_id=order_id,
+            trading_pair=trading_pair,
+            amount=amount,
+            order_type=order_type,
+            price=price,
+            **kwargs))
+        return order_id
 
     async def start_network(self):
         await super().start_network()
@@ -131,34 +176,37 @@ class AjaibExchange(ExchangePyBase):
 
     async def get_all_pairs_prices(self) -> List[Dict[str, str]]:
         """
-        Fetches best bid/ask for all symbols by querying /v1/depth for each.
+        Returns a list of ``{symbol, bidPrice, askPrice, lastPrice}`` dicts.
+
+        The Ajaib Open API exposes no public depth/ticker REST endpoint, so the
+        last close from ``/v1/klines`` is used as the reference price (bid == ask
+        == last). Consumed by ``AjaibRateSource``.
         """
         if not self._keys_configured:
             self.logger().warning("Ajaib API keys not configured. Cannot fetch prices.")
             return []
 
-        exchange_info = await self._api_get(
-            path_url=CONSTANTS.EXCHANGE_INFO_PATH_URL,
-            is_auth_required=True,
-        )
+        exchange_info = await self._make_trading_pairs_request()
         symbols = [s["symbol"] for s in exchange_info.get("symbols", [])
-                   if s.get("isSpotTradingAllowed", False)]
+                   if ajaib_utils.is_exchange_information_valid(s)]
 
-        results = []
+        results: List[Dict[str, str]] = []
         for symbol in symbols:
             try:
-                depth = await self._api_get(path_url=CONSTANTS.DEPTH_PATH_URL, params={"symbol": symbol, "limit": 1}, is_auth_required=True)
-                bids = depth.get("bids", [])
-                asks = depth.get("asks", [])
-                results.append({
-                    "symbol": symbol,
-                    "bidPrice": bids[0][0] if bids else "0",
-                    "bidQty": bids[0][1] if bids else "0",
-                    "askPrice": asks[0][0] if asks else "0",
-                    "askQty": asks[0][1] if asks else "0",
-                })
+                klines = await self._api_get(
+                    path_url=CONSTANTS.KLINES_PATH_URL,
+                    params={"symbol": symbol, "interval": "1m", "limit": 1},
+                    is_auth_required=True)
+                if klines and len(klines) > 0:
+                    last_price = str(klines[0][4])
+                    results.append({
+                        "symbol": symbol,
+                        "bidPrice": last_price,
+                        "askPrice": last_price,
+                        "lastPrice": last_price,
+                    })
             except Exception as e:
-                self.logger().debug(f"Failed to fetch depth for {symbol}: {e}")
+                self.logger().debug(f"Failed to fetch kline price for {symbol}: {e}")
 
         return results
 
@@ -198,7 +246,8 @@ class AjaibExchange(ExchangePyBase):
             throttler=self._throttler,
             time_synchronizer=self._time_synchronizer,
             domain=self._domain,
-            auth=self._auth)
+            auth=self._auth,
+            proxy_url=self._proxy_url or None)
 
     def _create_order_book_data_source(self) -> OrderBookTrackerDataSource:
         return AjaibAPIOrderBookDataSource(
@@ -224,7 +273,7 @@ class AjaibExchange(ExchangePyBase):
                  amount: Decimal,
                  price: Decimal = s_decimal_NaN,
                  is_maker: Optional[bool] = None) -> TradeFeeBase:
-        is_maker = order_type is OrderType.LIMIT_MAKER
+        is_maker = is_maker if is_maker is not None else (order_type is OrderType.LIMIT_MAKER)
         return DeductedFromReturnsTradeFee(percent=self.estimate_fee_pct(is_maker))
 
     async def _place_order(self,
@@ -241,32 +290,30 @@ class AjaibExchange(ExchangePyBase):
             "symbol": symbol,
             "side": AjaibExchange.ajaib_side(trade_type),
             "type": AjaibExchange.ajaib_order_type(order_type),
-            "quantity": str(amount),
+            "quantity": f"{amount:f}",
+            "price": f"{price:f}",
+            "timeInForce": CONSTANTS.TIME_IN_FORCE_GTC,
             "newClientOrderId": order_id,
         }
-
-        if order_type in [OrderType.LIMIT, OrderType.LIMIT_MAKER]:
-            api_params["price"] = str(price)
-            api_params["timeInForce"] = "GTC"
 
         order_result = await self._api_post(
             path_url=CONSTANTS.CREATE_ORDER_PATH_URL,
             data=api_params,
             is_auth_required=True)
 
-        o_id = str(order_result.get("orderId", order_id))
-        transact_time = order_result.get("time", self._time_synchronizer.time() * 1000) / 1000
+        o_id = str(order_result.get("orderId", ""))
+        transact_time = order_result.get("time", self._time_synchronizer.time() * 1e3) * 1e-3
 
         return o_id, transact_time
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair=tracked_order.trading_pair)
 
-        api_params = {"symbol": symbol}
-        if tracked_order.exchange_order_id:
-            api_params["orderId"] = tracked_order.exchange_order_id
-        else:
-            api_params["origClientOrderId"] = order_id
+        # ``order_id`` is the UUIDv4 we sent as newClientOrderId == clientOrderId.
+        api_params = {
+            "symbol": symbol,
+            "origClientOrderId": order_id,
+        }
 
         cancel_result = await self._api_delete(
             path_url=CONSTANTS.CANCEL_ORDER_PATH_URL,
@@ -329,47 +376,58 @@ class AjaibExchange(ExchangePyBase):
         async for event_message in self._iter_user_event_queue():
             try:
                 event_type = event_message.get("e", "")
-                if event_type == "executionReport":
-                    client_order_id = event_message.get("c", "")
-                    exchange_order_id = str(event_message.get("i", ""))
-                    tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
+                if event_type != CONSTANTS.WS_EXECUTION_REPORT_EVENT_TYPE:
+                    continue
 
-                    if tracked_order is not None:
-                        status = event_message.get("X", "")
-                        new_state = CONSTANTS.ORDER_STATE.get(status, tracked_order.current_state)
-                        order_update = OrderUpdate(
-                            trading_pair=tracked_order.trading_pair,
-                            update_timestamp=event_message.get("T", self._time_synchronizer.time() * 1000) / 1000,
-                            new_state=new_state,
-                            client_order_id=client_order_id,
-                            exchange_order_id=exchange_order_id,
-                        )
-                        self._order_tracker.process_order_update(order_update=order_update)
+                client_order_id = event_message.get("c", "")
+                exchange_order_id = str(event_message.get("i", ""))
+                tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
+                if tracked_order is None:
+                    continue
 
-                        fill_qty = Decimal(str(event_message.get("l", "0")))
-                        if fill_qty > 0:
-                            fill_price = Decimal(str(event_message.get("L", "0")))
-                            fee_amount = Decimal(str(event_message.get("n", "0")))
-                            fee_token = event_message.get("N", "")
+                event_ts = event_message.get("T") or event_message.get("E")
+                update_ts = (event_ts * 1e-3) if event_ts else self._time_synchronizer.time()
 
-                            fee = TradeFeeBase.new_spot_fee(
-                                fee_schema=self.trade_fee_schema(),
-                                trade_type=tracked_order.trade_type,
-                                flat_fees=[TokenAmount(amount=fee_amount, token=fee_token)]
-                            )
+                status = event_message.get("X", "")
+                new_state = CONSTANTS.ORDER_STATE.get(status, tracked_order.current_state)
+                order_update = OrderUpdate(
+                    trading_pair=tracked_order.trading_pair,
+                    update_timestamp=update_ts,
+                    new_state=new_state,
+                    client_order_id=client_order_id,
+                    exchange_order_id=exchange_order_id,
+                )
+                self._order_tracker.process_order_update(order_update=order_update)
 
-                            trade_update = TradeUpdate(
-                                trade_id=str(event_message.get("t", "")),
-                                client_order_id=client_order_id,
-                                exchange_order_id=exchange_order_id,
-                                trading_pair=tracked_order.trading_pair,
-                                fee=fee,
-                                fill_base_amount=fill_qty,
-                                fill_quote_amount=fill_qty * fill_price,
-                                fill_price=fill_price,
-                                fill_timestamp=event_message.get("T", self._time_synchronizer.time() * 1000) / 1000,
-                            )
-                            self._order_tracker.process_trade_update(trade_update)
+                # The execution report carries no commission, so emit the fill
+                # amount in real time with an estimated fee; the authoritative
+                # commission/tax is reconciled from ``/v1/trades`` polling.
+                fill_qty = Decimal(str(event_message.get("l", "0")))
+                if fill_qty > 0:
+                    fill_price = Decimal(str(event_message.get("L", "0")))
+                    fill_quote = event_message.get("Y")
+                    fill_quote_amount = Decimal(str(fill_quote)) if fill_quote is not None else fill_qty * fill_price
+                    is_maker = bool(event_message.get("m", False))
+
+                    fee = TradeFeeBase.new_spot_fee(
+                        fee_schema=self.trade_fee_schema(),
+                        trade_type=tracked_order.trade_type,
+                        percent=self.estimate_fee_pct(is_maker),
+                        percent_token=tracked_order.quote_asset,
+                    )
+
+                    trade_update = TradeUpdate(
+                        trade_id=str(event_message.get("t", "")),
+                        client_order_id=client_order_id,
+                        exchange_order_id=exchange_order_id,
+                        trading_pair=tracked_order.trading_pair,
+                        fee=fee,
+                        fill_base_amount=fill_qty,
+                        fill_quote_amount=fill_quote_amount,
+                        fill_price=fill_price,
+                        fill_timestamp=update_ts,
+                    )
+                    self._order_tracker.process_trade_update(trade_update)
 
             except asyncio.CancelledError:
                 raise
@@ -388,13 +446,19 @@ class AjaibExchange(ExchangePyBase):
                     is_auth_required=True)
 
                 for trade in all_fills_response:
-                    fee_amount = Decimal(str(trade.get("commission", 0)))
-                    fee_token = trade.get("commissionAsset", "")
+                    flat_fees = []
+                    commission = Decimal(str(trade.get("commission", "0")))
+                    if commission > 0:
+                        flat_fees.append(TokenAmount(amount=commission, token=trade.get("commissionAsset", "")))
+                    # Indonesian VAT is reported separately on each fill.
+                    tax = Decimal(str(trade.get("tax", "0")))
+                    if tax > 0:
+                        flat_fees.append(TokenAmount(amount=tax, token=trade.get("taxAsset", "")))
 
                     fee = TradeFeeBase.new_spot_fee(
                         fee_schema=self.trade_fee_schema(),
                         trade_type=order.trade_type,
-                        flat_fees=[TokenAmount(amount=fee_amount, token=fee_token)]
+                        flat_fees=flat_fees,
                     )
 
                     trade_update = TradeUpdate(
@@ -403,25 +467,22 @@ class AjaibExchange(ExchangePyBase):
                         exchange_order_id=order.exchange_order_id,
                         trading_pair=order.trading_pair,
                         fee=fee,
-                        fill_base_amount=Decimal(str(trade.get("qty", 0))),
-                        fill_quote_amount=Decimal(str(trade.get("quoteQty", 0))),
-                        fill_price=Decimal(str(trade.get("price", 0))),
-                        fill_timestamp=trade.get("time", self._time_synchronizer.time() * 1000) / 1000,
+                        fill_base_amount=Decimal(str(trade.get("qty", "0"))),
+                        fill_quote_amount=Decimal(str(trade.get("quoteQty", "0"))),
+                        fill_price=Decimal(str(trade.get("price", "0"))),
+                        fill_timestamp=trade.get("time", self._time_synchronizer.time() * 1e3) * 1e-3,
                     )
                     trade_updates.append(trade_update)
             except Exception as e:
-                self.logger().error(f"Error fetching trades for order: {e}")
+                self.logger().error(f"Error fetching trades for order {order.client_order_id}: {e}")
 
         return trade_updates
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair=tracked_order.trading_pair)
 
-        params = {"symbol": symbol}
-        if tracked_order.exchange_order_id:
-            params["orderId"] = tracked_order.exchange_order_id
-        else:
-            params["origClientOrderId"] = tracked_order.client_order_id
+        # Get Order is keyed by the client order id (our UUIDv4) per the docs.
+        params = {"symbol": symbol, "origClientOrderId": tracked_order.client_order_id}
 
         updated_order_data = await self._api_get(
             path_url=CONSTANTS.ORDER_STATUS_PATH_URL,
@@ -431,11 +492,12 @@ class AjaibExchange(ExchangePyBase):
         status = updated_order_data.get("status", "")
         new_state = CONSTANTS.ORDER_STATE.get(status, tracked_order.current_state)
 
+        update_ts = updated_order_data.get("updateTime") or updated_order_data.get("time")
         order_update = OrderUpdate(
             client_order_id=tracked_order.client_order_id,
             exchange_order_id=str(updated_order_data.get("orderId", "")),
             trading_pair=tracked_order.trading_pair,
-            update_timestamp=updated_order_data.get("updateTime", self._time_synchronizer.time() * 1000) / 1000,
+            update_timestamp=(update_ts * 1e-3) if update_ts else self._time_synchronizer.time(),
             new_state=new_state,
         )
         return order_update
@@ -445,15 +507,15 @@ class AjaibExchange(ExchangePyBase):
         remote_asset_names = set()
 
         account_info = await self._api_get(
-            path_url=CONSTANTS.ACCOUNT_PATH_URL,
+            path_url=CONSTANTS.PORTFOLIO_PATH_URL,
             is_auth_required=True)
 
-        balances = account_info.get("balances", []) if isinstance(account_info, dict) else []
+        balances = account_info.get("balances", []) if isinstance(account_info, dict) else account_info
 
         for balance_entry in balances:
             asset_name = balance_entry.get("asset", "")
-            free_balance = Decimal(str(balance_entry.get("free", 0)))
-            locked_balance = Decimal(str(balance_entry.get("locked", 0)))
+            free_balance = Decimal(str(balance_entry.get("free", "0")))
+            locked_balance = Decimal(str(balance_entry.get("locked", "0")))
             total_balance = free_balance + locked_balance
 
             self._account_available_balances[asset_name] = free_balance
@@ -472,12 +534,7 @@ class AjaibExchange(ExchangePyBase):
         Ajaib exchange-info format:
         {
             "symbols": [
-                {
-                    "symbol": "BTC_USDT",
-                    "baseAsset": "BTC",
-                    "quoteAsset": "USDT",
-                    ...
-                }
+                {"symbol": "BTC_USDT", "baseAsset": "BTC", "quoteAsset": "USDT", ...}
             ]
         }
         """

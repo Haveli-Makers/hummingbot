@@ -154,12 +154,14 @@ class AjaibRateSource(RateSourceBase):
     def _build_ajaib_connector() -> 'AjaibExchange':
         """
         Build an Ajaib exchange connector with API keys from saved config.
-        Ajaib requires Ed25519 authentication for all endpoints.
+        Ajaib requires Ed25519 authentication for every endpoint, and the API is
+        geo-blocked, so the configured proxy URL is forwarded as well.
         """
         from hummingbot.connector.exchange.ajaib.ajaib_exchange import AjaibExchange
 
         api_key = ""
         api_secret = ""
+        proxy_url = ""
 
         try:
             from hummingbot.client.config.security import Security
@@ -167,12 +169,14 @@ class AjaibRateSource(RateSourceBase):
             if keys:
                 api_key = keys.get("ajaib_api_key", "")
                 api_secret = keys.get("ajaib_api_secret", "")
+                proxy_url = keys.get("ajaib_proxy_url", "") or ""
         except Exception:
             pass
 
         return AjaibExchange(
             ajaib_api_key=api_key,
             ajaib_api_secret=api_secret,
+            ajaib_proxy_url=proxy_url,
             trading_pairs=[],
             trading_required=False,
         )

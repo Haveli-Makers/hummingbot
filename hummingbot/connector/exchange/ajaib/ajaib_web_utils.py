@@ -1,3 +1,4 @@
+import time
 from typing import Callable, Optional
 
 import hummingbot.connector.exchange.ajaib.ajaib_constants as CONSTANTS
@@ -9,11 +10,16 @@ from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFa
 
 
 def public_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
-    return CONSTANTS.BASE_URL.format(domain) + path_url
+    """Ajaib exposes a single production REST host regardless of ``domain``."""
+    return CONSTANTS.REST_URL + path_url
 
 
 def private_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
-    return CONSTANTS.BASE_URL.format(domain) + path_url
+    return public_rest_url(path_url=path_url, domain=domain)
+
+
+def wss_url(domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
+    return CONSTANTS.WSS_URL
 
 
 def build_api_factory(
@@ -22,14 +28,16 @@ def build_api_factory(
         domain: str = CONSTANTS.DEFAULT_DOMAIN,
         time_provider: Optional[Callable] = None,
         auth: Optional[AuthBase] = None,
+        proxy_url: Optional[str] = None,
 ) -> WebAssistantsFactory:
     throttler = throttler or create_throttler()
     time_synchronizer = time_synchronizer or TimeSynchronizer()
-    time_provider = time_provider or (lambda: get_current_server_time())
+    time_provider = time_provider or (lambda: get_current_server_time(throttler=throttler, domain=domain))
 
     api_factory = WebAssistantsFactory(
         throttler=throttler,
         auth=auth,
+        connections_factory=_build_connections_factory(proxy_url),
         rest_pre_processors=[
             TimeSynchronizerRESTPreProcessor(synchronizer=time_synchronizer, time_provider=time_provider),
         ])
@@ -40,6 +48,21 @@ def build_api_factory_without_time_synchronizer_pre_processor(throttler: AsyncTh
     return WebAssistantsFactory(throttler=throttler)
 
 
+def _build_connections_factory(proxy_url: Optional[str]):
+    """
+    Route traffic through an Indonesian proxy when ``proxy_url`` is configured
+    (Ajaib geo-blocks non-Indonesian IPs); otherwise use the default singleton
+    factory. The proxy import is lazy so connectors that never use one pay no
+    import cost.
+    """
+    if proxy_url:
+        from hummingbot.core.web_assistant.connections.proxy_connections_factory import ProxyConnectionsFactory
+        return ProxyConnectionsFactory(proxy_url=proxy_url)
+
+    from hummingbot.core.web_assistant.connections.connections_factory import ConnectionsFactory
+    return ConnectionsFactory()
+
+
 def create_throttler() -> AsyncThrottler:
     return AsyncThrottler(CONSTANTS.RATE_LIMITS)
 
@@ -48,5 +71,10 @@ async def get_current_server_time(
         throttler: Optional[AsyncThrottler] = None,
         domain: str = CONSTANTS.DEFAULT_DOMAIN,
 ) -> float:
-    import time
-    return time.time() * 1000
+    """
+    Ajaib's ``/v1/time`` endpoint itself requires a signed ``timestamp``, so it
+    cannot be used to bootstrap the time synchronizer without credentials. We
+    therefore fall back to local time; the generous ``recvWindow`` (see
+    ``ajaib_auth``) absorbs the small clock skew this leaves.
+    """
+    return time.time() * 1e3

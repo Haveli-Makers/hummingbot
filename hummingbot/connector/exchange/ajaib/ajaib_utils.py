@@ -1,3 +1,4 @@
+import uuid
 from decimal import Decimal
 from typing import Any, Dict
 
@@ -62,6 +63,14 @@ def hb_pair_to_ajaib_symbol(hb_pair: str) -> str:
     return hb_pair.replace("-", "_")
 
 
+def generate_client_order_id() -> str:
+    """
+    Ajaib requires ``newClientOrderId`` in UUIDv4 form, so the connector uses a
+    UUIDv4 as Hummingbot's client order id (strategies treat the id as opaque).
+    """
+    return str(uuid.uuid4())
+
+
 class AjaibConfigMap(BaseConnectorConfigMap):
     connector: str = "ajaib"
     ajaib_api_key: SecretStr = Field(
@@ -76,9 +85,21 @@ class AjaibConfigMap(BaseConnectorConfigMap):
     ajaib_api_secret: SecretStr = Field(
         default=...,
         json_schema_extra={
-            "prompt": lambda cm: "Enter the path to your Ajaib Ed25519 private key PEM file",
+            "prompt": lambda cm: "Enter the path to your Ajaib Ed25519 private key PEM file (or paste the PEM contents)",
             "is_secure": True,
             "is_connect_key": True,
+            "prompt_on_new": True,
+        }
+    )
+    ajaib_proxy_url: SecretStr = Field(
+        default=SecretStr(""),
+        json_schema_extra={
+            "prompt": lambda cm: (
+                "Enter a proxy URL to route Ajaib traffic through an Indonesian IP "
+                "(e.g. socks5://user:pass@host:1080), or leave blank to connect directly"
+            ),
+            "is_secure": True,
+            "is_connect_key": False,
             "prompt_on_new": True,
         }
     )

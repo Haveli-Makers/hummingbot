@@ -30,6 +30,7 @@ SUPPORTED_CONNECTORS = [
     "coindcx",
     "wazirx",
     "coinex",
+    "ajaib",
 ]
 
 

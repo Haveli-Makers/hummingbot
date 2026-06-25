@@ -16,6 +16,7 @@ from hummingbot.core.rate_oracle.sources.coinbase_advanced_trade_rate_source imp
 from hummingbot.core.rate_oracle.sources.coindcx_rate_source import CoindcxRateSource
 from hummingbot.core.rate_oracle.sources.coinex_rate_source import CoinexRateSource
 from hummingbot.core.rate_oracle.sources.coinswitch_rate_source import CoinswitchRateSource
+from hummingbot.core.rate_oracle.sources.csx_rate_source import CsxRateSource
 from hummingbot.core.rate_oracle.sources.cube_rate_source import CubeRateSource
 from hummingbot.core.rate_oracle.sources.derive_rate_source import DeriveRateSource
 from hummingbot.core.rate_oracle.sources.dexalot_rate_source import DexalotRateSource
@@ -36,6 +37,7 @@ RATE_ORACLE_SOURCES = {
     "coin_cap": CoinCapRateSource,
     "coin_switch": CoinswitchRateSource,
     "coindcx": CoindcxRateSource,
+    "csx": CsxRateSource,
     "coinex": CoinexRateSource,
     "kucoin": KucoinRateSource,
     "ascend_ex": AscendExRateSource,

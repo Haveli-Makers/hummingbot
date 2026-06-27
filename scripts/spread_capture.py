@@ -25,6 +25,7 @@ SUPPORTED_CONNECTORS = [
     "coindcx",
     "wazirx",
     "coinex",
+    "coinswitch",
 ]
 
 

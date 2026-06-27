@@ -19,6 +19,7 @@ COPY bin/ bin/
 COPY hummingbot/ hummingbot/
 COPY scripts/ scripts/
 COPY controllers/ controllers/
+COPY --from=strategies controllers controllers/
 COPY scripts/ scripts-copy/
 COPY setup.py .
 COPY LICENSE .
@@ -41,22 +42,15 @@ RUN python3 setup.py build_ext --inplace -j 8 && \
 # Build final image using artifacts from builder
 FROM continuumio/miniconda3:latest AS release
 
-# Dockerfile author / maintainer
-LABEL maintainer="Fede Cardoso @dardonacci <federico@hummingbot.org>"
-
 # Build arguments
-ARG BRANCH=""
-ARG COMMIT=""
+ARG BRANCH="master"
 ARG BUILD_DATE=""
 LABEL branch=${BRANCH}
-LABEL commit=${COMMIT}
 LABEL date=${BUILD_DATE}
 
 # Set ENV variables
-ENV COMMIT_SHA=${COMMIT}
 ENV COMMIT_BRANCH=${BRANCH}
 ENV BUILD_DATE=${BUILD_DATE}
-
 ENV INSTALLATION_TYPE=docker
 
 # Install system dependencies

@@ -19,6 +19,7 @@ class CreateExecutorAction(ExecutorAction):
     Action to create an executor.
     """
     executor_config: ExecutorConfigType
+    wait_on_executor_id: Optional[str] = None
 
 
 class StopExecutorAction(ExecutorAction):

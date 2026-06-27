@@ -395,6 +395,7 @@ class ExecutorOrchestrator:
                 config=executor_config,
                 update_interval=self.executors_update_interval,
                 max_retries=self.executors_max_retries,
+                wait_on_executor_id=action.wait_on_executor_id,
             )
         else:
             raise ValueError("Unsupported executor config type")

@@ -37,16 +37,18 @@ class BestPriceExecutor(ExecutorBase):
         return cls._logger
 
     def __init__(self, strategy: ScriptStrategyBase, config: BestPriceExecutorConfig,
-                 update_interval: float = 1.0, max_retries: int = 10):
+                 update_interval: float = 1.0, max_retries: int = 10,
+                 wait_on_executor_id: Optional[str] = None):
         """
         Initialize the BestPriceExecutor instance.
 
         :param strategy: The strategy to be used by the executor.
         :param config: The configuration for the executor.
         :param max_retries: The maximum number of retries for the executor.
+        :param wait_on_executor_id: If set, delays start until the specified executor terminates.
         """
         super().__init__(strategy=strategy, config=config, connectors=[config.connector_name],
-                         update_interval=update_interval)
+                         update_interval=update_interval, wait_on_executor_id=wait_on_executor_id)
         self.config: BestPriceExecutorConfig = config
 
         # Order tracking
@@ -57,18 +59,30 @@ class BestPriceExecutor(ExecutorBase):
         self._renewal_task: Optional[asyncio.Task] = None  # Task for async order renewal
 
     @property
+    def filled_amount_quote(self) -> Decimal:
+        total = Decimal("0")
+        for order_json in self._held_position_orders:
+            total += Decimal(order_json["executed_amount_quote"])
+        return total
+
+    @property
     def best_price(self) -> Decimal:
         """
-        Get the best price with one tick improvement defined by price_diff.
+        Get the best price from the order book level 0.
+        Only moves to next level if both price and qty match our order exactly.
         """
-        # Get current market price based on order side
-        price_type = PriceType.BestBid if self.config.side == TradeType.BUY else PriceType.BestAsk
-        best = self.get_price(self.config.connector_name, self.config.trading_pair, price_type=price_type)
+        level0 = self.get_orderbook_level(self.config.connector_name, self.config.trading_pair, self.config.side, 0)
+        if level0 is None:
+            price_type = PriceType.BestBid if self.config.side == TradeType.BUY else PriceType.BestAsk
+            return self.get_price(self.config.connector_name, self.config.trading_pair, price_type=price_type)
 
-        if self._order and self._order.order and best == self._order.order.price:
-            # Our order is already at the top, check next level
-            best = self._get_nth_level_price(1) or best
-        return best
+        book_price, book_qty = level0
+        if self._order and self._order.order:
+            if book_price == self._order.order.price and book_qty == self._order.order.remaining_amount:
+                next_level = self.get_orderbook_level(self.config.connector_name, self.config.trading_pair, self.config.side, 1)
+                if next_level is not None:
+                    return next_level[0]
+        return book_price
 
     async def control_task(self):
         """
@@ -96,6 +110,7 @@ class BestPriceExecutor(ExecutorBase):
         Renew immediately whenever the best price changes beyond our current price.
         """
         if not self._order or not self._order.order or not self._order.order.is_open:
+            self.logger().debug("No order to maintain")
             return
 
         desired_price = self._compute_best_price()
@@ -106,36 +121,6 @@ class BestPriceExecutor(ExecutorBase):
         # If our order is not at desired best price, renew it
         if current_order_price != desired_price:
             self.renew_order()
-
-    def _get_nth_level_price(self, level: int = 0) -> Optional[Decimal]:
-        """
-        Get the price at the Nth level of the order book based on the order side.
-
-        :param level: The level (0-indexed) to get the price from. 0 = best bid/ask, 1 = second level, etc.
-        :return: The price at the specified level, or None if not available.
-        """
-        try:
-            connector = self.connectors[self.config.connector_name]
-            order_book = connector.get_order_book(self.config.trading_pair)
-
-            if order_book is None:
-                return None
-
-            if self.config.side == TradeType.BUY:
-                bids_df = order_book.snapshot[0]
-                if len(bids_df) > level:
-                    price_value = bids_df.iloc[level]['price']
-                    return Decimal(str(price_value))  # Convert to string first to avoid float precision issues
-            else:
-                asks_df = order_book.snapshot[1]
-                if len(asks_df) > level:
-                    price_value = asks_df.iloc[level]['price']
-                    return Decimal(str(price_value))  # Convert to string first to avoid float precision issues
-
-            return None
-        except Exception as e:
-            self.logger().error(f"Error getting Nth level price: {e}")
-            return None
 
     def _compute_best_price(self) -> Decimal:
         """
@@ -234,9 +219,12 @@ class BestPriceExecutor(ExecutorBase):
                     self._held_position_orders.append(self._order.order.to_json())
                 self._held_position_orders.extend([order.order.to_json() for order in self._partial_filled_orders if order.order is not None])
                 self.stop()
-        else:
+        elif self._partial_filled_orders:
             self._held_position_orders.extend([order.order.to_json() for order in self._partial_filled_orders if order.order is not None])
             self.close_type = CloseType.POSITION_HOLD
+            self.stop()
+        else:
+            self.close_type = CloseType.EARLY_STOP
             self.stop()
         await self._sleep(5.0)
 
@@ -307,7 +295,23 @@ class BestPriceExecutor(ExecutorBase):
         adjusted_order_candidates = self.adjust_order_candidates(self.config.connector_name, [order_candidate])
         if adjusted_order_candidates[0].amount == Decimal("0"):
             self.close_type = CloseType.INSUFFICIENT_BALANCE
-            self.logger().error("Not enough budget to open best price position.")
+            base, quote = self.config.trading_pair.split("-")
+            collateral_token = quote if self.config.side == TradeType.BUY else base
+            available = self.connectors[self.config.connector_name].get_available_balance(collateral_token)
+            self.logger().error(
+                f"Not enough budget to open best price position. "
+                f"Available {collateral_token}: {available}, required notional: {self.config.amount * current_price}"
+            )
+            self.stop()
+            return
+
+        trading_rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
+        notional_value = self.config.amount * current_price
+        if trading_rules and notional_value < trading_rules.min_notional_size:
+            self.close_type = CloseType.BELOW_MIN_NOTIONAL
+            self.logger().error(
+                f"Order notional {notional_value} is below min notional {trading_rules.min_notional_size}."
+            )
             self.stop()
 
     def get_custom_info(self) -> Dict:
@@ -318,12 +322,13 @@ class BestPriceExecutor(ExecutorBase):
             "order_last_update": self._order.last_update_timestamp if self._order else None,
             "held_position_orders": self._held_position_orders,
             "price_diff": self.config.price_diff,
+            "side": self.config.side
         }
 
     def to_format_status(self, scale=1.0):
         """Format the status of the executor."""
         lines = [f"""
-| Trading Pair: {self.config.trading_pair} | Exchange: {self.config.connector_name} | Action: {self.config.position_action}
+| Trading Pair: {self.config.trading_pair} | Exchange: {self.config.connector_name}
 | Amount: {self.config.amount} | Price: {self._order.order.price if self._order and self._order.order else 'N/A'}
 | Strategy: BEST_PRICE | Price Diff: {self.config.price_diff}
 """]

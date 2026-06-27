@@ -84,7 +84,7 @@ class CoinswitchAPIOrderBookDataSource(OrderBookTrackerDataSource):
     def _build_client(self) -> socketio.AsyncClient:
         client = socketio.AsyncClient(logger=False, reconnection=False)
         namespace = self._namespace
-        snapshot_queue = self._message_queue[self._snapshot_messages_queue_key]
+        orderbook_queue = self._message_queue[self._diff_messages_queue_key]
         trade_queue = self._message_queue[self._trade_messages_queue_key]
 
         @client.event(namespace=namespace)
@@ -98,7 +98,7 @@ class CoinswitchAPIOrderBookDataSource(OrderBookTrackerDataSource):
         @client.on(CONSTANTS.ORDER_BOOK_EVENT_TYPE, namespace=namespace)
         async def on_order_book(message):
             if isinstance(message, dict) and ("bids" in message or "asks" in message):
-                snapshot_queue.put_nowait(message)
+                orderbook_queue.put_nowait(message)
 
         @client.on(CONSTANTS.TRADE_EVENT_TYPE, namespace=namespace)
         async def on_trade(message):
@@ -168,7 +168,7 @@ class CoinswitchAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 await self._client.connect(
                     CONSTANTS.WS_URL,
                     namespaces=[self._namespace],
-                    socketio_path=CONSTANTS.WS_SPOT_SOCKETIO_PATH,
+                    socketio_path=CONSTANTS.WS_SPOT_SOCKETIO_PATH + self._namespace,
                     transports=["websocket"],
                 )
                 await self._subscribe_channels(self._client)

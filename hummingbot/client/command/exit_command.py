@@ -35,5 +35,10 @@ class ExitCommand:
         for notifier in self.trading_core.notifiers:
             notifier.stop()
 
+        # Stop the MQTT bridge once the strategy has been stopped. Await it here
+        # (rather than the fire-and-forget mqtt_stop()) so it actually disconnects
+        # before the event loop is torn down by app.exit().
+        if self._mqtt is not None:
+            await self.stop_mqtt_async()
+
         self.app.exit()
-        self.mqtt_stop()

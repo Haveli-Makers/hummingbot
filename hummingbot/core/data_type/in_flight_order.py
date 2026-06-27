@@ -212,6 +212,10 @@ class InFlightOrder:
         )
 
     @property
+    def remaining_amount(self) -> Decimal:
+        return self.amount - self.executed_amount_base
+
+    @property
     def is_failure(self) -> bool:
         return self.current_state == OrderState.FAILED
 

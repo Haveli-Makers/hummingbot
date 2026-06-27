@@ -236,21 +236,71 @@ async def run_application(hb: HummingbotApplication, args: argparse.Namespace, c
                      strategy_file_path=log_file_name)
         await hb.run()
     else:
-        # Set up UI mode with start listener
-        start_listener: UIStartListener = UIStartListener(
-            hb,
-            is_script=args.config_file_name.endswith(".py") if args.config_file_name else False,
-            script_config=hb.script_config,
-            is_quickstart=True
-        )
-        hb.app.add_listener(HummingbotUIEvent.Start, start_listener)
-
+        is_script = args.config_file_name.endswith(".py") if args.config_file_name else False
+        logging.getLogger(__name__).info(
+            "run_application: UI mode (headless=%s, config_file=%s, strategy_name=%s)",
+            args.headless, args.config_file_name, hb.strategy_name)
         tasks: List[Coroutine] = [hb.run()]
+
+        if args.config_file_name is not None and hb.strategy_name is not None:
+            # A strategy was provided on the command line: start it explicitly once the
+            # UI is up. This does not rely on the prompt_toolkit Start event firing
+            # (which is timing/TTY dependent), so the strategy autostarts reliably
+            # alongside the UI and MQTT.
+            tasks.append(_ui_autostart_strategy(hb, is_script))
+        else:
+            # No strategy provided: keep the standard UI Start listener so the user can
+            # import/create and start a strategy interactively from the UI.
+            start_listener: UIStartListener = UIStartListener(
+                hb,
+                is_script=is_script,
+                script_config=hb.script_config,
+                is_quickstart=True
+            )
+            hb.app.add_listener(HummingbotUIEvent.Start, start_listener)
+
         if client_config_map.debug_console:
             management_port: int = detect_available_port(8211)
             tasks.append(start_management_console(locals(), host="localhost", port=management_port))
 
         await safe_gather(*tasks)
+
+
+async def _ui_autostart_strategy(hb: HummingbotApplication, is_script: bool):
+    """Start the configured strategy once the UI application is running.
+
+    Polls until the prompt_toolkit Application has been created and is running,
+    then issues the same start command the UI Start event would. The start_check
+    routine is idempotent (guards on _in_start_check / strategy_task), so if the
+    UI Start event also fires this is a no-op.
+    """
+    log = logging.getLogger(__name__)
+    log.info("UI autostart task scheduled (is_script=%s, strategy=%s, conf=%s)",
+             is_script, hb.strategy_name, hb.script_config)
+
+    # Wait for the UI app to be initialized and running (max ~30s).
+    became_running = False
+    for _ in range(300):
+        app = getattr(hb.app, "app", None)
+        if app is not None and getattr(app, "is_running", False):
+            became_running = True
+            break
+        await asyncio.sleep(0.1)
+    log.info("UI autostart: app became_running=%s, proceeding to start strategy", became_running)
+
+    # Bail out if the strategy is already running (e.g. UI Start event won the race).
+    strategy_task = hb.trading_core.strategy_task
+    if strategy_task is not None and not strategy_task.done():
+        log.info("UI autostart: strategy already running, skipping explicit start")
+        return
+
+    log.info("UI autostart: invoking hb.start() for strategy '%s'", hb.strategy_name)
+    hb.start(
+        log_level=hb.client_config_map.log_level,
+        script=hb.strategy_name if is_script else None,
+        conf=hb.script_config,
+        is_quickstart=True,
+    )
 
 
 def main():

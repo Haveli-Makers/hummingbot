@@ -29,6 +29,21 @@ class ZebpayAuthTests(unittest.IsolatedAsyncioTestCase):
         expected_sig = hmac.new(b"secret_key", expected_q.encode(), hashlib.sha256).hexdigest()
         self.assertEqual(expected_sig, result.headers["x-auth-signature"])
 
+    async def test_get_signature_matches_wire_query_when_escaping_needed(self):
+        # The signature must be computed over the EXACT query string aiohttp puts on
+        # the wire. aiohttp applies params via yarl's URL.extend_query, so we verify
+        # the signed string equals that — even for a value that needs escaping.
+        from yarl import URL
+        auth = _make_auth()
+        base_url = "https://sapi.zebpay.com/api/v2/ex/order"
+        req = RESTRequest(method=RESTMethod.GET, url=base_url,
+                          params={"clientId": "a b+c/d&e=f"})
+        result = await auth.rest_authenticate(req)
+
+        wire_query = URL(base_url).extend_query(result.params).query_string
+        expected_sig = hmac.new(b"secret_key", wire_query.encode(), hashlib.sha256).hexdigest()
+        self.assertEqual(expected_sig, result.headers["x-auth-signature"])
+
     async def test_post_signs_json_body_with_timestamp(self):
         auth = _make_auth()
         req = RESTRequest(method=RESTMethod.POST,

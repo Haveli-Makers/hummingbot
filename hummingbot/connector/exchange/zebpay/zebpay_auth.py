@@ -3,6 +3,8 @@ import hmac
 import json
 from typing import Dict
 
+from yarl import URL
+
 from hummingbot.core.web_assistant.auth import AuthBase
 from hummingbot.core.web_assistant.connections.data_types import RESTRequest, WSRequest
 
@@ -53,10 +55,18 @@ class ZebpayAuth(AuthBase):
             signature = self._sign(json_body)
             request.data = json_body
         else:
-            # Query request (GET/DELETE): sign the query string with timestamp included.
+            # Query request (GET/DELETE): sign the EXACT query string that goes on the
+            # wire. aiohttp serialises request.params with yarl (url.extend_query), so
+            # we build the signed string with the same yarl encoder — guaranteeing the
+            # signature matches the transmitted query for ANY value that needs escaping
+            # (space, '+', '&', '/', non-ASCII, ...). The previous hand-joined
+            # "k=v&..." signed raw, un-encoded values, which diverged from the wire the
+            # moment a value required escaping. For today's values (orderId, symbol,
+            # integer timestamp) the encoded string is identical to the old one, so
+            # live signing behaviour is unchanged.
             params: Dict = dict(request.params or {})
             params["timestamp"] = timestamp
-            query_string = "&".join(f"{key}={value}" for key, value in params.items())
+            query_string = URL(request.url).extend_query(params).query_string
             signature = self._sign(query_string)
             request.params = params
 

@@ -24,7 +24,7 @@ class ZebpayVolumeSource(VolumeSourceBase):
         for item in tickers:
             if not isinstance(item, dict):
                 continue
-            hb_symbol = str(item.get("symbol", "")).upper()
+            hb_symbol = await self._resolve_trading_pair(item)
             if not hb_symbol or "-" not in hb_symbol:
                 continue
             try:
@@ -32,6 +32,26 @@ class ZebpayVolumeSource(VolumeSourceBase):
             except (KeyError, ValueError):
                 continue
         return result
+
+    async def _resolve_trading_pair(self, ticker: Dict[str, Any]) -> Optional[str]:
+        """
+        Translate a ticker's exchange symbol to an HB trading pair via the connector
+        symbol map so the source keeps working if Zebpay ever returns a non-dashed
+        symbol. Falls back to baseAsset/quoteAsset, then a raw dashed symbol.
+        """
+        symbol = str(ticker.get("symbol", ""))
+        if symbol:
+            try:
+                return await self._exchange.trading_pair_associated_to_exchange_symbol(symbol=symbol)
+            except KeyError:
+                pass
+        base = str(ticker.get("baseAsset", "")).upper()
+        quote = str(ticker.get("quoteAsset", "")).upper()
+        if base and quote:
+            return f"{base}-{quote}"
+        if "-" in symbol:
+            return symbol.upper()
+        return None
 
     def _normalize_ticker(self, ticker: Dict[str, Any], hb_symbol: str) -> Dict[str, Any]:
         last = ticker.get("last") or ticker.get("lastPrice") or "0"

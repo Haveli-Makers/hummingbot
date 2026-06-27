@@ -161,15 +161,26 @@ class ZebpayExchange(ExchangePyBase):
 
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception) -> bool:
         msg = str(request_exception).lower()
-        return "timestamp" in msg or "signature" in msg and "time" in msg
+        # `and` binds tighter than `or`, so the previous
+        # `"timestamp" in msg or "signature" in msg and "time" in msg` grouped as
+        # `... or ("signature" and "time")` — a bare "invalid signature" (clock
+        # skew with no "time" word) returned False and the clock never resynced.
+        return "timestamp" in msg or "signature" in msg or "time" in msg
 
     def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
         msg = str(status_update_exception).lower()
-        return "not found" in msg or "does not exist" in msg or "404" in msg
+        return any(s in msg for s in CONSTANTS.ORDER_NOT_FOUND_MESSAGES)
 
     def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
+        # Zebpay rejects cancels of already-terminal orders with an HTTP 200 business
+        # error ("Order already cancelled" / "not in active state" / ...). Those must
+        # classify as not-found; otherwise the base cancel flow only logs and the
+        # order stays in-flight indefinitely, holding reserved balance.
         msg = str(cancelation_exception).lower()
-        return "not found" in msg or "does not exist" in msg or "404" in msg
+        return any(
+            s in msg
+            for s in CONSTANTS.ORDER_NOT_FOUND_MESSAGES + CONSTANTS.CANCEL_TERMINAL_MESSAGES
+        )
 
     # ── Trading pair initialisation ────────────────────────────────────────────
 
@@ -228,14 +239,29 @@ class ZebpayExchange(ExchangePyBase):
                 tick = item.get("tickSz")
                 lot = item.get("lotSz")
 
-                min_price_increment = (
-                    str_to_decimal(tick) if tick not in (None, "")
-                    else (Decimal(10) ** -int(price_prec) if price_prec is not None else Decimal("0.01"))
-                )
-                min_base_increment = (
-                    str_to_decimal(lot) if lot not in (None, "")
-                    else (Decimal(10) ** -int(qty_prec) if qty_prec is not None else Decimal("0.0001"))
-                )
+                if tick not in (None, ""):
+                    min_price_increment = str_to_decimal(tick)
+                elif price_prec is not None:
+                    min_price_increment = Decimal(10) ** -int(price_prec)
+                else:
+                    min_price_increment = CONSTANTS.DEFAULT_PRICE_INCREMENT
+                    self.logger().warning(
+                        f"Zebpay exchangeInfo for {trading_pair} has no tickSz/pricePrecision; "
+                        f"using fallback price increment {min_price_increment}. Orders may be "
+                        f"rejected if this does not match the venue's real tick size."
+                    )
+
+                if lot not in (None, ""):
+                    min_base_increment = str_to_decimal(lot)
+                elif qty_prec is not None:
+                    min_base_increment = Decimal(10) ** -int(qty_prec)
+                else:
+                    min_base_increment = CONSTANTS.DEFAULT_BASE_INCREMENT
+                    self.logger().warning(
+                        f"Zebpay exchangeInfo for {trading_pair} has no lotSz/quantityPrecision; "
+                        f"using fallback base increment {min_base_increment}. Orders may be "
+                        f"rejected if this does not match the venue's real lot size."
+                    )
                 min_order_size = str_to_decimal(item.get("minSize", item.get("minQty", lot))) or min_base_increment
 
                 # Zebpay doesn't publish a min order value in exchangeInfo, but it
@@ -306,6 +332,25 @@ class ZebpayExchange(ExchangePyBase):
             self.logger().error(f"Error fetching last traded price for {trading_pair}: {exc}")
         return 0.0
 
+    # ── Helpers ────────────────────────────────────────────────────────────────
+
+    def _ts_to_seconds(self, ts_raw: Any) -> float:
+        """
+        Convert a Zebpay timestamp field to epoch seconds.
+
+        Order/fill endpoints have returned milliseconds, but to stay robust if any
+        endpoint ever returns seconds we only divide when the value is clearly in
+        millisecond range (> 1e12) — the same guard the trade-feed parser uses, so
+        all paths agree on units. Falls back to synchronized local time when absent.
+        """
+        if not ts_raw:
+            return self._time_synchronizer.time()
+        try:
+            ts = float(ts_raw)
+        except (TypeError, ValueError):
+            return self._time_synchronizer.time()
+        return ts / 1000.0 if ts > 1e12 else ts
+
     # ── Order placement & cancellation ────────────────────────────────────────
 
     async def _place_order(
@@ -352,7 +397,7 @@ class ZebpayExchange(ExchangePyBase):
         if not exchange_order_id:
             raise IOError(f"Zebpay accepted the request but returned no orderId: {result}")
         ts_raw = data.get("timestamp") or data.get("createdAt") or 0
-        transact_time = float(ts_raw) / 1000.0 if ts_raw else self._time_synchronizer.time()
+        transact_time = self._ts_to_seconds(ts_raw)
         return exchange_order_id, transact_time
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder) -> bool:
@@ -402,7 +447,7 @@ class ZebpayExchange(ExchangePyBase):
             client_order_id=tracked_order.client_order_id,
             exchange_order_id=str(tracked_order.exchange_order_id),
             trading_pair=tracked_order.trading_pair,
-            update_timestamp=float(ts_raw) / 1000.0 if ts_raw else self._time_synchronizer.time(),
+            update_timestamp=self._ts_to_seconds(ts_raw),
             new_state=new_state,
         )
 
@@ -410,43 +455,44 @@ class ZebpayExchange(ExchangePyBase):
         if order.exchange_order_id is None:
             return []
         trade_updates: List[TradeUpdate] = []
-        try:
-            result = await self._api_get(
-                path_url=CONSTANTS.ORDER_FILLS_PATH_URL,
-                params={"orderId": order.exchange_order_id},
-                is_auth_required=True,
+        result = await self._api_get(
+            path_url=CONSTANTS.ORDER_FILLS_PATH_URL,
+            params={"orderId": order.exchange_order_id},
+            is_auth_required=True,
+        )
+        # Detect the HTTP-200 business error (data=null) instead of silently
+        # treating a filled order as having zero fills (dropping price/fees). Let it
+        # propagate — the base _update_orders_fills logs and retries next cycle.
+        raise_for_status(result)
+        data = unwrap_data(result)
+        fills = data.get("fills", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+        for fill in fills:
+            if not isinstance(fill, dict):
+                continue
+            fill_price = str_to_decimal(fill.get("price", "0"))
+            fill_base = str_to_decimal(fill.get("amount", fill.get("qty", "0")))
+            fill_quote = str_to_decimal(fill.get("cost")) or (fill_price * fill_base)
+            fee_token = fill.get("feeCurrency", fill.get("feeCoin", order.quote_asset))
+            fee = TradeFeeBase.new_spot_fee(
+                fee_schema=self.trade_fee_schema(),
+                trade_type=order.trade_type,
+                percent_token=fee_token,
+                flat_fees=[TokenAmount(amount=str_to_decimal(fill.get("fees", "0")), token=fee_token)],
             )
-            data = unwrap_data(result)
-            fills = data.get("fills", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-            for fill in fills:
-                if not isinstance(fill, dict):
-                    continue
-                fill_price = str_to_decimal(fill.get("price", "0"))
-                fill_base = str_to_decimal(fill.get("amount", fill.get("qty", "0")))
-                fill_quote = str_to_decimal(fill.get("cost")) or (fill_price * fill_base)
-                fee_token = fill.get("feeCurrency", fill.get("feeCoin", order.quote_asset))
-                fee = TradeFeeBase.new_spot_fee(
-                    fee_schema=self.trade_fee_schema(),
-                    trade_type=order.trade_type,
-                    percent_token=fee_token,
-                    flat_fees=[TokenAmount(amount=str_to_decimal(fill.get("fees", "0")), token=fee_token)],
+            ts_raw = fill.get("createdAt") or fill.get("timestamp") or 0
+            trade_updates.append(
+                TradeUpdate(
+                    trade_id=str(fill.get("id", fill.get("tradeId", f"{order.exchange_order_id}-{len(trade_updates)}"))),
+                    client_order_id=order.client_order_id,
+                    exchange_order_id=str(order.exchange_order_id),
+                    trading_pair=order.trading_pair,
+                    fee=fee,
+                    fill_base_amount=fill_base,
+                    fill_quote_amount=fill_quote,
+                    fill_price=fill_price,
+                    fill_timestamp=self._ts_to_seconds(ts_raw),
                 )
-                ts_raw = fill.get("createdAt") or fill.get("timestamp") or 0
-                trade_updates.append(
-                    TradeUpdate(
-                        trade_id=str(fill.get("id", fill.get("tradeId", f"{order.exchange_order_id}-{len(trade_updates)}"))),
-                        client_order_id=order.client_order_id,
-                        exchange_order_id=str(order.exchange_order_id),
-                        trading_pair=order.trading_pair,
-                        fee=fee,
-                        fill_base_amount=fill_base,
-                        fill_quote_amount=fill_quote,
-                        fill_price=fill_price,
-                        fill_timestamp=float(ts_raw) / 1000.0 if ts_raw else self._time_synchronizer.time(),
-                    )
-                )
-        except Exception as exc:
-            self.logger().error(f"Error fetching Zebpay fills for {order.exchange_order_id}: {exc}")
+            )
         return trade_updates
 
     # ── Balance ────────────────────────────────────────────────────────────────
@@ -456,8 +502,21 @@ class ZebpayExchange(ExchangePyBase):
         remote_assets: set = set()
         try:
             response = await self._api_get(path_url=CONSTANTS.BALANCE_PATH_URL, is_auth_required=True)
+            # Surface an HTTP-200 business error rather than parsing it as empty.
+            raise_for_status(response)
             from hummingbot.connector.exchange.zebpay.zebpay_utils import parse_balance_response
             parsed = parse_balance_response(response)
+
+            # A degenerate-but-200 response ({"data":{}} / {"data":[]}) parses to {}.
+            # Treating that as "account holds nothing" would wipe every tracked
+            # balance via the stale-removal loop below and stop the bot from sizing
+            # orders until a later good poll. Skip and keep the last known balances.
+            if not parsed:
+                self.logger().warning(
+                    "Zebpay balance response was empty; keeping last known balances."
+                )
+                return
+
             for asset, balances in parsed.items():
                 self._account_balances[asset] = balances["total"]
                 self._account_available_balances[asset] = balances["free"]
@@ -524,7 +583,9 @@ class ZebpayExchange(ExchangePyBase):
 
                         new_state = CONSTANTS.ORDER_STATE.get(status_str)
                         if new_state is None:
-                            continue
+                            # Unknown/unmapped status — keep the order at its current
+                            # state rather than dropping the update entirely.
+                            new_state = tracked.current_state
 
                         from hummingbot.core.data_type.in_flight_order import OrderState
                         if new_state == OrderState.OPEN and str_to_decimal(order_data.get("filled", "0")) > 0:
@@ -533,7 +594,7 @@ class ZebpayExchange(ExchangePyBase):
                         ts_raw = order_data.get("updatedAt") or order_data.get("timestamp") or 0
                         order_update = OrderUpdate(
                             trading_pair=tracked.trading_pair,
-                            update_timestamp=float(ts_raw) / 1000.0 if ts_raw else self._time_synchronizer.time(),
+                            update_timestamp=self._ts_to_seconds(ts_raw),
                             new_state=new_state,
                             client_order_id=tracked.client_order_id,
                             exchange_order_id=exchange_order_id,

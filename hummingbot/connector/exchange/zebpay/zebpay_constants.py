@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from hummingbot.core.api_throttler.data_types import LinkedLimitWeightPair, RateLimit
 from hummingbot.core.data_type.in_flight_order import OrderState
 
@@ -33,6 +35,11 @@ PING_PATH_URL = ALL_TICKERS_PATH_URL
 MIN_NOTIONAL_BY_QUOTE = {"INR": "99"}
 DEFAULT_MIN_NOTIONAL = "1"
 
+# Last-resort tick/lot increments used only when exchangeInfo publishes neither an
+# explicit size nor a precision for a pair. A warning is logged whenever these apply.
+DEFAULT_PRICE_INCREMENT = Decimal("0.01")
+DEFAULT_BASE_INCREMENT = Decimal("0.0001")
+
 SIDE_BUY = "BUY"
 SIDE_SELL = "SELL"
 
@@ -59,6 +66,16 @@ ORDER_STATE = {
     "EXPIRED": OrderState.FAILED,
     "FAILED": OrderState.FAILED,
 }
+
+# Error-message substrings that classify a status/cancel failure as "order not found".
+ORDER_NOT_FOUND_MESSAGES = ("not found", "does not exist", "404")
+# Additional substrings meaning a cancel hit an order that is already in a terminal
+# state. Zebpay returns these as HTTP 200 business errors; they must also be treated
+# as not-found so the cancel flow settles the order instead of leaving it in-flight.
+CANCEL_TERMINAL_MESSAGES = (
+    "already cancelled", "already canceled", "already filled", "already completed",
+    "not in active state", "not active", "cannot be cancelled", "cannot be canceled",
+)
 
 # ── Rate limits (docs: public 1200/min, private 600/min, per key) ─────────────
 PUBLIC_LIMIT_ID = "PUBLIC"

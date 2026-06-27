@@ -23,24 +23,45 @@ class ZebpayRateSource(RateSourceBase):
     async def get_prices(self, quote_token: Optional[str] = None) -> Dict[str, Decimal]:
         self._ensure_exchange()
         tickers = await self._zebpay_exchange.get_all_pairs_prices()
-        return self._extract_mid_prices(tickers, quote_token)
+        return await self._extract_mid_prices(tickers, quote_token)
 
     @async_ttl_cache(ttl=30, maxsize=1)
     async def get_bid_ask_prices(self, quote_token: Optional[str] = None) -> Dict[str, Dict[str, Decimal]]:
         self._ensure_exchange()
         tickers = await self._zebpay_exchange.get_all_pairs_prices()
-        return self._extract_bid_ask(tickers, quote_token)
+        return await self._extract_bid_ask(tickers, quote_token)
 
     def _ensure_exchange(self):
         if self._zebpay_exchange is None:
             self._zebpay_exchange = self._build_zebpay_connector()
 
-    def _extract_mid_prices(self, tickers, quote_token: Optional[str]) -> Dict[str, Decimal]:
+    async def _resolve_trading_pair(self, ticker: Dict) -> Optional[str]:
+        """
+        Translate a ticker's exchange symbol to an HB trading pair via the connector
+        symbol map, so the source keeps working if Zebpay ever stops returning the
+        dashed BASE-QUOTE form. Falls back to baseAsset/quoteAsset, then to a raw
+        dashed symbol, mirroring WazirxRateSource.
+        """
+        symbol = str(ticker.get("symbol", ""))
+        if symbol:
+            try:
+                return await self._zebpay_exchange.trading_pair_associated_to_exchange_symbol(symbol=symbol)
+            except KeyError:
+                pass
+        base = str(ticker.get("baseAsset", "")).upper()
+        quote = str(ticker.get("quoteAsset", "")).upper()
+        if base and quote:
+            return f"{base}-{quote}"
+        if "-" in symbol:
+            return symbol.upper()
+        return None
+
+    async def _extract_mid_prices(self, tickers, quote_token: Optional[str]) -> Dict[str, Decimal]:
         results: Dict[str, Decimal] = {}
         for ticker in tickers:
             if not isinstance(ticker, dict):
                 continue
-            tp = str(ticker.get("symbol", "")).upper()
+            tp = await self._resolve_trading_pair(ticker)
             if not tp or "-" not in tp:
                 continue
             if quote_token and not tp.endswith(f"-{quote_token}"):
@@ -54,12 +75,12 @@ class ZebpayRateSource(RateSourceBase):
                 results[tp] = last
         return results
 
-    def _extract_bid_ask(self, tickers, quote_token: Optional[str]) -> Dict[str, Dict[str, Decimal]]:
+    async def _extract_bid_ask(self, tickers, quote_token: Optional[str]) -> Dict[str, Dict[str, Decimal]]:
         results: Dict[str, Dict[str, Decimal]] = {}
         for ticker in tickers:
             if not isinstance(ticker, dict):
                 continue
-            tp = str(ticker.get("symbol", "")).upper()
+            tp = await self._resolve_trading_pair(ticker)
             if not tp or "-" not in tp:
                 continue
             if quote_token and not tp.endswith(f"-{quote_token}"):

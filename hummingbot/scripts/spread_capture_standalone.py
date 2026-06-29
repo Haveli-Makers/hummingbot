@@ -23,7 +23,6 @@ from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 
 SUPPORTED_CONNECTORS = [
     "binance",
-    "binance_perpetual",
     "binance_us",
     "kucoin",
     "gate_io",
@@ -34,6 +33,7 @@ SUPPORTED_CONNECTORS = [
     "dexalot",
     "coindcx",
     "wazirx",
+    "coinswitch",
 ]
 
 
@@ -191,7 +191,9 @@ class SpreadCapture(ScriptStrategyBase):
         set_data_path(data_dir)
 
         client_config = ClientConfigAdapter(ClientConfigMap())
-        sql_manager = SQLConnectionManager(client_config, SQLConnectionType.TRADE_FILLS, db_name="spread_capture_db")
+        sql_manager = SQLConnectionManager(
+            client_config, SQLConnectionType.TRADE_FILLS, db_name="spread_capture_standalone_db"
+        )
         try:
             market_data_collection = client_config.hb_config.market_data_collection
         except Exception:
@@ -370,20 +372,10 @@ def main():
     logging.basicConfig(level=logging.INFO)
 
     try:
-        client_config = ClientConfigAdapter(ClientConfigMap())
-        sql_manager = SQLConnectionManager(client_config, SQLConnectionType.TRADE_FILLS, db_name="spread_capture_standalone_db")
-        try:
-            market_data_collection = client_config.hb_config.market_data_collection
-        except Exception:
-            market_data_collection = MarketDataCollectionConfigMap()
-
-        try:
-            MarketsRecorder(sql=sql_manager, markets=[], config_file_path="spread_capture_standalone", strategy_name="spread_capture_standalone", market_data_collection=market_data_collection)
-            logging.getLogger("spread_capture_standalone").info("MarketsRecorder initialized; DB persistence enabled")
-        except Exception as e:
-            logging.getLogger("spread_capture_standalone").exception(f"Failed to initialize MarketsRecorder: {e}")
+        SpreadCapture.initialize_markets_recorder()
+        logging.getLogger("spread_capture_standalone").info("MarketsRecorder initialized; DB persistence enabled")
     except Exception as e:
-        logging.getLogger("spread_capture_standalone").exception(f"Failed to initialize DB manager: {e}")
+        logging.getLogger("spread_capture_standalone").exception(f"Failed to initialize MarketsRecorder: {e}")
 
     quote_tokens = [t.strip() for t in args.quote_tokens.split(",") if t.strip()]
 

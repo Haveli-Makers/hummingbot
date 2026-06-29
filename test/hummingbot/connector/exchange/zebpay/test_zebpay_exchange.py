@@ -47,6 +47,15 @@ class ZebpayExchangePropertiesTests(unittest.IsolatedAsyncioTestCase):
     def test_cancel_synchronous(self):
         self.assertTrue(self.exchange.is_cancel_request_in_exchange_synchronous)
 
+    def test_is_request_exception_related_to_time_synchronizer(self):
+        f = self.exchange._is_request_exception_related_to_time_synchronizer
+        # A bare "invalid signature" (clock skew, no "time" word) must trigger a
+        # resync — the previous `or ... and ...` grouping returned False here.
+        self.assertTrue(f(IOError("invalid signature")))
+        self.assertTrue(f(IOError("timestamp expired")))
+        self.assertTrue(f(IOError("request time too old")))
+        self.assertFalse(f(IOError("insufficient balance")))
+
 
 class ZebpayExchangeTradingPairTests(unittest.IsolatedAsyncioTestCase):
 
@@ -84,6 +93,15 @@ class ZebpayExchangeTradingPairTests(unittest.IsolatedAsyncioTestCase):
         rules = await self.exchange._format_trading_rules(info)
         self.assertEqual(Decimal("150"), rules[0].min_notional_size)
 
+    async def test_format_trading_rules_warns_on_default_increments(self):
+        # No tickSz/lotSz and no precision → hardcoded fallback increments + a warning.
+        info = {"data": [{"symbol": "FOO-INR", "baseAsset": "FOO", "quoteAsset": "INR"}]}
+        with self.assertLogs(level="WARNING") as cm:
+            rules = await self.exchange._format_trading_rules(info)
+        self.assertEqual(CONSTANTS.DEFAULT_PRICE_INCREMENT, rules[0].min_price_increment)
+        self.assertEqual(CONSTANTS.DEFAULT_BASE_INCREMENT, rules[0].min_base_amount_increment)
+        self.assertTrue(any("fallback" in line.lower() for line in cm.output))
+
 
 class ZebpayExchangeBalanceTests(unittest.IsolatedAsyncioTestCase):
 
@@ -109,6 +127,23 @@ class ZebpayExchangeBalanceTests(unittest.IsolatedAsyncioTestCase):
             mock_get.return_value = {"data": [{"currency": "BTC", "total": "1", "free": "1", "used": "0"}]}
             await self.exchange._update_balances()
         self.assertNotIn("STALE", self.exchange._account_balances)
+
+    async def test_update_balances_empty_response_does_not_wipe(self):
+        # HTTP-200 with empty data must not wipe tracked balances.
+        self.exchange._account_balances["BTC"] = Decimal("1")
+        self.exchange._account_available_balances["BTC"] = Decimal("1")
+        with patch.object(self.exchange, "_api_get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = {"data": [], "statusCode": 200}
+            await self.exchange._update_balances()
+        self.assertEqual(Decimal("1"), self.exchange._account_balances.get("BTC"))
+
+    async def test_update_balances_business_error_does_not_wipe(self):
+        self.exchange._account_balances["BTC"] = Decimal("1")
+        self.exchange._account_available_balances["BTC"] = Decimal("1")
+        with patch.object(self.exchange, "_api_get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = {"data": None, "statusCode": 500, "statusDescription": "blip"}
+            await self.exchange._update_balances()
+        self.assertEqual(Decimal("1"), self.exchange._account_balances.get("BTC"))
 
 
 class ZebpayExchangeOrderTests(unittest.IsolatedAsyncioTestCase):
@@ -198,48 +233,9 @@ class ZebpayExchangeOrderTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError):
                 await self.exchange._request_order_status(tracked)
 
-
-class ZebpayReviewFixTests(unittest.IsolatedAsyncioTestCase):
-    """Regression tests for the code-review findings."""
-
-    def setUp(self):
-        self.exchange = _make_exchange(trading_pairs=["BTC-INR"])
-        self.exchange._set_trading_pair_symbol_map(bidict({"BTC-INR": "BTC-INR"}))
-
-    def _order(self) -> InFlightOrder:
-        return InFlightOrder(
-            client_order_id="ZEBtest", exchange_order_id="ord-1", trading_pair="BTC-INR",
-            order_type=OrderType.LIMIT, trade_type=TradeType.BUY, amount=Decimal("0.001"),
-            price=Decimal("3000000"), creation_timestamp=1_700_000_000.0,
-        )
-
-    # ── Finding 1: empty / business-error balance must not wipe balances ──────
-    async def test_empty_balance_response_does_not_wipe(self):
-        self.exchange._account_balances["BTC"] = Decimal("1")
-        self.exchange._account_available_balances["BTC"] = Decimal("1")
-        with patch.object(self.exchange, "_api_get", new_callable=AsyncMock) as mock_get:
-            mock_get.return_value = {"data": [], "statusCode": 200}
-            await self.exchange._update_balances()
-        self.assertEqual(Decimal("1"), self.exchange._account_balances.get("BTC"))
-
-    async def test_business_error_balance_does_not_wipe(self):
-        self.exchange._account_balances["BTC"] = Decimal("1")
-        self.exchange._account_available_balances["BTC"] = Decimal("1")
-        with patch.object(self.exchange, "_api_get", new_callable=AsyncMock) as mock_get:
-            mock_get.return_value = {"data": None, "statusCode": 500, "statusDescription": "blip"}
-            await self.exchange._update_balances()
-        self.assertEqual(Decimal("1"), self.exchange._account_balances.get("BTC"))
-
-    async def test_good_balance_still_removes_stale(self):
-        self.exchange._account_balances["STALE"] = Decimal("9")
-        self.exchange._account_available_balances["STALE"] = Decimal("9")
-        with patch.object(self.exchange, "_api_get", new_callable=AsyncMock) as mock_get:
-            mock_get.return_value = {"data": [{"currency": "BTC", "total": "1", "free": "1", "used": "0"}]}
-            await self.exchange._update_balances()
-        self.assertNotIn("STALE", self.exchange._account_balances)
-
-    # ── Finding 2: already-cancelled cancels classify as not-found ────────────
-    def test_cancel_not_found_classification(self):
+    def test_is_order_not_found_during_cancelation_error(self):
+        # Terminal-state cancel rejections must classify as not-found so the base
+        # cancel flow settles the order instead of leaving it in-flight.
         f = self.exchange._is_order_not_found_during_cancelation_error
         self.assertTrue(f(IOError("Zebpay API error (statusCode 88): Order already cancelled")))
         self.assertTrue(f(IOError("Order not in active state")))
@@ -247,54 +243,58 @@ class ZebpayReviewFixTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(f(IOError("Order not found")))
         self.assertFalse(f(IOError("insufficient balance")))
 
-    # ── Finding 3: fills business error propagates instead of dropping fills ──
-    async def test_fills_business_error_raises(self):
+    async def test_all_trade_updates_business_error_raises(self):
+        # A 200-business-error on the fills path must propagate, not silently
+        # record zero fills.
+        tracked = InFlightOrder(
+            client_order_id="ZEBtest", exchange_order_id="ord-1", trading_pair="BTC-INR",
+            order_type=OrderType.LIMIT, trade_type=TradeType.BUY, amount=Decimal("0.001"),
+            price=Decimal("3000000"), creation_timestamp=1_700_000_000.0,
+        )
         with patch.object(self.exchange, "_api_get", new_callable=AsyncMock) as mock_get:
             mock_get.return_value = {"data": None, "statusCode": 500, "statusDescription": "blip"}
             with self.assertRaises(IOError):
-                await self.exchange._all_trade_updates_for_order(self._order())
+                await self.exchange._all_trade_updates_for_order(tracked)
 
-    async def test_fills_parsed_on_success(self):
+    async def test_all_trade_updates_parses_fills(self):
+        tracked = InFlightOrder(
+            client_order_id="ZEBtest", exchange_order_id="ord-1", trading_pair="BTC-INR",
+            order_type=OrderType.LIMIT, trade_type=TradeType.BUY, amount=Decimal("0.001"),
+            price=Decimal("3000000"), creation_timestamp=1_700_000_000.0,
+        )
         with patch.object(self.exchange, "_api_get", new_callable=AsyncMock) as mock_get:
             mock_get.return_value = {"data": {"fills": [{
                 "id": "f1", "price": "3000000", "amount": "0.001",
                 "fees": "3", "feeCurrency": "INR", "createdAt": 1_700_000_001_000,
             }]}}
-            updates = await self.exchange._all_trade_updates_for_order(self._order())
+            updates = await self.exchange._all_trade_updates_for_order(tracked)
         self.assertEqual(1, len(updates))
         self.assertEqual(Decimal("3000000"), updates[0].fill_price)
         self.assertEqual(Decimal("0.001"), updates[0].fill_base_amount)
 
-    # ── Finding 4: clock-resync predicate matches a bare signature error ──────
-    def test_time_sync_predicate(self):
-        f = self.exchange._is_request_exception_related_to_time_synchronizer
-        self.assertTrue(f(IOError("invalid signature")))          # the previously-missed case
-        self.assertTrue(f(IOError("timestamp expired")))
-        self.assertTrue(f(IOError("request time too old")))
-        self.assertFalse(f(IOError("insufficient balance")))
-
-    # ── Finding 5: warn when falling back to hardcoded tick/lot defaults ──────
-    async def test_trading_rules_warn_on_default_increments(self):
-        info = {"data": [{"symbol": "FOO-INR", "baseAsset": "FOO", "quoteAsset": "INR"}]}
-        with self.assertLogs(level="WARNING") as cm:
-            rules = await self.exchange._format_trading_rules(info)
-        self.assertEqual(CONSTANTS.DEFAULT_PRICE_INCREMENT, rules[0].min_price_increment)
-        self.assertEqual(CONSTANTS.DEFAULT_BASE_INCREMENT, rules[0].min_base_amount_increment)
-        self.assertTrue(any("fallback" in line.lower() for line in cm.output))
-
-    # ── Finding 7: seconds timestamps are not mis-scaled by /1000 ─────────────
-    async def test_order_status_timestamp_in_seconds_not_divided(self):
+    async def test_request_order_status_timestamp_in_seconds_not_divided(self):
+        # A seconds-scale timestamp (< 1e12) must not be divided by 1000.
+        tracked = InFlightOrder(
+            client_order_id="ZEBtest", exchange_order_id="ord-1", trading_pair="BTC-INR",
+            order_type=OrderType.LIMIT, trade_type=TradeType.BUY, amount=Decimal("0.001"),
+            price=Decimal("3000000"), creation_timestamp=1_700_000_000.0,
+        )
         with patch.object(self.exchange, "_api_get", new_callable=AsyncMock) as mock_get:
             mock_get.return_value = {"data": {"orderId": "ord-1", "status": "OPEN",
                                               "updatedAt": 1_700_000_000}}  # seconds
-            upd = await self.exchange._request_order_status(self._order())
+            upd = await self.exchange._request_order_status(tracked)
         self.assertEqual(1_700_000_000.0, upd.update_timestamp)
 
-    async def test_order_status_timestamp_in_millis_divided(self):
+    async def test_request_order_status_timestamp_in_millis_divided(self):
+        tracked = InFlightOrder(
+            client_order_id="ZEBtest", exchange_order_id="ord-1", trading_pair="BTC-INR",
+            order_type=OrderType.LIMIT, trade_type=TradeType.BUY, amount=Decimal("0.001"),
+            price=Decimal("3000000"), creation_timestamp=1_700_000_000.0,
+        )
         with patch.object(self.exchange, "_api_get", new_callable=AsyncMock) as mock_get:
             mock_get.return_value = {"data": {"orderId": "ord-1", "status": "OPEN",
                                               "updatedAt": 1_700_000_000_000}}  # millis
-            upd = await self.exchange._request_order_status(self._order())
+            upd = await self.exchange._request_order_status(tracked)
         self.assertEqual(1_700_000_000.0, upd.update_timestamp)
 
 

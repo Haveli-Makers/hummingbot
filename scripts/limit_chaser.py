@@ -29,6 +29,7 @@ SUPPORTED_CONNECTORS = [
     "dexalot",
     "coindcx",
     "wazirx",
+    "zebpay",
     "csx",
     "coinex",
 ]

@@ -310,7 +310,21 @@ class ZebpayExchange(ExchangePyBase):
         if not trading_pairs:
             return tickers
         requested = {tp.upper() for tp in trading_pairs}
-        return [t for t in tickers if str(t.get("symbol", "")).upper() in requested]
+        # Resolve each ticker's exchange symbol to its HB pair via the symbol map
+        # BEFORE filtering, so a non-dashed symbol (e.g. "BTCINR") still matches the
+        # requested HB pair ("BTC-INR"). Filtering on the raw symbol would drop every
+        # pair if Zebpay ever stopped returning dashed symbols — defeating the
+        # symbol-map fallback the rate/volume oracle sources rely on.
+        matched: List[Dict[str, Any]] = []
+        for ticker in tickers:
+            symbol = str(ticker.get("symbol", ""))
+            try:
+                hb_pair = await self.trading_pair_associated_to_exchange_symbol(symbol=symbol)
+            except KeyError:
+                hb_pair = symbol.upper() if "-" in symbol else ""
+            if hb_pair and hb_pair.upper() in requested:
+                matched.append(ticker)
+        return matched
 
     async def _get_last_traded_price(self, trading_pair: str) -> float:
         try:
@@ -507,13 +521,17 @@ class ZebpayExchange(ExchangePyBase):
             from hummingbot.connector.exchange.zebpay.zebpay_utils import parse_balance_response
             parsed = parse_balance_response(response)
 
-            # A degenerate-but-200 response ({"data":{}} / {"data":[]}) parses to {}.
-            # Treating that as "account holds nothing" would wipe every tracked
-            # balance via the stale-removal loop below and stop the bot from sizing
-            # orders until a later good poll. Skip and keep the last known balances.
-            if not parsed:
+            # Distinguish a genuinely-empty account from a degenerate response.
+            # Zebpay replies with an empty LIST ({"data": []}) when the account holds
+            # nothing — that must be reflected (the stale-removal loop wipes the old
+            # balances), otherwise the strategy keeps sizing orders against funds it no
+            # longer has. Any OTHER empty shape (null / non-list — a transient hiccup,
+            # already harmless after parse_balance_response's guard) is treated as
+            # degenerate and the last known balances are kept. Business errors raise via
+            # raise_for_status above and never reach here.
+            if not parsed and not isinstance(unwrap_data(response), list):
                 self.logger().warning(
-                    "Zebpay balance response was empty; keeping last known balances."
+                    "Zebpay balance payload was degenerate (not an empty list); keeping last known balances."
                 )
                 return
 

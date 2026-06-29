@@ -92,6 +92,11 @@ def parse_balance_response(response: Any) -> Dict[str, Dict[str, Decimal]]:
       {"currency": "BTC", "total": "1.0", "free": "0.8", "used": "0.2", ...}
     """
     data = unwrap_data(response)
+    # Guard against a degenerate {"data": null} (or any non-container) envelope:
+    # Zebpay can reply HTTP 200 with data:null, and data.get(...) below would raise
+    # AttributeError on None.
+    if not isinstance(data, (list, dict)):
+        return {}
     items = data if isinstance(data, list) else data.get("balances", data.get("assets", []))
     result: Dict[str, Dict[str, Decimal]] = {}
     if not isinstance(items, list):

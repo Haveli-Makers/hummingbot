@@ -42,6 +42,11 @@ class ZebpayUtilsTests(unittest.TestCase):
     def test_parse_balance_response_empty(self):
         self.assertEqual({}, parse_balance_response({"data": []}))
 
+    def test_parse_balance_response_null_data(self):
+        # {"data": null} must not raise AttributeError — return an empty mapping.
+        self.assertEqual({}, parse_balance_response({"data": None}))
+        self.assertEqual({}, parse_balance_response({"data": "unexpected-string"}))
+
     def test_raise_for_status_ok(self):
         ok = {"data": {"orderId": "1"}, "statusCode": 200}
         self.assertIs(ok, raise_for_status(ok))  # no raise, returns input

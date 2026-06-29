@@ -102,6 +102,18 @@ class ZebpayExchangeTradingPairTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(CONSTANTS.DEFAULT_BASE_INCREMENT, rules[0].min_base_amount_increment)
         self.assertTrue(any("fallback" in line.lower() for line in cm.output))
 
+    async def test_volume_tickers_resolve_symbol_before_filtering(self):
+        # A non-dashed exchange symbol must still match the requested HB pair via the
+        # symbol map; filtering on the raw symbol would drop it.
+        self.exchange._set_trading_pair_symbol_map(bidict({"BTCINR": "BTC-INR"}))
+        self.exchange.get_all_pairs_prices = AsyncMock(return_value=[
+            {"symbol": "BTCINR", "volume": "10"},
+            {"symbol": "ETHINR", "volume": "5"},
+        ])
+        out = await self.exchange.get_all_24h_volume_tickers(["BTC-INR"])
+        self.assertEqual(1, len(out))
+        self.assertEqual("BTCINR", out[0]["symbol"])
+
 
 class ZebpayExchangeBalanceTests(unittest.IsolatedAsyncioTestCase):
 
@@ -128,12 +140,23 @@ class ZebpayExchangeBalanceTests(unittest.IsolatedAsyncioTestCase):
             await self.exchange._update_balances()
         self.assertNotIn("STALE", self.exchange._account_balances)
 
-    async def test_update_balances_empty_response_does_not_wipe(self):
-        # HTTP-200 with empty data must not wipe tracked balances.
+    async def test_update_balances_empty_list_reflects_empty_account(self):
+        # A genuine empty account (HTTP 200 + {"data": []}) must wipe stale balances;
+        # keeping them would let the strategy size orders against funds it no longer has.
         self.exchange._account_balances["BTC"] = Decimal("1")
         self.exchange._account_available_balances["BTC"] = Decimal("1")
         with patch.object(self.exchange, "_api_get", new_callable=AsyncMock) as mock_get:
             mock_get.return_value = {"data": [], "statusCode": 200}
+            await self.exchange._update_balances()
+        self.assertNotIn("BTC", self.exchange._account_balances)
+
+    async def test_update_balances_degenerate_payload_keeps_balances(self):
+        # A degenerate {"data": null} (not an empty list) is a transient hiccup, not a
+        # real empty account — keep the last known balances.
+        self.exchange._account_balances["BTC"] = Decimal("1")
+        self.exchange._account_available_balances["BTC"] = Decimal("1")
+        with patch.object(self.exchange, "_api_get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = {"data": None, "statusCode": 200}
             await self.exchange._update_balances()
         self.assertEqual(Decimal("1"), self.exchange._account_balances.get("BTC"))
 

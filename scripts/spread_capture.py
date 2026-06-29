@@ -25,6 +25,7 @@ SUPPORTED_CONNECTORS = [
     "coindcx",
     "wazirx",
     "delta_perpetual",
+    "zebpay",
     "csx",
     "coinex",
 ]
@@ -138,6 +139,10 @@ def get_rate_source(connector_name: str) -> RateSourceBase:
         from hummingbot.core.rate_oracle.sources.delta_perpetual_rate_source import DeltaPerpetualRateSource
 
         return DeltaPerpetualRateSource()
+    elif connector_name_lower == "zebpay":
+        from hummingbot.core.rate_oracle.sources.zebpay_rate_source import ZebpayRateSource
+
+        return ZebpayRateSource()
     elif connector_name_lower == "csx":
         from hummingbot.core.rate_oracle.sources.csx_rate_source import CsxRateSource
 

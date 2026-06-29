@@ -111,6 +111,16 @@ cdef class RangePositionFeeCollectedListener(BaseStrategyEventListener):
 cdef class RangePositionClosedListener(BaseStrategyEventListener):
     cdef c_call(self, object arg):
         self._owner.c_did_close_position(arg)
+
+
+cdef class OrderEditedListener(BaseStrategyEventListener):
+    cdef c_call(self, object arg):
+        self._owner.c_did_edit_order(arg)
+
+
+cdef class OrderEditFailedListener(BaseStrategyEventListener):
+    cdef c_call(self, object arg):
+        self._owner.c_did_fail_order_edit(arg)
 # </editor-fold>
 
 
@@ -126,6 +136,8 @@ cdef class StrategyBase(TimeIterator):
     ORDER_FAILURE_EVENT_TAG = MarketEvent.OrderFailure.value
     BUY_ORDER_CREATED_EVENT_TAG = MarketEvent.BuyOrderCreated.value
     SELL_ORDER_CREATED_EVENT_TAG = MarketEvent.SellOrderCreated.value
+    ORDER_EDITED_EVENT_TAG = MarketEvent.OrderEdited.value
+    ORDER_EDIT_FAILED_EVENT_TAG = MarketEvent.OrderEditFailed.value
     RANGE_POSITION_LIQUIDITY_ADDED_EVENT_TAG = MarketEvent.RangePositionLiquidityAdded.value
     RANGE_POSITION_LIQUIDITY_REMOVED_EVENT_TAG = MarketEvent.RangePositionLiquidityRemoved.value
     RANGE_POSITION_UPDATE_EVENT_TAG = MarketEvent.RangePositionUpdate.value
@@ -158,6 +170,8 @@ cdef class StrategyBase(TimeIterator):
         self._sb_range_position_update_failure_listener = RangePositionUpdateFailureListener(self)
         self._sb_range_position_fee_collected_listener = RangePositionFeeCollectedListener(self)
         self._sb_range_position_closed_listener = RangePositionClosedListener(self)
+        self._sb_order_edited_listener = OrderEditedListener(self)
+        self._sb_order_edit_failed_listener = OrderEditFailedListener(self)
 
         self._sb_delegate_lock = False
 
@@ -333,6 +347,8 @@ cdef class StrategyBase(TimeIterator):
             typed_market.c_add_listener(self.RANGE_POSITION_UPDATE_FAILURE_EVENT_TAG, self._sb_range_position_update_failure_listener)
             typed_market.c_add_listener(self.RANGE_POSITION_FEE_COLLECTED_EVENT_TAG, self._sb_range_position_fee_collected_listener)
             typed_market.c_add_listener(self.RANGE_POSITION_CLOSED_EVENT_TAG, self._sb_range_position_closed_listener)
+            typed_market.c_add_listener(self.ORDER_EDITED_EVENT_TAG, self._sb_order_edited_listener)
+            typed_market.c_add_listener(self.ORDER_EDIT_FAILED_EVENT_TAG, self._sb_order_edit_failed_listener)
             self._sb_markets.add(typed_market)
 
     def add_markets(self, markets: List[ConnectorBase]):
@@ -363,6 +379,8 @@ cdef class StrategyBase(TimeIterator):
             typed_market.c_remove_listener(self.RANGE_POSITION_UPDATE_FAILURE_EVENT_TAG, self._sb_range_position_update_failure_listener)
             typed_market.c_remove_listener(self.RANGE_POSITION_FEE_COLLECTED_EVENT_TAG, self._sb_range_position_fee_collected_listener)
             typed_market.c_remove_listener(self.RANGE_POSITION_CLOSED_EVENT_TAG, self._sb_range_position_closed_listener)
+            typed_market.c_remove_listener(self.ORDER_EDITED_EVENT_TAG, self._sb_order_edited_listener)
+            typed_market.c_remove_listener(self.ORDER_EDIT_FAILED_EVENT_TAG, self._sb_order_edit_failed_listener)
             self._sb_markets.remove(typed_market)
 
     def remove_markets(self, markets: List[ConnectorBase]):
@@ -416,6 +434,12 @@ cdef class StrategyBase(TimeIterator):
         pass
 
     cdef c_did_expire_order(self, object expired_event):
+        pass
+
+    cdef c_did_edit_order(self, object order_edited_event):
+        pass
+
+    cdef c_did_fail_order_edit(self, object order_edit_failed_event):
         pass
 
     cdef c_did_complete_buy_order(self, object order_completed_event):

@@ -24,6 +24,8 @@ SUPPORTED_CONNECTORS = [
     "dexalot",
     "coindcx",
     "wazirx",
+    "csx",
+    "coinex",
 ]
 
 
@@ -131,7 +133,14 @@ def get_rate_source(connector_name: str) -> RateSourceBase:
         from hummingbot.core.rate_oracle.sources.coinswitch_rate_source import CoinswitchRateSource
 
         return CoinswitchRateSource()
+    elif connector_name_lower == "csx":
+        from hummingbot.core.rate_oracle.sources.csx_rate_source import CsxRateSource
 
+        return CsxRateSource()
+    elif connector_name_lower == "coinex":
+        from hummingbot.core.rate_oracle.sources.coinex_rate_source import CoinexRateSource
+
+        return CoinexRateSource()
     else:
         raise ValueError(
             f"Unsupported connector: {connector_name}. Supported connectors: " f"{', '.join(SUPPORTED_CONNECTORS)}"

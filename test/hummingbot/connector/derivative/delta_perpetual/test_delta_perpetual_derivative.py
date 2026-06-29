@@ -91,6 +91,10 @@ class DeltaPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
     def test_supported_position_modes_oneway_only(self):
         self.assertEqual([PositionMode.ONEWAY], self.connector.supported_position_modes())
 
+    def test_authenticator_is_cached(self):
+        # The authenticator (and its HMAC key) is built once and reused.
+        self.assertIs(self.connector.authenticator, self.connector.authenticator)
+
     # ── Symbol map / trading rules ─────────────────────────────────────────────
 
     async def test_initialize_symbol_map(self):
@@ -116,12 +120,37 @@ class DeltaPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual("USD", rule.buy_order_collateral_token)
         self.assertEqual("USD", rule.sell_order_collateral_token)
 
+    async def test_format_trading_rules_warns_on_missing_fields(self):
+        # Missing contract_value/tick_size must fall back to defaults WITH a warning,
+        # not silently quantize orders to a possibly-wrong increment.
+        product = _product()
+        product.pop("contract_value")
+        product.pop("tick_size")
+        with self.assertLogs(level="WARNING") as cm:
+            rules = await self.connector._format_trading_rules(_wrap([product]))
+        self.assertEqual(Decimal("1"), rules[0].min_base_amount_increment)
+        self.assertEqual(Decimal("0.5"), rules[0].min_price_increment)
+        self.assertTrue(any("contract_value" in line for line in cm.output))
+        self.assertTrue(any("tick_size" in line for line in cm.output))
+
     def test_contract_size_round_trip(self):
         self._bootstrap_symbol_map(contract_value="0.001")
         size = self.connector._format_amount_to_size(self.trading_pair, Decimal("0.005"))
         self.assertEqual(Decimal("5"), size)
         amount = self.connector._format_size_to_amount(self.trading_pair, Decimal("5"))
         self.assertEqual(Decimal("0.005"), amount)
+
+    def test_contract_conversion_works_before_trading_rules(self):
+        # Order-book init converts size<->amount before trading rules load; this must
+        # use the symbol-map contract value, not self._trading_rules (which KeyErrors).
+        self.connector._initialize_trading_pair_symbols_from_exchange_info(
+            _wrap([_product(contract_value="0.001")])
+        )
+        self.assertNotIn(self.trading_pair, self.connector._trading_rules)
+        self.assertEqual(Decimal("0.005"),
+                         self.connector._format_size_to_amount(self.trading_pair, Decimal("5")))
+        self.assertEqual(Decimal("5"),
+                         self.connector._format_amount_to_size(self.trading_pair, Decimal("0.005")))
 
     # ── Order placement / cancellation / status ────────────────────────────────
 
@@ -234,6 +263,17 @@ class DeltaPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
         self.assertFalse(ok)
         self.connector._api_delete.assert_not_called()
 
+    def test_cancel_of_terminal_order_classifies_as_not_found(self):
+        # Live-confirmed: Delta returns {"error":{"code":"open_order_not_found"}}
+        # (HTTP 400) when cancelling an order that is no longer open (filled or
+        # already cancelled). That must classify as not-found so the base cancel
+        # flow settles the order rather than leaving it phantom-in-flight.
+        err = IOError('HTTP status is 400. Error: '
+                      '{"error":{"code":"open_order_not_found"},"success":false}')
+        self.assertTrue(self.connector._is_order_not_found_during_cancelation_error(err))
+        self.assertFalse(
+            self.connector._is_order_not_found_during_cancelation_error(IOError("insufficient_margin")))
+
     async def test_request_order_status_maps_state(self):
         self._bootstrap_symbol_map()
         order = InFlightOrder(
@@ -263,6 +303,25 @@ class DeltaPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
         update = await self.connector._request_order_status(order)
         self.assertEqual(OrderState.PARTIALLY_FILLED, update.new_state)
 
+    async def test_process_order_event_unmapped_state_keeps_current(self):
+        # An unmapped WS order state must not be dropped; the order stays tracked at
+        # its current state instead of being silently ignored.
+        self._bootstrap_symbol_map()
+        order = InFlightOrder(
+            client_order_id="DLTA-7", trading_pair=self.trading_pair, order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY, amount=Decimal("0.001"), price=Decimal("50000"),
+            creation_timestamp=1700000000.0, exchange_order_id="999",
+        )
+        self.connector._order_tracker.start_tracking_order(order)
+        captured = {}
+        self.connector._order_tracker.process_order_update = lambda order_update: captured.update(
+            state=order_update.new_state)
+        self.connector._process_order_event(
+            {"client_order_id": "DLTA-7", "id": "999", "state": "some_unmapped_state",
+             "updated_at": 1700000001000000})
+        self.assertIn("state", captured)  # not dropped
+        self.assertEqual(order.current_state, captured["state"])
+
     # ── Balances / positions / leverage ────────────────────────────────────────
 
     async def test_update_balances(self):
@@ -272,6 +331,15 @@ class DeltaPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
         await self.connector._update_balances()
         self.assertEqual(Decimal("1000"), self.connector._account_balances["USD"])
         self.assertEqual(Decimal("800"), self.connector._account_available_balances["USD"])
+
+    async def test_update_balances_empty_does_not_wipe(self):
+        # A degenerate empty wallet payload (success:true, result:[]) must not wipe
+        # tracked balances.
+        self.connector._account_balances["USD"] = Decimal("1000")
+        self.connector._account_available_balances["USD"] = Decimal("800")
+        self.connector._api_get = AsyncMock(return_value=_wrap([]))
+        await self.connector._update_balances()
+        self.assertEqual(Decimal("1000"), self.connector._account_balances.get("USD"))
 
     async def test_update_positions_long(self):
         self._bootstrap_symbol_map()
@@ -349,6 +417,21 @@ class DeltaPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
             price=Decimal("50000"),
         )
         self.assertIsNotNone(fee)
+
+    def test_get_fee_respects_explicit_taker(self):
+        # An explicit is_maker=False must not be clobbered to maker just because the
+        # order type is LIMIT_MAKER.
+        taker = self.connector._get_fee(
+            base_currency="BTC", quote_currency="USD", order_type=OrderType.LIMIT_MAKER,
+            order_side=TradeType.BUY, position_action=PositionAction.OPEN, amount=Decimal("1"),
+            price=Decimal("50000"), is_maker=False)
+        self.assertEqual(self.connector.estimate_fee_pct(False), taker.percent)
+
+        inferred = self.connector._get_fee(
+            base_currency="BTC", quote_currency="USD", order_type=OrderType.LIMIT_MAKER,
+            order_side=TradeType.BUY, position_action=PositionAction.OPEN, amount=Decimal("1"),
+            price=Decimal("50000"))  # is_maker unspecified → infer maker
+        self.assertEqual(self.connector.estimate_fee_pct(True), inferred.percent)
 
     @patch.object(DeltaPerpetualDerivative, "_api_get", new_callable=AsyncMock)
     async def test_get_last_traded_price(self, api_get_mock):

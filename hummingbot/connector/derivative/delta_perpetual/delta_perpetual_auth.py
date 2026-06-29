@@ -4,6 +4,8 @@ import json
 from typing import Dict
 from urllib.parse import urlparse
 
+from yarl import URL
+
 import hummingbot.connector.derivative.delta_perpetual.delta_perpetual_constants as CONSTANTS
 from hummingbot.core.web_assistant.auth import AuthBase
 from hummingbot.core.web_assistant.connections.data_types import RESTRequest, WSRequest
@@ -46,8 +48,13 @@ class DeltaPerpetualAuth(AuthBase):
 
         query_string = ""
         if request.params:
-            qs = "&".join(f"{key}={value}" for key, value in request.params.items())
-            query_string = f"?{qs}"
+            # Sign the EXACT query string aiohttp transmits. aiohttp serialises
+            # request.params with yarl (url.extend_query), so build the signed string
+            # the same way — otherwise a value needing escaping would diverge from the
+            # wire and Delta would reject the signature. For plain values (product_id,
+            # state, ...) this is byte-for-byte identical to the old hand-joined string.
+            encoded = URL(request.url).extend_query(request.params).query_string
+            query_string = f"?{encoded}"
 
         body_str = ""
         if request.data:

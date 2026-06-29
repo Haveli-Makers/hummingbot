@@ -71,17 +71,28 @@ class DeltaPerpetualDerivative(PerpetualDerivativePyBase):
         # Delta orders reference an integer product_id and a contract size.
         self._product_id_by_symbol: Dict[str, int] = {}
         self._contract_value_by_symbol: Dict[str, Decimal] = {}
+        # Contract value keyed by HB trading pair too, so size<->amount conversion
+        # works during order-book init (which runs before trading rules load).
+        self._contract_value_by_pair: Dict[str, Decimal] = {}
+        # Built once and cached: rebuilding hex-decodes the secret and reconstructs
+        # the HMAC key on every access otherwise.
+        self._authenticator: Optional[DeltaPerpetualAuth] = None
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     # ── Properties ─────────────────────────────────────────────────────────────
 
     @property
     def authenticator(self):
-        return DeltaPerpetualAuth(
-            api_key=self.api_key,
-            secret_key=self.secret_key,
-            time_provider=self._time_synchronizer,
-        )
+        # Built once and cached. The base class reads this during __init__ and it
+        # may be accessed repeatedly afterwards; rebuilding each time reconstructs
+        # the HMAC signing key needlessly.
+        if self._authenticator is None:
+            self._authenticator = DeltaPerpetualAuth(
+                api_key=self.api_key,
+                secret_key=self.secret_key,
+                time_provider=self._time_synchronizer,
+            )
+        return self._authenticator
 
     @property
     def name(self) -> str:
@@ -200,17 +211,30 @@ class DeltaPerpetualDerivative(PerpetualDerivativePyBase):
 
     # ── Contract-size helpers ──────────────────────────────────────────────────
 
+    def _contract_value_for_pair(self, trading_pair: str) -> Decimal:
+        """
+        Contract value for a pair, taken from the symbol map (populated when the
+        trading-pair map loads — BEFORE trading rules). The order-book tracker
+        converts size<->amount during init, which can run before trading rules are
+        ready, so reading self._trading_rules here would KeyError. Fall back to the
+        trading rule, then to 1.
+        """
+        value = self._contract_value_by_pair.get(trading_pair)
+        if value is None:
+            rule = self._trading_rules.get(trading_pair)
+            value = Decimal(str(rule.min_base_amount_increment)) if rule is not None else Decimal("1")
+        return value
+
     def _format_amount_to_size(self, trading_pair: str, amount: Decimal) -> Decimal:
         """Convert a base-asset amount into integer Delta contracts."""
-        contract_value = Decimal(self._trading_rules[trading_pair].min_base_amount_increment)
+        contract_value = self._contract_value_for_pair(trading_pair)
         if contract_value <= 0:
             return amount
         return amount / contract_value
 
     def _format_size_to_amount(self, trading_pair: str, size: Decimal) -> Decimal:
         """Convert a Delta contract size back into a base-asset amount."""
-        contract_value = Decimal(self._trading_rules[trading_pair].min_base_amount_increment)
-        return size * contract_value
+        return size * self._contract_value_for_pair(trading_pair)
 
     async def _product_id_for_pair(self, trading_pair: str) -> Optional[int]:
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
@@ -231,6 +255,7 @@ class DeltaPerpetualDerivative(PerpetualDerivativePyBase):
         mapping = bidict()
         self._product_id_by_symbol = {}
         self._contract_value_by_symbol = {}
+        self._contract_value_by_pair = {}
         for product in _result(exchange_info) or []:
             try:
                 if not isinstance(product, dict):
@@ -247,7 +272,9 @@ class DeltaPerpetualDerivative(PerpetualDerivativePyBase):
                 hb_pair = combine_to_hb_trading_pair(base=base.upper(), quote=quote.upper())
                 mapping[symbol] = hb_pair
                 self._product_id_by_symbol[symbol] = int(product.get("id"))
-                self._contract_value_by_symbol[symbol] = Decimal(str(product.get("contract_value", "1")))
+                contract_value = Decimal(str(product.get("contract_value", "1")))
+                self._contract_value_by_symbol[symbol] = contract_value
+                self._contract_value_by_pair[hb_pair] = contract_value
             except Exception as exc:
                 self.logger().debug(f"Error parsing Delta product '{product}': {exc}")
         self._set_trading_pair_symbol_map(mapping)
@@ -279,8 +306,28 @@ class DeltaPerpetualDerivative(PerpetualDerivativePyBase):
                     continue
                 trading_pair = combine_to_hb_trading_pair(base=base.upper(), quote=quote.upper())
 
-                contract_value = Decimal(str(product.get("contract_value", "1")))
-                tick_size = Decimal(str(product.get("tick_size", "0.5")))
+                # Warn rather than silently quantizing to a wrong increment: Delta
+                # always publishes these, so a missing field signals an unexpected
+                # payload and orders may be rejected / mis-sized against the default.
+                raw_contract_value = product.get("contract_value")
+                if raw_contract_value in (None, ""):
+                    contract_value = Decimal("1")
+                    self.logger().warning(
+                        f"Delta product '{product.get('symbol')}' has no contract_value; using "
+                        f"fallback {contract_value}. Order sizing may be wrong if this is incorrect."
+                    )
+                else:
+                    contract_value = Decimal(str(raw_contract_value))
+
+                raw_tick_size = product.get("tick_size")
+                if raw_tick_size in (None, ""):
+                    tick_size = Decimal("0.5")
+                    self.logger().warning(
+                        f"Delta product '{product.get('symbol')}' has no tick_size; using fallback "
+                        f"{tick_size}. Orders may be rejected if this doesn't match the real tick."
+                    )
+                else:
+                    tick_size = Decimal(str(raw_tick_size))
 
                 rules.append(
                     TradingRule(
@@ -455,6 +502,13 @@ class DeltaPerpetualDerivative(PerpetualDerivativePyBase):
                 self._account_balances[asset] = total
                 self._account_available_balances[asset] = free
                 remote_assets.add(asset)
+            # A degenerate/empty wallet payload (e.g. success:true with result:[])
+            # would otherwise wipe every tracked balance via the stale-removal loop,
+            # leaving the bot believing it holds nothing. Keep last known balances.
+            if not remote_assets:
+                if local_assets:
+                    self.logger().warning("Delta wallet response had no balances; keeping last known balances.")
+                return
             for stale in local_assets - remote_assets:
                 del self._account_balances[stale]
                 del self._account_available_balances[stale]
@@ -539,7 +593,9 @@ class DeltaPerpetualDerivative(PerpetualDerivativePyBase):
         price: Decimal = s_decimal_NaN,
         is_maker: Optional[bool] = None,
     ) -> TradeFeeBase:
-        is_maker = is_maker or (order_type is OrderType.LIMIT_MAKER)
+        # Respect an explicit is_maker=False (e.g. a LIMIT_MAKER that crossed and
+        # filled as taker); only infer from the order type when it is unspecified.
+        is_maker = is_maker if is_maker is not None else (order_type is OrderType.LIMIT_MAKER)
         return TradeFeeBase.new_perpetual_fee(
             fee_schema=self.trade_fee_schema(),
             position_action=position_action,
@@ -601,7 +657,9 @@ class DeltaPerpetualDerivative(PerpetualDerivativePyBase):
 
         new_state = CONSTANTS.ORDER_STATE.get(state_str)
         if new_state is None:
-            return
+            # Unknown/unmapped state — keep the order at its current state rather
+            # than dropping the update entirely.
+            new_state = tracked.current_state
         unfilled = order_data.get("unfilled_size")
         if new_state == OrderState.OPEN and unfilled is not None and float(unfilled) < float(order_data.get("size", 0)):
             new_state = OrderState.PARTIALLY_FILLED

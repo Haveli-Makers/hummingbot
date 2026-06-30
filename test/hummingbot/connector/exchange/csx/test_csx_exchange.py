@@ -450,6 +450,27 @@ class CsxExchangeUserStreamListenerTests(IsolatedAsyncioWrapperTestCase):
 
         self.assertEqual(Decimal("2.0"), self.exchange._account_balances.get("BTC"))
 
+    async def test_terminal_order_update_records_final_fill(self):
+        # A settled-order terminal update must record the final fill BEFORE the order
+        # transitions to a terminal state — otherwise executed_amount_base is
+        # permanently under-reported for the last fill.
+        order = InFlightOrder(
+            client_order_id="x-CSX-settle", exchange_order_id="oid-settle",
+            trading_pair="BTC-INR", order_type=OrderType.LIMIT, trade_type=TradeType.BUY,
+            amount=Decimal("1.0"), price=Decimal("100"), creation_timestamp=1.0,
+        )
+        self.exchange._order_tracker.start_tracking_order(order)
+        event = {"event": "order_update", "data": [{
+            "orderId": "oid-settle", "status": "FULFILLED",
+            "filledQuantity": "1.0", "filledQuoteQuantity": "100", "updatedAt": 1,
+        }]}
+        with patch.object(self.exchange, "_iter_user_event_queue",
+                          return_value=_async_gen([event])):
+            await self.exchange._user_stream_event_listener()
+
+        self.assertEqual(Decimal("1.0"), order.executed_amount_base)  # final fill recorded
+        self.assertTrue(order.is_done)
+
 
 async def _async_gen(items):
     for item in items:

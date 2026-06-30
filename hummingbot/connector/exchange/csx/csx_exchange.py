@@ -15,7 +15,7 @@ from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
 from hummingbot.core.data_type.common import OrderType, TradeType
-from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate, TradeUpdate
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
@@ -586,68 +586,73 @@ class CsxExchange(ExchangePyBase):
     async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
         if order.exchange_order_id is None:
             return []
-
-        trade_updates: List[TradeUpdate] = []
         try:
             exchange_order_id = str(order.exchange_order_id)
             order_data = await self._fetch_order_data(exchange_order_id)
             # Cache for the state pass that immediately follows this fills pass.
             self._cache_order_data(exchange_order_id, order_data)
-
-            filled_qty = Decimal(str(order_data.get("filledQuantity", "0")))
-            if filled_qty <= 0:
-                return []
-
-            # CSX reports CUMULATIVE fills on every status poll and has no per-fill
-            # trade id. Emit only the increment since the last poll, keyed by a
-            # trade id unique to this cumulative value — otherwise
-            # InFlightOrder.update_with_trade_update dedupes the repeated id and the
-            # order stays permanently under-filled (and may never reach FILLED).
-            incremental_base = filled_qty - order.executed_amount_base
-            if incremental_base <= 0:
-                return []
-
-            filled_quote_qty = Decimal(str(order_data.get("filledQuoteQuantity", "0")))
-            if filled_quote_qty > 0:
-                avg_price = filled_quote_qty / filled_qty
-            else:
-                avg_price = Decimal(str(order_data.get("averagePrice", "0")))
-
-            incremental_quote = filled_quote_qty - order.executed_amount_quote
-            if incremental_quote <= 0:
-                incremental_quote = incremental_base * avg_price
-            fill_price = (incremental_quote / incremental_base) if incremental_quote > 0 else avg_price
-
-            is_maker = order.order_type is OrderType.LIMIT_MAKER
-            # makerFee/takerFee are whole-number percents per the CSX docs — e.g.
-            # BTC/INR returns maker 0.02 → 0.02%, taker 0.06 → 0.06% (confirmed via
-            # the GET /v1/me/orders and POST /v2/orders responses). TradeFeeBase.percent
-            # is a fraction, hence the /100. Note maker != taker on the live exchange,
-            # so selecting the correct side (see _get_fee) actually matters.
-            fee_pct = Decimal(str(
-                order_data.get("makerFee", 0) if is_maker else order_data.get("takerFee", 0)
-            ))
-            fee = DeductedFromReturnsTradeFee(percent=fee_pct / Decimal("100"))
-
-            trade_updates.append(
-                TradeUpdate(
-                    trade_id=f"{exchange_order_id}-{filled_qty}",
-                    client_order_id=order.client_order_id,
-                    exchange_order_id=exchange_order_id,
-                    trading_pair=order.trading_pair,
-                    fee=fee,
-                    fill_base_amount=incremental_base,
-                    fill_quote_amount=incremental_quote,
-                    fill_price=fill_price,
-                    fill_timestamp=float(order_data.get("updatedAt", 0)),
-                )
-            )
+            trade_update = self._build_trade_update_from_order_data(order, order_data)
+            return [trade_update] if trade_update is not None else []
         except Exception as exc:
             self.logger().error(
                 f"Error fetching trade updates for {order.exchange_order_id}: {exc}"
             )
+            return []
 
-        return trade_updates
+    def _build_trade_update_from_order_data(
+        self, order: InFlightOrder, order_data: Dict[str, Any]
+    ) -> Optional[TradeUpdate]:
+        """
+        Build the incremental TradeUpdate for ``order`` from a GET /orders/{id}
+        payload, or None when there is no new fill.
+
+        CSX reports CUMULATIVE fills with no per-fill trade id, so we emit only the
+        increment since the last applied fill, keyed by a trade id unique to the
+        cumulative value (InFlightOrder dedupes repeated ids). Shared by the
+        status-poll path and the user-stream terminal path, so the final fill can be
+        recorded BEFORE the order reaches a terminal state and stops being tracked.
+        """
+        if order.exchange_order_id is None:
+            return None
+        exchange_order_id = str(order.exchange_order_id)
+
+        filled_qty = Decimal(str(order_data.get("filledQuantity", "0")))
+        if filled_qty <= 0:
+            return None
+        incremental_base = filled_qty - order.executed_amount_base
+        if incremental_base <= 0:
+            return None
+
+        filled_quote_qty = Decimal(str(order_data.get("filledQuoteQuantity", "0")))
+        if filled_quote_qty > 0:
+            avg_price = filled_quote_qty / filled_qty
+        else:
+            avg_price = Decimal(str(order_data.get("averagePrice", "0")))
+
+        incremental_quote = filled_quote_qty - order.executed_amount_quote
+        if incremental_quote <= 0:
+            incremental_quote = incremental_base * avg_price
+        fill_price = (incremental_quote / incremental_base) if incremental_quote > 0 else avg_price
+
+        is_maker = order.order_type is OrderType.LIMIT_MAKER
+        # makerFee/takerFee are whole-number percents per the CSX docs (maker != taker
+        # on the live exchange); TradeFeeBase.percent is a fraction, hence the /100.
+        fee_pct = Decimal(str(
+            order_data.get("makerFee", 0) if is_maker else order_data.get("takerFee", 0)
+        ))
+        fee = DeductedFromReturnsTradeFee(percent=fee_pct / Decimal("100"))
+
+        return TradeUpdate(
+            trade_id=f"{exchange_order_id}-{filled_qty}",
+            client_order_id=order.client_order_id,
+            exchange_order_id=exchange_order_id,
+            trading_pair=order.trading_pair,
+            fee=fee,
+            fill_base_amount=incremental_base,
+            fill_quote_amount=incremental_quote,
+            fill_price=fill_price,
+            fill_timestamp=float(order_data.get("updatedAt", 0)),
+        )
 
     # ── Balance ────────────────────────────────────────────────────────────────
 
@@ -752,6 +757,18 @@ class CsxExchange(ExchangePyBase):
                         new_state = CONSTANTS.ORDER_STATE.get(status_str)
                         if new_state is None:
                             continue
+
+                        # Record any outstanding fill from this same payload BEFORE a
+                        # terminal transition stops tracking the order. The settled-order
+                        # fast-path emits the terminal OrderUpdate (FULFILLED→FILLED),
+                        # which removes the order from tracking; without this the final
+                        # fill increment would be lost and executed_amount_base would be
+                        # permanently under-reported. The trade-id dedup makes this a
+                        # no-op if the status poll already recorded that fill.
+                        if new_state in (OrderState.FILLED, OrderState.CANCELED, OrderState.FAILED):
+                            trade_update = self._build_trade_update_from_order_data(tracked, order_data)
+                            if trade_update is not None:
+                                self._order_tracker.process_trade_update(trade_update)
 
                         order_update = OrderUpdate(
                             trading_pair=tracked.trading_pair,

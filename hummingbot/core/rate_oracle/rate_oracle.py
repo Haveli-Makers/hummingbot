@@ -36,7 +36,7 @@ RATE_ORACLE_SOURCES = {
     "binance_us": BinanceUSRateSource,
     "coin_gecko": CoinGeckoRateSource,
     "coin_cap": CoinCapRateSource,
-    "coin_switch": CoinswitchRateSource,
+    "coinswitch": CoinswitchRateSource,
     "coindcx": CoindcxRateSource,
     "csx": CsxRateSource,
     "coinex": CoinexRateSource,

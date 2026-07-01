@@ -67,17 +67,26 @@ class CoinexRateSource(RateSourceBase):
         except Exception:
             return results
 
+        # Select the pairs we care about, then fetch every order book CONCURRENTLY.
+        # One depth call per pair done sequentially is N x latency (worse over a proxy);
+        # safe_gather issues them together while the connector throttler still bounds
+        # the actual request rate. Per-pair failures are isolated (return_exceptions).
+        trading_pairs = []
         for trading_pair in symbol_map.values():
             if quote_token is not None:
-                base, quote = trading_pair.split("-")
+                _, quote = trading_pair.split("-")
                 if quote != quote_token:
                     continue
+            trading_pairs.append(trading_pair)
 
-            try:
-                depth = await exchange.get_order_book_snapshot(trading_pair)
-            except Exception:
+        depths = await safe_gather(
+            *(exchange.get_order_book_snapshot(trading_pair) for trading_pair in trading_pairs),
+            return_exceptions=True,
+        )
+
+        for trading_pair, depth in zip(trading_pairs, depths):
+            if isinstance(depth, Exception) or not isinstance(depth, dict):
                 continue
-
             bids = depth.get("bids") or []
             asks = depth.get("asks") or []
             if not bids or not asks:

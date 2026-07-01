@@ -93,6 +93,18 @@ class CoinexRateSourceTest(IsolatedAsyncioWrapperTestCase):
         self.assertIn("BTC-USDT", ba)
         self.assertNotIn("ETH-USDT", ba)
 
+    async def test_bid_ask_concurrent_isolates_per_pair_failure(self):
+        # Depth is fetched concurrently (safe_gather); one pair's failing fetch must
+        # not drop the others.
+        depth = {"BTC-USDT": {"bids": [["61990", "1"]], "asks": [["62010", "1"]]},
+                 "SOL-USDT": {"bids": [["150", "1"]], "asks": [["151", "1"]]}}  # no ETH depth -> raises
+        rs = self._rate_source_with(self._fake_exchange_for_bid_ask(
+            {"BTCUSDT": "BTC-USDT", "ETHUSDT": "ETH-USDT", "SOLUSDT": "SOL-USDT"}, depth))
+        ba = await rs.get_bid_ask_prices()
+        self.assertIn("BTC-USDT", ba)
+        self.assertIn("SOL-USDT", ba)
+        self.assertNotIn("ETH-USDT", ba)  # its depth fetch raised -> isolated, not fatal
+
     async def test_bid_ask_empty_depth_skipped(self):
         depth = {"BTC-USDT": {"bids": [], "asks": []}}
         rs = self._rate_source_with(self._fake_exchange_for_bid_ask({"BTCUSDT": "BTC-USDT"}, depth))

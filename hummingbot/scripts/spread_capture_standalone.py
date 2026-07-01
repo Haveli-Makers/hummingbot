@@ -4,7 +4,7 @@ import logging
 import os
 import sys
 import time
-from typing import Dict, List, Optional, Set
+from typing import List, Optional, Set
 
 from pydantic import Field
 
@@ -14,27 +14,12 @@ from hummingbot import set_data_path
 from hummingbot.client.config.client_config_map import ClientConfigMap, MarketDataCollectionConfigMap
 from hummingbot.client.config.config_data_types import BaseClientModel
 from hummingbot.client.config.config_helpers import ClientConfigAdapter
-from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.connector.markets_recorder import MarketsRecorder
+from hummingbot.core.rate_oracle.rate_oracle import RATE_ORACLE_SOURCES
 from hummingbot.core.rate_oracle.sources.rate_source_base import RateSourceBase
-from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.model.sql_connection_manager import SQLConnectionManager, SQLConnectionType
-from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 
-SUPPORTED_CONNECTORS = [
-    "binance",
-    "binance_us",
-    "kucoin",
-    "gate_io",
-    "mexc",
-    "ascend_ex",
-    "cube",
-    "hyperliquid",
-    "dexalot",
-    "coindcx",
-    "wazirx",
-    "coinswitch",
-]
+SUPPORTED_CONNECTORS = list(RATE_ORACLE_SOURCES.keys())
 
 
 class SpreadCaptureConfig(BaseClientModel):
@@ -57,14 +42,6 @@ class SpreadCaptureConfig(BaseClientModel):
             "prompt_on_new": True,
         },
     )
-    interval_sec: int = Field(
-        default=900,
-        gt=0,
-        json_schema_extra={
-            "prompt": lambda mi: "Enter the fetch interval in seconds (e.g., 900 for 15 minutes): ",
-            "prompt_on_new": True,
-        },
-    )
     excluding_pairs: str = Field(
         default="",
         json_schema_extra={
@@ -83,100 +60,32 @@ class SpreadCaptureConfig(BaseClientModel):
 
 
 def get_rate_source(connector_name: str) -> RateSourceBase:
-    """
-    Factory method to get the appropriate rate source based on connector name.
-
-    :param connector_name: Name of the connector (e.g., 'binance', 'kucoin', 'gate_io', etc.)
-    :return: The corresponding rate source instance
-    :raises ValueError: If the connector is not supported
-    """
-    connector_name_lower = connector_name.lower()
-
-    if connector_name_lower == "binance":
-        from hummingbot.core.rate_oracle.sources.binance_rate_source import BinanceRateSource
-
-        return BinanceRateSource()
-    elif connector_name_lower == "binance_us":
-        from hummingbot.core.rate_oracle.sources.binance_us_rate_source import BinanceUSRateSource
-
-        return BinanceUSRateSource()
-    elif connector_name_lower == "kucoin":
-        from hummingbot.core.rate_oracle.sources.kucoin_rate_source import KucoinRateSource
-
-        return KucoinRateSource()
-    elif connector_name_lower == "gate_io":
-        from hummingbot.core.rate_oracle.sources.gate_io_rate_source import GateIoRateSource
-
-        return GateIoRateSource()
-    elif connector_name_lower == "mexc":
-        from hummingbot.core.rate_oracle.sources.mexc_rate_source import MexcRateSource
-
-        return MexcRateSource()
-    elif connector_name_lower == "ascend_ex":
-        from hummingbot.core.rate_oracle.sources.ascend_ex_rate_source import AscendExRateSource
-
-        return AscendExRateSource()
-    elif connector_name_lower == "cube":
-        from hummingbot.core.rate_oracle.sources.cube_rate_source import CubeRateSource
-
-        return CubeRateSource()
-    elif connector_name_lower == "hyperliquid":
-        from hummingbot.core.rate_oracle.sources.hyperliquid_rate_source import HyperliquidRateSource
-
-        return HyperliquidRateSource()
-    elif connector_name_lower == "dexalot":
-        from hummingbot.core.rate_oracle.sources.dexalot_rate_source import DexalotRateSource
-
-        return DexalotRateSource()
-
-    elif connector_name_lower == "wazirx":
-        from hummingbot.core.rate_oracle.sources.wazirx_rate_source import WazirxRateSource
-
-        return WazirxRateSource()
-    elif connector_name_lower == "coindcx":
-        from hummingbot.core.rate_oracle.sources.coindcx_rate_source import CoindcxRateSource
-
-        return CoindcxRateSource()
-    elif connector_name_lower == "coinswitch":
-        from hummingbot.core.rate_oracle.sources.coinswitch_rate_source import CoinswitchRateSource
-
-        return CoinswitchRateSource()
-
-    else:
+    source_cls = RATE_ORACLE_SOURCES.get(connector_name.lower())
+    if source_cls is None:
         raise ValueError(
-            f"Unsupported connector: {connector_name}. Supported connectors: " f"{', '.join(SUPPORTED_CONNECTORS)}"
+            f"Unsupported connector: {connector_name}. Supported connectors: {', '.join(SUPPORTED_CONNECTORS)}"
         )
+    return source_cls()
 
 
-class SpreadCapture(ScriptStrategyBase):
-    """
-    A script that fetches and stores spread data from various exchanges.
-
-    Configuration is created via the CLI 'create' command:
-        - connector_name: The exchange connector to use (e.g., 'binance', 'kucoin', 'gate_io', 'mexc')
-        - quote_token: The quote token to filter pairs (e.g., 'USDT', 'USDC')
-        - interval_sec: How often to fetch data (in seconds)
-    """
-
-    markets: Dict[str, Set[str]] = {}
+class SpreadCapture:
+    _logger: Optional[logging.Logger] = None
 
     @classmethod
-    def init_markets(cls, config: SpreadCaptureConfig):
-        """Initialize markets from config. Called by the start command."""
-        cls.markets = {}
+    def logger(cls) -> logging.Logger:
+        if cls._logger is None:
+            cls._logger = logging.getLogger(__name__)
+        return cls._logger
 
-    def __init__(self, connectors: Dict[str, ConnectorBase], config: Optional[SpreadCaptureConfig] = None):
+    def __init__(self, config: Optional[SpreadCaptureConfig] = None):
         if config is None:
             config = SpreadCaptureConfig()
-        super().__init__(connectors, config)
 
         self.connector_name = config.connector_name
         self.quote_token = config.quote_token
-        self.interval_sec = config.interval_sec
         self.excluding_pairs: Set[str] = self._parse_excluding_pairs(config.excluding_pairs)
         self.data_retention_days: int = config.data_retention_days
 
-        self.last_run: int = 0
         self._rate_source: Optional[RateSourceBase] = None
         self._initialized: bool = False
         self._initialize_rate_source()
@@ -192,7 +101,7 @@ class SpreadCapture(ScriptStrategyBase):
 
         client_config = ClientConfigAdapter(ClientConfigMap())
         sql_manager = SQLConnectionManager(
-            client_config, SQLConnectionType.TRADE_FILLS, db_name="spread_capture_standalone_db"
+            client_config, SQLConnectionType.TRADE_FILLS, db_name="haveli"
         )
         try:
             market_data_collection = client_config.hb_config.market_data_collection
@@ -319,27 +228,12 @@ class SpreadCapture(ScriptStrategyBase):
             return set()
         return {pair.strip().upper() for pair in excluding_pairs_str.split(",") if pair.strip()}
 
-    def on_tick(self):
-        if not self._initialized:
-            return
 
-        now = int(time.time())
-        if now - self.last_run < self.interval_sec:
-            return
-
-        self.last_run = now
-        safe_ensure_future(self.fetch_and_store_spread())
-
-    async def run_once(self):
-        return await self.fetch_and_store_spread()
-
-
-def _create_config_from_args(connector_name: str, quote_token: str, interval_sec: int,
+def _create_config_from_args(connector_name: str, quote_token: str,
                              excluding_pairs: str, data_retention_days: int) -> SpreadCaptureConfig:
     return SpreadCaptureConfig(
         connector_name=connector_name,
         quote_token=quote_token,
-        interval_sec=interval_sec,
         excluding_pairs=excluding_pairs,
         data_retention_days=data_retention_days,
     )
@@ -385,12 +279,11 @@ def main():
                 config = _create_config_from_args(
                     connector_name=args.connector_name,
                     quote_token=qt,
-                    interval_sec=args.interval_sec,
                     excluding_pairs=args.excluding_pairs,
                     data_retention_days=args.data_retention_days,
                 )
 
-                sc = SpreadCapture(connectors={}, config=config)
+                sc = SpreadCapture(config=config)
                 if not sc._initialized:
                     logging.getLogger("spread_capture_standalone").error("Rate source not initialized; skipping run")
                     continue

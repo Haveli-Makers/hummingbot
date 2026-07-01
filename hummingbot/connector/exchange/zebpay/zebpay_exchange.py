@@ -468,7 +468,6 @@ class ZebpayExchange(ExchangePyBase):
     async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
         if order.exchange_order_id is None:
             return []
-        trade_updates: List[TradeUpdate] = []
         result = await self._api_get(
             path_url=CONSTANTS.ORDER_FILLS_PATH_URL,
             params={"orderId": order.exchange_order_id},
@@ -480,6 +479,16 @@ class ZebpayExchange(ExchangePyBase):
         raise_for_status(result)
         data = unwrap_data(result)
         fills = data.get("fills", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+        return self._build_trade_updates_from_fills(order, fills)
+
+    def _build_trade_updates_from_fills(self, order: InFlightOrder, fills: list) -> List[TradeUpdate]:
+        """
+        Convert a Zebpay fills payload into TradeUpdates for ``order``. Shared by the
+        base status-poll path (_all_trade_updates_for_order) and the realtime
+        account-trades user-stream path. Each fill carries a unique id, so repeated
+        emissions are deduped by InFlightOrder.update_with_trade_update.
+        """
+        trade_updates: List[TradeUpdate] = []
         for fill in fills:
             if not isinstance(fill, dict):
                 continue
@@ -579,6 +588,23 @@ class ZebpayExchange(ExchangePyBase):
                     for asset, balances in parsed.items():
                         self._account_balances[asset] = balances["total"]
                         self._account_available_balances[asset] = balances["free"]
+
+                elif event_type == "trade_update":
+                    # Realtime account fills from the user-stream account-trades poll.
+                    for entry in event.get("data") or []:
+                        if not isinstance(entry, dict):
+                            continue
+                        exchange_order_id = str(entry.get("orderId") or "")
+                        fills = entry.get("fills") or []
+                        tracked = None
+                        for o in self._order_tracker.all_fillable_orders.values():
+                            if o.exchange_order_id == exchange_order_id:
+                                tracked = o
+                                break
+                        if tracked is None:
+                            continue
+                        for trade_update in self._build_trade_updates_from_fills(tracked, fills):
+                            self._order_tracker.process_trade_update(trade_update)
 
                 elif event_type == "order_update":
                     for order_data in event.get("data") or []:

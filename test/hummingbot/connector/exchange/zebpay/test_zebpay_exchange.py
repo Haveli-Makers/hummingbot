@@ -21,6 +21,11 @@ def _make_exchange(**kwargs) -> ZebpayExchange:
     return ZebpayExchange(**defaults)
 
 
+async def _async_gen(items):
+    for item in items:
+        yield item
+
+
 class ZebpayExchangePropertiesTests(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self):
@@ -294,6 +299,24 @@ class ZebpayExchangeOrderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(updates))
         self.assertEqual(Decimal("3000000"), updates[0].fill_price)
         self.assertEqual(Decimal("0.001"), updates[0].fill_base_amount)
+
+    async def test_trade_update_event_records_fills(self):
+        # The realtime account-trades user-stream event records fills onto the tracked
+        # order (process_trade_update), surfacing them faster than the status loop.
+        order = InFlightOrder(
+            client_order_id="ZEBtest", exchange_order_id="ord-1", trading_pair="BTC-INR",
+            order_type=OrderType.LIMIT, trade_type=TradeType.BUY, amount=Decimal("1.0"),
+            price=Decimal("100"), creation_timestamp=1_700_000_000.0,
+        )
+        self.exchange._order_tracker.start_tracking_order(order)
+        event = {"event": "trade_update", "data": [{
+            "orderId": "ord-1",
+            "fills": [{"id": "f1", "price": "100", "amount": "0.5", "fees": "0.1",
+                       "feeCurrency": "INR", "createdAt": 1_700_000_000_000}],
+        }]}
+        with patch.object(self.exchange, "_iter_user_event_queue", return_value=_async_gen([event])):
+            await self.exchange._user_stream_event_listener()
+        self.assertEqual(Decimal("0.5"), order.executed_amount_base)
 
     async def test_request_order_status_timestamp_in_seconds_not_divided(self):
         # A seconds-scale timestamp (< 1e12) must not be divided by 1000.

@@ -226,6 +226,18 @@ class CsxExchange(ExchangePyBase):
             domain=self._domain,
         )
 
+    async def stop_network(self):
+        await super().stop_network()
+        # With a proxy configured, the web-assistants factory owns a dedicated,
+        # per-connector aiohttp session (aiohttp-socks). Close it on shutdown so it
+        # doesn't leak ("Unclosed client session"). The default ConnectionsFactory
+        # is a shared singleton, so it is deliberately left alone.
+        if self._proxy_url:
+            try:
+                await self._web_assistants_factory.close()
+            except Exception:
+                self.logger().debug("Error closing CSX proxy connections factory on stop_network.", exc_info=True)
+
     # ── Exception classification ───────────────────────────────────────────────
 
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception) -> bool:
@@ -733,6 +745,26 @@ class CsxExchange(ExchangePyBase):
                         key = asset.upper()
                         self._account_balances[key] = free + held
                         self._account_available_balances[key] = free
+
+                elif event_type == "trade_update":
+                    # Realtime account fills from the user-stream account-trades poll.
+                    # Each entry is a GET /orders/{id} payload with the cumulative
+                    # filledQuantity; the helper turns it into the incremental fill,
+                    # deduped by trade id so re-emitting the same cumulative is a no-op.
+                    for order_data in event.get("data") or []:
+                        if not isinstance(order_data, dict):
+                            continue
+                        exchange_order_id = str(order_data.get("orderId", order_data.get("order_id", "")))
+                        tracked = None
+                        for o in self._order_tracker.all_fillable_orders.values():
+                            if o.exchange_order_id == exchange_order_id:
+                                tracked = o
+                                break
+                        if tracked is None:
+                            continue
+                        trade_update = self._build_trade_update_from_order_data(tracked, order_data)
+                        if trade_update is not None:
+                            self._order_tracker.process_trade_update(trade_update)
 
                 elif event_type == "order_update":
                     for order_data in event.get("data") or []:

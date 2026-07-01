@@ -32,6 +32,35 @@ class ZebpayUserStreamDataSourceTests(unittest.IsolatedAsyncioTestCase):
         resp = {"data": {"items": [{"orderId": "1"}, {"orderId": "2"}], "totalNum": 2}}
         self.assertEqual(2, len(ZebpayAPIUserStreamDataSource._extract_orders(resp)))
 
+    async def test_poll_balance_emits_event(self):
+        output = asyncio.Queue()
+        self.connector._api_get = AsyncMock(
+            return_value={"data": [{"currency": "BTC", "total": "1", "free": "1", "used": "0"}]})
+        await self.source._poll_balance(output)
+        self.assertEqual("balance_update", output.get_nowait()["event"])
+
+    async def test_poll_account_trades_emits_fills(self):
+        # Realtime account fills: an in-flight order's fills are fetched and emitted.
+        order = InFlightOrder(
+            client_order_id="ZEB-1", exchange_order_id="ord-9", trading_pair="BTC-INR",
+            order_type=OrderType.LIMIT, trade_type=TradeType.BUY, amount=Decimal("1"),
+            price=Decimal("100"), creation_timestamp=1_700_000_000.0,
+        )
+        self.connector._order_tracker.start_tracking_order(order)
+        self.connector._api_get = AsyncMock(
+            return_value={"data": {"fills": [{"id": "f1", "price": "100", "amount": "0.5"}]}})
+        output = asyncio.Queue()
+        await self.source._poll_account_trades(output)
+        event = output.get_nowait()
+        self.assertEqual("trade_update", event["event"])
+        self.assertEqual("ord-9", event["data"][0]["orderId"])
+        self.assertEqual(1, len(event["data"][0]["fills"]))
+
+    async def test_poll_account_trades_no_inflight_no_event(self):
+        output = asyncio.Queue()
+        await self.source._poll_account_trades(output)
+        self.assertTrue(output.empty())
+
     def test_extract_orders_plain_list(self):
         self.assertEqual(1, len(ZebpayAPIUserStreamDataSource._extract_orders({"data": [{"orderId": "1"}]})))
 

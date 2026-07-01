@@ -121,6 +121,35 @@ class CsxUserStreamDataSourceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], settled)
         self.assertIn("oid-7", self.source._open_order_ids)
 
+    async def test_poll_balance_emits_event(self):
+        output = asyncio.Queue()
+        self.connector._api_get = AsyncMock(return_value={"Available": {"BTC": "1.0"}, "Locked": {}})
+        await self.source._poll_balance(output)
+        self.assertEqual("balance_update", output.get_nowait()["event"])
+
+    async def test_poll_account_trades_emits_fills(self):
+        # Realtime account fills: an in-flight order's status (cumulative
+        # filledQuantity) is fetched and emitted as a trade_update event.
+        order = InFlightOrder(
+            client_order_id="x-CSX-9", exchange_order_id="oid-9", trading_pair="BTC-INR",
+            order_type=OrderType.LIMIT, trade_type=TradeType.BUY, amount=Decimal("1"),
+            price=Decimal("100"), creation_timestamp=1.0,
+        )
+        self.connector._order_tracker.start_tracking_order(order)
+        self.connector._api_get = AsyncMock(return_value={
+            "orderId": "oid-9", "status": "PARTIALLY_FULFILLED",
+            "filledQuantity": "0.5", "filledQuoteQuantity": "50", "updatedAt": 1})
+        output = asyncio.Queue()
+        await self.source._poll_account_trades(output)
+        event = output.get_nowait()
+        self.assertEqual("trade_update", event["event"])
+        self.assertEqual("oid-9", event["data"][0]["orderId"])
+
+    async def test_poll_account_trades_no_inflight_no_event(self):
+        output = asyncio.Queue()
+        await self.source._poll_account_trades(output)
+        self.assertTrue(output.empty())
+
 
 if __name__ == "__main__":
     unittest.main()

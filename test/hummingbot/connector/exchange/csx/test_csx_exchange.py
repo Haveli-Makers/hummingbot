@@ -85,6 +85,21 @@ class CsxExchangePropertiesTests(IsolatedAsyncioWrapperTestCase):
         # The authenticator (and its Ed25519 key) is built once and reused.
         self.assertIs(self.exchange.authenticator, self.exchange.authenticator)
 
+    async def test_stop_network_closes_proxy_factory(self):
+        # With a proxy, the dedicated aiohttp session must be closed on shutdown
+        # (else "Unclosed client session"). Use a fresh exchange, not the fixture.
+        ex = _make_exchange(csx_proxy_url="socks5://user:pass@host:1080")
+        ex._web_assistants_factory.close = AsyncMock()
+        await ex.stop_network()
+        ex._web_assistants_factory.close.assert_awaited_once()
+
+    async def test_stop_network_without_proxy_keeps_shared_factory(self):
+        # Without a proxy the connections factory is a shared singleton — never close it.
+        ex = _make_exchange()
+        ex._web_assistants_factory.close = AsyncMock()
+        await ex.stop_network()
+        ex._web_assistants_factory.close.assert_not_called()
+
 
 class CsxExchangeTradingPairTests(IsolatedAsyncioWrapperTestCase):
 
@@ -470,6 +485,23 @@ class CsxExchangeUserStreamListenerTests(IsolatedAsyncioWrapperTestCase):
 
         self.assertEqual(Decimal("1.0"), order.executed_amount_base)  # final fill recorded
         self.assertTrue(order.is_done)
+
+    async def test_trade_update_event_records_fills(self):
+        # The realtime account-trades event records the incremental fill (from the
+        # cumulative filledQuantity) onto the tracked order.
+        order = InFlightOrder(
+            client_order_id="x-CSX-trade", exchange_order_id="oid-t", trading_pair="BTC-INR",
+            order_type=OrderType.LIMIT, trade_type=TradeType.BUY, amount=Decimal("1.0"),
+            price=Decimal("100"), creation_timestamp=1.0,
+        )
+        self.exchange._order_tracker.start_tracking_order(order)
+        event = {"event": "trade_update", "data": [{
+            "orderId": "oid-t", "status": "PARTIALLY_FULFILLED",
+            "filledQuantity": "0.5", "filledQuoteQuantity": "50", "updatedAt": 1,
+        }]}
+        with patch.object(self.exchange, "_iter_user_event_queue", return_value=_async_gen([event])):
+            await self.exchange._user_stream_event_listener()
+        self.assertEqual(Decimal("0.5"), order.executed_amount_base)
 
 
 async def _async_gen(items):

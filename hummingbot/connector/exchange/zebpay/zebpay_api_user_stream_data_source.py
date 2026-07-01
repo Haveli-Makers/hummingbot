@@ -6,6 +6,7 @@ from hummingbot.connector.exchange.zebpay import zebpay_constants as CONSTANTS
 from hummingbot.connector.exchange.zebpay.zebpay_auth import ZebpayAuth
 from hummingbot.connector.exchange.zebpay.zebpay_utils import raise_for_status, unwrap_data
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
+from hummingbot.core.utils.async_utils import safe_gather
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
 if TYPE_CHECKING:
@@ -46,62 +47,99 @@ class ZebpayAPIUserStreamDataSource(UserStreamTrackerDataSource):
         return self._last_recv_time
 
     async def listen_for_user_stream(self, output: asyncio.Queue) -> None:
+        """
+        Zebpay has no WebSocket, so account data is kept realtime by polling each
+        data type on its OWN cadence in concurrent loops — balance, active orders,
+        and account trades (fills) — so a slow data type never delays a fast one.
+        """
+        await safe_gather(
+            self._poll_forever(self._poll_balance, output, CONSTANTS.BALANCE_POLL_INTERVAL, "balance"),
+            self._poll_forever(self._poll_active_orders, output, CONSTANTS.ACTIVE_ORDERS_POLL_INTERVAL, "active-orders"),
+            self._poll_forever(self._poll_account_trades, output, CONSTANTS.ACCOUNT_TRADES_POLL_INTERVAL, "account-trades"),
+        )
+
+    async def _poll_forever(self, poll_coro, output: asyncio.Queue, interval: float, label: str) -> None:
+        """Run a single data-type poll on a fixed cadence; isolate its failures."""
         while True:
             try:
-                # ── Balance update ─────────────────────────────────────────
-                try:
-                    balance_resp = await self._connector._api_get(
-                        path_url=CONSTANTS.BALANCE_PATH_URL,
-                        is_auth_required=True,
-                    )
-                    self._last_recv_time = time.time()
-                    await output.put({"event": "balance_update", "data": balance_resp})
-                except Exception as exc:
-                    self.logger().warning(f"Zebpay balance poll error: {exc}")
-
-                # ── Open orders update ─────────────────────────────────────
-                active_orders: list = []
-                active_ids: set = set()
-                for trading_pair in self._trading_pairs:
-                    try:
-                        try:
-                            symbol = await self._connector.exchange_symbol_associated_to_pair(
-                                trading_pair=trading_pair
-                            )
-                        except KeyError:
-                            symbol = trading_pair
-                        orders_resp = await self._connector._api_get(
-                            path_url=CONSTANTS.ORDERS_PATH_URL,
-                            params={"symbol": symbol, "status": CONSTANTS.ORDER_STATUS_ACTIVE},
-                            is_auth_required=True,
-                        )
-                        self._last_recv_time = time.time()
-                        for order in self._extract_orders(orders_resp):
-                            active_orders.append(order)
-                            oid = str(order.get("orderId") or order.get("id") or "")
-                            if oid:
-                                active_ids.add(oid)
-                    except Exception as exc:
-                        self.logger().warning(f"Zebpay open-orders poll error for {trading_pair}: {exc}")
-
-                # status=ACTIVE hides terminal orders, so a filled/cancelled order
-                # simply drops out and would never emit a terminal update via the
-                # stream. Fetch the final status of tracked orders that just left the
-                # active set so terminal transitions don't wait on the slower base
-                # status loop.
-                settled = await self._fetch_settled_order_updates(active_ids)
-
-                merged = active_orders + settled
-                if merged:
-                    await output.put({"event": "order_update", "data": merged})
-
-                await asyncio.sleep(CONSTANTS.USER_STREAM_POLL_INTERVAL)
-
+                await poll_coro(output)
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                self.logger().exception("Unexpected error in Zebpay user-stream polling. Retrying in 5 s …")
-                await asyncio.sleep(5.0)
+            except Exception as exc:
+                self.logger().warning(f"Zebpay {label} poll error: {exc}")
+            await asyncio.sleep(interval)
+
+    async def _poll_balance(self, output: asyncio.Queue) -> None:
+        balance_resp = await self._connector._api_get(
+            path_url=CONSTANTS.BALANCE_PATH_URL,
+            is_auth_required=True,
+        )
+        self._last_recv_time = time.time()
+        await output.put({"event": "balance_update", "data": balance_resp})
+
+    async def _poll_active_orders(self, output: asyncio.Queue) -> None:
+        active_orders: list = []
+        active_ids: set = set()
+        for trading_pair in self._trading_pairs:
+            try:
+                try:
+                    symbol = await self._connector.exchange_symbol_associated_to_pair(
+                        trading_pair=trading_pair
+                    )
+                except KeyError:
+                    symbol = trading_pair
+                orders_resp = await self._connector._api_get(
+                    path_url=CONSTANTS.ORDERS_PATH_URL,
+                    params={"symbol": symbol, "status": CONSTANTS.ORDER_STATUS_ACTIVE},
+                    is_auth_required=True,
+                )
+                self._last_recv_time = time.time()
+                for order in self._extract_orders(orders_resp):
+                    active_orders.append(order)
+                    oid = str(order.get("orderId") or order.get("id") or "")
+                    if oid:
+                        active_ids.add(oid)
+            except Exception as exc:
+                self.logger().warning(f"Zebpay open-orders poll error for {trading_pair}: {exc}")
+
+        # status=ACTIVE hides terminal orders, so a filled/cancelled order simply
+        # drops out and would never emit a terminal update via the stream. Fetch the
+        # final status of tracked orders that just left the active set.
+        settled = await self._fetch_settled_order_updates(active_ids)
+
+        merged = active_orders + settled
+        if merged:
+            await output.put({"event": "order_update", "data": merged})
+
+    async def _poll_account_trades(self, output: asyncio.Queue) -> None:
+        """
+        Realtime account fills: poll each tracked in-flight order's fills and emit a
+        ``trade_update`` event. Every Zebpay fill carries a unique id, so
+        InFlightOrder.update_with_trade_update dedupes repeats — re-emitting a fill is
+        harmless, and this surfaces fills far faster than the base ~10s status loop.
+        """
+        if self._connector is None:
+            return
+        orders = [o for o in self._connector.in_flight_orders.values() if o.exchange_order_id]
+        fills_by_order: list = []
+        for order in orders:
+            try:
+                resp = await self._connector._api_get(
+                    path_url=CONSTANTS.ORDER_FILLS_PATH_URL,
+                    params={"orderId": order.exchange_order_id},
+                    is_auth_required=True,
+                )
+                raise_for_status(resp)
+                data = unwrap_data(resp)
+                fills = data.get("fills", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                if fills:
+                    fills_by_order.append({"orderId": str(order.exchange_order_id), "fills": fills})
+            except Exception as exc:
+                self.logger().warning(f"Zebpay account-trades poll error for {order.exchange_order_id}: {exc}")
+
+        if fills_by_order:
+            self._last_recv_time = time.time()
+            await output.put({"event": "trade_update", "data": fills_by_order})
 
     async def _fetch_settled_order_updates(self, active_ids: set) -> list:
         """

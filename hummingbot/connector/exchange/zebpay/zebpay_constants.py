@@ -85,7 +85,19 @@ ONE_MINUTE = 60
 MAX_PUBLIC = 1200
 MAX_PRIVATE = 600
 
-USER_STREAM_POLL_INTERVAL = 5.0  # seconds between REST polls in the user-stream source
+USER_STREAM_POLL_INTERVAL = 5.0  # retained for back-compat / fallback
+
+# ── Realtime REST poll intervals (seconds), per data type ─────────────────────
+# Zebpay exposes no WebSocket, so account + market data is kept "realtime" by tight
+# polling. Each data type has its OWN cadence (the user-stream source runs them in
+# concurrent loops), so latency can be traded against the private rate limit
+# (600/min) independently and a slow data type never blocks a fast one. Lower =
+# fresher data but more requests; raise these if you track many pairs/orders.
+BALANCE_POLL_INTERVAL = 3.0          # GET /account/balance
+ACTIVE_ORDERS_POLL_INTERVAL = 2.0    # GET /ex/orders?status=ACTIVE (+ settled detection)
+ACCOUNT_TRADES_POLL_INTERVAL = 2.0   # GET /ex/order/fills per in-flight order
+ORDER_BOOK_POLL_INTERVAL = 2.0       # GET /market/orderbook snapshot (was 30s)
+PUBLIC_TRADES_POLL_INTERVAL = 3.0    # GET /market/trades
 
 _PUBLIC_PATHS = [
     EXCHANGE_INFO_PATH_URL, CURRENCIES_PATH_URL, ALL_TICKERS_PATH_URL, TICKER_PATH_URL,

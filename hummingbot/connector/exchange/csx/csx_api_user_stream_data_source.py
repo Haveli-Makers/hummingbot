@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, List, Optional
 from hummingbot.connector.exchange.csx import csx_constants as CONSTANTS
 from hummingbot.connector.exchange.csx.csx_auth import CsxAuth
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
+from hummingbot.core.utils.async_utils import safe_gather
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
 if TYPE_CHECKING:
@@ -46,58 +47,85 @@ class CsxAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
     async def listen_for_user_stream(self, output: asyncio.Queue) -> None:
         """
-        Continuously polls balance and open-orders endpoints and pushes
-        synthetic events into *output* so the exchange can react quickly to
-        fills and balance changes without waiting for the background polling
-        interval.
+        CSX has no WebSocket, so account data is kept realtime by polling each data
+        type on its OWN cadence in concurrent loops — balance, active orders, and
+        account trades (cumulative fills) — so a slow data type never delays a fast
+        one.
         """
+        await safe_gather(
+            self._poll_forever(self._poll_balance, output, CONSTANTS.BALANCE_POLL_INTERVAL, "balance"),
+            self._poll_forever(self._poll_active_orders, output, CONSTANTS.ACTIVE_ORDERS_POLL_INTERVAL, "active-orders"),
+            self._poll_forever(self._poll_account_trades, output, CONSTANTS.ACCOUNT_TRADES_POLL_INTERVAL, "account-trades"),
+        )
+
+    async def _poll_forever(self, poll_coro, output: asyncio.Queue, interval: float, label: str) -> None:
+        """Run a single data-type poll on a fixed cadence; isolate its failures."""
         while True:
             try:
-                # ── Balance update ─────────────────────────────────────────
-                try:
-                    balance_resp = await self._connector._api_get(
-                        path_url=CONSTANTS.BALANCE_V2_PATH_URL,
-                        is_auth_required=True,
-                    )
-                    self._last_recv_time = time.time()
-                    await output.put({"event": "balance_update", "data": balance_resp})
-                except Exception as exc:
-                    self.logger().warning(f"CSX balance poll error: {exc}")
-
-                # ── Open orders update ─────────────────────────────────────
-                # CSX requires both `onlyOpen` and `type` query parameters.
-                # The connector only places LIMIT orders, so we filter on LIMIT.
-                try:
-                    orders_resp = await self._connector._api_get(
-                        path_url=CONSTANTS.ME_ORDERS_PATH_URL,
-                        params={"onlyOpen": "true", "type": CONSTANTS.ORDER_TYPE_LIMIT},
-                        is_auth_required=True,
-                    )
-                    self._last_recv_time = time.time()
-                    orders = self._extract_orders(orders_resp)
-
-                    # `onlyOpen=true` hides an order the moment it reaches a
-                    # terminal state, so a fill/cancel would never surface a
-                    # terminal order_update via the stream — terminal detection
-                    # would fall entirely to the slower status-poll path. Fetch the
-                    # final status of any tracked order that just left the open set
-                    # so terminal states (and final fills) propagate promptly.
-                    orders.extend(await self._fetch_settled_order_updates(orders))
-
-                    if orders:
-                        await output.put({"event": "order_update", "data": orders})
-                except Exception as exc:
-                    self.logger().warning(f"CSX open-orders poll error: {exc}")
-
-                await asyncio.sleep(CONSTANTS.USER_STREAM_POLL_INTERVAL)
-
+                await poll_coro(output)
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                self.logger().exception(
-                    "Unexpected error in CSX user-stream polling. Retrying in 5 s …"
+            except Exception as exc:
+                self.logger().warning(f"CSX {label} poll error: {exc}")
+            await asyncio.sleep(interval)
+
+    async def _poll_balance(self, output: asyncio.Queue) -> None:
+        balance_resp = await self._connector._api_get(
+            path_url=CONSTANTS.BALANCE_V2_PATH_URL,
+            is_auth_required=True,
+        )
+        self._last_recv_time = time.time()
+        await output.put({"event": "balance_update", "data": balance_resp})
+
+    async def _poll_active_orders(self, output: asyncio.Queue) -> None:
+        # CSX requires both `onlyOpen` and `type` query parameters. The connector
+        # only places LIMIT orders, so we filter on LIMIT.
+        orders_resp = await self._connector._api_get(
+            path_url=CONSTANTS.ME_ORDERS_PATH_URL,
+            params={"onlyOpen": "true", "type": CONSTANTS.ORDER_TYPE_LIMIT},
+            is_auth_required=True,
+        )
+        self._last_recv_time = time.time()
+        orders = self._extract_orders(orders_resp)
+
+        # `onlyOpen=true` hides an order the moment it reaches a terminal state, so a
+        # fill/cancel would never surface a terminal order_update via the stream.
+        # Fetch the final status of any tracked order that just left the open set.
+        orders.extend(await self._fetch_settled_order_updates(orders))
+
+        if orders:
+            await output.put({"event": "order_update", "data": orders})
+
+    async def _poll_account_trades(self, output: asyncio.Queue) -> None:
+        """
+        Realtime account fills: poll each tracked in-flight order's status (which
+        carries the cumulative ``filledQuantity``) and emit a ``trade_update`` event.
+        The exchange turns each into the incremental fill since the last poll, keyed
+        by a trade id unique to the cumulative value, so re-emitting is deduped —
+        this surfaces fills far faster than the base ~10s status loop.
+        """
+        if self._connector is None:
+            return
+        orders = [o for o in self._connector.in_flight_orders.values() if o.exchange_order_id]
+        order_data_list: list = []
+        for order in orders:
+            try:
+                resp = await self._connector._api_get(
+                    path_url=f"{CONSTANTS.ORDER_BY_ID_PATH_URL}/{order.exchange_order_id}",
+                    limit_id=CONSTANTS.ORDER_BY_ID_PATH_URL,
+                    is_auth_required=True,
                 )
-                await asyncio.sleep(5.0)
+                data = resp if isinstance(resp, dict) and "orderId" in resp else (
+                    resp.get("data", resp) if isinstance(resp, dict) else {}
+                )
+                if isinstance(data, dict) and data:
+                    order_data_list.append(data)
+            except Exception as exc:
+                self.logger().warning(f"CSX account-trades poll error for {order.exchange_order_id}: {exc}")
+
+        if order_data_list:
+            self._last_recv_time = time.time()
+            await output.put({"event": "trade_update", "data": order_data_list})
 
     async def _fetch_settled_order_updates(self, open_orders: list) -> list:
         """

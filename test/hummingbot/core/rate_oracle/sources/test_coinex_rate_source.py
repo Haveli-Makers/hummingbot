@@ -10,6 +10,14 @@ from hummingbot.core.rate_oracle.sources.coinex_rate_source import CoinexRateSou
 
 class CoinexRateSourceTest(IsolatedAsyncioWrapperTestCase):
 
+    def setUp(self):
+        super().setUp()
+        # async_ttl_cache keys on str(args) which embeds the instance's memory
+        # address; addresses are reused across tests, so a stale entry from a
+        # previous test's freed instance can collide. Clear for determinism.
+        CoinexRateSource.get_prices.cache_clear()
+        CoinexRateSource.get_bid_ask_prices.cache_clear()
+
     @staticmethod
     def _ticker(market, last):
         return {"market": market, "last": last, "volume": "1", "value": "1"}

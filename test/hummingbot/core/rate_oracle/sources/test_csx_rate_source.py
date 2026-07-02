@@ -8,6 +8,14 @@ from hummingbot.core.rate_oracle.sources.csx_rate_source import CsxRateSource
 
 class CsxRateSourceTest(IsolatedAsyncioWrapperTestCase):
 
+    def setUp(self):
+        super().setUp()
+        # async_ttl_cache keys on str(args) which embeds the instance's memory
+        # address; addresses are reused across tests, so a stale entry from a
+        # previous test's freed instance can collide. Clear for determinism.
+        CsxRateSource.get_prices.cache_clear()
+        CsxRateSource.get_bid_ask_prices.cache_clear()
+
     @staticmethod
     def _ticker(instrument, last):
         return {"Instrument": instrument, "LastTradedPrice": last}

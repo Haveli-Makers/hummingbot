@@ -2,6 +2,7 @@ import asyncio
 import importlib
 import inspect
 import logging
+import os
 import sys
 import time
 from decimal import Decimal
@@ -29,6 +30,9 @@ from hummingbot.exceptions import InvalidScriptModule
 from hummingbot.logger import HummingbotLogger
 from hummingbot.model.sql_connection_manager import SQLConnectionManager
 from hummingbot.model.trade_fill import TradeFill
+from hummingbot.monitoring.alert_dispatcher import AlertDispatcher
+from hummingbot.monitoring.gchat_log_handler import GChatLogHandler
+from hummingbot.notifier.gchat_notifier import GChatNotifier
 from hummingbot.notifier.notifier_base import NotifierBase
 from hummingbot.strategy.directional_strategy_base import DirectionalStrategyBase
 from hummingbot.strategy.market_trading_pair_tuple import MarketTradingPairTuple
@@ -107,6 +111,11 @@ class TradingCore:
         self.kill_switch: Optional[KillSwitch] = None
         self.markets_recorder: Optional[MarketsRecorder] = None
         self.trade_fill_db: Optional[SQLConnectionManager] = None
+
+        # Monitoring / alerting components (enabled via the GCHAT_WEBHOOK_URL env var)
+        self.alert_dispatcher: Optional[AlertDispatcher] = None
+        self._gchat_notifier: Optional[GChatNotifier] = None
+        self._gchat_log_handler: Optional[GChatLogHandler] = None
 
         # Metrics collectors mapping (connector_name -> MetricsCollector)
         self._metrics_collectors: Dict[str, MetricsCollector] = {}
@@ -563,6 +572,9 @@ class TradingCore:
                 self.kill_switch = self.client_config_map.kill_switch_mode.get_kill_switch(self)
                 await self._wait_till_ready(self.kill_switch.start)
 
+            # Forward serious log records to Google Chat if a webhook is configured
+            self._start_gchat_alerts()
+
             self.logger().info(f"'{self.strategy_name}' strategy execution started.")
 
         except Exception as e:
@@ -599,6 +611,9 @@ class TradingCore:
             # Remove kill switch from clock
             if self.clock is not None and self.kill_switch is not None:
                 self.kill_switch.stop()
+
+            # Stop Google Chat alerting
+            self._stop_gchat_alerts()
 
             # Stop rate oracle
             RateOracle.get_instance().stop()
@@ -665,6 +680,42 @@ class TradingCore:
     def add_notifier(self, notifier: NotifierBase):
         """Add a notifier to the engine."""
         self.notifiers.append(notifier)
+
+    def _start_gchat_alerts(self):
+        """
+        Enable Google Chat alerting when the GCHAT_WEBHOOK_URL env var is set:
+        - attaches a log handler that forwards ERROR+ records as alerts (Layer A)
+        - registers the notifier so TradingCore.notify() messages also reach the space
+        A failure here only disables alerting; it never blocks the strategy start.
+        """
+        webhook_url = os.environ.get("GCHAT_WEBHOOK_URL", "")
+        if not webhook_url or self._gchat_log_handler is not None:
+            return
+        try:
+            notifier = GChatNotifier(webhook_url)
+            dispatcher = AlertDispatcher(notifiers=[notifier])
+            handler = GChatLogHandler(dispatcher, source=self.strategy_name or "hummingbot")
+            logging.getLogger().addHandler(handler)
+            notifier.start()
+            self.add_notifier(notifier)
+            self._gchat_notifier = notifier
+            self._gchat_log_handler = handler
+            self.alert_dispatcher = dispatcher
+            self.logger().info("Google Chat alerting enabled: forwarding ERROR+ logs to the configured webhook.")
+        except Exception as e:
+            self.logger().error(f"Failed to start Google Chat alerting: {e}", exc_info=True)
+
+    def _stop_gchat_alerts(self):
+        """Detach the Google Chat log handler and stop the notifier."""
+        if self._gchat_log_handler is not None:
+            logging.getLogger().removeHandler(self._gchat_log_handler)
+            self._gchat_log_handler = None
+        if self._gchat_notifier is not None:
+            if self._gchat_notifier in self.notifiers:
+                self.notifiers.remove(self._gchat_notifier)
+            self._gchat_notifier.stop()
+            self._gchat_notifier = None
+        self.alert_dispatcher = None
 
     def notify(self, msg: str, level: str = "INFO"):
         """Send a notification."""

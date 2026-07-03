@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import time
 from decimal import Decimal
 from pathlib import Path
@@ -387,6 +388,33 @@ class TradingCoreTest(IsolatedAsyncioWrapperTestCase):
         self.trading_core.notify("Test message", "INFO")
 
         mock_notifier.add_message_to_queue.assert_called_once_with("Test message")
+
+    async def test_gchat_alerts_start_and_stop(self):
+        """Test that Google Chat alerting attaches/detaches with the webhook env var set"""
+        with patch.dict("os.environ", {"GCHAT_WEBHOOK_URL": "https://chat.googleapis.com/v1/spaces/T/messages"}):
+            self.trading_core._start_gchat_alerts()
+
+        handler = self.trading_core._gchat_log_handler
+        self.assertIsNotNone(handler)
+        self.assertIn(handler, logging.getLogger().handlers)
+        self.assertIsNotNone(self.trading_core.alert_dispatcher)
+        self.assertIn(self.trading_core._gchat_notifier, self.trading_core.notifiers)
+
+        self.trading_core._stop_gchat_alerts()
+
+        self.assertNotIn(handler, logging.getLogger().handlers)
+        self.assertIsNone(self.trading_core._gchat_log_handler)
+        self.assertEqual([], self.trading_core.notifiers)
+        self.assertIsNone(self.trading_core.alert_dispatcher)
+
+    async def test_gchat_alerts_disabled_without_webhook(self):
+        """Test that Google Chat alerting stays off when no webhook is configured"""
+        with patch.dict("os.environ", {"GCHAT_WEBHOOK_URL": ""}):
+            self.trading_core._start_gchat_alerts()
+
+        self.assertIsNone(self.trading_core._gchat_log_handler)
+        self.assertIsNone(self.trading_core.alert_dispatcher)
+        self.assertEqual([], self.trading_core.notifiers)
 
     @patch.object(TradingCore, "initialize_markets_recorder")
     async def test_initialize_markets(self, mock_init_recorder):

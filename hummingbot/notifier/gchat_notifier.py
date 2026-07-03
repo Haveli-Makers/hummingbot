@@ -21,6 +21,7 @@ class GChatNotifier(NotifierBase):
 
     RETRY_DELAY = 2.0
     REQUEST_TIMEOUT = 10.0
+    MAX_PENDING_MESSAGES = 50
 
     @classmethod
     def logger(cls) -> HummingbotLogger:
@@ -49,6 +50,10 @@ class GChatNotifier(NotifierBase):
     async def _send_message(self, message: str):
         """
         POST the message to the webhook. Retries once on connection errors, 429 and 5xx.
+
+        When the webhook is unreachable (network outage), the message is re-queued so it
+        is delivered once connectivity returns — an alert raised *during* an outage is
+        usually about the outage itself and must not be lost with it.
         """
         payload = {"text": message}
         for attempt in range(2):
@@ -71,6 +76,18 @@ class GChatNotifier(NotifierBase):
                 raise
             except Exception as e:
                 if attempt > 0:
-                    self.logger().error(f"Failed to send Google Chat message: {e}")
+                    self._requeue_for_later_delivery(message, e)
                     return
             await self._sleep(self.RETRY_DELAY)
+
+    def _requeue_for_later_delivery(self, message: str, error: Exception):
+        if self._message_queue.qsize() < self.MAX_PENDING_MESSAGES:
+            self.add_message_to_queue(message)
+            self.logger().warning(
+                f"Could not reach Google Chat ({error}); message re-queued for delivery "
+                f"when connectivity returns."
+            )
+        else:
+            self.logger().error(
+                f"Could not reach Google Chat ({error}) and the pending queue is full; message dropped."
+            )

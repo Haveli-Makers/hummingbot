@@ -16,6 +16,7 @@ from hummingbot.core.clock import Clock
 from hummingbot.core.trading_core import StrategyType, TradingCore
 from hummingbot.exceptions import InvalidScriptModule
 from hummingbot.model.trade_fill import TradeFill
+from hummingbot.monitoring.config import PMMSLAMonitorConfig
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 from hummingbot.strategy.strategy_base import StrategyBase
 
@@ -415,6 +416,35 @@ class TradingCoreTest(IsolatedAsyncioWrapperTestCase):
         self.assertIsNone(self.trading_core._gchat_log_handler)
         self.assertIsNone(self.trading_core.alert_dispatcher)
         self.assertEqual([], self.trading_core.notifiers)
+
+    async def test_sla_monitor_started_when_config_present(self):
+        """Test that the SLA monitor starts when monitoring.yml enables it"""
+        config = PMMSLAMonitorConfig(connector_name="binance", trading_pair="BTC-USDT")
+        self.trading_core.connector_manager.connectors["binance"] = self.mock_connector
+        with patch("hummingbot.core.trading_core.load_monitoring_config", return_value=config):
+            with patch.object(TradingCore, "_wait_till_ready", new_callable=AsyncMock) as wait_mock:
+                await self.trading_core._start_sla_monitor()
+
+        self.assertIsNotNone(self.trading_core.sla_monitor)
+        wait_mock.assert_awaited_once()
+
+        self.trading_core._stop_sla_monitor()
+        self.assertIsNone(self.trading_core.sla_monitor)
+
+    async def test_sla_monitor_not_started_without_config(self):
+        """Test that the SLA monitor stays off without monitoring.yml"""
+        with patch("hummingbot.core.trading_core.load_monitoring_config", return_value=None):
+            await self.trading_core._start_sla_monitor()
+
+        self.assertIsNone(self.trading_core.sla_monitor)
+
+    async def test_sla_monitor_not_started_for_unknown_connector(self):
+        """Test that the SLA monitor refuses a connector that is not part of the strategy"""
+        config = PMMSLAMonitorConfig(connector_name="wazirx", trading_pair="USDT-INR")
+        with patch("hummingbot.core.trading_core.load_monitoring_config", return_value=config):
+            await self.trading_core._start_sla_monitor()
+
+        self.assertIsNone(self.trading_core.sla_monitor)
 
     @patch.object(TradingCore, "initialize_markets_recorder")
     async def test_initialize_markets(self, mock_init_recorder):

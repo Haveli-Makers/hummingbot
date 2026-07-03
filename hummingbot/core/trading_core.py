@@ -31,7 +31,9 @@ from hummingbot.logger import HummingbotLogger
 from hummingbot.model.sql_connection_manager import SQLConnectionManager
 from hummingbot.model.trade_fill import TradeFill
 from hummingbot.monitoring.alert_dispatcher import AlertDispatcher
+from hummingbot.monitoring.config import load_monitoring_config
 from hummingbot.monitoring.gchat_log_handler import GChatLogHandler
+from hummingbot.monitoring.pmm_sla_monitor import PMMSLAMonitor
 from hummingbot.notifier.gchat_notifier import GChatNotifier
 from hummingbot.notifier.notifier_base import NotifierBase
 from hummingbot.strategy.directional_strategy_base import DirectionalStrategyBase
@@ -116,6 +118,8 @@ class TradingCore:
         self.alert_dispatcher: Optional[AlertDispatcher] = None
         self._gchat_notifier: Optional[GChatNotifier] = None
         self._gchat_log_handler: Optional[GChatLogHandler] = None
+        # SLA monitor (enabled via conf/monitoring.yml)
+        self.sla_monitor: Optional[PMMSLAMonitor] = None
 
         # Metrics collectors mapping (connector_name -> MetricsCollector)
         self._metrics_collectors: Dict[str, MetricsCollector] = {}
@@ -575,6 +579,9 @@ class TradingCore:
             # Forward serious log records to Google Chat if a webhook is configured
             self._start_gchat_alerts()
 
+            # Start the SLA monitor if conf/monitoring.yml enables it
+            await self._start_sla_monitor()
+
             self.logger().info(f"'{self.strategy_name}' strategy execution started.")
 
         except Exception as e:
@@ -612,7 +619,8 @@ class TradingCore:
             if self.clock is not None and self.kill_switch is not None:
                 self.kill_switch.stop()
 
-            # Stop Google Chat alerting
+            # Stop SLA monitoring and Google Chat alerting
+            self._stop_sla_monitor()
             self._stop_gchat_alerts()
 
             # Stop rate oracle
@@ -716,6 +724,34 @@ class TradingCore:
             self._gchat_notifier.stop()
             self._gchat_notifier = None
         self.alert_dispatcher = None
+
+    async def _start_sla_monitor(self):
+        """
+        Start the SLA monitor when conf/monitoring.yml enables it. Waits for markets to
+        be ready (like the kill switch) so early samples don't score a warming-up bot.
+        A failure here only disables monitoring; it never blocks the strategy start.
+        """
+        if self.sla_monitor is not None:
+            return
+        try:
+            config = load_monitoring_config()
+            if config is None:
+                return
+            if config.connector_name not in self.markets:
+                self.logger().warning(
+                    f"SLA monitor configured for '{config.connector_name}' but that connector is not "
+                    f"part of this strategy; monitor not started."
+                )
+                return
+            self.sla_monitor = PMMSLAMonitor(self, config)
+            await self._wait_till_ready(self.sla_monitor.start)
+        except Exception as e:
+            self.logger().error(f"Failed to start the SLA monitor: {e}", exc_info=True)
+
+    def _stop_sla_monitor(self):
+        if self.sla_monitor is not None:
+            self.sla_monitor.stop()
+            self.sla_monitor = None
 
     def notify(self, msg: str, level: str = "INFO"):
         """Send a notification."""

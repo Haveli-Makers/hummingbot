@@ -96,6 +96,20 @@ class PMMSLAMonitorTests(TestCase):
         self.assertFalse(sample.in_spec)
         self.assertEqual([ORDER_BOOK_STALE], sample.reasons)
 
+    def test_reason_changes_tracked_while_out_of_spec(self):
+        # out of spec: ask missing entirely
+        self.set_orders(make_order(TradeType.BUY, "99", "250"))
+        self.monitor._process_sample(self.monitor.take_sample())
+        self.assertEqual(["one_side_missing"], self.monitor._last_reasons)
+
+        # still out of spec, but for a different reason: ask outside the band
+        self.set_orders(
+            make_order(TradeType.BUY, "99", "250"),
+            make_order(TradeType.SELL, "102", "300"),
+        )
+        self.monitor._process_sample(self.monitor.take_sample())
+        self.assertEqual(["spread_too_wide"], self.monitor._last_reasons)
+
     def test_uptime_tally(self):
         self.set_orders(
             make_order(TradeType.BUY, "99", "250"),

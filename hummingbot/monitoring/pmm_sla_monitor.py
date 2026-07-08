@@ -41,6 +41,7 @@ class PMMSLAMonitor:
         self._samples_total = 0
         self._samples_in_spec = 0
         self._last_in_spec: Optional[bool] = None
+        self._last_reasons: Optional[list] = None
         self._last_heartbeat_ts = 0.0
 
     @property
@@ -105,10 +106,12 @@ class PMMSLAMonitor:
         if sample.in_spec:
             self._samples_in_spec += 1
         self._log_transitions(sample)
-        self._log_heartbeat()
+        self._log_heartbeat(sample)
 
     def _log_transitions(self, sample: SampleResult):
-        if sample.in_spec == self._last_in_spec:
+        # Log when the in-spec state flips, and also when the reason set changes while
+        # staying out of spec (e.g. one_side_missing -> spread_too_wide).
+        if sample.in_spec == self._last_in_spec and sample.reasons == self._last_reasons:
             return
         if sample.in_spec:
             self.logger().info(
@@ -122,13 +125,17 @@ class PMMSLAMonitor:
                 f"(mid {sample.mid_price})."
             )
         self._last_in_spec = sample.in_spec
+        self._last_reasons = list(sample.reasons)
 
-    def _log_heartbeat(self):
+    def _log_heartbeat(self, sample: SampleResult):
         now = time.time()
         if now - self._last_heartbeat_ts < self._config.heartbeat_log_interval_sec:
             return
         self._last_heartbeat_ts = now
+        state = "in spec" if sample.in_spec else f"OUT of spec ({', '.join(sample.reasons)})"
         self.logger().info(
             f"SLA monitor heartbeat: uptime {self.uptime_pct:.2f}% "
-            f"({self._samples_in_spec}/{self._samples_total} samples in spec)."
+            f"({self._samples_in_spec}/{self._samples_total} samples in spec); currently {state}, "
+            f"bid depth {sample.bid_depth:.0f}, ask depth {sample.ask_depth:.0f} "
+            f"(mid {sample.mid_price})."
         )

@@ -44,6 +44,7 @@ def _find_config_key(connector_name: str, account: str) -> Optional[str]:
     exact = [k for k in candidates if k.lower() == f"{connector_name}:{account}".lower()]
     return exact[0] if exact else candidates[0]
 
+
 class ExchangeAdapter:
     def get_account_id(self, account_name: str) -> str:
         return account_name

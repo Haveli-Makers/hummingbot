@@ -103,7 +103,7 @@ def _print_results(all_results: List[VolumeResult]):
     failed = [r for r in all_results if not r.ok]
     ok.sort(key=lambda r: (r.month, r.quote_volume), reverse=True)
 
-    print(f"\nMonthly volume\n")
+    print("\nMonthly volume\n")
     print(f"{'connector':<22}{'pair':<14}{'base_volume':>20}{'quote_volume':>20}{'month':>10}")
     for r in ok:
         quote_volume = f"{r.quote_volume:,.2f}" if r.quote_volume else "N/A"

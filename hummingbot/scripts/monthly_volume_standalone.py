@@ -6,10 +6,13 @@ import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
+
+from pydantic import Field
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from hummingbot.client.config.config_data_types import BaseClientModel
 from hummingbot.core.web_assistant.connections.connections_factory import ConnectionsFactory
 from hummingbot.data_feed.candles_feed.candles_factory import CandlesFactory
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig, HistoricalCandlesConfig
@@ -29,12 +32,43 @@ class VolumeResult:
     trading_pair: str
     month: Optional[str] = None
     base_volume: Optional[float] = None
-    quote_volume: Optional[float] = None
+    quote_volume: Optional[Union[float, str]] = None
     error: Optional[str] = None
 
     @property
     def ok(self) -> bool:
         return self.error is None
+
+
+class MonthlyVolumeConfig(BaseClientModel):
+    """
+    Configuration for the Monthly Volume script.
+    """
+
+    script_file_name: str = Field(default_factory=lambda: os.path.basename(__file__))
+    connectors: str = Field(
+        default="",
+        json_schema_extra={
+            "prompt": lambda mi: f"Enter connector names to include (comma-separated), "
+                                  f"leave empty for all {len(SUPPORTED_CONNECTORS)} supported: ",
+            "prompt_on_new": True,
+        },
+    )
+    trading_pairs: str = Field(
+        default="BTC-USDT",
+        json_schema_extra={
+            "prompt": lambda mi: "Enter trading pairs to fetch (comma-separated, e.g. BTC-USDT,ETH-USDT): ",
+            "prompt_on_new": True,
+        },
+    )
+    months: int = Field(
+        default=1,
+        ge=1,
+        json_schema_extra={
+            "prompt": lambda mi: "Enter the number of most recent full calendar months to fetch: ",
+            "prompt_on_new": True,
+        },
+    )
 
 
 def _last_n_months(n: int) -> List[Tuple[int, int, str]]:
@@ -76,11 +110,13 @@ async def fetch_connector_volume(connector_name: str, trading_pair: str,
     if candles_df is None or candles_df.empty:
         raise ValueError("no candle data returned")
 
+    quote_volume_sum = float(candles_df["quote_asset_volume"].sum())
+
     return VolumeResult(
         connector=connector_name,
         trading_pair=trading_pair,
         base_volume=float(candles_df["volume"].sum()),
-        quote_volume=float(candles_df["quote_asset_volume"].sum()),
+        quote_volume=quote_volume_sum if quote_volume_sum else "-",
     )
 
 
@@ -101,12 +137,12 @@ async def fetch_all(targets: List[Tuple[str, str]], start_time: int, end_time: i
 def _print_results(all_results: List[VolumeResult]):
     ok = [r for r in all_results if r.ok]
     failed = [r for r in all_results if not r.ok]
-    ok.sort(key=lambda r: (r.month, r.quote_volume), reverse=True)
+    ok.sort(key=lambda r: (r.month, r.quote_volume if isinstance(r.quote_volume, (int, float)) else -1), reverse=True)
 
     print("\nMonthly volume\n")
     print(f"{'connector':<22}{'pair':<14}{'base_volume':>20}{'quote_volume':>20}{'month':>10}")
     for r in ok:
-        quote_volume = f"{r.quote_volume:,.2f}" if r.quote_volume else "N/A"
+        quote_volume = f"{r.quote_volume:,.2f}" if isinstance(r.quote_volume, (int, float)) else (r.quote_volume or "N/A")
         print(f"{r.connector:<22}{r.trading_pair:<14}{r.base_volume:>20,.4f}{quote_volume:>20}{r.month:>10}")
 
     if failed:
@@ -121,9 +157,11 @@ def _print_summary(all_results: List[VolumeResult]):
         if not r.ok:
             continue
         key = (r.connector, r.trading_pair)
-        totals = sums.setdefault(key, {"base_volume": 0.0, "quote_volume": 0.0, "months": 0})
+        totals = sums.setdefault(key, {"base_volume": 0.0, "quote_volume": 0.0, "quote_volume_count": 0, "months": 0})
         totals["base_volume"] += r.base_volume
-        totals["quote_volume"] += r.quote_volume
+        if isinstance(r.quote_volume, (int, float)):
+            totals["quote_volume"] += r.quote_volume
+            totals["quote_volume_count"] += 1
         totals["months"] += 1
 
     rows = sorted(sums.items(), key=lambda item: item[1]["quote_volume"], reverse=True)
@@ -131,7 +169,7 @@ def _print_summary(all_results: List[VolumeResult]):
     print(f"\nSum across {max((v['months'] for _, v in rows), default=0)} month(s)\n")
     print(f"{'connector':<22}{'pair':<14}{'months':>8}{'base_volume':>20}{'quote_volume':>20}")
     for (connector, trading_pair), totals in rows:
-        quote_volume = f"{totals['quote_volume']:,.2f}" if totals["quote_volume"] else "N/A"
+        quote_volume = f"{totals['quote_volume']:,.2f}" if totals["quote_volume_count"] else "-"
         print(f"{connector:<22}{trading_pair:<14}{totals['months']:>8}"
               f"{totals['base_volume']:>20,.4f}{quote_volume:>20}")
 
@@ -140,23 +178,55 @@ def _build_targets(connectors: List[str], trading_pairs: List[str]) -> List[Tupl
     return [(connector, trading_pair) for connector in connectors for trading_pair in trading_pairs]
 
 
-async def run(args: argparse.Namespace):
-    connectors = [c.strip() for c in args.connectors.split(",") if c.strip()] if args.connectors else SUPPORTED_CONNECTORS
-    trading_pairs = [p.strip() for p in args.trading_pairs.split(",") if p.strip()]
-    targets = _build_targets(connectors, trading_pairs)
+class MonthlyVolume:
+    _logger: Optional[logging.Logger] = None
 
-    all_results: List[VolumeResult] = []
-    for start_time, end_time, label in _last_n_months(args.months):
-        logger.info(f"Fetching {label} volume for {len(targets)} connector/pair combination(s)...")
-        results = await fetch_all(targets, start_time, end_time)
-        for result in results:
-            result.month = label
-        all_results.extend(results)
+    @classmethod
+    def logger(cls) -> logging.Logger:
+        if cls._logger is None:
+            cls._logger = logging.getLogger(__name__)
+        return cls._logger
 
-    _print_results(all_results)
-    _print_summary(all_results)
+    def __init__(self, config: Optional[MonthlyVolumeConfig] = None):
+        if config is None:
+            config = MonthlyVolumeConfig()
 
-    await ConnectionsFactory().close()
+        self.connectors: List[str] = (
+            [c.strip() for c in config.connectors.split(",") if c.strip()] if config.connectors else SUPPORTED_CONNECTORS
+        )
+        self.trading_pairs: List[str] = [p.strip() for p in config.trading_pairs.split(",") if p.strip()]
+        self.months: int = config.months
+
+    async def run_once(self) -> List[VolumeResult]:
+        """
+        Fetch monthly volume for the configured connectors/trading pairs, print the
+        results and summary, and return the raw results.
+        """
+        targets = _build_targets(self.connectors, self.trading_pairs)
+
+        all_results: List[VolumeResult] = []
+        try:
+            for start_time, end_time, label in _last_n_months(self.months):
+                self.logger().info(f"Fetching {label} volume for {len(targets)} connector/pair combination(s)...")
+                results = await fetch_all(targets, start_time, end_time)
+                for result in results:
+                    result.month = label
+                all_results.extend(results)
+
+            _print_results(all_results)
+            _print_summary(all_results)
+        finally:
+            await ConnectionsFactory().close()
+
+        return [r for r in all_results if r.ok]
+
+
+def _create_config_from_args(connectors: str, trading_pairs: str, months: int) -> MonthlyVolumeConfig:
+    return MonthlyVolumeConfig(
+        connectors=connectors,
+        trading_pairs=trading_pairs,
+        months=months,
+    )
 
 
 def main():
@@ -184,8 +254,15 @@ def main():
 
     args = parser.parse_args()
 
+    config = _create_config_from_args(
+        connectors=args.connectors,
+        trading_pairs=args.trading_pairs,
+        months=args.months,
+    )
+    mv = MonthlyVolume(config=config)
+
     try:
-        asyncio.run(run(args))
+        asyncio.run(mv.run_once())
     except KeyboardInterrupt:
         print("Interrupted, exiting")
 

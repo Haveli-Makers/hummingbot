@@ -398,12 +398,17 @@ class TradingCoreTest(IsolatedAsyncioWrapperTestCase):
         handler = self.trading_core._gchat_log_handler
         self.assertIsNotNone(handler)
         self.assertIn(handler, logging.getLogger().handlers)
+        # propagate=false subtrees must be patched directly or their errors never surface
+        self.assertIn(handler, logging.getLogger("hummingbot.connector").handlers)
+        # the alerting pipeline's own subtree must never feed back into itself
+        self.assertNotIn(handler, logging.getLogger("hummingbot.monitoring").handlers)
         self.assertIsNotNone(self.trading_core.alert_dispatcher)
         self.assertIn(self.trading_core._gchat_notifier, self.trading_core.notifiers)
 
         self.trading_core._stop_gchat_alerts()
 
         self.assertNotIn(handler, logging.getLogger().handlers)
+        self.assertNotIn(handler, logging.getLogger("hummingbot.connector").handlers)
         self.assertIsNone(self.trading_core._gchat_log_handler)
         self.assertEqual([], self.trading_core.notifiers)
         self.assertIsNone(self.trading_core.alert_dispatcher)

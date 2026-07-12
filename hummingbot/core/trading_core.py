@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type, Union
 
 from sqlalchemy.orm import Query, Session
 
+from hummingbot import get_logging_conf
 from hummingbot.client.config.client_config_map import ClientConfigMap
 from hummingbot.client.config.config_data_types import BaseClientModel
 from hummingbot.client.config.config_helpers import ClientConfigAdapter, get_strategy_starter_file
@@ -32,7 +33,7 @@ from hummingbot.model.sql_connection_manager import SQLConnectionManager
 from hummingbot.model.trade_fill import TradeFill
 from hummingbot.monitoring.alert_dispatcher import AlertDispatcher
 from hummingbot.monitoring.config import load_monitoring_config
-from hummingbot.monitoring.gchat_log_handler import GChatLogHandler
+from hummingbot.monitoring.gchat_log_handler import EXCLUDED_LOGGER_PREFIXES, GChatLogHandler
 from hummingbot.monitoring.pmm_sla_monitor import PMMSLAMonitor
 from hummingbot.notifier.gchat_notifier import GChatNotifier
 from hummingbot.notifier.notifier_base import NotifierBase
@@ -118,6 +119,7 @@ class TradingCore:
         self.alert_dispatcher: Optional[AlertDispatcher] = None
         self._gchat_notifier: Optional[GChatNotifier] = None
         self._gchat_log_handler: Optional[GChatLogHandler] = None
+        self._gchat_patched_loggers: List[logging.Logger] = []
         # SLA monitor (enabled via conf/monitoring.yml)
         self.sla_monitor: Optional[PMMSLAMonitor] = None
 
@@ -703,7 +705,9 @@ class TradingCore:
             notifier = GChatNotifier(webhook_url)
             dispatcher = AlertDispatcher(notifiers=[notifier])
             handler = GChatLogHandler(dispatcher, source=self.strategy_name or "hummingbot")
-            logging.getLogger().addHandler(handler)
+            self._gchat_patched_loggers = self._gchat_target_loggers()
+            for logger in self._gchat_patched_loggers:
+                logger.addHandler(handler)
             notifier.start()
             self.add_notifier(notifier)
             self._gchat_notifier = notifier
@@ -713,10 +717,35 @@ class TradingCore:
         except Exception as e:
             self.logger().error(f"Failed to start Google Chat alerting: {e}", exc_info=True)
 
+    def _gchat_target_loggers(self) -> List[logging.Logger]:
+        """
+        The loggers the Google Chat handler must attach to. The root logger alone is not
+        enough: the logging config sets propagate=false on the main hummingbot subtrees
+        (strategy, connector, client, core, ...), so their records never reach root.
+        Mirror the MQTT log handler and attach to every logger named in the logging
+        config as well, except the alerting pipeline's own subtrees.
+        """
+        targets = [logging.getLogger()]
+        try:
+            configured_names = list((get_logging_conf() or {}).get("loggers", {}).keys())
+        except Exception:
+            configured_names = []
+        if not configured_names:
+            # Sensible fallback when no logging config file is available
+            configured_names = ["hummingbot.strategy", "hummingbot.connector",
+                                "hummingbot.client", "hummingbot.core"]
+        for name in configured_names:
+            if name.startswith(EXCLUDED_LOGGER_PREFIXES):
+                continue
+            targets.append(logging.getLogger(name))
+        return targets
+
     def _stop_gchat_alerts(self):
         """Detach the Google Chat log handler and stop the notifier."""
         if self._gchat_log_handler is not None:
-            logging.getLogger().removeHandler(self._gchat_log_handler)
+            for logger in self._gchat_patched_loggers:
+                logger.removeHandler(self._gchat_log_handler)
+            self._gchat_patched_loggers = []
             self._gchat_log_handler = None
         if self._gchat_notifier is not None:
             if self._gchat_notifier in self.notifiers:

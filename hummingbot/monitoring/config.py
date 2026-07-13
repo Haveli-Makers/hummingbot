@@ -23,6 +23,7 @@ class PMMSLAMonitorConfig(BaseModel):
     required_uptime_pct: Decimal = Field(default=Decimal("96"), gt=0, le=100)
     sample_interval_sec: float = Field(default=1.0, gt=0)
     grace_period_sec: float = Field(default=2.0, ge=0)
+    alert_warmup_sec: float = Field(default=10.0, ge=0)
     day_reset_timezone: str = "Asia/Kolkata"
     heartbeat_log_interval_sec: float = Field(default=300.0, gt=0)
 

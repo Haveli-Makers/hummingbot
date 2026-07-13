@@ -2,16 +2,36 @@ import asyncio
 import logging
 import time
 from decimal import Decimal
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Dict, Optional
 
 from hummingbot.core.data_type.common import PriceType
+from hummingbot.core.network_iterator import NetworkStatus
 from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.logger import HummingbotLogger
+from hummingbot.monitoring.alert import Severity
+from hummingbot.monitoring.alert_dispatcher import AlertDispatcher
+from hummingbot.monitoring.breach_fsm import BreachStateMachine
 from hummingbot.monitoring.config import PMMSLAMonitorConfig
-from hummingbot.monitoring.sla_sampler import OpenOrder, SampleResult, evaluate_sample
+from hummingbot.monitoring.sla_sampler import (
+    DEPTH_BELOW_MIN,
+    ONE_SIDE_MISSING,
+    ORDER_BOOK_STALE,
+    SPREAD_TOO_WIDE,
+    OpenOrder,
+    SampleResult,
+    evaluate_sample,
+)
 
 if TYPE_CHECKING:
     from hummingbot.core.trading_core import TradingCore
+
+# Severity and headline for each real-time SLA alert (plan §5, Layer B)
+CHECK_ALERTS = {
+    ONE_SIDE_MISSING: (Severity.CRITICAL, "One side has no standing orders"),
+    SPREAD_TOO_WIDE: (Severity.WARNING, "Standing orders are outside the spread band"),
+    DEPTH_BELOW_MIN: (Severity.WARNING, "Depth below the SLA minimum"),
+    ORDER_BOOK_STALE: (Severity.WARNING, "Order book stale or connector disconnected"),
+}
 
 
 class PMMSLAMonitor:
@@ -33,7 +53,10 @@ class PMMSLAMonitor:
             cls._logger = logging.getLogger(__name__)
         return cls._logger
 
-    def __init__(self, trading_core: "TradingCore", config: PMMSLAMonitorConfig):
+    def __init__(self,
+                 trading_core: "TradingCore",
+                 config: PMMSLAMonitorConfig,
+                 dispatcher: Optional[AlertDispatcher] = None):
         self._trading_core = trading_core
         self._config = config
         self._monitor_task: Optional[asyncio.Task] = None
@@ -43,6 +66,20 @@ class PMMSLAMonitor:
         self._last_in_spec: Optional[bool] = None
         self._last_reasons: Optional[list] = None
         self._last_heartbeat_ts = 0.0
+        self._started_at = 0.0
+        # One breach state machine per check; without a dispatcher the monitor is log-only
+        self._fsms: Dict[str, BreachStateMachine] = {}
+        if dispatcher is not None:
+            source = f"pmm.{config.connector_name}.{config.trading_pair}"
+            for check, (severity, title) in CHECK_ALERTS.items():
+                self._fsms[check] = BreachStateMachine(
+                    source=source,
+                    check=check,
+                    severity=severity,
+                    title=title,
+                    dispatcher=dispatcher,
+                    grace_period_sec=config.grace_period_sec,
+                )
 
     @property
     def uptime_pct(self) -> Decimal:
@@ -60,10 +97,12 @@ class PMMSLAMonitor:
         self._monitor_task = None
 
     async def monitor_loop(self):
+        self._started_at = time.time()
+        alerting = "alerts on" if self._fsms else "log-only"
         self.logger().info(
             f"SLA monitor started for {self._config.connector_name}:{self._config.trading_pair} "
             f"(band {self._config.spread_band_pct}%, min depth {self._config.min_depth_quote} quote, "
-            f"target uptime {self._config.required_uptime_pct}%)."
+            f"target uptime {self._config.required_uptime_pct}%, {alerting})."
         )
         while True:
             try:
@@ -80,7 +119,11 @@ class PMMSLAMonitor:
         connector = self._trading_core.markets.get(self._config.connector_name)
         mid: Optional[Decimal] = None
         orders = []
-        if connector is not None:
+        # A disconnected connector serves a frozen local order book: the last-known mid
+        # looks valid but proves nothing. Score those seconds as orderbook_stale.
+        connected = (connector is not None
+                     and getattr(connector, "network_status", NetworkStatus.CONNECTED) is NetworkStatus.CONNECTED)
+        if connected:
             try:
                 mid = connector.get_price_by_type(self._config.trading_pair, PriceType.MidPrice)
             except Exception:
@@ -107,6 +150,25 @@ class PMMSLAMonitor:
             self._samples_in_spec += 1
         self._log_transitions(sample)
         self._log_heartbeat(sample)
+        self._update_breach_alerts(sample)
+
+    def _update_breach_alerts(self, sample: SampleResult):
+        if not self._fsms:
+            return
+        # Give the strategy a moment to place its first orders so every start does not
+        # begin with a spurious one_side_missing alert.
+        if time.time() - self._started_at < self._config.alert_warmup_sec:
+            return
+        detail = (f"Bid depth {sample.bid_depth:.0f}, ask depth {sample.ask_depth:.0f}, "
+                  f"need {self._config.min_depth_quote} per side (mid {sample.mid_price}).")
+        metrics = {
+            "bid_depth": f"{sample.bid_depth:.0f}",
+            "ask_depth": f"{sample.ask_depth:.0f}",
+            "mid": str(sample.mid_price),
+            "uptime_pct": f"{self.uptime_pct:.2f}",
+        }
+        for check, fsm in self._fsms.items():
+            fsm.update(breached=check in sample.reasons, message=detail, metrics=metrics)
 
     def _log_transitions(self, sample: SampleResult):
         # Log when the in-spec state flips, and also when the reason set changes while

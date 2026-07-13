@@ -772,7 +772,7 @@ class TradingCore:
                     f"part of this strategy; monitor not started."
                 )
                 return
-            self.sla_monitor = PMMSLAMonitor(self, config)
+            self.sla_monitor = PMMSLAMonitor(self, config, dispatcher=self.alert_dispatcher)
             await self._wait_till_ready(self.sla_monitor.start)
         except Exception as e:
             self.logger().error(f"Failed to start the SLA monitor: {e}", exc_info=True)

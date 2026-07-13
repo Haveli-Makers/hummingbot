@@ -426,9 +426,10 @@ class TradingCoreTest(IsolatedAsyncioWrapperTestCase):
         """Test that the SLA monitor starts when monitoring.yml enables it"""
         config = PMMSLAMonitorConfig(connector_name="binance", trading_pair="BTC-USDT")
         self.trading_core.connector_manager.connectors["binance"] = self.mock_connector
-        with patch("hummingbot.core.trading_core.load_monitoring_config", return_value=config):
-            with patch.object(TradingCore, "_wait_till_ready", new_callable=AsyncMock) as wait_mock:
-                await self.trading_core._start_sla_monitor()
+        with patch("hummingbot.core.trading_core.load_monitoring_config", return_value=config), \
+                patch("hummingbot.core.trading_core.SLADayTracker"), \
+                patch.object(TradingCore, "_wait_till_ready", new_callable=AsyncMock) as wait_mock:
+            await self.trading_core._start_sla_monitor()
 
         self.assertIsNotNone(self.trading_core.sla_monitor)
         wait_mock.assert_awaited_once()

@@ -12,6 +12,7 @@ from hummingbot.monitoring.alert import Severity
 from hummingbot.monitoring.alert_dispatcher import AlertDispatcher
 from hummingbot.monitoring.breach_fsm import BreachStateMachine
 from hummingbot.monitoring.config import PMMSLAMonitorConfig
+from hummingbot.monitoring.sla_day_tracker import SLADayTracker
 from hummingbot.monitoring.sla_sampler import (
     DEPTH_BELOW_MIN,
     ONE_SIDE_MISSING,
@@ -56,9 +57,11 @@ class PMMSLAMonitor:
     def __init__(self,
                  trading_core: "TradingCore",
                  config: PMMSLAMonitorConfig,
-                 dispatcher: Optional[AlertDispatcher] = None):
+                 dispatcher: Optional[AlertDispatcher] = None,
+                 day_tracker: Optional[SLADayTracker] = None):
         self._trading_core = trading_core
         self._config = config
+        self._day_tracker = day_tracker
         self._monitor_task: Optional[asyncio.Task] = None
         # Session-local tally (Phase 5 replaces this with the persistent daily tracker)
         self._samples_total = 0
@@ -95,6 +98,8 @@ class PMMSLAMonitor:
         if self._monitor_task is not None and not self._monitor_task.done():
             self._monitor_task.cancel()
         self._monitor_task = None
+        if self._day_tracker is not None:
+            self._day_tracker.flush()
 
     async def monitor_loop(self):
         self._started_at = time.time()
@@ -148,9 +153,22 @@ class PMMSLAMonitor:
         self._samples_total += 1
         if sample.in_spec:
             self._samples_in_spec += 1
+        self._record_daily(sample)
         self._log_transitions(sample)
         self._log_heartbeat(sample)
         self._update_breach_alerts(sample)
+
+    def _record_daily(self, sample: SampleResult):
+        if self._day_tracker is None:
+            return
+        finished = self._day_tracker.record(sample)
+        if finished is not None:
+            # Phase 6 additionally writes the CSV row and raises the daily SLA alert here.
+            self.logger().info(
+                f"SLA day closed: {finished.day} uptime {finished.uptime_pct:.2f}% "
+                f"({finished.in_spec_samples}/{finished.total_samples} samples in spec"
+                f"{', main cause ' + finished.main_cause if finished.main_cause else ''})."
+            )
 
     def _update_breach_alerts(self, sample: SampleResult):
         if not self._fsms:
@@ -195,9 +213,13 @@ class PMMSLAMonitor:
             return
         self._last_heartbeat_ts = now
         state = "in spec" if sample.in_spec else f"OUT of spec ({', '.join(sample.reasons)})"
+        day_part = ""
+        if self._day_tracker is not None:
+            day_part = (f" Day {self._day_tracker.current_day} uptime {self._day_tracker.uptime_pct:.2f}% "
+                        f"({self._day_tracker.in_spec_samples}/{self._day_tracker.total_samples}).")
         self.logger().info(
             f"SLA monitor heartbeat: uptime {self.uptime_pct:.2f}% "
             f"({self._samples_in_spec}/{self._samples_total} samples in spec); currently {state}, "
             f"bid depth {sample.bid_depth:.0f}, ask depth {sample.ask_depth:.0f} "
-            f"(mid {sample.mid_price})."
+            f"(mid {sample.mid_price}).{day_part}"
         )

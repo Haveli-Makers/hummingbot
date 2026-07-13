@@ -1,3 +1,4 @@
+import tempfile
 from decimal import Decimal
 from unittest import TestCase
 from unittest.mock import MagicMock, Mock
@@ -7,6 +8,7 @@ from hummingbot.core.network_iterator import NetworkStatus
 from hummingbot.monitoring.alert import AlertStatus
 from hummingbot.monitoring.config import PMMSLAMonitorConfig
 from hummingbot.monitoring.pmm_sla_monitor import PMMSLAMonitor
+from hummingbot.monitoring.sla_day_tracker import SLADayTracker
 from hummingbot.monitoring.sla_sampler import DEPTH_BELOW_MIN, ONE_SIDE_MISSING, ORDER_BOOK_STALE
 
 
@@ -159,6 +161,22 @@ class PMMSLAMonitorTests(TestCase):
         resolved = [call.args[0] for call in dispatcher.dispatch.call_args_list
                     if call.args[0].status == AlertStatus.RESOLVED]
         self.assertTrue(any(a.check == ONE_SIDE_MISSING for a in resolved))
+
+    def test_day_tracker_records_samples(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tracker = SLADayTracker(self.config, state_dir=tmp)
+            monitor = PMMSLAMonitor(self.trading_core, self.config, day_tracker=tracker)
+            self.set_orders(
+                make_order(TradeType.BUY, "99", "250"),
+                make_order(TradeType.SELL, "101", "210"),
+            )
+            monitor._process_sample(monitor.take_sample())
+            self.set_orders(make_order(TradeType.BUY, "99", "250"))
+            monitor._process_sample(monitor.take_sample())
+
+            self.assertEqual(2, tracker.total_samples)
+            self.assertEqual(1, tracker.in_spec_samples)
+            self.assertEqual({ONE_SIDE_MISSING: 1}, tracker.summary().downtime_by_reason)
 
     def test_no_dispatcher_means_log_only(self):
         self.set_orders(make_order(TradeType.BUY, "99", "250"))

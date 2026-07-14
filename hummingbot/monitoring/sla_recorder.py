@@ -7,7 +7,8 @@ from hummingbot import data_path
 from hummingbot.logger import HummingbotLogger
 from hummingbot.monitoring.alert import Alert, AlertStatus, Severity
 from hummingbot.monitoring.alert_dispatcher import AlertDispatcher
-from hummingbot.monitoring.config import PMMSLAMonitorConfig
+from hummingbot.monitoring.config import MonitoringConfigBase
+from hummingbot.monitoring.sampler_base import MonitorIdentity
 from hummingbot.monitoring.sla_day_tracker import DaySummary
 
 CSV_COLUMNS = [
@@ -40,15 +41,16 @@ class SLARecorder:
         return cls._logger
 
     def __init__(self,
-                 config: PMMSLAMonitorConfig,
+                 config: MonitoringConfigBase,
+                 identity: MonitorIdentity,
                  dispatcher: Optional[AlertDispatcher] = None,
                  output_dir: Optional[Union[str, Path]] = None):
         self._config = config
+        self._identity = identity
         self._dispatcher = dispatcher
         directory = Path(output_dir) if output_dir is not None else Path(data_path()) / "sla"
         directory.mkdir(parents=True, exist_ok=True)
-        safe_pair = config.trading_pair.replace("/", "-")
-        self._csv_path = directory / f"{config.connector_name}_{safe_pair}_sla_daily.csv"
+        self._csv_path = directory / f"{identity.instance_id}_sla_daily.csv"
 
     @property
     def csv_path(self) -> Path:
@@ -102,7 +104,7 @@ class SLARecorder:
         partial_note = "" if summary.complete else " Partial day: the bot was down at rollover."
         cause_note = f" Main cause: {summary.main_cause}." if summary.main_cause else ""
         self._dispatcher.dispatch(Alert(
-            source=f"pmm.{summary.connector_name}.{summary.trading_pair}",
+            source=self._identity.source,
             check="daily_sla_breach",
             severity=Severity.CRITICAL,
             title="Daily SLA breached",

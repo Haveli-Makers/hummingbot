@@ -6,24 +6,24 @@ from pathlib import Path
 from unittest import TestCase
 from zoneinfo import ZoneInfo
 
-from hummingbot.monitoring.config import PMMSLAMonitorConfig
+from hummingbot.monitoring.config import MonitoringConfigBase
+from hummingbot.monitoring.sampler_base import MonitorIdentity, SLASample
 from hummingbot.monitoring.sla_day_tracker import SLADayTracker
-from hummingbot.monitoring.sla_sampler import DEPTH_BELOW_MIN, ONE_SIDE_MISSING, SampleResult
+from hummingbot.monitoring.sla_sampler import DEPTH_BELOW_MIN, ONE_SIDE_MISSING
 
 IST = ZoneInfo("Asia/Kolkata")
+IDENTITY = MonitorIdentity("pmm", "wazirx", "USDT-INR")
 
 
 def ist_ts(year, month, day, hour=0, minute=0, second=0) -> float:
     return datetime(year, month, day, hour, minute, second, tzinfo=IST).timestamp()
 
 
-def sample(in_spec: bool = True, reasons=None) -> SampleResult:
-    return SampleResult(
+def sample(in_spec: bool = True, reasons=None) -> SLASample:
+    return SLASample(
         in_spec=in_spec,
-        bid_depth=Decimal("290"),
-        ask_depth=Decimal("298"),
         reasons=list(reasons or []),
-        mid_price=Decimal("98"),
+        metrics={"bid_depth": "290", "ask_depth": "298"},
     )
 
 
@@ -43,7 +43,7 @@ class SLADayTrackerTests(TestCase):
         super().setUp()
         self._tmp = tempfile.TemporaryDirectory()
         self.state_dir = Path(self._tmp.name)
-        self.config = PMMSLAMonitorConfig(connector_name="wazirx", trading_pair="USDT-INR")
+        self.config = MonitoringConfigBase()
         self.clock = FakeClock(ist_ts(2026, 7, 13, 12, 0, 0))
 
     def tearDown(self):
@@ -53,6 +53,7 @@ class SLADayTrackerTests(TestCase):
     def make_tracker(self, persist_interval: float = 0.0) -> SLADayTracker:
         return SLADayTracker(
             self.config,
+            IDENTITY,
             state_dir=self.state_dir,
             time_fn=self.clock.time,
             persist_interval_sec=persist_interval,

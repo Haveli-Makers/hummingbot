@@ -10,8 +10,8 @@ from zoneinfo import ZoneInfo
 
 from hummingbot import data_path
 from hummingbot.logger import HummingbotLogger
-from hummingbot.monitoring.config import PMMSLAMonitorConfig
-from hummingbot.monitoring.sla_sampler import SampleResult
+from hummingbot.monitoring.config import MonitoringConfigBase
+from hummingbot.monitoring.sampler_base import MonitorIdentity, SLASample
 
 STATE_VERSION = 1
 
@@ -65,18 +65,19 @@ class SLADayTracker:
         return cls._logger
 
     def __init__(self,
-                 config: PMMSLAMonitorConfig,
+                 config: MonitoringConfigBase,
+                 identity: MonitorIdentity,
                  state_dir: Optional[Union[str, Path]] = None,
                  time_fn: Callable[[], float] = time.time,
                  persist_interval_sec: float = 5.0):
         self._config = config
+        self._identity = identity
         self._time = time_fn
         self._tz = ZoneInfo(config.day_reset_timezone)
         self._persist_interval_sec = persist_interval_sec
         directory = Path(state_dir) if state_dir is not None else Path(data_path()) / "sla"
         directory.mkdir(parents=True, exist_ok=True)
-        safe_pair = config.trading_pair.replace("/", "-")
-        self._state_path = directory / f"{config.connector_name}_{safe_pair}_sla_state.json"
+        self._state_path = directory / f"{identity.instance_id}_sla_state.json"
 
         self._current_day = self._day_key(self._time())
         self._total_samples = 0
@@ -104,7 +105,7 @@ class SLADayTracker:
             return Decimal("0")
         return Decimal(self._in_spec_samples) / Decimal(self._total_samples) * Decimal("100")
 
-    def record(self, sample: SampleResult) -> Optional[DaySummary]:
+    def record(self, sample: SLASample) -> Optional[DaySummary]:
         """
         Record one sample against the current day.
 
@@ -131,8 +132,8 @@ class SLADayTracker:
         """The accounting of the current day so far."""
         return DaySummary(
             day=self._current_day,
-            connector_name=self._config.connector_name,
-            trading_pair=self._config.trading_pair,
+            connector_name=self._identity.connector_name,
+            trading_pair=self._identity.trading_pair,
             total_samples=self._total_samples,
             in_spec_samples=self._in_spec_samples,
             downtime_by_reason=dict(self._downtime_by_reason),
@@ -144,8 +145,8 @@ class SLADayTracker:
             payload = {
                 "version": STATE_VERSION,
                 "day": self._current_day,
-                "connector_name": self._config.connector_name,
-                "trading_pair": self._config.trading_pair,
+                "connector_name": self._identity.connector_name,
+                "trading_pair": self._identity.trading_pair,
                 "total_samples": self._total_samples,
                 "in_spec_samples": self._in_spec_samples,
                 "downtime_by_reason": self._downtime_by_reason,
@@ -188,8 +189,8 @@ class SLADayTracker:
             # The bot was down over midnight: surface the interrupted day for recording.
             self.pending_summary = DaySummary(
                 day=str(data["day"]),
-                connector_name=str(data.get("connector_name", self._config.connector_name)),
-                trading_pair=str(data.get("trading_pair", self._config.trading_pair)),
+                connector_name=str(data.get("connector_name", self._identity.connector_name)),
+                trading_pair=str(data.get("trading_pair", self._identity.trading_pair)),
                 total_samples=int(data.get("total_samples", 0)),
                 in_spec_samples=int(data.get("in_spec_samples", 0)),
                 downtime_by_reason={str(k): int(v) for k, v in data.get("downtime_by_reason", {}).items()},

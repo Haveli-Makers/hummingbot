@@ -4,10 +4,13 @@ from pathlib import Path
 from unittest import TestCase
 
 from hummingbot.monitoring.alert import AlertStatus, Severity
-from hummingbot.monitoring.config import PMMSLAMonitorConfig
+from hummingbot.monitoring.config import MonitoringConfigBase
+from hummingbot.monitoring.sampler_base import MonitorIdentity
 from hummingbot.monitoring.sla_day_tracker import DaySummary
 from hummingbot.monitoring.sla_recorder import SLARecorder
 from hummingbot.monitoring.sla_sampler import DEPTH_BELOW_MIN, ONE_SIDE_MISSING
+
+IDENTITY = MonitorIdentity("pmm", "wazirx", "USDT-INR")
 
 
 class FakeDispatcher:
@@ -40,9 +43,10 @@ class SLARecorderTests(TestCase):
         super().setUp()
         self._tmp = tempfile.TemporaryDirectory()
         self.output_dir = Path(self._tmp.name)
-        self.config = PMMSLAMonitorConfig(connector_name="wazirx", trading_pair="USDT-INR")
+        self.config = MonitoringConfigBase()
         self.dispatcher = FakeDispatcher()
-        self.recorder = SLARecorder(self.config, dispatcher=self.dispatcher, output_dir=self.output_dir)
+        self.recorder = SLARecorder(self.config, IDENTITY,
+                                    dispatcher=self.dispatcher, output_dir=self.output_dir)
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -111,7 +115,7 @@ class SLARecorderTests(TestCase):
         self.assertIn("Partial day", self.dispatcher.alerts[0].message)
 
     def test_without_dispatcher_records_csv_only(self):
-        recorder = SLARecorder(self.config, output_dir=self.output_dir)
+        recorder = SLARecorder(self.config, IDENTITY, output_dir=self.output_dir)
         recorder.record(make_summary(in_spec=1000))
 
         self.assertEqual(2, len(self.read_rows()))
@@ -125,9 +129,8 @@ class SLARecorderTests(TestCase):
         self.assertEqual(1, len(self.dispatcher.alerts))
 
     def test_downtime_uses_sample_interval(self):
-        config = PMMSLAMonitorConfig(connector_name="wazirx", trading_pair="USDT-INR",
-                                     sample_interval_sec=2.0)
-        recorder = SLARecorder(config, dispatcher=self.dispatcher, output_dir=self.output_dir)
+        config = MonitoringConfigBase(sample_interval_sec=2.0)
+        recorder = SLARecorder(config, IDENTITY, dispatcher=self.dispatcher, output_dir=self.output_dir)
         recorder.record(make_summary(total=43200, in_spec=43000))
 
         rows = self.read_rows()

@@ -33,10 +33,9 @@ from hummingbot.model.sql_connection_manager import SQLConnectionManager
 from hummingbot.model.trade_fill import TradeFill
 from hummingbot.monitoring.alert_dispatcher import AlertDispatcher
 from hummingbot.monitoring.config import load_monitoring_config
+from hummingbot.monitoring.factory import create_sla_monitor
 from hummingbot.monitoring.gchat_log_handler import EXCLUDED_LOGGER_PREFIXES, GChatLogHandler
-from hummingbot.monitoring.pmm_sla_monitor import PMMSLAMonitor
-from hummingbot.monitoring.sla_day_tracker import SLADayTracker
-from hummingbot.monitoring.sla_recorder import SLARecorder
+from hummingbot.monitoring.sla_monitor import SLAMonitor
 from hummingbot.notifier.gchat_notifier import GChatNotifier
 from hummingbot.notifier.notifier_base import NotifierBase
 from hummingbot.strategy.directional_strategy_base import DirectionalStrategyBase
@@ -123,7 +122,7 @@ class TradingCore:
         self._gchat_log_handler: Optional[GChatLogHandler] = None
         self._gchat_patched_loggers: List[logging.Logger] = []
         # SLA monitor (enabled via conf/monitoring.yml)
-        self.sla_monitor: Optional[PMMSLAMonitor] = None
+        self.sla_monitor: Optional[SLAMonitor] = None
 
         # Metrics collectors mapping (connector_name -> MetricsCollector)
         self._metrics_collectors: Dict[str, MetricsCollector] = {}
@@ -768,19 +767,9 @@ class TradingCore:
             config = load_monitoring_config()
             if config is None:
                 return
-            if config.connector_name not in self.markets:
-                self.logger().warning(
-                    f"SLA monitor configured for '{config.connector_name}' but that connector is not "
-                    f"part of this strategy; monitor not started."
-                )
-                return
-            day_tracker = SLADayTracker(config)
-            recorder = SLARecorder(config, dispatcher=self.alert_dispatcher)
-            self.sla_monitor = PMMSLAMonitor(self, config,
-                                             dispatcher=self.alert_dispatcher,
-                                             day_tracker=day_tracker,
-                                             recorder=recorder)
-            await self._wait_till_ready(self.sla_monitor.start)
+            self.sla_monitor = create_sla_monitor(self, config, dispatcher=self.alert_dispatcher)
+            if self.sla_monitor is not None:
+                await self._wait_till_ready(self.sla_monitor.start)
         except Exception as e:
             self.logger().error(f"Failed to start the SLA monitor: {e}", exc_info=True)
 

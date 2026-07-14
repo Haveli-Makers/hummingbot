@@ -428,6 +428,7 @@ class TradingCoreTest(IsolatedAsyncioWrapperTestCase):
         self.trading_core.connector_manager.connectors["binance"] = self.mock_connector
         with patch("hummingbot.core.trading_core.load_monitoring_config", return_value=config), \
                 patch("hummingbot.core.trading_core.SLADayTracker"), \
+                patch("hummingbot.core.trading_core.SLARecorder"), \
                 patch.object(TradingCore, "_wait_till_ready", new_callable=AsyncMock) as wait_mock:
             await self.trading_core._start_sla_monitor()
 

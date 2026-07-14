@@ -13,6 +13,7 @@ from hummingbot.monitoring.alert_dispatcher import AlertDispatcher
 from hummingbot.monitoring.breach_fsm import BreachStateMachine
 from hummingbot.monitoring.config import PMMSLAMonitorConfig
 from hummingbot.monitoring.sla_day_tracker import SLADayTracker
+from hummingbot.monitoring.sla_recorder import SLARecorder
 from hummingbot.monitoring.sla_sampler import (
     DEPTH_BELOW_MIN,
     ONE_SIDE_MISSING,
@@ -26,7 +27,7 @@ from hummingbot.monitoring.sla_sampler import (
 if TYPE_CHECKING:
     from hummingbot.core.trading_core import TradingCore
 
-# Severity and headline for each real-time SLA alert (plan §5, Layer B)
+# Severity and headline for each real-time SLA alert
 CHECK_ALERTS = {
     ONE_SIDE_MISSING: (Severity.CRITICAL, "One side has no standing orders"),
     SPREAD_TOO_WIDE: (Severity.WARNING, "Standing orders are outside the spread band"),
@@ -37,12 +38,16 @@ CHECK_ALERTS = {
 
 class PMMSLAMonitor:
     """
-    In-bot SLA monitor for market making (plan: Layer B/C measurement source).
+    In-bot SLA monitor for market making.
 
     Every ``sample_interval_sec`` it reads the strategy's open orders and the live mid
-    price from the connector, and evaluates whether both sides meet the SLA (orders
-    within the spread band with at least the minimum depth). Phase 3 logs the results;
-    Phase 4 attaches breach state machines, Phase 5 the daily uptime tally.
+    price from the connector and evaluates whether both sides meet the SLA (orders
+    within the spread band with at least the minimum depth). Each sample:
+    - is logged (state transitions and periodic heartbeats),
+    - drives one breach state machine per check, which raises and resolves alerts
+      through the dispatcher with a grace period,
+    - is accumulated by the day tracker into a persistent per-day uptime figure; at
+      day rollover the finished day is handed to the recorder (CSV row + breach alert).
 
     Read-only by design: it never places, cancels or modifies anything.
     """
@@ -58,12 +63,14 @@ class PMMSLAMonitor:
                  trading_core: "TradingCore",
                  config: PMMSLAMonitorConfig,
                  dispatcher: Optional[AlertDispatcher] = None,
-                 day_tracker: Optional[SLADayTracker] = None):
+                 day_tracker: Optional[SLADayTracker] = None,
+                 recorder: Optional[SLARecorder] = None):
         self._trading_core = trading_core
         self._config = config
         self._day_tracker = day_tracker
+        self._recorder = recorder
         self._monitor_task: Optional[asyncio.Task] = None
-        # Session-local tally (Phase 5 replaces this with the persistent daily tracker)
+        # Counters for the current run; the day tracker owns the persistent daily figure
         self._samples_total = 0
         self._samples_in_spec = 0
         self._last_in_spec: Optional[bool] = None
@@ -92,7 +99,18 @@ class PMMSLAMonitor:
 
     def start(self):
         if self._monitor_task is None or self._monitor_task.done():
+            self._record_interrupted_day()
             self._monitor_task = safe_ensure_future(self.monitor_loop())
+
+    def _record_interrupted_day(self):
+        """Record a day that ended while the bot was down (found in the state file)."""
+        if self._day_tracker is None or self._recorder is None:
+            return
+        pending = self._day_tracker.pending_summary
+        if pending is not None:
+            self.logger().info(f"Recording interrupted SLA day {pending.day} from a previous run.")
+            self._recorder.record(pending)
+            self._day_tracker.pending_summary = None
 
     def stop(self):
         if self._monitor_task is not None and not self._monitor_task.done():
@@ -163,12 +181,13 @@ class PMMSLAMonitor:
             return
         finished = self._day_tracker.record(sample)
         if finished is not None:
-            # Phase 6 additionally writes the CSV row and raises the daily SLA alert here.
             self.logger().info(
                 f"SLA day closed: {finished.day} uptime {finished.uptime_pct:.2f}% "
                 f"({finished.in_spec_samples}/{finished.total_samples} samples in spec"
                 f"{', main cause ' + finished.main_cause if finished.main_cause else ''})."
             )
+            if self._recorder is not None:
+                self._recorder.record(finished)
 
     def _update_breach_alerts(self, sample: SampleResult):
         if not self._fsms:

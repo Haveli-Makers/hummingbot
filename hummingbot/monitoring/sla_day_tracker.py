@@ -53,8 +53,8 @@ class SLADayTracker:
       seconds, and restored on restart when it belongs to the current day, so an
       intraday restart does not reset the daily figure.
     - A stale state file from a previous day is surfaced as ``pending_summary``
-      (complete=False) instead of being restored, so a day interrupted by downtime can
-      still be recorded.
+      (complete=False) instead of being restored, so the recorder can still write out
+      a day that ended while the bot was down.
     """
     _logger: Optional[HummingbotLogger] = None
 

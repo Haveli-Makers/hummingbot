@@ -36,6 +36,7 @@ from hummingbot.monitoring.config import load_monitoring_config
 from hummingbot.monitoring.gchat_log_handler import EXCLUDED_LOGGER_PREFIXES, GChatLogHandler
 from hummingbot.monitoring.pmm_sla_monitor import PMMSLAMonitor
 from hummingbot.monitoring.sla_day_tracker import SLADayTracker
+from hummingbot.monitoring.sla_recorder import SLARecorder
 from hummingbot.notifier.gchat_notifier import GChatNotifier
 from hummingbot.notifier.notifier_base import NotifierBase
 from hummingbot.strategy.directional_strategy_base import DirectionalStrategyBase
@@ -774,9 +775,11 @@ class TradingCore:
                 )
                 return
             day_tracker = SLADayTracker(config)
+            recorder = SLARecorder(config, dispatcher=self.alert_dispatcher)
             self.sla_monitor = PMMSLAMonitor(self, config,
                                              dispatcher=self.alert_dispatcher,
-                                             day_tracker=day_tracker)
+                                             day_tracker=day_tracker,
+                                             recorder=recorder)
             await self._wait_till_ready(self.sla_monitor.start)
         except Exception as e:
             self.logger().error(f"Failed to start the SLA monitor: {e}", exc_info=True)

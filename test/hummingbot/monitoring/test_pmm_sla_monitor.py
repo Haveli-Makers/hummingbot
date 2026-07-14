@@ -178,6 +178,42 @@ class PMMSLAMonitorTests(TestCase):
             self.assertEqual(1, tracker.in_spec_samples)
             self.assertEqual({ONE_SIDE_MISSING: 1}, tracker.summary().downtime_by_reason)
 
+    def test_day_close_hands_summary_to_recorder(self):
+        tracker = MagicMock()
+        tracker.uptime_pct = Decimal("0")
+        tracker.current_day = "2026-07-14"
+        tracker.in_spec_samples = 0
+        tracker.total_samples = 1
+        finished_day = MagicMock()
+        finished_day.uptime_pct = Decimal("94.20")
+        finished_day.day = "2026-07-13"
+        finished_day.in_spec_samples = 81389
+        finished_day.total_samples = 86400
+        finished_day.main_cause = "depth_below_min"
+        tracker.record.return_value = finished_day
+        recorder = MagicMock()
+        monitor = PMMSLAMonitor(self.trading_core, self.config,
+                                day_tracker=tracker, recorder=recorder)
+        self.set_orders(make_order(TradeType.BUY, "99", "250"))
+
+        monitor._process_sample(monitor.take_sample())
+
+        recorder.record.assert_called_once_with(finished_day)
+
+    def test_interrupted_day_recorded_on_start(self):
+        tracker = MagicMock()
+        pending = MagicMock()
+        pending.day = "2026-07-12"
+        tracker.pending_summary = pending
+        recorder = MagicMock()
+        monitor = PMMSLAMonitor(self.trading_core, self.config,
+                                day_tracker=tracker, recorder=recorder)
+
+        monitor._record_interrupted_day()
+
+        recorder.record.assert_called_once_with(pending)
+        self.assertIsNone(tracker.pending_summary)
+
     def test_no_dispatcher_means_log_only(self):
         self.set_orders(make_order(TradeType.BUY, "99", "250"))
 

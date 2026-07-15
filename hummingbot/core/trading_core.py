@@ -2,6 +2,7 @@ import asyncio
 import importlib
 import inspect
 import logging
+import os
 import sys
 import time
 from decimal import Decimal
@@ -11,6 +12,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type, Union
 
 from sqlalchemy.orm import Query, Session
 
+from hummingbot import get_logging_conf
 from hummingbot.client.config.client_config_map import ClientConfigMap
 from hummingbot.client.config.config_data_types import BaseClientModel
 from hummingbot.client.config.config_helpers import ClientConfigAdapter, get_strategy_starter_file
@@ -29,6 +31,12 @@ from hummingbot.exceptions import InvalidScriptModule
 from hummingbot.logger import HummingbotLogger
 from hummingbot.model.sql_connection_manager import SQLConnectionManager
 from hummingbot.model.trade_fill import TradeFill
+from hummingbot.monitoring.alert_dispatcher import AlertDispatcher
+from hummingbot.monitoring.config import load_monitoring_config
+from hummingbot.monitoring.factory import create_sla_monitor
+from hummingbot.monitoring.gchat_log_handler import EXCLUDED_LOGGER_PREFIXES, GChatLogHandler
+from hummingbot.monitoring.sla_monitor import SLAMonitor
+from hummingbot.notifier.gchat_notifier import GChatNotifier
 from hummingbot.notifier.notifier_base import NotifierBase
 from hummingbot.strategy.directional_strategy_base import DirectionalStrategyBase
 from hummingbot.strategy.market_trading_pair_tuple import MarketTradingPairTuple
@@ -107,6 +115,14 @@ class TradingCore:
         self.kill_switch: Optional[KillSwitch] = None
         self.markets_recorder: Optional[MarketsRecorder] = None
         self.trade_fill_db: Optional[SQLConnectionManager] = None
+
+        # Monitoring / alerting components (enabled via the GCHAT_WEBHOOK_URL env var)
+        self.alert_dispatcher: Optional[AlertDispatcher] = None
+        self._gchat_notifier: Optional[GChatNotifier] = None
+        self._gchat_log_handler: Optional[GChatLogHandler] = None
+        self._gchat_patched_loggers: List[logging.Logger] = []
+        # SLA monitor (enabled via conf/monitoring.yml)
+        self.sla_monitor: Optional[SLAMonitor] = None
 
         # Metrics collectors mapping (connector_name -> MetricsCollector)
         self._metrics_collectors: Dict[str, MetricsCollector] = {}
@@ -563,6 +579,12 @@ class TradingCore:
                 self.kill_switch = self.client_config_map.kill_switch_mode.get_kill_switch(self)
                 await self._wait_till_ready(self.kill_switch.start)
 
+            # Forward serious log records to Google Chat if a webhook is configured
+            self._start_gchat_alerts()
+
+            # Start the SLA monitor if conf/monitoring.yml enables it
+            await self._start_sla_monitor()
+
             self.logger().info(f"'{self.strategy_name}' strategy execution started.")
 
         except Exception as e:
@@ -599,6 +621,10 @@ class TradingCore:
             # Remove kill switch from clock
             if self.clock is not None and self.kill_switch is not None:
                 self.kill_switch.stop()
+
+            # Stop SLA monitoring and Google Chat alerting
+            self._stop_sla_monitor()
+            self._stop_gchat_alerts()
 
             # Stop rate oracle
             RateOracle.get_instance().stop()
@@ -665,6 +691,92 @@ class TradingCore:
     def add_notifier(self, notifier: NotifierBase):
         """Add a notifier to the engine."""
         self.notifiers.append(notifier)
+
+    def _start_gchat_alerts(self):
+        """
+        Enable Google Chat alerting when the GCHAT_WEBHOOK_URL env var is set:
+        - attaches a log handler that forwards ERROR+ records as alerts (Layer A)
+        - registers the notifier so TradingCore.notify() messages also reach the space
+        A failure here only disables alerting; it never blocks the strategy start.
+        """
+        webhook_url = os.environ.get("GCHAT_WEBHOOK_URL", "")
+        if not webhook_url or self._gchat_log_handler is not None:
+            return
+        try:
+            notifier = GChatNotifier(webhook_url)
+            dispatcher = AlertDispatcher(notifiers=[notifier])
+            handler = GChatLogHandler(dispatcher, source=self.strategy_name or "hummingbot")
+            self._gchat_patched_loggers = self._gchat_target_loggers()
+            for logger in self._gchat_patched_loggers:
+                logger.addHandler(handler)
+            notifier.start()
+            self.add_notifier(notifier)
+            self._gchat_notifier = notifier
+            self._gchat_log_handler = handler
+            self.alert_dispatcher = dispatcher
+            self.logger().info("Google Chat alerting enabled: forwarding ERROR+ logs to the configured webhook.")
+        except Exception as e:
+            self.logger().error(f"Failed to start Google Chat alerting: {e}", exc_info=True)
+
+    def _gchat_target_loggers(self) -> List[logging.Logger]:
+        """
+        The loggers the Google Chat handler must attach to. The root logger alone is not
+        enough: the logging config sets propagate=false on the main hummingbot subtrees
+        (strategy, connector, client, core, ...), so their records never reach root.
+        Mirror the MQTT log handler and attach to every logger named in the logging
+        config as well, except the alerting pipeline's own subtrees.
+        """
+        targets = [logging.getLogger()]
+        try:
+            configured_names = list((get_logging_conf() or {}).get("loggers", {}).keys())
+        except Exception:
+            configured_names = []
+        if not configured_names:
+            # Sensible fallback when no logging config file is available
+            configured_names = ["hummingbot.strategy", "hummingbot.connector",
+                                "hummingbot.client", "hummingbot.core"]
+        for name in configured_names:
+            if name.startswith(EXCLUDED_LOGGER_PREFIXES):
+                continue
+            targets.append(logging.getLogger(name))
+        return targets
+
+    def _stop_gchat_alerts(self):
+        """Detach the Google Chat log handler and stop the notifier."""
+        if self._gchat_log_handler is not None:
+            for logger in self._gchat_patched_loggers:
+                logger.removeHandler(self._gchat_log_handler)
+            self._gchat_patched_loggers = []
+            self._gchat_log_handler = None
+        if self._gchat_notifier is not None:
+            if self._gchat_notifier in self.notifiers:
+                self.notifiers.remove(self._gchat_notifier)
+            self._gchat_notifier.stop()
+            self._gchat_notifier = None
+        self.alert_dispatcher = None
+
+    async def _start_sla_monitor(self):
+        """
+        Start the SLA monitor when conf/monitoring.yml enables it. Waits for markets to
+        be ready (like the kill switch) so early samples don't score a warming-up bot.
+        A failure here only disables monitoring; it never blocks the strategy start.
+        """
+        if self.sla_monitor is not None:
+            return
+        try:
+            config = load_monitoring_config()
+            if config is None:
+                return
+            self.sla_monitor = create_sla_monitor(self, config, dispatcher=self.alert_dispatcher)
+            if self.sla_monitor is not None:
+                await self._wait_till_ready(self.sla_monitor.start)
+        except Exception as e:
+            self.logger().error(f"Failed to start the SLA monitor: {e}", exc_info=True)
+
+    def _stop_sla_monitor(self):
+        if self.sla_monitor is not None:
+            self.sla_monitor.stop()
+            self.sla_monitor = None
 
     def notify(self, msg: str, level: str = "INFO"):
         """Send a notification."""

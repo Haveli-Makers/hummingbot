@@ -63,7 +63,7 @@ class BreachStateMachineTests(TestCase):
         alert = self.dispatcher.alerts[0]
         self.assertEqual(AlertStatus.FIRING, alert.status)
         self.assertEqual("depth_below_min", alert.check)
-        self.assertIn("Broken for 2s", alert.message)
+        self.assertIn("Down for 2s", alert.message)
         self.assertIn("bid 100", alert.message)
 
     def test_firing_redispatches_each_update_for_renotify(self):

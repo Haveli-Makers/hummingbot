@@ -104,13 +104,24 @@ class AlertDispatcher:
         return False
 
     def _format(self, alert: Alert) -> str:
-        prefix = "✅" if alert.status is AlertStatus.RESOLVED else SEVERITY_EMOJI[alert.severity]
-        lines = [f"{prefix} [{alert.source}] {alert.title}"]
+        if alert.status is AlertStatus.RESOLVED:
+            header = f"✅ *Resolved: {alert.title}*"
+        else:
+            header = f"{SEVERITY_EMOJI[alert.severity]} *{alert.title}*"
+        lines = [header, self._format_source(alert.source)]
         if alert.message:
             lines.append(alert.message)
         if alert.metrics:
-            lines.append(" | ".join(f"{k}={v}" for k, v in alert.metrics.items()))
+            lines.append(" | ".join(f"{k}: {v}" for k, v in alert.metrics.items()))
         return "\n".join(lines)
+
+    @staticmethod
+    def _format_source(source: str) -> str:
+        parts = source.split(".")
+        if len(parts) == 3:
+            monitor_type, connector, pair = parts
+            return f"{connector} · {pair} ({monitor_type})"
+        return source
 
     def _deliver(self, text: str):
         for notifier in self._notifiers:

@@ -1,9 +1,9 @@
 from decimal import Decimal
 from pathlib import Path
-from typing import Dict, Optional, Type, Union
+from typing import Dict, List, Optional, Type, Union
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from hummingbot.client.settings import CONF_DIR_PATH
 
@@ -23,6 +23,13 @@ class MonitoringConfigBase(BaseModel):
     day_reset_timezone: str = "Asia/Kolkata"
     heartbeat_log_interval_sec: float = Field(default=300.0, gt=0)
 
+    def slo_targets(self) -> Dict[str, Decimal]:
+        """
+        Per-sub-objective daily uptime targets (SLO name -> required %). Monitors with a
+        single overall target return an empty dict.
+        """
+        return {}
+
 
 class PMMSLAMonitorConfig(MonitoringConfigBase):
     """Market-making SLA: standing orders within a spread band with minimum depth."""
@@ -32,9 +39,39 @@ class PMMSLAMonitorConfig(MonitoringConfigBase):
     min_depth_quote: Decimal = Field(default=Decimal("20000"), gt=0)
 
 
+class SLATierConfig(BaseModel):
+    """One tier of a multi-level market-making SLA (cumulative depth within a band)."""
+    name: str = Field(min_length=1)
+    spread_band_pct: Decimal = Field(gt=0)
+    min_depth_quote: Decimal = Field(gt=0)
+    required_uptime_pct: Decimal = Field(gt=0, le=100)
+
+
+class MultiLevelPMMSLAMonitorConfig(MonitoringConfigBase):
+    """
+    Multi-level market-making SLA: several nested depth tiers, each with its own
+    spread band, minimum cumulative depth per side, and daily uptime target.
+    """
+    connector_name: str
+    trading_pair: str
+    tiers: List[SLATierConfig] = Field(min_length=1)
+
+    @field_validator("tiers")
+    @classmethod
+    def validate_tiers(cls, tiers: List[SLATierConfig]) -> List[SLATierConfig]:
+        names = [tier.name for tier in tiers]
+        if len(names) != len(set(names)):
+            raise ValueError("Tier names must be unique.")
+        return tiers
+
+    def slo_targets(self) -> Dict[str, Decimal]:
+        return {tier.name: tier.required_uptime_pct for tier in self.tiers}
+
+
 # conf/monitoring.yml section name -> config model. Register new strategy monitors here.
 MONITOR_CONFIG_SECTIONS: Dict[str, Type[MonitoringConfigBase]] = {
     "pmm_sla_monitor": PMMSLAMonitorConfig,
+    "multilevel_pmm_sla_monitor": MultiLevelPMMSLAMonitorConfig,
 }
 
 

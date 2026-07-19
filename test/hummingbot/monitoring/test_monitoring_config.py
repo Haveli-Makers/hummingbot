@@ -3,7 +3,12 @@ from decimal import Decimal
 from pathlib import Path
 from unittest import TestCase
 
-from hummingbot.monitoring.config import PMMSLAMonitorConfig, load_monitoring_config
+from hummingbot.monitoring.config import (
+    MultiLevelPMMSLAMonitorConfig,
+    PMMSLAMonitorConfig,
+    SLATierConfig,
+    load_monitoring_config,
+)
 
 
 class LoadMonitoringConfigTests(TestCase):
@@ -72,6 +77,48 @@ class LoadMonitoringConfigTests(TestCase):
         )
 
         self.assertIsNone(load_monitoring_config(self.config_path))
+
+    def test_loads_multilevel_config_with_tiers(self):
+        self.write(
+            "multilevel_pmm_sla_monitor:\n"
+            "  connector_name: wazirx\n"
+            "  trading_pair: USDT-INR\n"
+            "  tiers:\n"
+            "    - {name: tier1, spread_band_pct: 1.35, min_depth_quote: 10000, required_uptime_pct: 99}\n"
+            "    - {name: tier2, spread_band_pct: 1.75, min_depth_quote: 40000, required_uptime_pct: 97}\n"
+            "    - {name: tier3, spread_band_pct: 2.10, min_depth_quote: 90000, required_uptime_pct: 96}\n"
+        )
+
+        config = load_monitoring_config(self.config_path)
+
+        self.assertIsInstance(config, MultiLevelPMMSLAMonitorConfig)
+        self.assertEqual(3, len(config.tiers))
+        self.assertEqual(Decimal("1.35"), config.tiers[0].spread_band_pct)
+        self.assertEqual(
+            {"tier1": Decimal("99"), "tier2": Decimal("97"), "tier3": Decimal("96")},
+            config.slo_targets(),
+        )
+
+    def test_duplicate_tier_names_raise(self):
+        with self.assertRaises(Exception):
+            MultiLevelPMMSLAMonitorConfig(
+                connector_name="wazirx",
+                trading_pair="USDT-INR",
+                tiers=[
+                    SLATierConfig(name="t", spread_band_pct=Decimal("1"),
+                                  min_depth_quote=Decimal("1"), required_uptime_pct=Decimal("99")),
+                    SLATierConfig(name="t", spread_band_pct=Decimal("2"),
+                                  min_depth_quote=Decimal("2"), required_uptime_pct=Decimal("97")),
+                ],
+            )
+
+    def test_empty_tiers_raise(self):
+        with self.assertRaises(Exception):
+            MultiLevelPMMSLAMonitorConfig(connector_name="wazirx", trading_pair="USDT-INR", tiers=[])
+
+    def test_single_slo_config_has_no_slo_targets(self):
+        config = PMMSLAMonitorConfig(connector_name="wazirx", trading_pair="USDT-INR")
+        self.assertEqual({}, config.slo_targets())
 
     def test_invalid_values_raise(self):
         self.write(

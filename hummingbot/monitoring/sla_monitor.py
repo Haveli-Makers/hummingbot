@@ -146,11 +146,15 @@ class SLAMonitor:
         # begin with a spurious alert.
         if time.time() - self._started_at < self._config.alert_warmup_sec:
             return
-        detail = f"{self._sampler.describe(sample)}."
-        metrics = dict(sample.metrics)
-        metrics["uptime_pct"] = f"{self.uptime_pct:.2f}"
+        metrics = {"session uptime": f"{self.uptime_pct:.2f}%"}
+        if self._day_tracker is not None:
+            metrics["day uptime"] = f"{self._day_tracker.uptime_pct:.2f}%"
         for check, fsm in self._fsms.items():
-            fsm.update(breached=check in sample.reasons, message=detail, metrics=metrics)
+            fsm.update(
+                breached=check in sample.reasons,
+                message=f"{self._sampler.describe_check(check, sample)}.",
+                metrics=dict(metrics),
+            )
 
     def _log_transitions(self, sample: SLASample):
         # Log when the in-spec state flips, and also when the reason set changes while

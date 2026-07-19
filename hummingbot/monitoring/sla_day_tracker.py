@@ -25,6 +25,8 @@ class DaySummary:
     total_samples: int
     in_spec_samples: int
     downtime_by_reason: Dict[str, int] = field(default_factory=dict)
+    # Per-sub-objective in-spec counts (SLO name -> samples); empty for single-SLO monitors
+    slo_in_spec: Dict[str, int] = field(default_factory=dict)
     # False when rebuilt from a stale state file (the bot was down at midnight, so the
     # tail of the day was never observed).
     complete: bool = True
@@ -34,6 +36,11 @@ class DaySummary:
         if self.total_samples == 0:
             return Decimal("0")
         return Decimal(self.in_spec_samples) / Decimal(self.total_samples) * Decimal("100")
+
+    def slo_uptime_pct(self, slo_name: str) -> Decimal:
+        if self.total_samples == 0:
+            return Decimal("0")
+        return Decimal(self.slo_in_spec.get(slo_name, 0)) / Decimal(self.total_samples) * Decimal("100")
 
     @property
     def main_cause(self) -> str:
@@ -83,6 +90,7 @@ class SLADayTracker:
         self._total_samples = 0
         self._in_spec_samples = 0
         self._downtime_by_reason: Dict[str, int] = {}
+        self._slo_in_spec: Dict[str, int] = {}
         self._last_persist_ts = 0.0
         self.pending_summary: Optional[DaySummary] = None
         self._restore()
@@ -124,6 +132,12 @@ class SLADayTracker:
         else:
             for reason in sample.reasons:
                 self._downtime_by_reason[reason] = self._downtime_by_reason.get(reason, 0) + 1
+        if sample.slo_results:
+            for slo_name, slo_ok in sample.slo_results.items():
+                if slo_ok:
+                    self._slo_in_spec[slo_name] = self._slo_in_spec.get(slo_name, 0) + 1
+                else:
+                    self._slo_in_spec.setdefault(slo_name, 0)
         if now - self._last_persist_ts >= self._persist_interval_sec:
             self.flush()
         return finished
@@ -137,6 +151,7 @@ class SLADayTracker:
             total_samples=self._total_samples,
             in_spec_samples=self._in_spec_samples,
             downtime_by_reason=dict(self._downtime_by_reason),
+            slo_in_spec=dict(self._slo_in_spec),
         )
 
     def flush(self):
@@ -150,6 +165,7 @@ class SLADayTracker:
                 "total_samples": self._total_samples,
                 "in_spec_samples": self._in_spec_samples,
                 "downtime_by_reason": self._downtime_by_reason,
+                "slo_in_spec": self._slo_in_spec,
                 "updated_at": self._time(),
             }
             tmp_path = self._state_path.with_suffix(".json.tmp")
@@ -167,6 +183,7 @@ class SLADayTracker:
         self._total_samples = 0
         self._in_spec_samples = 0
         self._downtime_by_reason = {}
+        self._slo_in_spec = {}
         self.flush()
 
     def _restore(self):
@@ -181,6 +198,7 @@ class SLADayTracker:
             self._total_samples = int(data.get("total_samples", 0))
             self._in_spec_samples = int(data.get("in_spec_samples", 0))
             self._downtime_by_reason = {str(k): int(v) for k, v in data.get("downtime_by_reason", {}).items()}
+            self._slo_in_spec = {str(k): int(v) for k, v in data.get("slo_in_spec", {}).items()}
             self.logger().info(
                 f"Restored SLA day state for {self._current_day}: "
                 f"{self._in_spec_samples}/{self._total_samples} samples in spec."
@@ -194,5 +212,6 @@ class SLADayTracker:
                 total_samples=int(data.get("total_samples", 0)),
                 in_spec_samples=int(data.get("in_spec_samples", 0)),
                 downtime_by_reason={str(k): int(v) for k, v in data.get("downtime_by_reason", {}).items()},
+                slo_in_spec={str(k): int(v) for k, v in data.get("slo_in_spec", {}).items()},
                 complete=False,
             )

@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from hummingbot.monitoring.alert import Severity
 
@@ -21,15 +21,22 @@ class MonitorIdentity:
 
     @property
     def instance_id(self) -> str:
-        return f"{self.connector_name}_{self.trading_pair.replace('/', '-')}"
+        return f"{self.monitor_type}_{self.connector_name}_{self.trading_pair.replace('/', '-')}"
 
 
 @dataclass
 class SLASample:
-    """One evaluation of a strategy's SLA condition, produced every sample interval."""
+    """
+    One evaluation of a strategy's SLA condition, produced every sample interval.
+
+    ``slo_results`` carries named sub-objectives (e.g. depth tiers) when the monitor
+    tracks more than one uptime target; each name accrues its own daily uptime figure.
+    Single-objective monitors leave it None.
+    """
     in_spec: bool
     reasons: List[str] = field(default_factory=list)   # empty when in_spec
     metrics: Dict[str, str] = field(default_factory=dict)
+    slo_results: Optional[Dict[str, bool]] = None
 
 
 class SLASamplerBase(ABC):
@@ -66,3 +73,10 @@ class SLASamplerBase(ABC):
     def describe(self, sample: SLASample) -> str:
         """Human-readable detail line for logs and alert messages."""
         return ", ".join(f"{key} {value}" for key, value in sample.metrics.items())
+
+    def describe_check(self, check: str, sample: SLASample) -> str:
+        """
+        Detail line for one specific check's alert. Defaults to the full describe();
+        override to show only the figures relevant to that check (e.g. one tier).
+        """
+        return self.describe(sample)

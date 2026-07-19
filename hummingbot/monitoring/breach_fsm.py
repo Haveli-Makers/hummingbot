@@ -12,6 +12,15 @@ class BreachState(Enum):
     FIRING = "firing"
 
 
+def format_duration(seconds: float) -> str:
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60:02d}s"
+    return f"{seconds // 3600}h {(seconds % 3600) // 60:02d}m"
+
+
 class BreachStateMachine:
     """
     Turns a per-sample breach signal into alerts with a grace period:
@@ -59,26 +68,25 @@ class BreachStateMachine:
                     and now - self._breach_started_at >= self._grace_period_sec):
                 self._state = BreachState.FIRING
             if self._state is BreachState.FIRING:
-                broken_for = int(now - self._breach_started_at)
-                detail = f"Broken for {broken_for}s."
+                detail = f"Down for {format_duration(now - self._breach_started_at)}."
                 self._dispatcher.dispatch(Alert(
                     source=self._source,
                     check=self._check,
                     severity=self._severity,
                     title=self._title,
-                    message=f"{message} {detail}" if message else detail,
+                    message=f"{detail} {message}" if message else detail,
                     metrics=metrics or {},
                     status=AlertStatus.FIRING,
                 ))
         else:
             if self._state is BreachState.FIRING:
-                recovered_after = int(now - self._breach_started_at)
+                detail = f"Recovered after {format_duration(now - self._breach_started_at)}."
                 self._dispatcher.dispatch(Alert(
                     source=self._source,
                     check=self._check,
                     severity=self._severity,
                     title=self._title,
-                    message=f"Recovered after {recovered_after}s.",
+                    message=f"{detail} {message}" if message else detail,
                     metrics=metrics or {},
                     status=AlertStatus.RESOLVED,
                 ))

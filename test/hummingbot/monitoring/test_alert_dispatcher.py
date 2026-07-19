@@ -57,12 +57,11 @@ class AlertDispatcherTests(TestCase):
         self.assertTrue(sent)
         self.assertEqual(1, len(self.notifier.messages))
         message = self.notifier.messages[0]
-        self.assertIn("🟠", message)
-        self.assertIn("[pmm.wazirx.USDT-INR]", message)
-        self.assertIn("Depth below minimum", message)
+        self.assertIn("🟠 *Depth below minimum*", message)
+        self.assertIn("wazirx · USDT-INR (pmm)", message)
         self.assertIn("Ask depth within 1.5%", message)
-        self.assertIn("mid=102.50", message)
-        self.assertIn("bid_depth=21300", message)
+        self.assertIn("mid: 102.50", message)
+        self.assertIn("bid_depth: 21300", message)
 
     def test_critical_alert_uses_red_marker(self):
         self.dispatcher.dispatch(make_alert(severity=Severity.CRITICAL))
@@ -87,7 +86,7 @@ class AlertDispatcherTests(TestCase):
         sent = self.dispatcher.dispatch(make_alert(status=AlertStatus.RESOLVED))
 
         self.assertTrue(sent)
-        self.assertIn("✅", self.notifier.messages[-1])
+        self.assertIn("✅ *Resolved: Depth below minimum*", self.notifier.messages[-1])
         # After resolution a fresh firing alert is delivered immediately (state cleared)
         self.assertTrue(self.dispatcher.dispatch(make_alert()))
         self.assertEqual(3, len(self.notifier.messages))

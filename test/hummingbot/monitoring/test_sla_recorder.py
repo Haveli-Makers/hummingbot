@@ -25,7 +25,8 @@ class FakeDispatcher:
 def make_summary(total: int = 86400,
                  in_spec: int = 84499,
                  complete: bool = True,
-                 downtime_by_reason=None) -> DaySummary:
+                 downtime_by_reason=None,
+                 slo_in_spec=None) -> DaySummary:
     return DaySummary(
         day="2026-07-13",
         connector_name="wazirx",
@@ -34,6 +35,7 @@ def make_summary(total: int = 86400,
         in_spec_samples=in_spec,
         downtime_by_reason=downtime_by_reason if downtime_by_reason is not None
         else {DEPTH_BELOW_MIN: total - in_spec},
+        slo_in_spec=slo_in_spec or {},
         complete=complete,
     )
 
@@ -63,7 +65,7 @@ class SLARecorderTests(TestCase):
         self.assertEqual(2, len(rows))
         self.assertEqual("date", rows[0][0])
         self.assertEqual(
-            ["2026-07-13", "wazirx", "USDT-INR", "97.80", "84499", "86400", "31.7",
+            ["2026-07-13", "wazirx", "USDT-INR", "overall", "97.80", "84499", "86400", "31.7",
              DEPTH_BELOW_MIN, "yes", "yes"],
             rows[1],
         )
@@ -82,7 +84,7 @@ class SLARecorderTests(TestCase):
         self.recorder.record(make_summary(in_spec=81389))
 
         rows = self.read_rows()
-        self.assertEqual("no", rows[1][8])
+        self.assertEqual("no", rows[1][9])
         self.assertEqual(1, len(self.dispatcher.alerts))
         alert = self.dispatcher.alerts[0]
         self.assertEqual("daily_sla_breach", alert.check)
@@ -111,7 +113,7 @@ class SLARecorderTests(TestCase):
                                           downtime_by_reason={ONE_SIDE_MISSING: 500}))
 
         rows = self.read_rows()
-        self.assertEqual("no", rows[1][9])
+        self.assertEqual("no", rows[1][10])
         self.assertIn("Partial day", self.dispatcher.alerts[0].message)
 
     def test_without_dispatcher_records_csv_only(self):
@@ -128,11 +130,43 @@ class SLARecorderTests(TestCase):
         # The alert still goes out even though the CSV write failed
         self.assertEqual(1, len(self.dispatcher.alerts))
 
+    def test_multi_slo_day_writes_row_and_alert_per_tier(self):
+        from decimal import Decimal
+        recorder = SLARecorder(
+            self.config, IDENTITY, dispatcher=self.dispatcher, output_dir=self.output_dir,
+            slo_targets={"tier1": Decimal("99"), "tier2": Decimal("97")},
+        )
+        # overall 99.54% (target 96, met); tier1 99.54% (target 99, met);
+        # tier2 96.06% (target 97, BREACHED)
+        summary = make_summary(
+            total=86400, in_spec=86000,
+            downtime_by_reason={"tier2_depth_below_min": 3400},
+            slo_in_spec={"tier1": 86000, "tier2": 83000},
+        )
+
+        recorder.record(summary)
+
+        rows = self.read_rows()
+        self.assertEqual(4, len(rows))  # header + overall + tier1 + tier2
+        slo_column = [row[3] for row in rows[1:]]
+        self.assertEqual(["overall", "tier1", "tier2"], slo_column)
+        tier2_row = rows[3]
+        self.assertEqual("96.06", tier2_row[4])
+        self.assertEqual("tier2_depth_below_min", tier2_row[8])
+        self.assertEqual("no", tier2_row[9])
+
+        self.assertEqual(1, len(self.dispatcher.alerts))
+        alert = self.dispatcher.alerts[0]
+        self.assertEqual("daily_sla_breach_tier2", alert.check)
+        self.assertIn("96.06%", alert.message)
+        self.assertIn("target 97", alert.message)
+        self.assertIn("tier2_depth_below_min", alert.message)
+
     def test_downtime_uses_sample_interval(self):
         config = MonitoringConfigBase(sample_interval_sec=2.0)
         recorder = SLARecorder(config, IDENTITY, dispatcher=self.dispatcher, output_dir=self.output_dir)
         recorder.record(make_summary(total=43200, in_spec=43000))
 
         rows = self.read_rows()
-        self.assertEqual("86400", rows[1][5])   # 43200 samples * 2s
-        self.assertEqual("6.7", rows[1][6])     # 200 samples * 2s / 60
+        self.assertEqual("86400", rows[1][6])   # 43200 samples * 2s
+        self.assertEqual("6.7", rows[1][7])     # 200 samples * 2s / 60

@@ -3,7 +3,8 @@ from typing import TYPE_CHECKING, Callable, Dict, Optional, Type
 
 from hummingbot.logger import HummingbotLogger
 from hummingbot.monitoring.alert_dispatcher import AlertDispatcher
-from hummingbot.monitoring.config import MonitoringConfigBase, PMMSLAMonitorConfig
+from hummingbot.monitoring.config import MonitoringConfigBase, MultiLevelPMMSLAMonitorConfig, PMMSLAMonitorConfig
+from hummingbot.monitoring.multilevel_pmm_sampler import MultiLevelPMMSampler
 from hummingbot.monitoring.pmm_sampler import PMMDepthSampler
 from hummingbot.monitoring.sampler_base import SLASamplerBase
 from hummingbot.monitoring.sla_day_tracker import SLADayTracker
@@ -27,6 +28,7 @@ def logger() -> HummingbotLogger:
 # their config section in hummingbot.monitoring.config.MONITOR_CONFIG_SECTIONS).
 SAMPLER_FACTORIES: Dict[Type[MonitoringConfigBase], Callable[["TradingCore", MonitoringConfigBase], SLASamplerBase]] = {
     PMMSLAMonitorConfig: PMMDepthSampler,
+    MultiLevelPMMSLAMonitorConfig: MultiLevelPMMSampler,
 }
 
 
@@ -51,6 +53,7 @@ def create_sla_monitor(trading_core: "TradingCore",
         )
         return None
     day_tracker = SLADayTracker(config, identity)
-    recorder = SLARecorder(config, identity, dispatcher=dispatcher)
+    recorder = SLARecorder(config, identity, dispatcher=dispatcher,
+                           slo_targets=config.slo_targets())
     return SLAMonitor(sampler, config, dispatcher=dispatcher,
                       day_tracker=day_tracker, recorder=recorder)

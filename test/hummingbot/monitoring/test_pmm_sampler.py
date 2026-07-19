@@ -46,7 +46,7 @@ class PMMDepthSamplerTests(TestCase):
 
     def test_identity(self):
         self.assertEqual("pmm.wazirx.USDT-INR", self.sampler.identity.source)
-        self.assertEqual("wazirx_USDT-INR", self.sampler.identity.instance_id)
+        self.assertEqual("pmm_wazirx_USDT-INR", self.sampler.identity.instance_id)
 
     def test_in_spec_sample_with_metrics(self):
         self.set_orders(

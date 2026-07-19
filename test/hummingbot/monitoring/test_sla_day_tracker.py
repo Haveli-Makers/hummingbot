@@ -19,11 +19,12 @@ def ist_ts(year, month, day, hour=0, minute=0, second=0) -> float:
     return datetime(year, month, day, hour, minute, second, tzinfo=IST).timestamp()
 
 
-def sample(in_spec: bool = True, reasons=None) -> SLASample:
+def sample(in_spec: bool = True, reasons=None, slo_results=None) -> SLASample:
     return SLASample(
         in_spec=in_spec,
         reasons=list(reasons or []),
         metrics={"bid_depth": "290", "ask_depth": "298"},
+        slo_results=slo_results,
     )
 
 
@@ -61,7 +62,7 @@ class SLADayTrackerTests(TestCase):
 
     @property
     def state_path(self) -> Path:
-        return self.state_dir / "wazirx_USDT-INR_sla_state.json"
+        return self.state_dir / "pmm_wazirx_USDT-INR_sla_state.json"
 
     def test_tally_and_downtime_by_reason(self):
         tracker = self.make_tracker()
@@ -161,6 +162,37 @@ class SLADayTrackerTests(TestCase):
         self.assertEqual("USDT-INR", data["trading_pair"])
         self.assertEqual(1, data["total_samples"])
         self.assertEqual(1, data["in_spec_samples"])
+
+    def test_slo_counters_tallied_and_summarized(self):
+        tracker = self.make_tracker()
+        tracker.record(sample(in_spec=True, slo_results={"tier1": True, "tier2": True}))
+        self.clock.advance(1)
+        tracker.record(sample(in_spec=False, reasons=["tier2_depth_below_min"],
+                              slo_results={"tier1": True, "tier2": False}))
+
+        summary = tracker.summary()
+        self.assertEqual({"tier1": 2, "tier2": 1}, summary.slo_in_spec)
+        self.assertEqual(Decimal("100"), summary.slo_uptime_pct("tier1"))
+        self.assertEqual(Decimal("50"), summary.slo_uptime_pct("tier2"))
+
+    def test_slo_counters_survive_restart(self):
+        tracker = self.make_tracker()
+        tracker.record(sample(in_spec=True, slo_results={"tier1": True, "tier2": False}))
+
+        restarted = self.make_tracker()
+
+        self.assertEqual({"tier1": 1, "tier2": 0}, restarted.summary().slo_in_spec)
+
+    def test_rollover_summary_carries_slo_counters(self):
+        self.clock = FakeClock(ist_ts(2026, 7, 13, 23, 59, 59))
+        tracker = self.make_tracker()
+        tracker.record(sample(in_spec=True, slo_results={"tier1": True}))
+        self.clock.advance(2)
+
+        finished = tracker.record(sample(in_spec=True, slo_results={"tier1": True}))
+
+        self.assertEqual({"tier1": 1}, finished.slo_in_spec)
+        self.assertEqual({"tier1": 1}, tracker.summary().slo_in_spec)
 
     def test_persist_interval_throttles_writes(self):
         tracker = self.make_tracker(persist_interval=5.0)

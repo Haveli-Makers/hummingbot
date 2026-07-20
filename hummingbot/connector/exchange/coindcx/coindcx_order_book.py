@@ -59,7 +59,7 @@ class CoinDCXOrderBook(OrderBook):
 
         content = {
             "trading_pair": metadata.get("trading_pair"),
-            "update_id": msg.get("vs", 0),
+            "update_id": msg.get("vs", int(timestamp * 1000)),
             "bids": bids,
             "asks": asks
         }
@@ -88,7 +88,7 @@ class CoinDCXOrderBook(OrderBook):
 
         content = {
             "trading_pair": metadata.get("trading_pair"),
-            "update_id": msg.get("vs", 0),
+            "update_id": msg.get("vs", int(timestamp * 1000)),
             "bids": bids,
             "asks": asks
         }

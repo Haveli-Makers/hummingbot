@@ -148,7 +148,7 @@ class SymmetricGrid(ControllerBase):
         status = []
         mid_price = self.market_data_provider.get_price_by_type(
             self.config.connector_name, self.config.trading_pair, PriceType.MidPrice)
-        fair_price = self.config.reference_price if self.config.reference_price else mid_price
+        fair_price = self.config.reference_price if self.config.reference_price is not None else mid_price
 
         box_width = 114
         status.append("+" + "-" * box_width + "+")

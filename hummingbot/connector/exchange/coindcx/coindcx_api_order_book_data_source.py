@@ -218,12 +218,28 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         )
         return snapshot_msg
 
+    @staticmethod
+    def _symbol_from_coindcx_pair(pair_or_channel: str) -> str:
+        """
+        Normalize a CoinDCX pair-format string (e.g. "I-BTC_USDT") or channel name
+        (e.g. "I-BTC_USDT@orderbook@20") to its plain symbol form (e.g. "BTCUSDT").
+        """
+        pair_part = pair_or_channel.split("@", 1)[0]
+        base_quote = pair_part.split("-", 1)[-1] if "-" in pair_part else pair_part
+        return base_quote.replace("_", "")
+
     async def _parse_trade_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
         """
         Parse and enqueue a trade message from the exchange.
         """
         self.logger().debug(f"Received trade message: {raw_message}")
         pair_symbol = raw_message.get("s", "")
+        if pair_symbol and "-" in pair_symbol and "_" in pair_symbol:
+            pair_symbol = self._symbol_from_coindcx_pair(pair_symbol)
+        if not pair_symbol:
+            channel = raw_message.get("channel", "")
+            if "@trades" in channel:
+                pair_symbol = self._symbol_from_coindcx_pair(channel)
         if pair_symbol:
             trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=pair_symbol)
             trade_message = CoinDCXOrderBook.trade_message_from_exchange(
@@ -243,8 +259,7 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
             else:
                 channel = raw_message.get("channel", "")
                 if "@orderbook" in channel:
-                    pair_part = channel.split("@")[0]
-                    simple_symbol = pair_part.split("-", 1)[-1].replace("_", "") if "-" in pair_part else pair_part.replace("_", "")
+                    simple_symbol = self._symbol_from_coindcx_pair(channel)
                     trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=simple_symbol)
 
             if trading_pair:
@@ -261,6 +276,11 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
             pair_symbol = raw_message.get("s") or raw_message.get("symbol") or ""
             if pair_symbol:
                 trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=pair_symbol)
+            else:
+                channel = raw_message.get("channel", "")
+                if "@orderbook" in channel:
+                    simple_symbol = self._symbol_from_coindcx_pair(channel)
+                    trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=simple_symbol)
 
             if trading_pair:
                 snapshot_msg = CoinDCXOrderBook.snapshot_message_from_exchange(

@@ -70,6 +70,13 @@ class SymmetricGridExecutor(ExecutorBase):
         self._canceled_orders: List[str] = []
         self._close_order: Optional[TrackedOrder] = None
 
+        self._filled_orders_processed_idx = 0
+        self._buy_amount_quote_sum = Decimal("0")
+        self._sell_amount_quote_sum = Decimal("0")
+        self._fees_quote_sum = Decimal("0")
+        self._buy_amount_base_sum = Decimal("0")
+        self._sell_amount_base_sum = Decimal("0")
+
         self._level_failures: Dict[str, tuple] = {}
         self._max_level_failures = 5
         self._level_failure_cooldown = 60
@@ -120,6 +127,11 @@ class SymmetricGridExecutor(ExecutorBase):
             return self.config.fair_price
         fetcher = self._FAIR_PRICE_FETCHERS[self.config.fair_price_type]
         return fetcher(self)
+
+    @staticmethod
+    def _is_valid_fair_price(price: Decimal) -> bool:
+        """Return True when a fair price can safely be used to calculate grid levels."""
+        return price is not None and price.is_finite() and price > Decimal("0")
 
     @property
     def is_perpetual(self) -> bool:
@@ -344,11 +356,26 @@ class SymmetricGridExecutor(ExecutorBase):
             return
 
         new_fair_price = self.get_fair_price()
-        if self.fair_price == Decimal("0"):
+        if not self._is_valid_fair_price(new_fair_price):
+            self.logger().warning(
+                f"[#{self._seq()}] Ignoring invalid fair price during refresh: {new_fair_price}"
+            )
+            return
+
+        if not self._is_valid_fair_price(self.fair_price):
             self.fair_price = new_fair_price
             return
 
         price_change_pct = abs(new_fair_price - self.fair_price) / self.fair_price
+        max_refresh_price_change_pct = Decimal("0.5")
+        if price_change_pct > max_refresh_price_change_pct:
+            self.logger().warning(
+                f"[#{self._seq()}] Ignoring fair price refresh from {self.fair_price} to {new_fair_price}: "
+                f"change {float(price_change_pct) * 100:.4f}% exceeds "
+                f"{float(max_refresh_price_change_pct) * 100:.4f}% sanity limit."
+            )
+            return
+
         now = self._strategy.current_timestamp
 
         if now - self._last_price_log_timestamp >= self._price_log_interval:
@@ -403,7 +430,7 @@ class SymmetricGridExecutor(ExecutorBase):
 
     def _is_level_on_cooldown(self, level_id: str) -> bool:
         """Check if a level is in failure cooldown (including insufficient-funds cooldown)."""
-        if self._level_insufficient_funds.get(level_id, False):
+        if level_id in self._level_insufficient_funds:
             ts = self._level_insufficient_funds[level_id]
             if self._strategy.current_timestamp - ts < self._insufficient_funds_cooldown:
                 return True
@@ -689,32 +716,36 @@ class SymmetricGridExecutor(ExecutorBase):
         )
 
     def update_realized_pnl_metrics(self):
-        """Calculate realized and unrealized PnL from filled orders."""
+        """Calculate realized and unrealized PnL, summing only fills not yet accumulated."""
         if len(self._filled_orders) == 0:
             self._reset_metrics()
+            self._filled_orders_processed_idx = 0
             return
 
-        self.total_buy_quote = sum(
-            Decimal(order["executed_amount_quote"])
-            for order in self._filled_orders if order["trade_type"] == TradeType.BUY.name
-        )
-        self.total_sell_quote = sum(
-            Decimal(order["executed_amount_quote"])
-            for order in self._filled_orders if order["trade_type"] == TradeType.SELL.name
-        )
-        self.total_fees_quote = sum(
-            Decimal(order["cumulative_fee_paid_quote"])
-            for order in self._filled_orders
-        )
+        if self._filled_orders_processed_idx == 0 or self._filled_orders_processed_idx > len(self._filled_orders):
+            self._buy_amount_quote_sum = Decimal("0")
+            self._sell_amount_quote_sum = Decimal("0")
+            self._fees_quote_sum = Decimal("0")
+            self._buy_amount_base_sum = Decimal("0")
+            self._sell_amount_base_sum = Decimal("0")
+            self._filled_orders_processed_idx = 0
 
-        buy_amount_base = sum(
-            Decimal(order["executed_amount_base"])
-            for order in self._filled_orders if order["trade_type"] == TradeType.BUY.name
-        )
-        sell_amount_base = sum(
-            Decimal(order["executed_amount_base"])
-            for order in self._filled_orders if order["trade_type"] == TradeType.SELL.name
-        )
+        for order in self._filled_orders[self._filled_orders_processed_idx:]:
+            self._fees_quote_sum += Decimal(order["cumulative_fee_paid_quote"])
+            if order["trade_type"] == TradeType.BUY.name:
+                self._buy_amount_quote_sum += Decimal(order["executed_amount_quote"])
+                self._buy_amount_base_sum += Decimal(order["executed_amount_base"])
+            else:
+                self._sell_amount_quote_sum += Decimal(order["executed_amount_quote"])
+                self._sell_amount_base_sum += Decimal(order["executed_amount_base"])
+        self._filled_orders_processed_idx = len(self._filled_orders)
+
+        self.total_buy_quote = self._buy_amount_quote_sum
+        self.total_sell_quote = self._sell_amount_quote_sum
+        self.total_fees_quote = self._fees_quote_sum
+
+        buy_amount_base = self._buy_amount_base_sum
+        sell_amount_base = self._sell_amount_base_sum
 
         self.net_inventory_base = buy_amount_base - sell_amount_base
         self.net_inventory_quote = self.net_inventory_base * self.mid_price

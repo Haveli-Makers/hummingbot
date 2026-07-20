@@ -335,6 +335,36 @@ class TestSymmetricGridExecutor(IsolatedAsyncioWrapperTestCase):
 
     @patch.object(SymmetricGridExecutor, "get_trading_rules")
     @patch.object(SymmetricGridExecutor, "get_price", return_value=Decimal("100"))
+    def test_refresh_rejects_invalid_fair_price(self, _mock_price, mock_rules):
+        mock_rules.return_value = TradingRule(trading_pair="ETH-USDT", min_notional_size=Decimal("1"))
+        executor = self._make_executor(price_refresh_tolerance=Decimal("0.001"))
+        self._set_executor_running(executor)
+        executor.fair_price = Decimal("100")
+
+        for invalid_price in [Decimal("NaN"), Decimal("0"), Decimal("-1")]:
+            with patch.object(SymmetricGridExecutor, "get_fair_price", return_value=invalid_price):
+                executor.refresh_orders_on_price_change()
+
+            self.assertEqual(executor.fair_price, Decimal("100"))
+            self.strategy.cancel.assert_not_called()
+
+    @patch.object(SymmetricGridExecutor, "get_trading_rules")
+    @patch.object(SymmetricGridExecutor, "get_price", return_value=Decimal("100"))
+    def test_refresh_rejects_large_fair_price_jump(self, _mock_price, mock_rules):
+        mock_rules.return_value = TradingRule(trading_pair="ETH-USDT", min_notional_size=Decimal("1"))
+        executor = self._make_executor(price_refresh_tolerance=Decimal("0.001"))
+        self._set_executor_running(executor)
+        executor.fair_price = Decimal("100")
+        executor._last_refresh_timestamp = 0
+
+        with patch.object(SymmetricGridExecutor, "get_fair_price", return_value=Decimal("151")):
+            executor.refresh_orders_on_price_change()
+
+        self.assertEqual(executor.fair_price, Decimal("100"))
+        self.strategy.cancel.assert_not_called()
+
+    @patch.object(SymmetricGridExecutor, "get_trading_rules")
+    @patch.object(SymmetricGridExecutor, "get_price", return_value=Decimal("100"))
     def test_refresh_cooldown_prevents_rapid_refresh(self, _mock_price, mock_rules):
         mock_rules.return_value = TradingRule(trading_pair="ETH-USDT", min_notional_size=Decimal("1"))
         executor = self._make_executor(price_refresh_tolerance=Decimal("0.001"))
@@ -419,6 +449,19 @@ class TestSymmetricGridExecutor(IsolatedAsyncioWrapperTestCase):
         executor.manage_orders()
         self.assertIsNone(executor.grid_levels[0].sell_order)
         self.assertIsNotNone(executor.grid_levels[0].buy_order)
+
+    @patch.object(SymmetricGridExecutor, "get_trading_rules")
+    @patch.object(SymmetricGridExecutor, "get_price", return_value=Decimal("100"))
+    def test_insufficient_funds_cooldown_handles_zero_timestamp(self, _mock_price, mock_rules):
+        mock_rules.return_value = TradingRule(trading_pair="ETH-USDT", min_notional_size=Decimal("1"))
+        executor = self._make_executor()
+        self._set_executor_running(executor)
+        type(self.strategy).current_timestamp = PropertyMock(return_value=1)
+
+        executor._level_insufficient_funds["L0_sell"] = 0
+
+        self.assertTrue(executor._is_level_on_cooldown("L0_sell"))
+        type(self.strategy).current_timestamp = PropertyMock(return_value=1_000_000)
 
     @patch.object(SymmetricGridExecutor, "get_trading_rules")
     @patch.object(SymmetricGridExecutor, "get_price", return_value=Decimal("100"))

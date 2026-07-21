@@ -57,6 +57,7 @@ class PMMDepthSamplerTests(TestCase):
         sample = self.sampler.take_sample()
 
         self.assertTrue(sample.in_spec)
+        self.assertTrue(sample.data_available)
         self.assertEqual([], sample.reasons)
         self.assertEqual("24750", sample.metrics["bid_depth"])
         self.assertEqual("21210", sample.metrics["ask_depth"])
@@ -116,6 +117,7 @@ class PMMDepthSamplerTests(TestCase):
         sample = self.sampler.take_sample()
 
         self.assertEqual([ORDER_BOOK_STALE], sample.reasons)
+        self.assertFalse(sample.data_available)
 
     def test_describe_includes_depths_and_requirement(self):
         self.set_orders(

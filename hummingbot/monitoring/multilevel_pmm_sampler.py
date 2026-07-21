@@ -82,9 +82,11 @@ class MultiLevelPMMSampler(SLASamplerBase):
                 reasons=[ORDER_BOOK_STALE],
                 metrics={"mid": "n/a"},
                 slo_results={tier.name: False for tier in self._config.tiers},
+                data_available=False,
             )
 
         reasons = []
+        held_checks = []
         metrics = {"mid": str(mid)}
         slo_results: Dict[str, bool] = {}
         side_missing = not any(o.is_buy for o in orders) or not any(not o.is_buy for o in orders)
@@ -100,16 +102,22 @@ class MultiLevelPMMSampler(SLASamplerBase):
             slo_results[tier.name] = result.in_spec
             metrics[f"{tier.name}_bid"] = f"{result.bid_depth:.0f}"
             metrics[f"{tier.name}_ask"] = f"{result.ask_depth:.0f}"
-            # A missing side already raises the critical alert; tier alerts cover the
-            # cases where orders exist but a tier's depth requirement is not met.
-            if not result.in_spec and not side_missing:
+            if result.in_spec:
+                continue
+            # A missing side already raises the critical alert; the tier depth checks
+            # are still failing but held (not surfaced, not resolved) so they don't
+            # flip-flop as the side drops and returns. Otherwise the tier owns its alert.
+            if side_missing:
+                held_checks.append(tier_check(tier.name))
+            else:
                 reasons.append(tier_check(tier.name))
 
         return SLASample(
-            in_spec=len(reasons) == 0,
+            in_spec=len(reasons) == 0 and len(held_checks) == 0,
             reasons=reasons,
             metrics=metrics,
             slo_results=slo_results,
+            held_checks=held_checks,
         )
 
     def describe(self, sample: SLASample) -> str:

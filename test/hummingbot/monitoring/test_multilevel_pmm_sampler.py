@@ -87,15 +87,22 @@ class MultiLevelPMMSamplerTests(TestCase):
 
         self.assertFalse(sample.in_spec)
         self.assertEqual(["tier3_depth_below_min"], sample.reasons)
+        self.assertEqual([], sample.held_checks)   # both sides present -> tier owns its alert
         self.assertEqual({"tier1": True, "tier2": True, "tier3": False}, sample.slo_results)
 
-    def test_missing_side_raises_only_the_critical_reason(self):
+    def test_missing_side_raises_critical_and_holds_tier_checks(self):
         self.set_orders([make_order(TradeType.BUY, "98.75", "1.1")])
 
         sample = self.sampler.take_sample()
 
         self.assertFalse(sample.in_spec)
+        # The critical alert fires; the tier checks are failing but held, so they neither
+        # fire redundantly nor resolve while the side is missing.
         self.assertEqual([ONE_SIDE_MISSING], sample.reasons)
+        self.assertEqual(
+            ["tier1_depth_below_min", "tier2_depth_below_min", "tier3_depth_below_min"],
+            sample.held_checks,
+        )
         self.assertEqual({"tier1": False, "tier2": False, "tier3": False}, sample.slo_results)
 
     def test_disconnected_is_stale_with_all_tiers_failing(self):
@@ -105,7 +112,13 @@ class MultiLevelPMMSamplerTests(TestCase):
         sample = self.sampler.take_sample()
 
         self.assertEqual([ORDER_BOOK_STALE], sample.reasons)
+        self.assertFalse(sample.data_available)
         self.assertEqual({"tier1": False, "tier2": False, "tier3": False}, sample.slo_results)
+
+    def test_in_spec_sample_marks_data_available(self):
+        self.set_orders(three_levels())
+
+        self.assertTrue(self.sampler.take_sample().data_available)
 
     def test_describe_check_shows_only_the_failing_tier(self):
         self.set_orders(three_levels(ask_l3_amount="0.5"))

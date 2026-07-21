@@ -32,11 +32,23 @@ class SLASample:
     ``slo_results`` carries named sub-objectives (e.g. depth tiers) when the monitor
     tracks more than one uptime target; each name accrues its own daily uptime figure.
     Single-objective monitors leave it None.
+
+    ``data_available`` is False when the sampler could not actually measure the SLA
+    (e.g. the connector is disconnected and its order book is frozen). Such a sample
+    still counts as out of spec, but the engine will not read it as recovery for other
+    checks — "can't measure" must never resolve an in-progress breach.
+
+    ``held_checks`` lists checks that are still failing but intentionally not surfaced
+    this tick because a more important condition masks them (e.g. tier depth checks
+    while a whole side is missing). The engine freezes these — they neither fire a new
+    alert nor resolve an in-progress one; "masked" must never read as "recovered".
     """
     in_spec: bool
     reasons: List[str] = field(default_factory=list)   # empty when in_spec
     metrics: Dict[str, str] = field(default_factory=dict)
     slo_results: Optional[Dict[str, bool]] = None
+    data_available: bool = True
+    held_checks: Optional[List[str]] = None
 
 
 class SLASamplerBase(ABC):

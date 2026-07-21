@@ -11,6 +11,7 @@ from hummingbot.monitoring.sla_day_tracker import SLADayTracker
 from hummingbot.monitoring.sla_monitor import SLAMonitor
 
 CHECK = "one_side_missing"
+STALE = "orderbook_stale"
 
 
 class FakeSampler(SLASamplerBase):
@@ -20,7 +21,10 @@ class FakeSampler(SLASamplerBase):
 
     @property
     def check_alerts(self) -> Dict[str, Tuple[Severity, str]]:
-        return {CHECK: (Severity.CRITICAL, "One side has no standing orders")}
+        return {
+            CHECK: (Severity.CRITICAL, "One side has no standing orders"),
+            STALE: (Severity.WARNING, "Order book stale or connector disconnected"),
+        }
 
     def take_sample(self) -> SLASample:
         return self.next_sample
@@ -43,6 +47,15 @@ class SLAMonitorTests(TestCase):
 
     def breached(self) -> SLASample:
         return SLASample(in_spec=False, reasons=[CHECK], metrics={"bid_depth": "0"})
+
+    def stale(self) -> SLASample:
+        return SLASample(in_spec=False, reasons=[STALE], metrics={"bid_depth": "n/a"},
+                         data_available=False)
+
+    def masked(self) -> SLASample:
+        # data available, but CHECK is failing and held behind a dominating condition
+        return SLASample(in_spec=False, reasons=[], metrics={"bid_depth": "0"},
+                         held_checks=[CHECK])
 
     def test_uptime_tally(self):
         monitor = self.make_monitor()
@@ -77,6 +90,47 @@ class SLAMonitorTests(TestCase):
         self.assertEqual({}, monitor._fsms)
         monitor._process_sample(self.breached())
         self.assertEqual(1, monitor._samples_total)
+
+    def test_unavailable_data_does_not_resolve_an_active_breach(self):
+        dispatcher = MagicMock()
+        dispatcher.dispatch.return_value = True
+        monitor = self.make_monitor(dispatcher=dispatcher)
+
+        monitor._process_sample(self.breached())     # CHECK fires
+        dispatcher.dispatch.reset_mock()
+        monitor._process_sample(self.stale())         # connector drops mid-breach
+
+        # The stale check fires; the active CHECK breach is neither resolved nor re-fired.
+        dispatched = [call.args[0] for call in dispatcher.dispatch.call_args_list]
+        self.assertTrue(any(a.check == STALE and a.status == AlertStatus.FIRING for a in dispatched))
+        self.assertFalse(any(a.check == CHECK for a in dispatched))
+
+    def test_held_check_does_not_resolve_an_active_breach(self):
+        dispatcher = MagicMock()
+        dispatcher.dispatch.return_value = True
+        monitor = self.make_monitor(dispatcher=dispatcher)
+
+        monitor._process_sample(self.breached())      # CHECK fires
+        dispatcher.dispatch.reset_mock()
+        monitor._process_sample(self.masked())        # CHECK failing but masked/held
+
+        # Held while masked: no resolve and no re-fire for CHECK this tick.
+        self.assertEqual([], [call.args[0] for call in dispatcher.dispatch.call_args_list
+                              if call.args[0].check == CHECK])
+
+    def test_breach_resolves_only_on_a_measured_recovery(self):
+        dispatcher = MagicMock()
+        dispatcher.dispatch.return_value = True
+        monitor = self.make_monitor(dispatcher=dispatcher)
+
+        monitor._process_sample(self.breached())      # CHECK fires
+        monitor._process_sample(self.stale())         # data gone -> held, no resolve
+        dispatcher.dispatch.reset_mock()
+        monitor._process_sample(self.in_spec())       # genuine, measured recovery
+
+        resolved = [call.args[0] for call in dispatcher.dispatch.call_args_list
+                    if call.args[0].status == AlertStatus.RESOLVED]
+        self.assertTrue(any(a.check == CHECK for a in resolved))
 
     def test_reason_changes_tracked(self):
         monitor = self.make_monitor()

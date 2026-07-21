@@ -86,6 +86,7 @@ class PMMDepthSampler(SLASamplerBase):
                 "ask_depth": f"{result.ask_depth:.0f}",
                 "mid": str(result.mid_price),
             },
+            data_available=ORDER_BOOK_STALE not in result.reasons,
         )
 
     def describe(self, sample: SLASample) -> str:

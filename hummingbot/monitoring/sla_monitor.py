@@ -149,9 +149,17 @@ class SLAMonitor:
         metrics = {"session uptime": f"{self.uptime_pct:.2f}%"}
         if self._day_tracker is not None:
             metrics["day uptime"] = f"{self._day_tracker.uptime_pct:.2f}%"
+        held = set(sample.held_checks or [])
         for check, fsm in self._fsms.items():
+            breached = check in sample.reasons
+            # Freeze a non-breached check when we cannot assert it recovered: either the
+            # whole sample was unmeasurable (data_available False), or the sampler masked
+            # this check behind a dominating condition (held_checks) — e.g. tier depth
+            # checks while a side is missing. Frozen checks neither fire nor resolve.
+            if not breached and (not sample.data_available or check in held):
+                continue
             fsm.update(
-                breached=check in sample.reasons,
+                breached=breached,
                 message=f"{self._sampler.describe_check(check, sample)}.",
                 metrics=dict(metrics),
             )

@@ -1,6 +1,5 @@
 # How to Add SLA Monitoring & Alerting for a New Strategy
 
-
 ## 0. What you get for free vs. what you build
 
 The monitoring engine is strategy-agnostic. By implementing one small class you inherit
@@ -13,8 +12,8 @@ The monitoring engine is strategy-agnostic. By implementing one small class you 
 | Dedup, severity filter, 20/min rate limit | `monitoring/alert_dispatcher.py` |
 | Google Chat delivery with outage requeue | `notifier/gchat_notifier.py` |
 | Transition + heartbeat logging | `monitoring/sla_monitor.py` |
-| Per-day uptime tally, IST midnight reset, restart persistence | `monitoring/sla_day_tracker.py` |
-| Daily CSV row + `daily_sla_breach` alert | `monitoring/sla_recorder.py` |
+| Per-day uptime tally (per objective), timezone-aware reset, restart persistence | `monitoring/sla_day_tracker.py` |
+| Daily CSV rows + per-objective `daily_sla_breach` alerts | `monitoring/sla_recorder.py` |
 | Strategy lifecycle wiring (starts/stops with the strategy) | `core/trading_core.py` (untouched) |
 | ERROR-log alerts (Layer A) | already bot-wide, nothing to do |
 
@@ -25,6 +24,11 @@ The monitoring engine is strategy-agnostic. By implementing one small class you 
 
 Files you must NOT touch: `sla_monitor.py`, `breach_fsm.py`, `alert_dispatcher.py`,
 `gchat_notifier.py`, `sla_day_tracker.py`, `sla_recorder.py`, `trading_core.py`.
+
+Two in-tree reference implementations to copy from:
+- `monitoring/pmm_sampler.py` — single-objective (one band, one depth, one target).
+- `monitoring/multilevel_pmm_sampler.py` — multi-objective (tiered SLAs, per-tier
+  targets); see §7 below.
 
 ---
 
@@ -51,7 +55,8 @@ Answer these five questions first (worth a 10-minute review with a senior):
 ## 2. Step 1 — the config class (`hummingbot/monitoring/config.py`)
 
 Add a subclass of `MonitoringConfigBase` containing **only** your strategy-specific
-fields, and register its YAML section name:
+fields, and register its YAML section name. Worked example: a **Limit Chaser** monitor
+("the order must always rest within X% of the top of book on its side"):
 
 ```python
 class LimitChaserSLAMonitorConfig(MonitoringConfigBase):
@@ -64,6 +69,7 @@ class LimitChaserSLAMonitorConfig(MonitoringConfigBase):
 
 MONITOR_CONFIG_SECTIONS: Dict[str, Type[MonitoringConfigBase]] = {
     "pmm_sla_monitor": PMMSLAMonitorConfig,
+    "multilevel_pmm_sla_monitor": MultiLevelPMMSLAMonitorConfig,
     "limit_chaser_sla_monitor": LimitChaserSLAMonitorConfig,   # <-- add this line
 }
 ```
@@ -167,12 +173,12 @@ class LimitChaserSampler(SLASamplerBase):
 1. **Read-only.** Never place, cancel, or modify anything. Only read connector state.
 2. **Never trust a disconnected connector.** Copy the `network_status` guard verbatim —
    a disconnected connector serves a *frozen* local order book whose last-known prices
-   look valid. Without the guard, outages count as healthy uptime (we proved this live).
+   look valid. Without the guard, outages count as healthy uptime (proven live).
 3. **Reason codes are stable identifiers.** They key the breach FSMs, alert dedup and
    the per-reason downtime accounting in the daily CSV. Never rename casually; reuse
    `ORDER_BOOK_STALE` from `sla_sampler.py` rather than inventing a synonym.
 4. **`metrics` values are strings** — they go straight into log lines and the alert's
-   `k=v` footer. Format numbers yourself (`f"{x:.2f}"`).
+   context footer. Format numbers yourself (`f"{x:.2f}"`).
 5. **`reasons` empty ⇔ `in_spec=True`.** The engine and tracker rely on that invariant.
 6. **Don't raise from `take_sample()`** if you can classify the situation — a raised
    exception is caught by the engine but logged as a monitor error rather than scored
@@ -186,6 +192,10 @@ class LimitChaserSampler(SLASamplerBase):
    (MidPrice/BestBid/BestAsk/LastTrade), `get_order_book(pair)`, `get_balance(asset)`,
    `get_available_balance(asset)`, `network_status`.
 
+Optional hooks with sensible defaults: `describe_check(check, sample)` — the detail
+line for one specific check's alert (override to show only that check's figures, see
+the multilevel sampler); `describe(sample)` — the general log/heartbeat detail line.
+
 ---
 
 ## 4. Step 3 — register in the factory (`hummingbot/monitoring/factory.py`)
@@ -193,6 +203,7 @@ class LimitChaserSampler(SLASamplerBase):
 ```python
 SAMPLER_FACTORIES: Dict[...] = {
     PMMSLAMonitorConfig: PMMDepthSampler,
+    MultiLevelPMMSLAMonitorConfig: MultiLevelPMMSampler,
     LimitChaserSLAMonitorConfig: LimitChaserSampler,   # <-- add this line
 }
 ```
@@ -200,18 +211,14 @@ SAMPLER_FACTORIES: Dict[...] = {
 That's all the wiring. `trading_core` already calls
 `create_sla_monitor(trading_core, config, dispatcher)`, which looks up your sampler by
 config type, verifies the connector is part of the running strategy, and assembles the
-tracker + recorder + engine around it.
+tracker + recorder + engine around it. State and CSV files are automatically named
+`data/sla/<monitor_type>_<connector>_<pair>_...` from your `MonitorIdentity`, so
+monitor types can never collide.
 
-**Caveat — file naming:** state/CSV files are named
-`data/sla/<connector>_<pair>_sla_state.json` (`MonitorIdentity.instance_id`). If two
-*different* monitor types will ever run against the same connector+pair, extend
-`instance_id` to include `monitor_type` first (one-line change in `sampler_base.py`) —
-otherwise their daily accounting files would collide.
-
-**Caveat — one monitor at a time:** `load_monitoring_config` returns the *first*
+**Known limit — one monitor at a time:** `load_monitoring_config` returns the *first*
 enabled known section in `conf/monitoring.yml`. Running multiple monitors concurrently
-is a known deferred feature (the factory/registry design is ready for it; the loader
-and `trading_core.sla_monitor` field are single-instance today).
+is a designed-for but deferred feature (the factory/registry is ready; the loader and
+`trading_core.sla_monitor` field are single-instance today).
 
 ---
 
@@ -223,19 +230,17 @@ recorder already have their own suites.
 | What | Template to copy | Typical cases |
 |---|---|---|
 | Pure math (if extracted) | `test/hummingbot/monitoring/test_sla_sampler.py` | boundary inclusive/exclusive, zero/None inputs, cumulative behavior |
-| Sampler | `test/hummingbot/monitoring/test_pmm_sampler.py` | in-spec sample + metrics; each reason code; disconnected connector → stale; missing connector; price fetch raising; orders filtered by pair/side/open; `describe()` content; identity values |
+| Sampler | `test/hummingbot/monitoring/test_pmm_sampler.py` (or `test_multilevel_pmm_sampler.py`) | in-spec sample + metrics; each reason code; disconnected connector → stale; missing connector; price fetch raising; orders filtered by pair/side/open; `describe()` content; identity values |
 | Config | `test/hummingbot/monitoring/test_monitoring_config.py` | your section loads; defaults; invalid values raise |
 
-Mock pattern (from `test_pmm_sampler.py`): `MagicMock()` connector with
-`get_price_by_type.return_value`, `network_status = NetworkStatus.CONNECTED`, and
-`in_flight_orders` as a dict of `Mock` orders carrying the real attribute types
-(`Decimal` prices/amounts, `TradeType` enum).
+Mock pattern: `MagicMock()` connector with `get_price_by_type.return_value`,
+`network_status = NetworkStatus.CONNECTED`, and `in_flight_orders` as a dict of `Mock`
+orders carrying the real attribute types (`Decimal` prices/amounts, `TradeType` enum).
 
 Run everything:
 ```bash
-wsl -d ubuntu bash -c "cd /home/vinay/haveli/hummingbot && \
-  /home/vinay/miniconda3/envs/hummingbot/bin/python -m pytest test/hummingbot/monitoring/ -q && \
-  /home/vinay/miniconda3/envs/hummingbot/bin/python -m flake8 hummingbot/monitoring/"
+python -m pytest test/hummingbot/monitoring/ -q
+python -m flake8 hummingbot/monitoring/
 ```
 
 ---
@@ -254,31 +259,46 @@ limit_chaser_sla_monitor:
   required_uptime_pct: 96
   grace_period_sec: 2
   alert_warmup_sec: 10
-  day_reset_timezone: Asia/Kolkata
-  heartbeat_log_interval_sec: 60   # 300 for production
 ```
 
 Then: `export GCHAT_WEBHOOK_URL=...` → start the bot → start the strategy.
 
 ---
 
-## 7. Step 6 — verification checklist (every new monitor, before calling it done)
+## 7. Multi-objective (tiered) SLAs
+
+When one monitor must track **several uptime targets at once** (e.g. depth tiers with
+99/97/96% targets), use the multi-objective support — `monitoring/multilevel_pmm_sampler.py`
+is the complete in-tree example:
+
+- Your sampler sets `SLASample.slo_results = {"tier1": True, "tier2": False, ...}` —
+  each named objective accrues its **own daily uptime figure** in the tracker.
+- Your config overrides `slo_targets()` returning `{name: required_uptime_pct}` —
+  the recorder writes **one daily CSV row per objective** (plus "overall") and raises
+  a per-objective `daily_sla_breach_<name>` alert against each target.
+- Give each objective its own reason code (e.g. `tier2_depth_below_min`) so real-time
+  alerts, dedup and downtime attribution stay per-objective, and override
+  `describe_check` so each alert shows only its own figures.
+
+---
+
+## 8. Step 6 — verification checklist (every new monitor, before calling it done)
 
 | # | Check | Pass looks like |
 |---|---|---|
 | 1 | Startup banner | `SLA monitor started for <conn>:<pair> (<your config_summary>, target uptime 96%, alerts on).` |
-| 2 | Heartbeat | per-minute line with session uptime, your `describe()` output, and the `Day ... uptime` figure |
+| 2 | Heartbeat | periodic line with session uptime, your `describe()` output, and the `Day ... uptime` figure |
 | 3 | Each reason code, forced live | flip a config threshold (or break the condition) → `SLA OUT of spec (<reason>): ...` in the log |
 | 4 | Alert + reminder | 🟠/🔴 in Gchat ~`warmup+grace` seconds after a sustained breach; one reminder at +5 min |
-| 5 | Recovery | fix the condition → `SLA back IN spec` + ✅ `Recovered after Xs` |
+| 5 | Recovery | fix the condition → `SLA back IN spec` + ✅ `Resolved ... Recovered after Xs` |
 | 6 | Quiet startup | no alert during the first ~12s of any start |
-| 7 | Restart persistence | `stop`/`start` → `Restored SLA day state ...`, Day counter continues |
-| 8 | Outage honesty | Wi-Fi off 40s → `orderbook_stale` samples, uptime drops, queued alerts deliver after reconnect |
-| 9 | Day close | interrupted-day trick (edit the state file's `"day"` to yesterday, restart) → CSV row + breach alert if below target |
+| 7 | Restart persistence | `stop`/`start` mid-day → `Restored SLA day state...`, Day counter continues |
+| 8 | Outage honesty | disconnect the network ~40s → `orderbook_stale` samples, uptime drops, queued alerts deliver after reconnect |
+| 9 | Day close | edit the state file's `"day"` to yesterday, restart → CSV row(s) + breach alert(s) if below target |
 
 ---
 
-## 8. Quick reference — the complete diff for a new strategy
+## 9. Quick reference — the complete diff for a new strategy
 
 ```
 hummingbot/monitoring/config.py                 ~10 lines (config class + 1 registry line)
@@ -292,3 +312,9 @@ Nothing else changes. If you find yourself editing `sla_monitor.py`,
 `trading_core.py`, or the dispatcher to make a strategy work — stop; either the
 sampler contract is being misused, or you've found a genuine engine gap that should be
 its own reviewed change.
+
+---
+
+*See also: [MONITORING_USER_GUIDE.md](MONITORING_USER_GUIDE.md) for setup and daily use,
+and [MONITORING_INTERNALS.md](MONITORING_INTERNALS.md) for the framework's internals
+and design decisions.*

@@ -42,7 +42,14 @@ class WazirxExchange(WalletTransferExecutorMixin, ExchangePyBase):
     # Wallet-transfer capabilities (see WalletTransferExecutorMixin)
     supports_sub_to_master_transfer = True
     supports_master_to_sub_transfer = True
-    supports_withdrawal = False  # WazirX does not expose an external withdrawal endpoint
+    # External transfers: WazirX withdraws only to Address Book entries whitelisted out of band
+    # (there is no API to add one), so the destination is an address-book id/name, not an address.
+    supports_withdrawal = True
+    supports_deposit_address = True
+    requires_whitelisted_address = True
+    # The withdraw-history endpoint is heavily rate limited (429 / 2136) and `_wazirx_request` is
+    # not throttled, so poll withdrawal status conservatively. ERC20 settles in minutes anyway.
+    TRANSFER_STATUS_POLL_INTERVAL = 30.0
 
     def __init__(self,
                  wazirx_api_key: str,
@@ -156,6 +163,12 @@ class WazirxExchange(WalletTransferExecutorMixin, ExchangePyBase):
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
         error_msg = str(request_exception)
         return "2098" in error_msg or "out of receiving window" in error_msg.lower()
+
+    @staticmethod
+    def _is_rate_limited(exception: Exception) -> bool:
+        """True for WazirX's rate-limit error (HTTP 429 / code 2136 "Too many api request")."""
+        text = str(exception).lower()
+        return "2136" in text or "too many api request" in text or "429" in text
 
     def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
         return "Order does not exist" in str(status_update_exception)
@@ -341,6 +354,301 @@ class WazirxExchange(WalletTransferExecutorMixin, ExchangePyBase):
             params=dict(query_params),
             is_auth_required=True,
             auth=self._master_authenticator,
+        )
+
+    # ------------------------------------------------------------------
+    # External transfers (crypto leaves / enters the exchange)
+    #
+    # These use the account's OWN credentials (not the master key) and are a separate category
+    # from the sub-account/master transfers above: they settle on-chain, so they are reported as
+    # SUBMITTED and confirmed later via the withdraw-history poll.
+    # ------------------------------------------------------------------
+    async def get_coins_info(self) -> Any:
+        """GET /sapi/v1/coins - deposit/withdraw metadata per coin, including ``networkList``."""
+        return await self._wazirx_request(
+            method="GET", path=CONSTANTS.COINS_PATH_URL, is_auth_required=True,
+        )
+
+    async def get_address_book(self, coin: str, **query_params: Any) -> Any:
+        """
+        GET /sapi/v1/crypto/withdraw/address-book - the whitelisted withdrawal destinations.
+
+        Returned addresses are MASKED (e.g. ``tb1p5cyxnu*****mvzv``), so entries are selected by
+        ``id`` or ``name`` rather than by matching a full address.
+        """
+        params = {"coin": coin.lower(), **query_params}
+        return await self._wazirx_request(
+            method="GET", path=CONSTANTS.CRYPTO_WITHDRAW_ADDRESS_BOOK_PATH_URL,
+            params=params, is_auth_required=True,
+        )
+
+    async def get_withdraw_history(self, **query_params: Any) -> Any:
+        """GET /sapi/v1/crypto/withdraws - withdrawal records (filterable by ``withdrawOrderId``)."""
+        return await self._wazirx_request(
+            method="GET", path=CONSTANTS.CRYPTO_WITHDRAWS_PATH_URL,
+            params=dict(query_params), is_auth_required=True,
+        )
+
+    async def _request_deposit_address(self, asset: str, network: Optional[str] = None) -> Dict[str, Any]:
+        """GET /sapi/v1/crypto/deposits/address - the address to deposit ``asset`` INTO WazirX."""
+        if not network:
+            raise ValueError("WazirX requires a network to look up a deposit address (e.g. 'matic').")
+        return await self._wazirx_request(
+            method="GET", path=CONSTANTS.CRYPTO_DEPOSITS_ADDRESS_PATH_URL,
+            params={"coin": asset.lower(), "network": network}, is_auth_required=True,
+        )
+
+    async def _resolve_address_book_entry(self, coin: str, address_book_id: str) -> Dict[str, Any]:
+        """
+        Find the Address Book entry matching ``address_book_id`` (its numeric ``id`` or its
+        ``name``) and verify it is currently withdrawable.
+        """
+        entries = await self.get_address_book(coin)
+        if isinstance(entries, dict):
+            entries = entries.get("rows") or entries.get("data") or []
+        wanted = str(address_book_id).strip().lower()
+        match = next(
+            (
+                entry for entry in entries
+                if isinstance(entry, dict)
+                and wanted in {str(entry.get("id", "")).lower(), str(entry.get("name", "")).strip().lower()}
+            ),
+            None,
+        )
+        if match is None:
+            available = [
+                f"{e.get('id')}:{e.get('name')!r}[{(e.get('networkObj') or {}).get('network')}]"
+                for e in entries if isinstance(e, dict)
+            ]
+            raise ValueError(
+                f"No WazirX address-book entry for {coin.upper()} matching {address_book_id!r}. "
+                f"Whitelist it in the WazirX app first. Available: {available or 'none'}"
+            )
+        if match.get("disabled") is True:
+            raise ValueError(
+                f"WazirX address-book entry {match.get('id')} ({match.get('name')!r}) is disabled."
+            )
+        if match.get("isWithdrawAllowed") is False:
+            raise ValueError(
+                f"WazirX address-book entry {match.get('id')} ({match.get('name')!r}) is not yet "
+                f"withdrawable (isWithdrawAllowed=false, withdrawAllowedAfter="
+                f"{match.get('withdrawAllowedAfter')})."
+            )
+        return match
+
+    async def _get_coin_record(self, coin: str) -> Optional[Dict[str, Any]]:
+        """
+        Find the /sapi/v1/coins record for ``coin``.
+
+        Verified live: the response is a flat list and each record keys the asset as ``currency``
+        (NOT ``coin``, which the docs' sample implies). One fetch feeds the consent string, the
+        enablement flags and the amount limits — /sapi/v1/coins is rate limited (~5/min), so
+        callers should reuse the record rather than re-fetching.
+        """
+        coins = await self.get_coins_info()
+        records = coins if isinstance(coins, list) else [coins]
+        wanted = coin.lower()
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            if any(str(record.get(key, "")).lower() == wanted for key in ("currency", "coin", "symbol")):
+                return record
+        return None
+
+    @staticmethod
+    def _consent_message(network_entry: Dict[str, Any]) -> str:
+        """
+        Extract the mandatory ``withdrawConsent`` string.
+
+        Verified live as ``{"helpUrl": ..., "message": "I confirm that this withdrawal ..."}``;
+        a plain string is also accepted defensively.
+        """
+        consent = network_entry.get("withdrawConsent")
+        if isinstance(consent, dict):
+            return str(consent.get("message") or "")
+        return str(consent or "")
+
+    async def _resolve_withdraw_network(self, coin: str, network: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Pick the ``networkList`` entry to withdraw over, and verify WazirX will actually accept it.
+
+        Withdrawals are gated at two levels — the coin (``withdrawDetails.disabled``) and the
+        network (``withdrawEnable``). Both were observed disabled ("Crypto withdrawals are disabled
+        for maintenance"), so fail fast with the exchange's own wording rather than submitting a
+        request that cannot succeed.
+        """
+        record = await self._get_coin_record(coin)
+        if record is None:
+            raise ValueError(f"WazirX does not list coin {coin.upper()}.")
+
+        details = record.get("withdrawDetails") or {}
+        if details.get("disabled"):
+            message = (details.get("disabledMessage") or {}).get("description") \
+                or "Crypto withdrawals are disabled"
+            raise ValueError(f"WazirX: {message} (coin {coin.upper()}).")
+
+        networks = [n for n in (record.get("networkList") or []) if isinstance(n, dict)]
+        if not networks:
+            raise ValueError(f"WazirX lists no withdrawal networks for {coin.upper()}.")
+
+        if network:
+            entry = next(
+                (n for n in networks if str(n.get("network", "")).lower() == network.lower()), None
+            )
+            if entry is None:
+                raise ValueError(
+                    f"Unknown WazirX network {network!r} for {coin.upper()}. "
+                    f"Available: {[n.get('network') for n in networks]}"
+                )
+        else:
+            entry = next((n for n in networks if n.get("isDefault")), networks[0])
+
+        if entry.get("withdrawEnable") is False:
+            description = (entry.get("withdrawDesc") or {}).get("description") \
+                or "withdrawals are disabled on this network"
+            raise ValueError(
+                f"WazirX network {entry.get('network')!r} ({entry.get('name')}) "
+                f"for {coin.upper()}: {description}"
+            )
+        return entry
+
+    @staticmethod
+    def _validate_withdraw_amount(amount: Decimal, network_entry: Dict[str, Any], coin: str) -> None:
+        """Enforce the network's published min/max before submitting."""
+        minimum = network_entry.get("minWithdrawAmount")
+        maximum = network_entry.get("maxWithdrawAmount")
+        network = network_entry.get("network")
+        if minimum not in (None, "") and amount < Decimal(str(minimum)):
+            raise ValueError(
+                f"WazirX minimum withdrawal for {coin.upper()} on {network} is {minimum} "
+                f"(requested {amount})."
+            )
+        if maximum not in (None, "") and amount > Decimal(str(maximum)):
+            raise ValueError(
+                f"WazirX maximum withdrawal for {coin.upper()} on {network} is {maximum} "
+                f"(requested {amount})."
+            )
+
+    async def _place_withdrawal(self, transfer: WalletTransfer, **kwargs) -> TransferUpdate:
+        """
+        POST /sapi/v1/crypto/withdraw - withdraw to a whitelisted Address Book destination.
+
+        Returns SUBMITTED (not COMPLETED): the withdrawal is only accepted here, and is confirmed
+        later by ``_request_transfer_status`` polling the withdraw history.
+        """
+        coin = transfer.asset.lower()
+        entry = await self._resolve_address_book_entry(coin, transfer.address_book_id)
+        # Record what we actually resolved so the tracked transfer is self-describing.
+        transfer.address_book_id = str(entry.get("id"))
+        transfer.address = transfer.address or entry.get("address")
+
+        # An address-book entry is bound to ONE network (`networkObj`), e.g. a TRC20 address can
+        # only be paid over `trx`. Take the network from the entry rather than guessing a default,
+        # and refuse a caller-supplied network that contradicts it — sending an ERC20 withdrawal to
+        # a Tron address would lose the funds.
+        entry_network = (entry.get("networkObj") or {}).get("network")
+        if entry_network:
+            if transfer.network and transfer.network.lower() != str(entry_network).lower():
+                raise ValueError(
+                    f"WazirX address-book entry {entry.get('id')} ({entry.get('name')!r}) is bound to "
+                    f"network {entry_network!r}, but {transfer.network!r} was requested."
+                )
+            transfer.network = str(entry_network)
+
+        # One /sapi/v1/coins fetch drives enablement, the consent string and the amount limits.
+        network_entry = await self._resolve_withdraw_network(coin, transfer.network)
+        transfer.network = transfer.network or network_entry.get("network")
+        self._validate_withdraw_amount(transfer.amount, network_entry, coin)
+
+        consent = kwargs.get("withdraw_consent") or self._consent_message(network_entry)
+        if not consent:
+            raise ValueError(
+                f"WazirX did not return a withdrawConsent message for {coin.upper()} on "
+                f"{network_entry.get('network')}; refusing to submit without it."
+            )
+        params = {
+            "coin": coin,
+            "addressBookId": entry.get("id"),
+            "amount": f"{transfer.amount:f}",
+            "withdrawConsent": consent,
+            "extra": kwargs.get("extra", "hummingbot wallet transfer"),
+            "withdrawOrderId": transfer.client_transfer_id,
+        }
+        resp = await self._wazirx_request(
+            method="POST",
+            path=CONSTANTS.CRYPTO_WITHDRAW_PATH_URL,
+            params=params,
+            is_auth_required=True,
+            params_in_query=True,
+        )
+
+        withdraw_id = resp.get("id") if isinstance(resp, dict) else None
+        if withdraw_id is None:
+            raise IOError(f"WazirX rejected the withdrawal: {resp}")
+
+        return TransferUpdate(
+            client_transfer_id=transfer.client_transfer_id,
+            new_state=TransferState.SUBMITTED,
+            update_timestamp=self.current_timestamp,
+            exchange_transfer_id=str(withdraw_id),
+        )
+
+    async def _request_transfer_status(self, transfer: WalletTransfer) -> TransferUpdate:
+        """
+        Poll the withdraw history for this withdrawal and map its status.
+
+        WazirX documents ``status`` as an INT naming Success/Failed/Pending/Cancelled without
+        publishing the numeric mapping, so both the numeric and string forms are matched and
+        anything unrecognised is treated as still pending.
+
+        The withdraw-history endpoint is aggressively rate limited (429 / code 2136) and
+        ``_wazirx_request`` bypasses the throttler, so a rate-limit hit is treated as a transient
+        "still pending" rather than an error — the loop simply retries on the next (spaced) tick.
+        """
+        try:
+            history = await self.get_withdraw_history(withdrawOrderId=transfer.client_transfer_id)
+        except IOError as exception:
+            if self._is_rate_limited(exception):
+                return TransferUpdate(
+                    client_transfer_id=transfer.client_transfer_id,
+                    new_state=TransferState.SUBMITTED,
+                    update_timestamp=self.current_timestamp,
+                )
+            raise
+        rows = history if isinstance(history, list) else (history or {}).get("rows", [])
+        record = next(
+            (r for r in rows if isinstance(r, dict)
+             and str(r.get("withdrawOrderId", "")) == transfer.client_transfer_id),
+            None,
+        )
+        if record is None:
+            # Not visible yet - stay SUBMITTED; the polling loop will retry until it times out.
+            return TransferUpdate(
+                client_transfer_id=transfer.client_transfer_id,
+                new_state=TransferState.SUBMITTED,
+                update_timestamp=self.current_timestamp,
+            )
+
+        status = str(record.get("status", "")).strip().lower()
+        # Verified live: the field is `txid` (lowercase). The docs' sample showed `txId`; accept both.
+        tx_hash = record.get("txid") or record.get("txId") or record.get("txHash")
+        if status in CONSTANTS.WITHDRAW_STATUS_SUCCESS:
+            new_state = TransferState.COMPLETED
+        elif status in CONSTANTS.WITHDRAW_STATUS_FAILED:
+            new_state = TransferState.FAILED
+        else:
+            new_state = TransferState.SUBMITTED
+
+        return TransferUpdate(
+            client_transfer_id=transfer.client_transfer_id,
+            new_state=new_state,
+            update_timestamp=self.current_timestamp,
+            exchange_transfer_id=str(record.get("id")) if record.get("id") else None,
+            tx_hash=tx_hash,
+            misc_updates=(
+                {"error_message": record.get("failureInfo"), "error_type": "WithdrawalFailed"}
+                if new_state is TransferState.FAILED else None
+            ),
         )
 
     def _get_fee(self,

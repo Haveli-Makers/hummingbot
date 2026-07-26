@@ -30,8 +30,18 @@ SUB_ACCOUNT_FUND_TRANSFER_PATH_URL = "/v1/sub_account/fund_transfer"
 SUB_ACCOUNT_FUND_TRANSFER_HISTORY_PATH_URL = "/v1/sub_account/fund_transfer/history"
 SUB_ACCOUNT_ACCOUNTS_PATH_URL = "/v1/sub_account/accounts"
 # Reserved for future external withdrawal support
+# External transfers (crypto leaves / enters the exchange)
+CRYPTO_WITHDRAW_PATH_URL = "/v1/crypto/withdraw"
+CRYPTO_WITHDRAW_ADDRESS_BOOK_PATH_URL = "/v1/crypto/withdraw/address-book"
+CRYPTO_DEPOSITS_ADDRESS_PATH_URL = "/v1/crypto/deposits/address"
 CRYPTO_WITHDRAWS_PATH_URL = "/v1/crypto/withdraws"
 COINS_PATH_URL = "/v1/coins"
+
+# WazirX withdraw-history `status` is a STRING enum (the docs mislabel it INT). Verified live:
+# a completed ERC20 withdrawal returns "SUCCESS". Documented states: Success/Failed/Pending/Cancelled
+# (compared case-insensitively). Anything else (e.g. Pending) is treated as still in-flight.
+WITHDRAW_STATUS_SUCCESS = {"success", "completed"}
+WITHDRAW_STATUS_FAILED = {"failed", "failure", "cancelled", "canceled", "rejected"}
 
 WS_HEARTBEAT_TIME_INTERVAL = 30
 
@@ -70,4 +80,7 @@ RATE_LIMITS = [
     RateLimit(limit_id=SUB_ACCOUNT_ACCOUNTS_PATH_URL, limit=1, time_interval=ONE_SECOND),
     RateLimit(limit_id=CRYPTO_WITHDRAWS_PATH_URL, limit=1, time_interval=ONE_SECOND),
     RateLimit(limit_id=COINS_PATH_URL, limit=1, time_interval=ONE_SECOND),
+    RateLimit(limit_id=CRYPTO_WITHDRAW_PATH_URL, limit=1, time_interval=ONE_SECOND),
+    RateLimit(limit_id=CRYPTO_WITHDRAW_ADDRESS_BOOK_PATH_URL, limit=1, time_interval=ONE_SECOND),
+    RateLimit(limit_id=CRYPTO_DEPOSITS_ADDRESS_PATH_URL, limit=1, time_interval=ONE_SECOND),
 ]

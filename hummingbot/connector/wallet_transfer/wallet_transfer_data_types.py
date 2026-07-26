@@ -4,15 +4,41 @@ from enum import Enum
 from typing import Any, Dict, NamedTuple, Optional
 
 
+class TransferCategory(Enum):
+    """
+    The broad class of a fund movement. The two classes behave very differently, so connectors
+    implement them through separate hooks even though they share the tracking/event machinery.
+
+    INTERNAL: funds stay inside the exchange (sub <-> master, spot <-> futures). These settle
+              immediately, so they go PENDING_CREATE -> COMPLETED in one step.
+    EXTERNAL: crypto leaves or enters the exchange (withdrawal to an address, deposit from one).
+              These settle on-chain over time, so they go PENDING_CREATE -> SUBMITTED ->
+              COMPLETED/FAILED and MUST be confirmed by polling rather than trusted on submit.
+    """
+    INTERNAL = "internal"
+    EXTERNAL = "external"
+
+
 class TransferType(Enum):
     """
     The kind of fund movement a connector can perform.
 
-    New transfer kinds can be added here as more exchanges/operations are supported.
+    New transfer kinds can be added here as more exchanges/operations are supported; each one
+    belongs to exactly one :class:`TransferCategory`.
     """
     SUB_TO_MASTER = "sub_to_master"  # internal transfer from a sub-account to the master account
     MASTER_TO_SUB = "master_to_sub"  # internal transfer from the master account to a sub-account
     WITHDRAWAL = "withdrawal"  # external withdrawal to a wallet address
+
+    @property
+    def category(self) -> TransferCategory:
+        if self is TransferType.WITHDRAWAL:
+            return TransferCategory.EXTERNAL
+        return TransferCategory.INTERNAL
+
+    @property
+    def is_external(self) -> bool:
+        return self.category is TransferCategory.EXTERNAL
 
 
 class TransferState(Enum):
@@ -51,9 +77,12 @@ class WalletTransfer:
     asset: str
     amount: Decimal
     creation_timestamp: float
+    # --- internal transfers ---
     source: Optional[str] = None  # sub-account email/id for internal transfers
     destination: Optional[str] = None  # master-account email/id for internal transfers
-    address: Optional[str] = None  # external address for withdrawals
+    # --- external transfers (withdrawals) ---
+    address: Optional[str] = None  # destination address, where the exchange accepts a raw address
+    address_book_id: Optional[str] = None  # whitelisted Address Book entry id (or name), e.g. WazirX
     network: Optional[str] = None  # chain/network for withdrawals
     state: TransferState = TransferState.PENDING_CREATE
     exchange_transfer_id: Optional[str] = None
@@ -61,6 +90,10 @@ class WalletTransfer:
     last_update_timestamp: float = 0.0
     error_message: Optional[str] = None
     error_type: Optional[str] = None
+
+    @property
+    def category(self) -> TransferCategory:
+        return self.transfer_type.category
 
     @property
     def is_done(self) -> bool:

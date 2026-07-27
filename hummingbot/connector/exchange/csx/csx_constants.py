@@ -33,6 +33,14 @@ ORDER_BY_ID_PATH_URL = "/api/v1/orders"
 ME_ORDERS_PATH_URL = "/api/v1/me/orders/"
 BALANCE_V2_PATH_URL = "/api/v2/me/balance/"
 
+# External transfers (crypto leaves / enters the exchange). Signed with the account's OWN creds.
+# CSX takes a RAW address (not a whitelist id) and exposes NO withdrawal-status endpoint, so an
+# accepted request is the terminal observable state. The deposit ADDRESS comes from the profile
+# (`walletAddress`); /v2/me/deposit only VERIFIES an inbound deposit by its on-chain tx hash.
+WITHDRAWAL_PATH_URL = "/api/v1/me/withdrawal"
+INR_WITHDRAWAL_PATH_URL = "/api/v1/me/inrWithdrawal"
+DEPOSIT_VERIFY_PATH_URL = "/api/v2/me/deposit/"
+
 SIDE_BUY = "BUY"
 SIDE_SELL = "SELL"
 
@@ -110,5 +118,14 @@ RATE_LIMITS = [
                              LinkedLimitWeightPair(RAW_REQUESTS, 1)]),
     RateLimit(limit_id=BALANCE_V2_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
               linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, 5),
+                             LinkedLimitWeightPair(RAW_REQUESTS, 1)]),
+    RateLimit(limit_id=WITHDRAWAL_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, 1),
+                             LinkedLimitWeightPair(RAW_REQUESTS, 1)]),
+    RateLimit(limit_id=INR_WITHDRAWAL_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, 1),
+                             LinkedLimitWeightPair(RAW_REQUESTS, 1)]),
+    RateLimit(limit_id=DEPOSIT_VERIFY_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, 1),
                              LinkedLimitWeightPair(RAW_REQUESTS, 1)]),
 ]

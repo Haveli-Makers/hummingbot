@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -109,9 +110,14 @@ class CsxExchange(WalletTransferExecutorMixin, ExchangePyBase):
     # The connector's own (primary) profile exposes brokerID (the sub) and parentID (the master),
     # so both transfer sides can be resolved from the configured credentials — no need to prompt.
     requires_explicit_sub_account = False
-    # CSX *does* expose POST /api/v1/me/withdrawal, but external withdrawal is intentionally left
-    # unimplemented for now (kept consistent with the other connectors).
-    supports_withdrawal = False
+    # External transfers: CSX withdraws to a RAW address (POST /api/v1/me/withdrawal), so no
+    # Address Book / whitelist id is needed. It has NO withdrawal-status endpoint, so an accepted
+    # request is the terminal state.
+    supports_withdrawal = True
+    # The only API source of a deposit address is the profile's `walletAddress`, and CSX populates
+    # it with placeholders (verified live: only "btc" -> "NOTAVAILABLE123" on every account), so the
+    # lookup exists but will normally raise. Deposit addresses must come from the CSX app/website.
+    supports_deposit_address = True
 
     def __init__(
         self,
@@ -586,6 +592,120 @@ class CsxExchange(WalletTransferExecutorMixin, ExchangePyBase):
             client_transfer_id=transfer.client_transfer_id,
             new_state=TransferState.COMPLETED,
             update_timestamp=self.current_timestamp,
+        )
+
+    # ── External transfers (crypto leaves / enters the exchange) ───────────────
+    #
+    # Signed with the account's OWN (primary) creds via _api_post, so they route through the same
+    # proxy as every other CSX call. CSX takes a RAW address (no whitelist) and has no
+    # withdrawal-status endpoint, so an accepted request is treated as the terminal state.
+
+    @staticmethod
+    def _extract_request_id(message: str) -> Optional[str]:
+        """Pull the UUID out of "... Request ID: 08875d18-0ecb-...". Returns None if absent."""
+        match = re.search(r"Request ID:\s*([0-9a-fA-F-]{8,})", message or "")
+        return match.group(1).strip() if match else None
+
+    async def _place_withdrawal(self, transfer: WalletTransfer, **kwargs) -> TransferUpdate:
+        """
+        POST /api/v1/me/withdrawal - withdraw crypto to an external address.
+
+        CSX exposes NO endpoint to query a withdrawal's status afterwards, so a successful (accepted)
+        request is the terminal observable state: this returns COMPLETED with the CSX request id.
+        "COMPLETED" here means CSX ACCEPTED the request for processing, not that it has settled
+        on-chain (which CSX's API cannot report).
+
+        ``sub_address`` (memo/tag for chains that need one) may be passed via kwargs; it defaults to
+        "" but is sent because CSX marks it required.
+        """
+        if not transfer.address:
+            raise ValueError("CSX withdrawal requires a destination 'address'.")
+        if not transfer.network:
+            raise ValueError("CSX withdrawal requires a 'network' (chain), e.g. eth / trx.")
+
+        payload = {
+            "assetName": transfer.asset.upper(),
+            "chain": transfer.network,
+            "amount": float(transfer.amount),
+            "address": transfer.address,
+            "subAddress": kwargs.get("sub_address", "") or "",
+        }
+        resp = await self._api_post(
+            path_url=CONSTANTS.WITHDRAWAL_PATH_URL, data=payload, is_auth_required=True,
+        )
+
+        message = str(resp.get("message", "")) if isinstance(resp, dict) else ""
+        if "success" not in message.lower() and "processed" not in message.lower():
+            raise IOError(f"CSX rejected the withdrawal: {resp}")
+
+        request_id = self._extract_request_id(message)
+        if request_id is None and isinstance(resp, dict):
+            request_id = (resp.get("data") or {}).get("requestId")
+
+        return TransferUpdate(
+            client_transfer_id=transfer.client_transfer_id,
+            new_state=TransferState.COMPLETED,  # accepted; CSX has no post-submission status
+            update_timestamp=self.current_timestamp,
+            exchange_transfer_id=str(request_id) if request_id else None,
+        )
+
+    @staticmethod
+    def _is_placeholder_address(address: Any) -> bool:
+        """
+        CSX returns placeholder values instead of real deposit addresses (observed live: every
+        account exposes only ``btc`` with the literal address ``"NOTAVAILABLE123"``). Treat those
+        as "no address" so a caller can never mistake one for a fundable destination.
+        """
+        text = str(address or "").strip()
+        return not text or "notavailable" in text.replace(" ", "").lower()
+
+    async def _request_deposit_address(self, asset: str, network: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Return the address to deposit ``asset`` INTO CSX.
+
+        CSX has no dedicated deposit-address endpoint; the only source is the profile's
+        ``walletAddress`` list ([{"instrument": "btc", "address": ...}, ...]). In practice CSX
+        populates this with placeholders (see :meth:`_is_placeholder_address`), so this usually
+        raises — deposit addresses have to be taken from the CSX app/website instead.
+        """
+        profile = await self.get_profile(use_master=False)
+        wallets = [w for w in (profile.get("walletAddress") or []) if isinstance(w, dict)]
+        match = next(
+            (w for w in wallets if str(w.get("instrument", "")).lower() == asset.lower()), None
+        )
+        if match is None:
+            available = [w.get("instrument") for w in wallets]
+            raise ValueError(
+                f"CSX profile exposes no deposit address for {asset.upper()}. Available: "
+                f"{available or 'none'}. CSX does not serve deposit addresses over the API — "
+                f"get it from the CSX app/website."
+            )
+        if self._is_placeholder_address(match.get("address")):
+            raise ValueError(
+                f"CSX returned a placeholder deposit address for {asset.upper()} "
+                f"({match.get('address')!r}), not a real one. Get the deposit address from the "
+                f"CSX app/website; do not send funds to this value."
+            )
+        return match
+
+    async def verify_deposit(self, txn_hash: str) -> Any:
+        """GET /api/v2/me/deposit/ - verify an inbound deposit by its on-chain transaction hash."""
+        return await self._api_get(
+            path_url=CONSTANTS.DEPOSIT_VERIFY_PATH_URL,
+            params={"TxnHash": txn_hash},
+            is_auth_required=True,
+        )
+
+    async def withdraw_inr_to_bank(self, amount: Decimal, account_number: str) -> Any:
+        """
+        POST /api/v1/me/inrWithdrawal - withdraw INR to a bank account.
+
+        This is a FIAT/bank payout (no address/chain), so it does NOT go through the crypto
+        wallet-transfer tracker; it returns the raw CSX response ({"data": {"requestId": ...}}).
+        """
+        payload = {"amount": str(amount), "accountNumber": str(account_number)}
+        return await self._api_post(
+            path_url=CONSTANTS.INR_WITHDRAWAL_PATH_URL, data=payload, is_auth_required=True,
         )
 
     # ── Order placement & cancellation ────────────────────────────────────────

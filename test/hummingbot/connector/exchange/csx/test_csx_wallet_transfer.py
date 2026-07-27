@@ -213,6 +213,78 @@ class CsxWalletTransferTest(IsolatedAsyncioWrapperTestCase):
         with self.assertRaises(ValueError):
             exchange.transfer_to_master(asset="INR", amount=Decimal("20"), from_account="sub-456")
 
-    def test_withdrawal_not_supported(self):
-        with self.assertRaises(NotImplementedError):
-            self.exchange.withdraw_to_address(asset="INR", amount=Decimal("20"), address="0xabc")
+    # ── External transfers (crypto withdrawal / deposit) ───────────────────────
+
+    def _withdraw_url(self):
+        return web_utils.private_rest_url(CONSTANTS.WITHDRAWAL_PATH_URL)
+
+    @aioresponses()
+    async def test_withdrawal_accepted_completes_with_request_id(self, mock_api):
+        # CSX takes a RAW address (no whitelist) and returns the request id inside the message
+        # string; with no status endpoint, an accepted request is COMPLETED.
+        mock_api.post(self._withdraw_url(), body=json.dumps(
+            {"message": "Withdrawal request processed successfully. Request ID: 08875d18-0ecb-418c-b6d0-d3b6cd737516"}
+        ))
+        transfer = WalletTransfer(
+            client_transfer_id="wd1",
+            transfer_type=TransferType.WITHDRAWAL,
+            asset="USDT",
+            amount=Decimal("5"),
+            creation_timestamp=1700000000.0,
+            address="0xabc0000000000000000000000000000000000000",
+            network="eth",
+        )
+        update = await self.exchange._place_withdrawal(transfer)
+        self.assertEqual(TransferState.COMPLETED, update.new_state)
+        self.assertEqual("08875d18-0ecb-418c-b6d0-d3b6cd737516", update.exchange_transfer_id)
+
+    @aioresponses()
+    async def test_withdrawal_rejected_message_raises(self, mock_api):
+        mock_api.post(self._withdraw_url(), body=json.dumps({"message": "Insufficient balance"}))
+        transfer = WalletTransfer(
+            client_transfer_id="wd2", transfer_type=TransferType.WITHDRAWAL, asset="USDT",
+            amount=Decimal("5"), creation_timestamp=1700000000.0, address="0xabc", network="eth",
+        )
+        with self.assertRaises(IOError):
+            await self.exchange._place_withdrawal(transfer)
+
+    def test_withdrawal_requires_address_and_network(self):
+        # Missing address -> ValueError up front (before scheduling); raw address, no whitelist.
+        with self.assertRaises(ValueError):
+            self.exchange.withdraw_to_address(asset="USDT", amount=Decimal("5"), network="eth")
+
+    def test_csx_does_not_require_whitelisted_address(self):
+        self.assertFalse(self.exchange.requires_whitelisted_address)
+
+    @aioresponses()
+    async def test_get_deposit_address_from_profile(self, mock_api):
+        mock_api.get(self._profile_url(), body=json.dumps(
+            {"data": {"brokerID": "b1", "walletAddress": [
+                {"instrument": "btc", "address": "bc1qexample"},
+                {"instrument": "usdt", "address": "0xdeposit"}]}}))
+        result = await self.exchange.get_deposit_address(asset="USDT")
+        self.assertEqual("0xdeposit", result["address"])
+
+    @aioresponses()
+    async def test_get_deposit_address_missing_asset_raises(self, mock_api):
+        mock_api.get(self._profile_url(), body=json.dumps(
+            {"data": {"walletAddress": [{"instrument": "btc", "address": "bc1qexample"}]}}))
+        with self.assertRaises(ValueError):
+            await self.exchange.get_deposit_address(asset="ETH")
+
+    @aioresponses()
+    async def test_placeholder_deposit_address_is_rejected(self, mock_api):
+        # Verified live: CSX returns only {"instrument": "btc", "address": "NOTAVAILABLE123"} —
+        # a placeholder. It must never be handed back as if it were a fundable address.
+        mock_api.get(self._profile_url(), body=json.dumps(
+            {"data": {"brokerID": "b1", "walletAddress": [
+                {"instrument": "btc", "address": "NOTAVAILABLE123"}]}}))
+        with self.assertRaises(ValueError) as ctx:
+            await self.exchange.get_deposit_address(asset="BTC")
+        self.assertIn("placeholder", str(ctx.exception).lower())
+
+    def test_placeholder_address_detection(self):
+        for value in ("NOTAVAILABLE123", "notavailable", "", None, "  "):
+            self.assertTrue(self.exchange._is_placeholder_address(value), value)
+        for value in ("bc1qexample", "0xdeadbeef", "TJZozM6TW5kP5mx3S2cxNQX3knj2SQzgWW"):
+            self.assertFalse(self.exchange._is_placeholder_address(value), value)

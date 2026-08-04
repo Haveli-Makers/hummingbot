@@ -304,5 +304,5 @@ def main():
 
 
 if __name__ == "__main__":
-    """Run the spread_capture_standalone script standalone using python -m hummingbot.scripts.spread_capture_standalone --connector_name mexc --quote_tokens USDT --interval_sec 900 --once"""
+    """Run the spread_capture script standalone using python -m hummingbot.scripts.spread_capture --connector_name mexc --quote_tokens USDT --interval_sec 900 --once"""
     main()

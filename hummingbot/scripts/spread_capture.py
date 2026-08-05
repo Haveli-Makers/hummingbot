@@ -33,6 +33,8 @@ class SpreadCaptureConfig(BaseClientModel):
         json_schema_extra={
             "prompt": lambda mi: f"Enter the connector name ({', '.join(SUPPORTED_CONNECTORS)}): ",
             "prompt_on_new": True,
+            "input_type": "select",
+            "options": SUPPORTED_CONNECTORS,
         },
     )
     quote_token: str = Field(
@@ -111,8 +113,8 @@ class SpreadCapture:
         MarketsRecorder(
             sql=sql_manager,
             markets=[],
-            config_file_path="spread_capture_standalone",
-            strategy_name="spread_capture_standalone",
+            config_file_path="spread_capture",
+            strategy_name="spread_capture",
             market_data_collection=market_data_collection,
         )
 
@@ -267,9 +269,9 @@ def main():
 
     try:
         SpreadCapture.initialize_markets_recorder()
-        logging.getLogger("spread_capture_standalone").info("MarketsRecorder initialized; DB persistence enabled")
+        logging.getLogger("spread_capture").info("MarketsRecorder initialized; DB persistence enabled")
     except Exception as e:
-        logging.getLogger("spread_capture_standalone").exception(f"Failed to initialize MarketsRecorder: {e}")
+        logging.getLogger("spread_capture").exception(f"Failed to initialize MarketsRecorder: {e}")
 
     quote_tokens = [t.strip() for t in args.quote_tokens.split(",") if t.strip()]
 

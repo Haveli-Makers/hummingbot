@@ -118,6 +118,8 @@ async def fetch_connector_volume(connector_name: str, trading_pair: str,
         connector=connector_name,
         trading_pair=trading_pair,
         base_volume=float(candles_df["volume"].sum()),
+        # A real trading day essentially never sums to exactly 0 quote volume, so treat
+        # a 0 sum as the connector not reporting quote_asset_volume rather than a genuine reading.
         quote_volume=quote_volume_sum if quote_volume_sum else "-",
     )
 

@@ -52,6 +52,8 @@ class MonthlyVolumeConfig(BaseClientModel):
             "prompt": lambda mi: f"Enter connector names to include (comma-separated), "
                                   f"leave empty for all {len(SUPPORTED_CONNECTORS)} supported: ",
             "prompt_on_new": True,
+            "input_type": "multiselect",
+            "options": SUPPORTED_CONNECTORS,
         },
     )
     trading_pairs: str = Field(

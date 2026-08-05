@@ -270,7 +270,7 @@ def main():
 if __name__ == "__main__":
     """
     Run standalone, e.g.:
-    python -m hummingbot.scripts.monthly_volume_standalone --connectors binance,coindcx --trading-pairs BTC-USDT --months 2
-    python -m hummingbot.scripts.monthly_volume_standalone --connectors binance --trading-pairs BTC-USDT,ETH-USDT --months 3
+    python -m hummingbot.scripts.monthly_volume --connectors binance,coindcx --trading-pairs BTC-USDT --months 2
+    python -m hummingbot.scripts.monthly_volume --connectors binance --trading-pairs BTC-USDT,ETH-USDT --months 3
     """
     main()

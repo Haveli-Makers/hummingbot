@@ -23,6 +23,7 @@ from hummingbot.core.volume_oracle.sources.mexc_volume_source import MexcVolumeS
 from hummingbot.core.volume_oracle.sources.okx_volume_source import OkxVolumeSource
 from hummingbot.core.volume_oracle.sources.volume_source_base import VolumeSourceBase
 from hummingbot.core.volume_oracle.sources.wazirx_volume_source import WazirxVolumeSource
+from hummingbot.core.volume_oracle.sources.zebpay_volume_source import ZebpayVolumeSource
 from hummingbot.logger import HummingbotLogger
 
 VOLUME_ORACLE_SOURCES = {
@@ -44,6 +45,7 @@ VOLUME_ORACLE_SOURCES = {
     "mexc": MexcVolumeSource,
     "okx": OkxVolumeSource,
     "wazirx": WazirxVolumeSource,
+    "zebpay": ZebpayVolumeSource,
 }
 
 

@@ -81,6 +81,10 @@ class CsxExchangePropertiesTests(IsolatedAsyncioWrapperTestCase):
     def test_static_to_hb_order_type(self):
         self.assertEqual(OrderType.LIMIT, CsxExchange.to_hb_order_type("LIMIT"))
 
+    def test_authenticator_is_cached(self):
+        # The authenticator (and its Ed25519 key) is built once and reused.
+        self.assertIs(self.exchange.authenticator, self.exchange.authenticator)
+
 
 class CsxExchangeTradingPairTests(IsolatedAsyncioWrapperTestCase):
 
@@ -351,6 +355,65 @@ class CsxExchangeOrderTests(IsolatedAsyncioWrapperTestCase):
             with self.assertRaises(ValueError):
                 await self.exchange._request_order_status(tracked)
 
+    async def test_cumulative_fills_reported_incrementally(self):
+        # CSX reports cumulative fills per poll; they must be emitted as unique,
+        # incremental trade updates so they aren't deduped and dropped.
+        order = InFlightOrder(
+            client_order_id="x-CSX-fill", exchange_order_id="oid-1", trading_pair="BTC-INR",
+            order_type=OrderType.LIMIT, trade_type=TradeType.BUY, amount=Decimal("1.0"),
+            price=Decimal("100"), creation_timestamp=1.0,
+        )
+
+        async def poll(filled_qty, filled_quote, status):
+            resp = {"orderId": "oid-1", "status": status, "filledQuantity": filled_qty,
+                    "filledQuoteQuantity": filled_quote, "updatedAt": 1}
+            with patch.object(self.exchange, "_api_get", new_callable=AsyncMock) as mock_get:
+                mock_get.return_value = resp
+                return await self.exchange._all_trade_updates_for_order(order)
+
+        u1 = await poll("0.3", "30", "PARTIALLY_FULFILLED")
+        self.assertEqual(1, len(u1))
+        self.assertEqual(Decimal("0.3"), u1[0].fill_base_amount)
+        self.assertTrue(order.update_with_trade_update(u1[0]))
+
+        u2 = await poll("1.0", "100", "FULFILLED")
+        self.assertEqual(1, len(u2))
+        self.assertEqual(Decimal("0.7"), u2[0].fill_base_amount)  # increment, not cumulative
+        self.assertNotEqual(u1[0].trade_id, u2[0].trade_id)
+        self.assertTrue(order.update_with_trade_update(u2[0]))
+        self.assertEqual(Decimal("1.0"), order.executed_amount_base)
+
+        u3 = await poll("1.0", "100", "FULFILLED")  # repeated poll, no new fill
+        self.assertEqual([], u3)
+
+    async def test_place_order_raises_without_order_id(self):
+        # A create-order response with no orderId must raise, not return "".
+        self.exchange._username = "u"
+        with patch.object(self.exchange, "_api_post", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = {"data": {"status": "OPEN"}, "message": "missing id"}
+            with self.assertRaises(ValueError):
+                await self.exchange._place_order(
+                    order_id="xCSXtest",
+                    trading_pair="BTC-INR",
+                    amount=Decimal("0.001"),
+                    trade_type=TradeType.BUY,
+                    order_type=OrderType.LIMIT,
+                    price=Decimal("3000000"),
+                )
+
+    def test_get_fee_respects_explicit_taker(self):
+        # An explicit is_maker=False must not be clobbered to maker just because
+        # the order type is LIMIT_MAKER.
+        taker = self.exchange._get_fee(
+            "BTC", "INR", OrderType.LIMIT_MAKER, TradeType.BUY,
+            Decimal("1"), Decimal("1"), is_maker=False)
+        self.assertEqual(self.exchange.estimate_fee_pct(False), taker.percent)
+
+        inferred = self.exchange._get_fee(
+            "BTC", "INR", OrderType.LIMIT_MAKER, TradeType.BUY,
+            Decimal("1"), Decimal("1"))  # is_maker unspecified → infer maker
+        self.assertEqual(self.exchange.estimate_fee_pct(True), inferred.percent)
+
 
 class CsxExchangeUserStreamListenerTests(IsolatedAsyncioWrapperTestCase):
 
@@ -386,92 +449,6 @@ class CsxExchangeUserStreamListenerTests(IsolatedAsyncioWrapperTestCase):
             await self.exchange._user_stream_event_listener()
 
         self.assertEqual(Decimal("2.0"), self.exchange._account_balances.get("BTC"))
-
-
-class CsxExchangeReviewFixTests(IsolatedAsyncioWrapperTestCase):
-    """Regression tests for the code-review findings."""
-
-    def setUp(self):
-        super().setUp()
-        self.exchange = _make_exchange(trading_pairs=["BTC-INR"])
-        self.exchange._set_trading_pair_symbol_map(bidict({"BTC/INR": "BTC-INR"}))
-
-    def _order(self) -> InFlightOrder:
-        return InFlightOrder(
-            client_order_id="x-CSX-test",
-            exchange_order_id="oid-1",
-            trading_pair="BTC-INR",
-            order_type=OrderType.LIMIT,
-            trade_type=TradeType.BUY,
-            amount=Decimal("1.0"),
-            price=Decimal("100"),
-            creation_timestamp=1.0,
-        )
-
-    async def _trade_updates(self, order, filled_qty, filled_quote, status):
-        resp = {
-            "orderId": "oid-1",
-            "status": status,
-            "filledQuantity": filled_qty,
-            "filledQuoteQuantity": filled_quote,
-            "updatedAt": 1,
-        }
-        with patch.object(self.exchange, "_api_get", new_callable=AsyncMock) as mock_get:
-            mock_get.return_value = resp
-            return await self.exchange._all_trade_updates_for_order(order)
-
-    async def test_cumulative_fills_reported_incrementally(self):
-        # Finding #1: cumulative fills across polls must yield incremental,
-        # uniquely-keyed trade updates so they aren't deduped and dropped.
-        order = self._order()
-
-        u1 = await self._trade_updates(order, "0.3", "30", "PARTIALLY_FULFILLED")
-        self.assertEqual(1, len(u1))
-        self.assertEqual(Decimal("0.3"), u1[0].fill_base_amount)
-        self.assertTrue(order.update_with_trade_update(u1[0]))
-
-        u2 = await self._trade_updates(order, "1.0", "100", "FULFILLED")
-        self.assertEqual(1, len(u2))
-        self.assertEqual(Decimal("0.7"), u2[0].fill_base_amount)  # increment, not cumulative
-        self.assertNotEqual(u1[0].trade_id, u2[0].trade_id)
-        self.assertTrue(order.update_with_trade_update(u2[0]))
-        self.assertEqual(Decimal("1.0"), order.executed_amount_base)
-
-        # A repeated poll with no new fill produces nothing.
-        u3 = await self._trade_updates(order, "1.0", "100", "FULFILLED")
-        self.assertEqual([], u3)
-
-    async def test_place_order_raises_without_order_id(self):
-        # Finding #5: a response with no orderId must raise, not return "".
-        self.exchange._username = "u"
-        with patch.object(self.exchange, "_api_post", new_callable=AsyncMock) as mock_post:
-            mock_post.return_value = {"data": {"status": "OPEN"}, "message": "missing id"}
-            with self.assertRaises(ValueError):
-                await self.exchange._place_order(
-                    order_id="xCSXtest",
-                    trading_pair="BTC-INR",
-                    amount=Decimal("0.001"),
-                    trade_type=TradeType.BUY,
-                    order_type=OrderType.LIMIT,
-                    price=Decimal("3000000"),
-                )
-
-    def test_get_fee_respects_explicit_taker(self):
-        # Finding #3: an explicit is_maker=False must not be clobbered to maker
-        # just because the order type is LIMIT_MAKER.
-        taker = self.exchange._get_fee(
-            "BTC", "INR", OrderType.LIMIT_MAKER, TradeType.BUY,
-            Decimal("1"), Decimal("1"), is_maker=False)
-        self.assertEqual(self.exchange.estimate_fee_pct(False), taker.percent)
-
-        inferred = self.exchange._get_fee(
-            "BTC", "INR", OrderType.LIMIT_MAKER, TradeType.BUY,
-            Decimal("1"), Decimal("1"))  # is_maker unspecified → infer maker
-        self.assertEqual(self.exchange.estimate_fee_pct(True), inferred.percent)
-
-    def test_authenticator_is_cached(self):
-        # Finding #8: the authenticator (and its Ed25519 key) is built once.
-        self.assertIs(self.exchange.authenticator, self.exchange.authenticator)
 
 
 async def _async_gen(items):

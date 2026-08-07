@@ -27,7 +27,7 @@ from hummingbot.core.data_type.funding_info import FundingInfo
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.trade_fee import TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
-from hummingbot.core.utils.async_utils import safe_gather
+from hummingbot.core.utils.async_utils import safe_ensure_future, safe_gather
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
@@ -57,12 +57,14 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
     * Fees and every margin figure the API reports are in USDT even when the
       margin currency is INR, so fee tokens are always USDT.
 
-    CAVEAT for ``margin_currency == "INR"``: the collateral token becomes INR to
-    match the funded wallet, but Hummingbot's budget checker sizes collateral
-    from the contract's USDT-quoted notional. Those units differ by the INR/USDT
-    rate, so an automated strategy would UNDERSTATE the INR required. Direct
-    calls that pass an explicit amount (``_place_order``, the verify script) are
-    unaffected — the budget checker is not in that path.
+    With ``margin_currency == "INR"`` both sides of the budget check are kept in
+    USDT: the collateral token stays USDT (see ``get_buy_collateral_token``) and
+    ``_update_balances`` publishes the INR wallet's USDT equivalent rather than
+    its native amount, so required collateral and available balance are
+    commensurate. The conversion uses the public ``USDTINR`` spot ticker, which
+    can sit 1-2% away from CoinDCX's internal
+    ``settlement_currency_conversion_price``; the published buying power is
+    therefore approximate, and slightly conservative when the spot rate is high.
     """
 
     web_utils = web_utils
@@ -94,6 +96,11 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
         # Cached margin-currency -> quote-currency rate (see _margin_conversion_rate).
         self._conversion_rate: Optional[Decimal] = None
         self._conversion_rate_ts: float = 0.0
+
+        # Order events that arrived before _place_order recorded the exchange id,
+        # held as (exchange_order_id, payload, buffered_at) in arrival order.
+        self._pending_order_events: List[Tuple[str, Dict[str, Any], float]] = []
+        self._pending_order_events_task: Optional[asyncio.Task] = None
 
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
@@ -222,6 +229,16 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
 
     async def stop_network(self):
         await super().stop_network()
+
+        if self._pending_order_events_task is not None:
+            self._pending_order_events_task.cancel()
+            try:
+                await self._pending_order_events_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._pending_order_events_task = None
+        self._pending_order_events.clear()
+
         # A proxied factory owns a dedicated aiohttp session; the default factory
         # is a shared singleton and must be left alone.
         if self._proxy_url:
@@ -241,15 +258,56 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
                 or CONSTANTS.ORDER_NOT_EXIST_MESSAGE.lower() in exc.lower())
 
     def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
-        exc = str(cancelation_exception)
-        return (str(CONSTANTS.ORDER_NOT_EXIST_ERROR_CODE) in exc
-                or str(CONSTANTS.INVALID_REQUEST_ERROR_CODE) in exc
-                or CONSTANTS.ORDER_NOT_EXIST_MESSAGE.lower() in exc.lower())
+        """
+        Only treat a cancel failure as "the order is already gone".
+
+        HTTP 422 on CoinDCX is a generic validation status — it is also returned
+        for malformed params, a wrong margin currency and permission problems.
+        Treating any 422 as "already cancelled" would make the framework drop a
+        still-resting order from tracking, leaving it live and unmanaged, so a
+        422 must also carry a message that names the condition.
+        """
+        exc = str(cancelation_exception).lower()
+        if str(CONSTANTS.ORDER_NOT_EXIST_ERROR_CODE) in exc:
+            return True
+        has_hint = any(hint in exc for hint in CONSTANTS.ORDER_GONE_MESSAGE_HINTS)
+        if str(CONSTANTS.INVALID_REQUEST_ERROR_CODE) in exc:
+            return has_hint
+        return has_hint
+
+    async def _paginated_records(self, path_url: str, data: Dict[str, Any],
+                                 page_size: int = CONSTANTS.PAGE_SIZE,
+                                 max_pages: int = CONSTANTS.MAX_PAGES):
+        """
+        Page through one of the account-wide list endpoints.
+
+        None of them accepts a pair filter, so a record for the pair we care
+        about can sit well beyond the first page on a busy account. Stops on the
+        first short page (the last one) or when ``max_pages`` is reached.
+        """
+        for page in range(1, max_pages + 1):
+            payload = dict(data)
+            payload["page"] = str(page)
+            payload["size"] = str(page_size)
+            records = await self._api_post(path_url=path_url, data=payload, is_auth_required=True)
+            if not isinstance(records, list) or not records:
+                return
+            yield records
+            if len(records) < page_size:
+                return
+        self.logger().warning(
+            f"Stopped paging {path_url} after {max_pages} pages; some records may not have "
+            f"been read.")
 
     # ---- exchange info / trading rules ---------------------------------------
 
     async def _make_trading_pairs_request(self) -> Any:
-        return await self._fetch_instruments()
+        # The symbol map only needs pair/base/quote, all of which are encoded in
+        # the instrument name (B-BTC_USDT). Skipping the per-instrument detail
+        # calls matters: TradingPairFetcher builds this connector with no trading
+        # pairs at every startup, which would otherwise fan out to one request
+        # per listed instrument.
+        return await self._fetch_instrument_names()
 
     async def _make_trading_rules_request(self) -> Any:
         return await self._fetch_instruments()
@@ -274,7 +332,14 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
             wanted = {utils.hb_pair_to_coindcx_pair(tp) for tp in self._trading_pairs}
             pair_names = [p for p in pair_names if p in wanted]
 
-        results = await safe_gather(*[self._fetch_instrument(p) for p in pair_names], return_exceptions=True)
+        # One request per instrument, so bound the fan-out.
+        semaphore = asyncio.Semaphore(CONSTANTS.INSTRUMENT_FETCH_CONCURRENCY)
+
+        async def _fetch(pair_name: str):
+            async with semaphore:
+                return await self._fetch_instrument(pair_name)
+
+        results = await safe_gather(*[_fetch(p) for p in pair_names], return_exceptions=True)
         instruments: List[Dict[str, Any]] = []
         for pair_name, result in zip(pair_names, results):
             if isinstance(result, Exception) or not result:
@@ -282,6 +347,36 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
                 continue
             instruments.append(result)
             self._instruments[result.get("pair", pair_name)] = result
+        return instruments
+
+    async def _fetch_instrument_names(self) -> List[Dict[str, Any]]:
+        """
+        Minimal instrument records built from the active-instrument names alone,
+        for callers that only need the symbol map. One request, no fan-out.
+        """
+        rest_assistant = await self._web_assistants_factory.get_rest_assistant()
+        pair_names = await rest_assistant.execute_request(
+            url=web_utils.public_rest_url(CONSTANTS.ACTIVE_INSTRUMENTS_PATH_URL, domain=self._domain),
+            method=RESTMethod.GET,
+            throttler_limit_id=CONSTANTS.ACTIVE_INSTRUMENTS_PATH_URL,
+        )
+        instruments: List[Dict[str, Any]] = []
+        for pair_name in pair_names if isinstance(pair_names, list) else []:
+            base, quote = utils.split_coindcx_pair(pair_name)
+            if not (base and quote):
+                continue
+            instruments.append({
+                "pair": pair_name,
+                "underlying_currency_short_name": base,
+                "quote_currency_short_name": quote,
+                # Listed by active_instruments, so it is tradable by definition.
+                "status": "active",
+                "kind": "perpetual",
+                "is_inverse": False,
+                "exit_only": False,
+                "min_quantity": 0,
+                "max_quantity": 1,
+            })
         return instruments
 
     async def _fetch_instrument(self, coindcx_pair: str) -> Optional[Dict[str, Any]]:
@@ -431,10 +526,14 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
             data={"id": exchange_order_id},
             is_auth_required=True,
         )
+        # Only an explicit success counts. Falling back to "any non-null payload"
+        # would report a list-shaped error body as a successful cancel and drop
+        # tracking of an order still resting on the exchange.
         if isinstance(response, dict):
             code = response.get("code", response.get("status"))
-            return str(response.get("message", "")).lower() == "success" or code in (200, "200")
-        return response is not None
+            if str(response.get("message", "")).lower() == "success" or code in (200, "200"):
+                return True
+        raise IOError(f"Unexpected response cancelling order {exchange_order_id}: {response}")
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
         order_data = await self._fetch_order_by_id(tracked_order)
@@ -450,20 +549,20 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
         exchange_order_id = tracked_order.exchange_order_id
         if exchange_order_id is None:
             return None
-        orders = await self._api_post(
-            path_url=CONSTANTS.LIST_ORDERS_PATH_URL,
-            data={
-                "status": CONSTANTS.ALL_ORDER_STATUSES,
-                "side": self.coindcx_side(tracked_order.trade_type),
-                "page": "1",
-                "size": "100",
-                "margin_currency_short_name": [self._margin_currency],
-            },
-            is_auth_required=True,
-        )
-        for order in orders if isinstance(orders, list) else []:
-            if str(order.get("id")) == str(exchange_order_id):
-                return order
+
+        # The list is account-wide (no pair filter) and covers every status, so a
+        # still-open order can sit beyond the first page on a busy account. Page
+        # through rather than declaring it missing — the caller turns "not found"
+        # into an order failure.
+        base_payload = {
+            "status": CONSTANTS.ALL_ORDER_STATUSES,
+            "side": self.coindcx_side(tracked_order.trade_type),
+            "margin_currency_short_name": [self._margin_currency],
+        }
+        async for page in self._paginated_records(CONSTANTS.LIST_ORDERS_PATH_URL, base_payload):
+            for order in page:
+                if isinstance(order, dict) and str(order.get("id")) == str(exchange_order_id):
+                    return order
         return None
 
     def _order_update_from_payload(self, order: Dict[str, Any], tracked_order: InFlightOrder) -> OrderUpdate:
@@ -632,23 +731,32 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
     # ---- positions -----------------------------------------------------------
 
     async def _update_positions(self):
-        positions = await self._api_post(
-            path_url=CONSTANTS.POSITIONS_PATH_URL,
-            data={
-                "page": "1",
-                "size": "100",
-                "margin_currency_short_name": [self._margin_currency],
-            },
-            is_auth_required=True,
-        )
+        # Account-wide and paged, with no pair filter: an open position can sit
+        # beyond the first page once an account has traded many contracts.
+        payload = {"margin_currency_short_name": [self._margin_currency]}
+        reported_keys = set()
+        async for page in self._paginated_records(CONSTANTS.POSITIONS_PATH_URL, payload):
+            for position in page:
+                if isinstance(position, dict):
+                    pos_key = self._process_position_payload(position)
+                    if pos_key is not None:
+                        reported_keys.add(pos_key)
 
-        for position in positions if isinstance(positions, list) else []:
-            self._process_position_payload(position)
+        # Anything the exchange no longer reports is flat. Relying solely on an
+        # active_pos=0 row would strand a "ghost" position forever if CoinDCX
+        # simply omits a position closed outside this poll (e.g. from the web
+        # UI) instead of returning it with a zero size.
+        for pos_key in list(self._perpetual_trading.account_positions.keys()):
+            if pos_key not in reported_keys:
+                self.logger().debug(
+                    f"Position {pos_key} is no longer reported by CoinDCX; treating it as closed.")
+                self._perpetual_trading.remove_position(pos_key)
 
-    def _process_position_payload(self, position: Dict[str, Any]):
+    def _process_position_payload(self, position: Dict[str, Any]) -> Optional[str]:
+        """Returns the position key when a live position was recorded, else None."""
         coindcx_pair = position.get("pair")
         if not coindcx_pair:
-            return
+            return None
         trading_pair = utils.coindcx_pair_to_hb_pair(coindcx_pair)
 
         amount = Decimal(str(position.get("active_pos", 0) or 0))
@@ -659,7 +767,7 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
             # Flat: drop any position previously tracked for the pair. In ONEWAY
             # mode the key is the trading pair, so this covers both sides.
             self._perpetual_trading.remove_position(pos_key)
-            return
+            return None
 
         entry_price = Decimal(str(position.get("avg_price", 0) or 0))
         mark_price = Decimal(str(position.get("mark_price", 0) or 0))
@@ -675,6 +783,7 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
             amount=amount,
             leverage=leverage,
         ))
+        return pos_key
 
     async def _trading_pair_position_mode_set(self, mode: PositionMode, trading_pair: str) -> Tuple[bool, str]:
         if mode is PositionMode.ONEWAY:
@@ -727,9 +836,15 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
 
     async def build_funding_info(self, trading_pair: str) -> FundingInfo:
         prices = await self._fetch_current_prices()
-        info = prices.get(utils.hb_pair_to_coindcx_pair(trading_pair), {})
+        info = prices.get(utils.hb_pair_to_coindcx_pair(trading_pair))
+        if not info:
+            # A zero mark price would silently corrupt PnL and funding maths.
+            raise ValueError(
+                f"No entry for {trading_pair} in the CoinDCX current-prices feed.")
         mark_price = Decimal(str(info.get("mp", 0) or 0))
         last_price = Decimal(str(info.get("ls", 0) or 0))
+        if mark_price <= s_decimal_0 and last_price <= s_decimal_0:
+            raise ValueError(f"CoinDCX reported no usable price for {trading_pair}.")
         rate = Decimal(str(info.get("fr", 0) or 0))
         return FundingInfo(
             trading_pair=trading_pair,
@@ -753,21 +868,20 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
         """
         coindcx_pair = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
 
-        transactions = await self._api_post(
-            path_url=CONSTANTS.TRANSACTIONS_PATH_URL,
-            data={
-                "stage": CONSTANTS.TRANSACTION_STAGE_FUNDING,
-                "page": "1",
-                "size": "50",
-                "margin_currency_short_name": [self._margin_currency],
-            },
-            is_auth_required=True,
-        )
+        # The ledger is account-wide with no pair filter, so on a multi-pair
+        # account this pair's entries can fall outside the first page. Paging
+        # avoids silently reporting "never paid funding".
+        payload = {
+            "stage": CONSTANTS.TRANSACTION_STAGE_FUNDING,
+            "margin_currency_short_name": [self._margin_currency],
+        }
+        records: List[Dict[str, Any]] = []
+        async for page in self._paginated_records(CONSTANTS.TRANSACTIONS_PATH_URL, payload):
+            records.extend(
+                record for record in page
+                if isinstance(record, dict) and record.get("pair") == coindcx_pair
+            )
 
-        records = [
-            record for record in (transactions if isinstance(transactions, list) else [])
-            if isinstance(record, dict) and record.get("pair") == coindcx_pair
-        ]
         if not records:
             return 0, Decimal("-1"), Decimal("-1")
 
@@ -793,7 +907,10 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
         prices = await self._fetch_current_prices()
         info = prices.get(utils.hb_pair_to_coindcx_pair(trading_pair), {})
         last = info.get("ls") or info.get("mp")
-        return float(last) if last is not None else 0.0
+        if last is None:
+            # Returning 0 would feed a zero price straight into strategy maths.
+            raise ValueError(f"No price for {trading_pair} in the CoinDCX current-prices feed.")
+        return float(last)
 
     async def get_all_pairs_prices(self) -> List[Dict[str, str]]:
         """Ticker-shaped view over the public current-prices feed (rate oracle)."""
@@ -843,26 +960,108 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
         exchange_order_id = str(order.get("id", ""))
         if not exchange_order_id:
             return
-        tracked_order = next(
+        tracked_order = self._tracked_order_for(exchange_order_id)
+        if tracked_order is None:
+            self._defer_order_event(exchange_order_id, order)
+            return
+        self._apply_order_event(order, tracked_order)
+
+    def _tracked_order_for(self, exchange_order_id: str) -> Optional[InFlightOrder]:
+        return next(
             (o for o in self._order_tracker.all_updatable_orders.values()
              if o.exchange_order_id == exchange_order_id),
             None,
         )
-        if tracked_order is None:
-            return
 
-        self._order_tracker.process_order_update(self._order_update_from_payload(order, tracked_order))
+    def _apply_order_event(self, order: Dict[str, Any], tracked_order: InFlightOrder, replayed: bool = False):
+        # A replayed event is by definition older than anything already applied.
+        # ``update_with_order_update`` assigns ``current_state`` unconditionally,
+        # so applying a stale "open" over a settled order would resurrect it.
+        # Fills are always safe: they dedupe on trade id.
+        if not (replayed and tracked_order.is_done):
+            self._order_tracker.process_order_update(self._order_update_from_payload(order, tracked_order))
 
         # ``trades`` carries the fills that belong to this order update.
         for fill in order.get("trades") or []:
             if isinstance(fill, dict):
                 self._order_tracker.process_trade_update(self._trade_update_from_fill(fill, tracked_order))
 
-    def _process_balance_event(self, balance: Dict[str, Any]):
-        asset = balance.get("currency_short_name")
-        if not asset:
+    def _defer_order_event(self, exchange_order_id: str, order: Dict[str, Any]):
+        """
+        Hold an unmatched order event until its order becomes trackable.
+
+        CoinDCX assigns no client-order-id, so an order is only matchable once
+        ``_place_order`` returns and the tracker records the exchange id. A market
+        order can fill before that REST response lands, and dropping the event
+        would leave the fill to the periodic REST poll seconds later. Events are
+        only worth holding while some order is still awaiting its id — anything
+        else belongs to another session or a manual trade.
+        """
+        if not any(o.exchange_order_id is None
+                   for o in self._order_tracker.all_updatable_orders.values()):
+            self.logger().debug(
+                f"Ignoring {CONSTANTS.ORDER_UPDATE_EVENT_TYPE} for untracked order "
+                f"{exchange_order_id} (status={order.get('status')}); no order is awaiting "
+                f"an exchange id, so it is not ours.")
             return
+
+        if len(self._pending_order_events) >= CONSTANTS.MAX_PENDING_ORDER_EVENTS:
+            dropped_id = self._pending_order_events.pop(0)[0]
+            self.logger().warning(
+                f"Pending order-event buffer is full; dropped the oldest event for "
+                f"{dropped_id}. The REST poll will reconcile it.")
+
+        self._pending_order_events.append((exchange_order_id, order, time.time()))
+        if self._pending_order_events_task is None or self._pending_order_events_task.done():
+            self._pending_order_events_task = safe_ensure_future(self._replay_pending_order_events())
+
+    async def _replay_pending_order_events(self):
+        """Re-match held events until they land, expire, or the buffer drains."""
+        try:
+            while self._pending_order_events:
+                await self._sleep(CONSTANTS.PENDING_ORDER_EVENT_RETRY_INTERVAL)
+                still_pending: List[Tuple[str, Dict[str, Any], float]] = []
+                for exchange_order_id, order, buffered_at in self._pending_order_events:
+                    tracked_order = self._tracked_order_for(exchange_order_id)
+                    if tracked_order is not None:
+                        self.logger().debug(
+                            f"Replaying deferred {CONSTANTS.ORDER_UPDATE_EVENT_TYPE} for "
+                            f"{exchange_order_id} against {tracked_order.client_order_id}.")
+                        self._apply_order_event(order, tracked_order, replayed=True)
+                    elif time.time() - buffered_at < CONSTANTS.PENDING_ORDER_EVENT_TTL:
+                        still_pending.append((exchange_order_id, order, buffered_at))
+                    else:
+                        self.logger().debug(
+                            f"Deferred {CONSTANTS.ORDER_UPDATE_EVENT_TYPE} for {exchange_order_id} "
+                            f"expired unmatched; leaving it to the REST poll.")
+                self._pending_order_events = still_pending
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.logger().exception("Unexpected error replaying deferred order events.")
+
+    def _process_balance_event(self, balance: Dict[str, Any]):
+        """
+        Apply a websocket balance frame using the same rules as ``_update_balances``:
+        only the configured margin wallet counts, and it is published in the quote
+        currency. Writing the raw wallet row instead would add a bogus native-currency
+        balance and leave the quote-denominated figure — the one the budget checker
+        reads — stale.
+        """
+        asset = balance.get("currency_short_name")
+        if asset != self._margin_currency:
+            return
+
+        rate = self._conversion_rate if self._margin_currency != CONSTANTS.QUOTE_CURRENCY else Decimal("1")
+        if not rate or rate <= s_decimal_0:
+            # No cached rate yet: leave the REST-polled figure rather than
+            # publishing an unconverted one.
+            self.logger().debug(
+                f"Skipping {self._margin_currency} balance frame: no "
+                f"{CONSTANTS.QUOTE_CURRENCY} conversion rate cached yet.")
+            return
+
         available = Decimal(str(balance.get("balance", 0) or 0))
         locked = Decimal(str(balance.get("locked_balance", 0) or 0))
-        self._account_available_balances[asset] = available
-        self._account_balances[asset] = available + locked
+        self._account_available_balances[CONSTANTS.QUOTE_CURRENCY] = available / rate
+        self._account_balances[CONSTANTS.QUOTE_CURRENCY] = (available + locked) / rate

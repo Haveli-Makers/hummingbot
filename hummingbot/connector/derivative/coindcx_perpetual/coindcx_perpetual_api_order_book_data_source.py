@@ -216,7 +216,12 @@ class CoinDCXPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
             return
         try:
             trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=coindcx_pair)
-        except Exception:
+        except Exception as exception:
+            # Usually the symbol map is still loading at start-up. Swallowing this
+            # silently would drop every trade for the pair with no trace, making a
+            # stale last-traded price impossible to diagnose.
+            self.logger().warning(
+                f"Dropping trade for unknown CoinDCX symbol {coindcx_pair}: {exception}")
             return
         message_queue.put_nowait(CoinDCXPerpetualOrderBook.trade_message_from_exchange(
             raw_message, metadata={"trading_pair": trading_pair}))

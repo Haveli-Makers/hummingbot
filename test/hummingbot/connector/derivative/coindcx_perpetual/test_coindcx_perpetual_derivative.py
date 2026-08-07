@@ -1,4 +1,5 @@
 import asyncio
+import time
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from unittest.mock import AsyncMock
@@ -738,6 +739,437 @@ class CoindcxPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
         ex._api_post = AsyncMock(side_effect=fake_post)
         await ex._fetch_last_fee_payment(self.trading_pair)
         self.assertEqual(["INR"], captured["margin_currency_short_name"])
+
+    # ---- pagination (list endpoints are account-wide, no pair filter) ----------
+
+    @staticmethod
+    def _pages(*pages):
+        """Serve successive pages to _api_post, keyed on the requested page."""
+        async def _post(path_url, data, is_auth_required):
+            index = int(data.get("page", 1)) - 1
+            return pages[index] if index < len(pages) else []
+        return _post
+
+    async def test_order_lookup_pages_past_the_first_page(self):
+        """A resting order beyond page 1 must not be reported as missing —
+        the caller turns 'not found' into an order failure."""
+        self._bootstrap()
+        page1 = [{"id": f"other-{i}", "status": "filled"} for i in range(CONSTANTS.PAGE_SIZE)]
+        page2 = [{"id": "ex-1", "status": "open", "updated_at": 1700000001000}]
+        self.exchange._api_post = AsyncMock(side_effect=self._pages(page1, page2))
+
+        found = await self.exchange._fetch_order_by_id(self._order())
+        self.assertIsNotNone(found, "order on page 2 was not found")
+        self.assertEqual("ex-1", found["id"])
+
+    async def test_order_lookup_stops_on_a_short_page(self):
+        self._bootstrap()
+        calls = []
+
+        async def _post(path_url, data, is_auth_required):
+            calls.append(data["page"])
+            return [{"id": "other", "status": "filled"}]  # short page -> last
+
+        self.exchange._api_post = AsyncMock(side_effect=_post)
+        self.assertIsNone(await self.exchange._fetch_order_by_id(self._order()))
+        self.assertEqual(["1"], calls, "should not keep paging past a short page")
+
+    async def test_positions_are_paged(self):
+        self._bootstrap()
+        page1 = [{"pair": f"B-X{i}_USDT", "active_pos": 0} for i in range(CONSTANTS.PAGE_SIZE)]
+        page2 = [{"pair": "B-BTC_USDT", "active_pos": 0.5, "avg_price": 60000.0,
+                  "mark_price": 61000.0, "leverage": 10.0}]
+        self.exchange._api_post = AsyncMock(side_effect=self._pages(page1, page2))
+
+        await self.exchange._update_positions()
+        self.assertIn(self.trading_pair, self.exchange.account_positions,
+                      "position on page 2 was missed")
+
+    async def test_funding_ledger_is_paged(self):
+        self._bootstrap()
+        page1 = [{"pair": "B-ETH_USDT", "amount": 1.0, "created_at": 1}
+                 for _ in range(CONSTANTS.PAGE_SIZE)]
+        page2 = [{"pair": "B-BTC_USDT", "amount": -0.25, "created_at": 1728462694499}]
+        self.exchange._api_post = AsyncMock(side_effect=self._pages(page1, page2))
+        self.exchange._fetch_current_prices = AsyncMock(return_value={"B-BTC_USDT": {"fr": 0.0001}})
+
+        timestamp, rate, payment = await self.exchange._fetch_last_fee_payment(self.trading_pair)
+        self.assertEqual(Decimal("-0.25"), payment, "funding entry on page 2 was missed")
+        self.assertEqual(1728462694.499, timestamp)
+
+    async def test_paging_is_capped(self):
+        self._bootstrap()
+        calls = []
+
+        async def _post(path_url, data, is_auth_required):
+            calls.append(data["page"])
+            return [{"id": "x"} for _ in range(CONSTANTS.PAGE_SIZE)]  # always full
+
+        self.exchange._api_post = AsyncMock(side_effect=_post)
+        await self.exchange._fetch_order_by_id(self._order())
+        self.assertEqual(CONSTANTS.MAX_PAGES, len(calls), "paging must be bounded")
+
+    # ---- start-up fan-out -----------------------------------------------------
+
+    async def test_symbol_map_request_makes_a_single_call(self):
+        """TradingPairFetcher builds this connector with no trading pairs at every
+        startup; the symbol map must not fan out to one request per instrument."""
+        calls = []
+
+        async def _execute(url, method, throttler_limit_id, **kwargs):
+            calls.append(url)
+            return ["B-BTC_USDT", "B-ETH_USDT", "B-SOL_USDT"]
+
+        assistant = AsyncMock()
+        assistant.execute_request = AsyncMock(side_effect=_execute)
+        self.exchange._web_assistants_factory.get_rest_assistant = AsyncMock(return_value=assistant)
+
+        instruments = await self.exchange._make_trading_pairs_request()
+        self.assertEqual(1, len(calls), "symbol map must cost exactly one request")
+        self.assertEqual(3, len(instruments))
+
+        self.exchange._initialize_trading_pair_symbols_from_exchange_info(instruments)
+        self.assertEqual(
+            "BTC-USDT",
+            await self.exchange.trading_pair_associated_to_exchange_symbol(symbol="B-BTC_USDT"))
+
+    async def test_instrument_detail_fetches_are_concurrency_capped(self):
+        in_flight = 0
+        peak = 0
+
+        async def _fetch(pair):
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0)
+            in_flight -= 1
+            return {**INSTRUMENT, "pair": pair}
+
+        names = [f"B-X{i}_USDT" for i in range(60)]
+        assistant = AsyncMock()
+        assistant.execute_request = AsyncMock(return_value=names)
+        self.exchange._web_assistants_factory.get_rest_assistant = AsyncMock(return_value=assistant)
+        self.exchange._trading_pairs = []
+        self.exchange._fetch_instrument = _fetch
+
+        await self.exchange._fetch_instruments()
+        self.assertLessEqual(peak, CONSTANTS.INSTRUMENT_FETCH_CONCURRENCY,
+                             f"fan-out peaked at {peak} concurrent requests")
+
+    # ---- error classification / cancel safety ---------------------------------
+
+    def test_generic_422_is_not_treated_as_order_gone(self):
+        """422 is a generic validation status on CoinDCX. Misreading it as
+        'already cancelled' drops a still-live order from tracking."""
+        for message in ("HTTP status is 422. Error: invalid margin_currency_short_name",
+                        "HTTP status is 422. Error: permission denied",
+                        "HTTP status is 422. Error: malformed parameter"):
+            self.assertFalse(
+                self.exchange._is_order_not_found_during_cancelation_error(IOError(message)),
+                f"must not classify as order-gone: {message}")
+
+    def test_422_with_an_order_gone_message_is_recognised(self):
+        for message in ("HTTP status is 422. Error: Order not found",
+                        "HTTP status is 422. Error: order already cancelled",
+                        "HTTP status is 404. Error: whatever"):
+            self.assertTrue(
+                self.exchange._is_order_not_found_during_cancelation_error(IOError(message)),
+                f"should classify as order-gone: {message}")
+
+    async def test_cancel_rejects_a_non_dict_response(self):
+        # A list-shaped error body must not read as a successful cancel.
+        self.exchange._api_post = AsyncMock(return_value=[{"message": "invalid request"}])
+        with self.assertRaises(IOError):
+            await self.exchange._place_cancel("haveli-1", self._order())
+
+    async def test_cancel_rejects_a_dict_without_success(self):
+        self.exchange._api_post = AsyncMock(return_value={"message": "something else", "code": 422})
+        with self.assertRaises(IOError):
+            await self.exchange._place_cancel("haveli-1", self._order())
+
+    # ---- missing price data ---------------------------------------------------
+
+    async def test_missing_price_raises_instead_of_returning_zero(self):
+        self._bootstrap()
+        self.exchange._fetch_current_prices = AsyncMock(return_value={})
+        with self.assertRaises(ValueError):
+            await self.exchange._get_last_traded_price(self.trading_pair)
+        with self.assertRaises(ValueError):
+            await self.exchange.build_funding_info(self.trading_pair)
+
+    async def test_funding_info_raises_when_prices_are_zero(self):
+        self._bootstrap()
+        self.exchange._fetch_current_prices = AsyncMock(
+            return_value={"B-BTC_USDT": {"mp": 0, "ls": 0, "fr": 0.0001}})
+        with self.assertRaises(ValueError):
+            await self.exchange.build_funding_info(self.trading_pair)
+
+    # ---- websocket balance frames ---------------------------------------------
+
+    def test_ws_balance_frame_is_converted_like_the_rest_poll(self):
+        """A raw write would add a bogus INR row and leave the USDT figure —
+        the one the budget checker reads — stale."""
+        inr = self._inr_exchange()
+        inr._conversion_rate = Decimal("100.0")
+        inr._process_balance_event(
+            {"currency_short_name": "INR", "balance": "500.0", "locked_balance": "100.0"})
+
+        self.assertNotIn("INR", inr._account_balances)
+        self.assertEqual(Decimal("5"), inr._account_available_balances["USDT"])
+        self.assertEqual(Decimal("6"), inr._account_balances["USDT"])
+
+    def test_ws_balance_frame_for_another_wallet_is_ignored(self):
+        inr = self._inr_exchange()
+        inr._conversion_rate = Decimal("100.0")
+        inr._process_balance_event({"currency_short_name": "USDT", "balance": "7.0"})
+        self.assertNotIn("USDT", inr._account_balances)
+
+    def test_ws_balance_frame_skipped_without_a_cached_rate(self):
+        inr = self._inr_exchange()
+        inr._account_available_balances["USDT"] = Decimal("9.5")
+        inr._conversion_rate = None
+        inr._process_balance_event({"currency_short_name": "INR", "balance": "500.0"})
+        self.assertEqual(Decimal("9.5"), inr._account_available_balances["USDT"])
+
+    def test_usdt_margin_ws_balance_frame_applies_directly(self):
+        self.exchange._process_balance_event(
+            {"currency_short_name": "USDT", "balance": "10.0", "locked_balance": "2.0"})
+        self.assertEqual(Decimal("10"), self.exchange._account_available_balances["USDT"])
+        self.assertEqual(Decimal("12"), self.exchange._account_balances["USDT"])
+
+    # ---- wire format (shapes confirmed against the live API) --------------------
+    #
+    # CoinDCX rejects the wrong type outright: a bare string for
+    # margin_currency_short_name 500s on every filter endpoint, and a list for
+    # `status` 422s. These pin the shapes so a tidy-up refactor cannot undo them.
+
+    async def _capture_post(self, coroutine, response=None):
+        """Run a coroutine and return the payloads it sent to _api_post."""
+        sent = []
+
+        async def _post(path_url, data, is_auth_required=False, **kwargs):
+            sent.append(data)
+            return response if response is not None else []
+
+        self.exchange._api_post = AsyncMock(side_effect=_post)
+        await coroutine()
+        return sent
+
+    async def test_filter_endpoints_send_margin_currency_as_a_list(self):
+        self._bootstrap()
+
+        sent = await self._capture_post(lambda: self.exchange._update_positions())
+        self.assertEqual([self.exchange.margin_currency],
+                         sent[0]["margin_currency_short_name"],
+                         "positions requires a list; a string returns HTTP 500")
+
+        sent = await self._capture_post(
+            lambda: self.exchange._fetch_order_by_id(self._order()))
+        self.assertEqual([self.exchange.margin_currency],
+                         sent[0]["margin_currency_short_name"],
+                         "list orders requires a list; a string returns HTTP 500")
+
+        self.exchange._fetch_current_prices = AsyncMock(return_value={})
+        sent = await self._capture_post(
+            lambda: self.exchange._fetch_last_fee_payment(self.trading_pair))
+        self.assertEqual([self.exchange.margin_currency],
+                         sent[0]["margin_currency_short_name"],
+                         "transactions requires a list; a string returns HTTP 500")
+
+    async def test_list_orders_sends_status_as_a_comma_string(self):
+        self._bootstrap()
+        sent = await self._capture_post(
+            lambda: self.exchange._fetch_order_by_id(self._order()))
+        status = sent[0]["status"]
+        self.assertIsInstance(status, str, "a list of statuses returns HTTP 422")
+        self.assertIn(",", status)
+
+    async def test_action_endpoints_send_margin_currency_as_a_string(self):
+        self._bootstrap()
+
+        sent = await self._capture_post(
+            lambda: self.exchange._set_trading_pair_leverage(self.trading_pair, 10),
+            response={"message": "success"})
+        self.assertEqual(self.exchange.margin_currency, sent[0]["margin_currency_short_name"])
+
+        sent = await self._capture_post(
+            lambda: self.exchange._place_order(
+                order_id="haveli-1", trading_pair=self.trading_pair, amount=Decimal("0.01"),
+                trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("60000"),
+                position_action=PositionAction.OPEN),
+            response=[{"id": "ex-1", "created_at": 1700000000000}])
+        self.assertEqual(self.exchange.margin_currency,
+                         sent[0]["order"]["margin_currency_short_name"])
+
+    # ---- order events racing _place_order --------------------------------------
+
+    def _track(self, client_order_id="haveli-1", exchange_order_id=None):
+        """Track an order the way _create_order does: exchange id not yet known."""
+        self.exchange.start_tracking_order(
+            order_id=client_order_id,
+            exchange_order_id=exchange_order_id,
+            trading_pair=self.trading_pair,
+            trade_type=TradeType.BUY,
+            price=Decimal("60000"),
+            amount=Decimal("0.01"),
+            order_type=OrderType.LIMIT,
+            leverage=10,
+            position=PositionAction.OPEN,
+        )
+        return self.exchange._order_tracker.active_orders[client_order_id]
+
+    @staticmethod
+    def _fill_event(exchange_order_id="ex-1", status="filled"):
+        return {
+            "id": exchange_order_id,
+            "status": status,
+            "updated_at": 1700000001000,
+            "trades": [{
+                "fill_id": "f-1", "id": exchange_order_id, "pair": "B-BTC_USDT",
+                "price": "60000", "quantity": "0.01", "fee_amount": "0.35",
+                "timestamp": 1700000001000,
+            }],
+        }
+
+    async def test_fill_arriving_before_the_exchange_id_is_replayed(self):
+        """A market order can fill before the REST create response lands. The
+        event must be held and replayed, not dropped to the slow REST poll."""
+        self._bootstrap()
+        order = self._track()  # exchange_order_id is still None
+        self.exchange._process_order_event(self._fill_event())
+
+        self.assertEqual(1, len(self.exchange._pending_order_events), "event was not deferred")
+        self.assertEqual(Decimal("0"), order.executed_amount_base)
+
+        # _place_order returns and the tracker records the id.
+        order.update_exchange_order_id("ex-1")
+        await self.exchange._replay_pending_order_events()
+
+        self.assertEqual(0, len(self.exchange._pending_order_events))
+        self.assertEqual(Decimal("0.01"), order.executed_amount_base,
+                         "replayed fill was not applied")
+
+    async def test_deferred_events_replay_in_arrival_order(self):
+        self._bootstrap()
+        order = self._track()
+        self.exchange._process_order_event(
+            {"id": "ex-1", "status": "open", "updated_at": 1700000000000})
+        self.exchange._process_order_event(self._fill_event())
+        self.assertEqual(2, len(self.exchange._pending_order_events))
+
+        order.update_exchange_order_id("ex-1")
+        await self.exchange._replay_pending_order_events()
+        self.assertEqual(Decimal("0.01"), order.executed_amount_base)
+
+    async def test_replayed_event_cannot_resurrect_a_settled_order(self):
+        """update_with_order_update assigns current_state unconditionally, so a
+        stale 'open' replayed over a finished order would reopen it."""
+        self._bootstrap()
+        order = self._track()
+        self.exchange._process_order_event(
+            {"id": "ex-1", "status": "open", "updated_at": 1700000000000})
+
+        order.update_exchange_order_id("ex-1")
+        order.current_state = OrderState.CANCELED
+        await self.exchange._replay_pending_order_events()
+
+        self.assertEqual(OrderState.CANCELED, order.current_state,
+                         "a stale replayed event reopened a settled order")
+
+    def test_event_is_not_buffered_when_no_order_awaits_an_exchange_id(self):
+        """Someone else's order (or a manual trade) must not accumulate."""
+        self._bootstrap()
+        self._track(exchange_order_id="ex-known")
+        self.exchange._process_order_event(self._fill_event(exchange_order_id="ex-other"))
+        self.assertEqual(0, len(self.exchange._pending_order_events))
+
+    def test_matched_events_still_apply_directly(self):
+        self._bootstrap()
+        order = self._track(exchange_order_id="ex-1")
+        self.exchange._process_order_event(self._fill_event())
+        self.assertEqual(0, len(self.exchange._pending_order_events),
+                         "a matchable event must not be deferred")
+        self.assertEqual(Decimal("0.01"), order.executed_amount_base)
+
+    async def test_deferred_events_expire_and_do_not_leak(self):
+        self._bootstrap()
+        self._track()
+        self.exchange._process_order_event(self._fill_event())
+        self.assertEqual(1, len(self.exchange._pending_order_events))
+
+        # Backdate past the TTL; the order never gets its id.
+        exchange_order_id, payload, _ = self.exchange._pending_order_events[0]
+        self.exchange._pending_order_events = [
+            (exchange_order_id, payload, time.time() - CONSTANTS.PENDING_ORDER_EVENT_TTL - 1)]
+        await self.exchange._replay_pending_order_events()
+        self.assertEqual(0, len(self.exchange._pending_order_events), "buffer leaked")
+
+    def test_pending_buffer_is_bounded(self):
+        self._bootstrap()
+        self._track()
+        for index in range(CONSTANTS.MAX_PENDING_ORDER_EVENTS + 25):
+            self.exchange._process_order_event(self._fill_event(exchange_order_id=f"ex-{index}"))
+        self.assertEqual(CONSTANTS.MAX_PENDING_ORDER_EVENTS,
+                         len(self.exchange._pending_order_events))
+
+    async def test_stop_network_clears_the_pending_buffer(self):
+        self._bootstrap()
+        self._track()
+        self.exchange._process_order_event(self._fill_event())
+        self.assertEqual(1, len(self.exchange._pending_order_events))
+
+        await asyncio.sleep(0)  # let the replay task actually start
+        await self.exchange.stop_network()
+        self.assertEqual(0, len(self.exchange._pending_order_events))
+        self.assertIsNone(self.exchange._pending_order_events_task)
+
+    # ---- positions closed outside the poll -------------------------------------
+
+    async def test_position_absent_from_the_response_is_closed(self):
+        """CoinDCX may omit a closed position rather than return active_pos=0
+        (e.g. closed from the web UI), which would strand a ghost position."""
+        self._bootstrap()
+        self.exchange._api_post = AsyncMock(return_value=[
+            {"pair": "B-BTC_USDT", "active_pos": 0.5, "avg_price": 60000.0,
+             "mark_price": 61000.0, "leverage": 10.0}])
+        await self.exchange._update_positions()
+        self.assertEqual(1, len(self.exchange.account_positions))
+
+        # Position closed externally; CoinDCX now simply omits it.
+        self.exchange._api_post = AsyncMock(return_value=[])
+        await self.exchange._update_positions()
+        self.assertEqual(0, len(self.exchange.account_positions),
+                         "ghost position survived the poll")
+
+    async def test_explicit_zero_size_still_closes_a_position(self):
+        self._bootstrap()
+        self.exchange._api_post = AsyncMock(return_value=[
+            {"pair": "B-BTC_USDT", "active_pos": 0.5, "avg_price": 60000.0,
+             "mark_price": 61000.0, "leverage": 10.0}])
+        await self.exchange._update_positions()
+
+        self.exchange._api_post = AsyncMock(return_value=[
+            {"pair": "B-BTC_USDT", "active_pos": 0}])
+        await self.exchange._update_positions()
+        self.assertEqual(0, len(self.exchange.account_positions))
+
+    async def test_other_pairs_are_not_swept_away(self):
+        self._bootstrap()
+        self.exchange._api_post = AsyncMock(return_value=[
+            {"pair": "B-BTC_USDT", "active_pos": 0.5, "avg_price": 60000.0,
+             "mark_price": 61000.0, "leverage": 10.0},
+            {"pair": "B-ETH_USDT", "active_pos": 2.0, "avg_price": 3000.0,
+             "mark_price": 3100.0, "leverage": 5.0}])
+        await self.exchange._update_positions()
+        self.assertEqual(2, len(self.exchange.account_positions))
+
+        # Only ETH closes; BTC must survive.
+        self.exchange._api_post = AsyncMock(return_value=[
+            {"pair": "B-BTC_USDT", "active_pos": 0.5, "avg_price": 60000.0,
+             "mark_price": 61000.0, "leverage": 10.0}])
+        await self.exchange._update_positions()
+        self.assertEqual(1, len(self.exchange.account_positions))
+        self.assertIn(self.trading_pair, self.exchange.account_positions)
 
     # ---- user stream ----------------------------------------------------------
 

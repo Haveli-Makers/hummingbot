@@ -60,13 +60,27 @@ def coindcx_pair_to_market_symbol(coindcx_pair: str) -> str:
     """
     "B-BTC_USDT" -> "BTCUSDT".
 
-    The ``depth-snapshot`` websocket frames identify the instrument with this
-    market symbol rather than with the CoinDCX pair used everywhere else.
-    Verified unique across all active instruments, and identical to the ``mkt``
-    field exposed by the current-prices endpoint.
+    ``depth-snapshot`` frames carry this market symbol in their ``s`` field,
+    where every other stream puts the CoinDCX pair. Confirmed against a live
+    multi-pair capture: a depth frame reads
+    ``{"s": "ETHUSDT", "bids": ..., "asks": ...}`` and carries no ``mkt`` key,
+    while a ``new-trade`` frame on the same socket reads ``{"s": "B-BTC_USDT"}``.
+    The same value appears as ``mkt`` on the current-prices REST endpoint.
+    Verified unique across all active instruments.
     """
     without_ecode = coindcx_pair.split("-", 1)[1] if "-" in coindcx_pair else coindcx_pair
     return without_ecode.replace("_", "")
+
+
+def split_coindcx_pair(coindcx_pair: str) -> tuple:
+    """
+    "B-BTC_USDT" -> ("BTC", "USDT"); ("", "") when the name is not parseable.
+    """
+    without_ecode = coindcx_pair.split("-", 1)[1] if "-" in coindcx_pair else coindcx_pair
+    if "_" not in without_ecode:
+        return "", ""
+    base, quote = without_ecode.split("_", 1)
+    return base, quote
 
 
 def hb_pair_to_market_symbol(hb_pair: str) -> str:

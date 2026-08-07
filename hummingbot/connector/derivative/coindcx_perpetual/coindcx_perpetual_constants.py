@@ -118,8 +118,42 @@ ORDER_STATE = {
     "rejected": OrderState.FAILED,
 }
 
-# Statuses queried when listing orders (the endpoint requires an explicit list).
+# Statuses queried when listing orders. Must be a COMMA-SEPARATED STRING: sending
+# the same values as a JSON array is rejected with HTTP 422 "Invalid Request".
 ALL_ORDER_STATUSES = "open,filled,partially_filled,partially_cancelled,cancelled,rejected,untriggered"
+
+# The list endpoints (orders, positions, transactions) are account-wide and paged;
+# none of them accepts a pair filter, so callers page through until the record is
+# found or the pages run out.
+PAGE_SIZE = 100
+MAX_PAGES = 20
+
+# Instrument details are fetched one request per pair; cap the fan-out so a
+# connector built without trading pairs (as TradingPairFetcher does) cannot fire
+# hundreds of concurrent requests.
+INSTRUMENT_FETCH_CONCURRENCY = 10
+
+# Substrings that mark an error as "this order is already gone". HTTP 422 alone is
+# a generic validation status on CoinDCX (malformed params, wrong margin currency,
+# permissions), so it must be paired with one of these before an order is treated
+# as already cancelled.
+ORDER_GONE_MESSAGE_HINTS = (
+    "order not found",
+    "not found",
+    "already cancel",
+    "already filled",
+    "already executed",
+    "cannot be cancel",
+    "invalid order",
+)
+
+# CoinDCX orders carry no client-order-id, so a websocket order event can only be
+# matched once _place_order has recorded the exchange id. A fast fill can beat the
+# REST create response, so unmatched events are held briefly and replayed instead
+# of being dropped and left to the much slower REST poll.
+PENDING_ORDER_EVENT_TTL = 15.0
+PENDING_ORDER_EVENT_RETRY_INTERVAL = 0.2
+MAX_PENDING_ORDER_EVENTS = 256
 
 RATE_LIMITS = [
     RateLimit(limit_id=ACTIVE_INSTRUMENTS_PATH_URL, limit=2000, time_interval=ONE_MINUTE),

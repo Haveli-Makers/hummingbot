@@ -69,6 +69,12 @@ class SimpleGridExecutorConfig(ExecutorConfigBase):
     entry_price: Optional[Decimal] = None
     entry_order_type: OrderType = OrderType.LIMIT
 
+    # Rests the entry this far *away* from the touch price — below the bid for a long,
+    # above the ask for a short. Zero is the strategy's real behaviour; a non-zero value
+    # is how you put genuine orders on an exchange that are not meant to fill, so order
+    # placement can be verified live without taking a position.
+    entry_offset_pct: Decimal = Decimal("0")
+
     # Entry chasing. A resting order that the market walks away from never fills, so the
     # executor re-places it as the touch price drifts, bounded three ways.
     chase_entry: bool = True
@@ -97,6 +103,14 @@ class SimpleGridExecutorConfig(ExecutorConfigBase):
     def validate_amount(cls, value: Decimal) -> Decimal:
         if value <= Decimal("0"):
             raise ValueError("amount must be greater than zero")
+        return value
+
+    @field_validator("entry_offset_pct")
+    @classmethod
+    def validate_entry_offset(cls, value: Decimal) -> Decimal:
+        if value < Decimal("0"):
+            raise ValueError("entry_offset_pct cannot be negative; it always moves the entry "
+                             "away from the market, on whichever side is being quoted")
         return value
 
     @field_validator("entry_order_type")

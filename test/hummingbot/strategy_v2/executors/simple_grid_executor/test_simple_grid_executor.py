@@ -176,6 +176,28 @@ class TestSimpleGridExecutor(IsolatedAsyncioWrapperTestCase):
 
     @patch.object(SimpleGridExecutor, "get_trading_rules")
     @patch.object(SimpleGridExecutor, "get_price")
+    async def test_entry_offset_rests_the_order_away_from_the_market(self, mock_price, rules_mock):
+        """Used to verify placement on a live exchange without the order filling."""
+        mock_price.side_effect = self.price_feed(best_bid="100", best_ask="102")
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(self.config(
+            entry_mode=SimpleGridEntryMode.BOTH_OCO, entry_offset_pct=Decimal("0.05")))
+        await executor.control_task()
+        # A long rests below the bid, a short above the ask — each pushed away from the book.
+        self.assertEqual(self.strategy.buy.call_args.args[4], Decimal("95.00"))
+        self.assertEqual(self.strategy.sell.call_args.args[4], Decimal("107.10"))
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    async def test_zero_entry_offset_is_the_touch_price(self, mock_price, rules_mock):
+        mock_price.side_effect = self.price_feed(best_bid="99", best_ask="101")
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(self.config(entry_offset_pct=Decimal("0")))
+        await executor.control_task()
+        self.assertEqual(self.strategy.buy.call_args.args[4], Decimal("99"))
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
     async def test_both_oco_places_an_entry_on_each_side(self, mock_price, rules_mock):
         mock_price.side_effect = self.price_feed()
         rules_mock.return_value = self.trading_rules()

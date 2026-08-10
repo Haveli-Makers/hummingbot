@@ -135,10 +135,7 @@ class SimpleGridExecutor(ExecutorBase):
             order = self._entry_orders[self._filled_side]
             if order and order.executed_amount_base > Decimal("0"):
                 return order.average_executed_price
-        if self.config.entry_price is not None:
-            return self.config.entry_price
-        side = self.side or TradeType.BUY
-        return self._touch_price(side)
+        return self._entry_target_price(self.side or TradeType.BUY)
 
     @property
     def close_price(self) -> Decimal:
@@ -198,6 +195,22 @@ class SimpleGridExecutor(ExecutorBase):
         """Passive price for the given side: best bid to buy, best ask to sell."""
         price_type = PriceType.BestBid if side == TradeType.BUY else PriceType.BestAsk
         return self.get_price(self.config.connector_name, self.config.trading_pair, price_type=price_type)
+
+    def _entry_target_price(self, side: TradeType) -> Decimal:
+        """
+        Where this side's entry should rest right now.
+
+        An explicit entry_price pins it; otherwise it is the touch price, optionally pushed
+        further away from the market by entry_offset_pct.
+        """
+        if self.config.entry_price is not None:
+            return self.config.entry_price
+        touch = self._touch_price(side)
+        if self.config.entry_offset_pct == Decimal("0"):
+            return touch
+        if side == TradeType.BUY:
+            return touch * (1 - self.config.entry_offset_pct)
+        return touch * (1 + self.config.entry_offset_pct)
 
     def _exit_reference_price(self) -> Decimal:
         """
@@ -301,7 +314,7 @@ class SimpleGridExecutor(ExecutorBase):
                 self._maybe_repost_entry(side)
 
     def place_entry_order(self, side: TradeType):
-        price = self.config.entry_price if self.config.entry_price is not None else self._touch_price(side)
+        price = self._entry_target_price(side)
         order_id = self.place_order(
             connector_name=self.config.connector_name,
             trading_pair=self.config.trading_pair,
@@ -331,7 +344,7 @@ class SimpleGridExecutor(ExecutorBase):
             return
 
         quoted = self._quoted_price[side]
-        touch = self._touch_price(side)
+        touch = self._entry_target_price(side)
         if quoted is None or quoted == Decimal("0"):
             return
         if abs(touch - quoted) / quoted < self.config.entry_repost_threshold:

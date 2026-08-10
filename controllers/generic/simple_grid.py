@@ -42,6 +42,9 @@ class SimpleGridConfig(ControllerConfigBase):
 
     # Entry behaviour.
     entry_order_type: OrderType = OrderType.LIMIT
+    # Set non-zero only to verify order placement on a live exchange without filling:
+    # it rests the entry that far away from the touch price. Leave at 0 to trade.
+    entry_offset_pct: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
     chase_entry: bool = Field(default=True, json_schema_extra={"is_updatable": True})
     entry_repost_threshold: Decimal = Field(default=Decimal("0.0005"), json_schema_extra={"is_updatable": True})
     min_repost_interval: float = Field(default=1.0, json_schema_extra={"is_updatable": True})
@@ -223,6 +226,7 @@ class SimpleGrid(ControllerBase):
             entry_mode=self._next_entry_mode(),
             amount=amount,
             entry_order_type=self.config.entry_order_type,
+            entry_offset_pct=self.config.entry_offset_pct,
             chase_entry=self.config.chase_entry,
             entry_repost_threshold=self.config.entry_repost_threshold,
             min_repost_interval=self.config.min_repost_interval,

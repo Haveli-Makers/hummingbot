@@ -28,7 +28,9 @@ SUPPORTED_CONNECTORS = [
     "hyperliquid",
     "dexalot",
     "coindcx",
+    "coindcx_perpetual",
     "wazirx",
+    "zebpay",
     "csx",
     "coinex",
 ]

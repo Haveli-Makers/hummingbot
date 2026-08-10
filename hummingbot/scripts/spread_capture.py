@@ -4,14 +4,14 @@ import logging
 import os
 import sys
 import time
-from typing import List, Optional, Set
+from typing import Dict, List, Optional, Set
 
 from pydantic import Field
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from hummingbot import set_data_path
-from hummingbot.client.config.client_config_map import ClientConfigMap, MarketDataCollectionConfigMap
+from hummingbot.client.config.client_config_map import ClientConfigMap, DBOtherMode, MarketDataCollectionConfigMap
 from hummingbot.client.config.config_data_types import BaseClientModel
 from hummingbot.client.config.config_helpers import ClientConfigAdapter
 from hummingbot.connector.markets_recorder import MarketsRecorder
@@ -20,6 +20,7 @@ from hummingbot.core.rate_oracle.sources.rate_source_base import RateSourceBase
 from hummingbot.model.sql_connection_manager import SQLConnectionManager, SQLConnectionType
 
 SUPPORTED_CONNECTORS = list(RATE_ORACLE_SOURCES.keys())
+DB_TARGETS = ("local", "production")
 
 
 class SpreadCaptureConfig(BaseClientModel):
@@ -59,6 +60,15 @@ class SpreadCaptureConfig(BaseClientModel):
             "prompt_on_new": True,
         },
     )
+    db_target: str = Field(
+        default="local",
+        json_schema_extra={
+            "prompt": lambda mi: f"Database target to store fetched data in ({', '.join(DB_TARGETS)}): ",
+            "prompt_on_new": True,
+            "input_type": "select",
+            "options": list(DB_TARGETS),
+        },
+    )
 
 
 def get_rate_source(connector_name: str) -> RateSourceBase:
@@ -72,6 +82,11 @@ def get_rate_source(connector_name: str) -> RateSourceBase:
 
 class SpreadCapture:
     _logger: Optional[logging.Logger] = None
+    # Keyed by db_target ("local"/"production") - MarketsRecorder.__init__ overwrites the
+    # process-wide MarketsRecorder._shared_instance, so a single long-lived process (the API
+    # server) handling both local and production writes must keep its own recorder per target
+    # rather than relying on that global singleton.
+    _recorders: Dict[str, MarketsRecorder] = {}
 
     @classmethod
     def logger(cls) -> logging.Logger:
@@ -87,36 +102,55 @@ class SpreadCapture:
         self.quote_token = config.quote_token
         self.excluding_pairs: Set[str] = self._parse_excluding_pairs(config.excluding_pairs)
         self.data_retention_days: int = config.data_retention_days
+        self.db_target: str = (config.db_target or "local").strip().lower()
+        if self.db_target not in DB_TARGETS:
+            self.logger().warning(f"Unknown db_target '{self.db_target}', falling back to 'local'")
+            self.db_target = "local"
 
         self._rate_source: Optional[RateSourceBase] = None
         self._initialized: bool = False
         self._initialize_rate_source()
 
-    @staticmethod
-    def initialize_markets_recorder():
-        if MarketsRecorder._shared_instance is not None:
-            return
+    @classmethod
+    def initialize_markets_recorder(cls, db_target: str = "local") -> MarketsRecorder:
+        if db_target in cls._recorders:
+            return cls._recorders[db_target]
 
         data_dir = os.path.abspath(os.path.join(os.getcwd(), "bots", "data"))
         os.makedirs(data_dir, exist_ok=True)
         set_data_path(data_dir)
 
         client_config = ClientConfigAdapter(ClientConfigMap())
+        db_name = "haveli"
+
+        if db_target == "production":
+            db_name = os.environ.get("PROD_DB_NAME", "haveli")
+            client_config.db_mode = DBOtherMode(
+                db_engine=os.environ.get("PROD_DB_ENGINE", "postgresql"),
+                db_host=os.environ["PROD_DB_HOST"],
+                db_port=int(os.environ.get("PROD_DB_PORT", "5432")),
+                db_username=os.environ["PROD_DB_USERNAME"],
+                db_password=os.environ["PROD_DB_PASSWORD"],
+                db_name=db_name,
+            )
+
         sql_manager = SQLConnectionManager(
-            client_config, SQLConnectionType.TRADE_FILLS, db_name="haveli"
+            client_config, SQLConnectionType.TRADE_FILLS, db_name=db_name
         )
         try:
             market_data_collection = client_config.hb_config.market_data_collection
         except Exception:
             market_data_collection = MarketDataCollectionConfigMap()
 
-        MarketsRecorder(
+        recorder = MarketsRecorder(
             sql=sql_manager,
             markets=[],
-            config_file_path="spread_capture",
+            config_file_path=f"spread_capture_{db_target}",
             strategy_name="spread_capture",
             market_data_collection=market_data_collection,
         )
+        cls._recorders[db_target] = recorder
+        return recorder
 
     def _initialize_rate_source(self):
         """Initialize the rate source based on the configured connector."""
@@ -140,7 +174,7 @@ class SpreadCapture:
     async def fetch_and_store_spread(self):
 
         try:
-            self.initialize_markets_recorder()
+            self._recorder = self.initialize_markets_recorder(self.db_target)
             bid_ask_prices = await self._rate_source.get_bid_ask_prices(quote_token=self.quote_token)
 
             if not bid_ask_prices:
@@ -177,11 +211,11 @@ class SpreadCapture:
                 )
 
             self.store_spread_data(market_data_batch)
+            self._remove_old_market_data()
             self.logger().info(
                 f"Processed {len(market_data_batch)} trading pairs from {self.connector_name}"
                 + (f" (excluded {excluded_count} pairs)" if excluded_count > 0 else "")
             )
-            self._remove_old_market_data()
             return market_data_batch
 
         except Exception as e:
@@ -193,32 +227,30 @@ class SpreadCapture:
         if self.data_retention_days == 0:
             return
         try:
-            markets_recorder = MarketsRecorder._shared_instance
-            if markets_recorder is None:
-                return
+            markets_recorder = getattr(self, "_recorder", None) or self.initialize_markets_recorder(self.db_target)
             cutoff = time.time() - self.data_retention_days * 24 * 3600
             deleted = markets_recorder.delete_old_market_data(cutoff)
             if deleted > 0:
                 self.logger().info(
-                    f"Removed {deleted} market data records older than {self.data_retention_days} days"
+                    f"Removed {deleted} market data records older than {self.data_retention_days} days "
+                    f"from '{self.db_target}' database"
                 )
         except Exception as e:
             self.logger().error(f"Error removing old market data: {e}")
 
     def store_spread_data(self, market_data_list: List[dict]):
         """
-        Store spread/market data using the MarketsRecorder.
+        Store spread/market data using the MarketsRecorder for this run's db_target.
         """
         if not market_data_list:
             return
 
         try:
-            markets_recorder = MarketsRecorder._shared_instance
-            if markets_recorder is not None:
-                markets_recorder.store_market_data(market_data_list)
-                self.logger().info(f"Stored {len(market_data_list)} market data records to database")
-            else:
-                self.logger().warning("MarketsRecorder instance not available - data not stored")
+            markets_recorder = getattr(self, "_recorder", None) or self.initialize_markets_recorder(self.db_target)
+            markets_recorder.store_market_data(market_data_list)
+            self.logger().info(
+                f"Stored {len(market_data_list)} market data records to '{self.db_target}' database"
+            )
         except Exception as e:
             self.logger().error(f"Error storing market data: {e}")
 
@@ -232,12 +264,14 @@ class SpreadCapture:
 
 
 def _create_config_from_args(connector_name: str, quote_token: str,
-                             excluding_pairs: str, data_retention_days: int) -> SpreadCaptureConfig:
+                             excluding_pairs: str, data_retention_days: int,
+                             db_target: str = "local") -> SpreadCaptureConfig:
     return SpreadCaptureConfig(
         connector_name=connector_name,
         quote_token=quote_token,
         excluding_pairs=excluding_pairs,
         data_retention_days=data_retention_days,
+        db_target=db_target,
     )
 
 
@@ -262,14 +296,20 @@ def main():
         help="Days to retain market data (0 to keep all)",
     )
     parser.add_argument("--once", action="store_true", help="Run once and exit")
+    parser.add_argument(
+        "--db_target",
+        default="local",
+        choices=list(DB_TARGETS),
+        help="Database to store fetched data in: 'local' (sqlite) or 'production' (needs PROD_DB_* env vars)",
+    )
 
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
 
     try:
-        SpreadCapture.initialize_markets_recorder()
-        logging.getLogger("spread_capture").info("MarketsRecorder initialized; DB persistence enabled")
+        SpreadCapture.initialize_markets_recorder(args.db_target)
+        logging.getLogger("spread_capture").info(f"MarketsRecorder initialized for '{args.db_target}' database")
     except Exception as e:
         logging.getLogger("spread_capture").exception(f"Failed to initialize MarketsRecorder: {e}")
 
@@ -283,6 +323,7 @@ def main():
                     quote_token=qt,
                     excluding_pairs=args.excluding_pairs,
                     data_retention_days=args.data_retention_days,
+                    db_target=args.db_target,
                 )
 
                 sc = SpreadCapture(config=config)

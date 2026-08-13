@@ -23,7 +23,11 @@ SUPPORTED_CONNECTORS = [
     "hyperliquid",
     "dexalot",
     "coindcx",
+    "coindcx_perpetual",
     "wazirx",
+    "zebpay",
+    "csx",
+    "coinex",
 ]
 
 
@@ -59,6 +63,14 @@ class SpreadCaptureConfig(BaseClientModel):
         default="",
         json_schema_extra={
             "prompt": lambda mi: "Enter trading pairs to exclude (comma-separated, e.g., BTC-USDT,ETH-USDT), leave empty to include all: ",
+            "prompt_on_new": True,
+        },
+    )
+    data_retention_days: int = Field(
+        default=30,
+        ge=0,
+        json_schema_extra={
+            "prompt": lambda mi: "Enter the number of days to retain market data (rows older than this will be deleted, enter 0 to keep data): ",
             "prompt_on_new": True,
         },
     )
@@ -119,7 +131,26 @@ def get_rate_source(connector_name: str) -> RateSourceBase:
         from hummingbot.core.rate_oracle.sources.coindcx_rate_source import CoindcxRateSource
 
         return CoindcxRateSource()
+    elif connector_name_lower == "coindcx_perpetual":
+        from hummingbot.core.rate_oracle.sources.coindcx_perpetual_rate_source import CoinDCXPerpetualRateSource
 
+        return CoinDCXPerpetualRateSource()
+    elif connector_name_lower == "coinswitch":
+        from hummingbot.core.rate_oracle.sources.coinswitch_rate_source import CoinswitchRateSource
+
+        return CoinswitchRateSource()
+    elif connector_name_lower == "zebpay":
+        from hummingbot.core.rate_oracle.sources.zebpay_rate_source import ZebpayRateSource
+
+        return ZebpayRateSource()
+    elif connector_name_lower == "csx":
+        from hummingbot.core.rate_oracle.sources.csx_rate_source import CsxRateSource
+
+        return CsxRateSource()
+    elif connector_name_lower == "coinex":
+        from hummingbot.core.rate_oracle.sources.coinex_rate_source import CoinexRateSource
+
+        return CoinexRateSource()
     else:
         raise ValueError(
             f"Unsupported connector: {connector_name}. Supported connectors: " f"{', '.join(SUPPORTED_CONNECTORS)}"
@@ -152,6 +183,7 @@ class SpreadCapture(ScriptStrategyBase):
         self.quote_token = config.quote_token
         self.interval_sec = config.interval_sec
         self.excluding_pairs: Set[str] = self._parse_excluding_pairs(config.excluding_pairs)
+        self.data_retention_days: int = config.data_retention_days
 
         self.last_run: int = 0
         self._rate_source: Optional[RateSourceBase] = None
@@ -220,9 +252,27 @@ class SpreadCapture(ScriptStrategyBase):
                 f"Processed {len(market_data_batch)} trading pairs from {self.connector_name}"
                 + (f" (excluded {excluded_count} pairs)" if excluded_count > 0 else "")
             )
+            self._remove_old_market_data()
 
         except Exception as e:
             self.logger().error(f"Error fetching bid/ask prices from {self.connector_name}: {e}")
+
+    def _remove_old_market_data(self):
+        """Delete MarketData rows older than data_retention_days. Skipped if data_retention_days is 0."""
+        if self.data_retention_days == 0:
+            return
+        try:
+            markets_recorder = MarketsRecorder.get_instance()
+            if markets_recorder is None:
+                return
+            cutoff = time.time() - self.data_retention_days * 24 * 3600
+            deleted = markets_recorder.delete_old_market_data(cutoff)
+            if deleted > 0:
+                self.logger().info(
+                    f"Removed {deleted} market data records older than {self.data_retention_days} days"
+                )
+        except Exception as e:
+            self.logger().error(f"Error removing old market data: {e}")
 
     def store_spread_data(self, market_data_list: List[dict]):
         """

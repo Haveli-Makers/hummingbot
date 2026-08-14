@@ -64,25 +64,29 @@ class SimpleGridExecutorConfig(ExecutorConfigBase):
     entry_mode: SimpleGridEntryMode = SimpleGridEntryMode.LONG_ONLY
     amount: Decimal
 
-    # Entry. Left as None, the entry price is taken from the live touch price: best bid
-    # for a long, best ask for a short.
+    # The anchor the entry levels are measured from. None means use the live touch price.
     entry_price: Optional[Decimal] = None
-    entry_order_type: OrderType = OrderType.LIMIT
 
-    # Rests the entry this far *away* from the touch price — below the bid for a long,
-    # above the ask for a short. Zero is the strategy's real behaviour; a non-zero value
-    # is how you put genuine orders on an exchange that are not meant to fill, so order
-    # placement can be verified live without taking a position.
+    # The entry fires once the market reaches the level, so it crosses the spread. MARKET
+    # guarantees we get in; a limit type risks the move leaving us behind.
+    entry_order_type: OrderType = OrderType.MARKET
+
+    # How far from the anchor each entry level sits: the long level one step ABOVE, the
+    # short level one step BELOW. Zero means enter immediately at the anchor.
     entry_offset_pct: Decimal = Decimal("0")
 
-    # Entry chasing. A resting order that the market walks away from never fills, so the
-    # executor re-places it as the touch price drifts, bounded three ways.
-    chase_entry: bool = True
-    entry_repost_threshold: Decimal = Decimal("0.0005")
-    min_repost_interval: float = 1.0
-    max_entry_reposts: Optional[int] = None
-    max_entry_drift: Optional[Decimal] = Decimal("0.01")
+    # Give up if neither level is reached within this many seconds.
     entry_timeout: Optional[int] = None
+
+    # Seconds to wait for a passive entry before taking the price instead. A resting order
+    # only fills if the market comes back to it, so in a market moving away it never does —
+    # this is what stops a patient entry missing the move entirely. None means wait forever.
+    entry_cross_after: Optional[float] = None
+
+    # Spot can only ever buy, so it watches both levels and buys whichever one the market
+    # reaches: a step up means join the rise, a step down means buy the dip. Without this a
+    # long-only chain would sit idle through every fall, waiting for a rise to buy into.
+    enter_on_either_level: bool = False
 
     # On a partial fill the barriers arm against whatever filled; the unfilled remainder
     # is cancelled by default so take profit and stop loss stay pinned to one entry price.
@@ -109,21 +113,16 @@ class SimpleGridExecutorConfig(ExecutorConfigBase):
     @classmethod
     def validate_entry_offset(cls, value: Decimal) -> Decimal:
         if value < Decimal("0"):
-            raise ValueError("entry_offset_pct cannot be negative; it always moves the entry "
-                             "away from the market, on whichever side is being quoted")
-        return value
-
-    @field_validator("entry_order_type")
-    @classmethod
-    def validate_entry_order_type(cls, value: OrderType) -> OrderType:
-        if not value.is_limit_type():
-            raise ValueError("entry_order_type must be a limit type; the entry is passive by design")
+            raise ValueError("entry_offset_pct cannot be negative; the side already decides "
+                             "which way the level sits relative to the anchor")
         return value
 
     @model_validator(mode="after")
-    def validate_chase_bounds(self):
-        if self.chase_entry and self.max_entry_drift is not None and self.max_entry_drift <= Decimal("0"):
-            raise ValueError("max_entry_drift must be greater than zero when chase_entry is enabled")
+    def validate_two_sided_needs_a_step(self):
+        # With no step both levels collapse onto the anchor and both would trigger at once.
+        if self.entry_mode == SimpleGridEntryMode.BOTH_OCO and self.entry_offset_pct == Decimal("0"):
+            raise ValueError("both_oco needs a non-zero entry_offset_pct, otherwise the long and "
+                             "short levels are the same price")
         return self
 
     def sides(self):

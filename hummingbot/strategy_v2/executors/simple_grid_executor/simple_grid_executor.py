@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Union
 
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.core.data_type.common import OrderType, PositionAction, PriceType, TradeType
+from hummingbot.core.data_type.in_flight_order import OrderState
 from hummingbot.core.data_type.order_candidate import OrderCandidate, PerpetualOrderCandidate
 from hummingbot.core.event.events import (
     BuyOrderCompletedEvent,
@@ -60,17 +61,22 @@ class SimpleGridExecutor(ExecutorBase):
         # Entry state, tracked per side so both_oco can run two candidates at once.
         self._entry_orders: Dict[TradeType, Optional[TrackedOrder]] = {side: None for side in config.sides()}
         self._quoted_price: Dict[TradeType, Optional[Decimal]] = {side: None for side in config.sides()}
-        self._first_quoted_price: Dict[TradeType, Optional[Decimal]] = {side: None for side in config.sides()}
-        self._repost_count: Dict[TradeType, int] = {side: 0 for side in config.sides()}
-        self._last_repost_timestamp: Dict[TradeType, float] = {side: 0.0 for side in config.sides()}
 
-        # The side that won the race; None until something fills.
+        # The side whose level triggered first, set the instant we commit rather than when
+        # the fill lands, and the side that has actually filled.
+        self._triggered_side: Optional[TradeType] = None
         self._filled_side: Optional[TradeType] = None
         self._entry_remainder_cancelled = False
+        self._entry_placed_at: Dict[TradeType, float] = {}
+        self._entry_crossed = False
 
         self._take_profit_order: Optional[TrackedOrder] = None
         self._close_order: Optional[TrackedOrder] = None
         self._failed_orders: List[TrackedOrder] = []
+
+        # Orders already warned about in _order_filled_base, so the warning is logged once
+        # each rather than on every tick.
+        self._assumed_full_fills: List[str] = []
 
         self._current_retries = 0
         self._max_retries = max_retries
@@ -87,9 +93,16 @@ class SimpleGridExecutor(ExecutorBase):
 
     @property
     def side(self) -> Optional[TradeType]:
-        """The side actually taken, or the only side on offer if nothing has filled yet."""
+        """
+        The side actually taken.
+
+        Falls back to the triggered side while a fill is in flight, and to the only side on
+        offer when the leg is single-sided. None means the direction is still undecided.
+        """
         if self._filled_side is not None:
             return self._filled_side
+        if self._triggered_side is not None:
+            return self._triggered_side
         sides = self.config.sides()
         return sides[0] if len(sides) == 1 else None
 
@@ -99,9 +112,51 @@ class SimpleGridExecutor(ExecutorBase):
             return None
         return TradeType.SELL if self.side == TradeType.BUY else TradeType.BUY
 
+    def _order_filled_base(self, order: Optional[TrackedOrder]) -> Decimal:
+        """
+        How much of an order filled, trusting the venue's terminal state when the fills
+        themselves never arrived.
+
+        executed_amount_base is populated only by trade updates, so a venue whose trade feed
+        lags can report an order FILLED with zero executed amount. Every size derived from it
+        then collapses to zero and no exit is armed while a real position sits on the venue.
+        The completion event cannot help — it is built from the same field. A terminal FILLED
+        state means the venue considers the order fully filled, so fall back to the requested
+        amount and log the assumption.
+        """
+        if order is None:
+            return Decimal("0")
+        live = order.executed_amount_base or Decimal("0")
+        if live > Decimal("0"):
+            return live
+        in_flight = order.order
+        if in_flight is not None and in_flight.current_state == OrderState.FILLED \
+                and in_flight.amount > Decimal("0"):
+            if order.order_id not in self._assumed_full_fills:
+                self._assumed_full_fills.append(order.order_id)
+                self.logger().warning(
+                    f"Executor ID: {self.config.id} - order {order.order_id} is FILLED but no "
+                    f"fills arrived; assuming the full {in_flight.amount} at {in_flight.price}. "
+                    f"Sizes and PnL for this leg are approximate.")
+            return in_flight.amount
+        return Decimal("0")
+
+    def _order_avg_price(self, order: Optional[TrackedOrder]) -> Optional[Decimal]:
+        """Average fill price, falling back to the order's own price when fills are missing."""
+        if order is None:
+            return None
+        if order.executed_amount_base and order.executed_amount_base > Decimal("0"):
+            price = order.average_executed_price
+            if price and not price.is_nan() and price > Decimal("0"):
+                return price
+        in_flight = order.order
+        if in_flight is not None and in_flight.current_state == OrderState.FILLED \
+                and in_flight.price and in_flight.price > Decimal("0"):
+            return in_flight.price
+        return None
+
     def _executed_amount(self, side: TradeType) -> Decimal:
-        order = self._entry_orders.get(side)
-        return order.executed_amount_base if order else Decimal("0")
+        return self._order_filled_base(self._entry_orders.get(side))
 
     @property
     def open_filled_amount(self) -> Decimal:
@@ -122,7 +177,7 @@ class SimpleGridExecutor(ExecutorBase):
 
     @property
     def close_filled_amount(self) -> Decimal:
-        return self._close_order.executed_amount_base if self._close_order else Decimal("0")
+        return self._order_filled_base(self._close_order)
 
     @property
     def amount_to_close(self) -> Decimal:
@@ -132,15 +187,16 @@ class SimpleGridExecutor(ExecutorBase):
     def entry_price(self) -> Decimal:
         """Average price actually paid, falling back to the price we are quoting at."""
         if self._filled_side is not None:
-            order = self._entry_orders[self._filled_side]
-            if order and order.executed_amount_base > Decimal("0"):
-                return order.average_executed_price
+            price = self._order_avg_price(self._entry_orders[self._filled_side])
+            if price is not None:
+                return price
         return self._entry_target_price(self.side or TradeType.BUY)
 
     @property
     def close_price(self) -> Decimal:
-        if self._close_order and self._close_order.executed_amount_base > Decimal("0"):
-            return self._close_order.average_executed_price
+        price = self._order_avg_price(self._close_order)
+        if price is not None:
+            return price
         return self._exit_reference_price()
 
     @property
@@ -198,19 +254,21 @@ class SimpleGridExecutor(ExecutorBase):
 
     def _entry_target_price(self, side: TradeType) -> Decimal:
         """
-        Where this side's entry should rest right now.
+        The price level at which this side would be entered.
 
-        An explicit entry_price pins it; otherwise it is the touch price, optionally pushed
-        further away from the market by entry_offset_pct.
+        Measured from the grid anchor when the controller supplies one, otherwise from the
+        live touch price. The long level sits one step ABOVE the anchor and the short level
+        one step BELOW it, because this strategy enters in the direction the market is
+        already moving: we go long once the price has risen to our level, short once it has
+        fallen to ours. A step of zero means enter here and now.
         """
-        if self.config.entry_price is not None:
-            return self.config.entry_price
-        touch = self._touch_price(side)
+        base = self.config.entry_price if self.config.entry_price is not None \
+            else self._touch_price(side)
         if self.config.entry_offset_pct == Decimal("0"):
-            return touch
+            return base
         if side == TradeType.BUY:
-            return touch * (1 - self.config.entry_offset_pct)
-        return touch * (1 + self.config.entry_offset_pct)
+            return base * (1 + self.config.entry_offset_pct)
+        return base * (1 - self.config.entry_offset_pct)
 
     def _exit_reference_price(self) -> Decimal:
         """
@@ -223,7 +281,33 @@ class SimpleGridExecutor(ExecutorBase):
         price_type = self.config.trigger_price_type
         if price_type in (PriceType.BestBid, PriceType.BestAsk):
             price_type = PriceType.BestBid if self.side == TradeType.BUY else PriceType.BestAsk
-        return self.get_price(self.config.connector_name, self.config.trading_pair, price_type=price_type)
+        price = self._usable_price(price_type)
+        # Nothing usable: fall back to the entry price so callers get a number rather than a
+        # NaN. control_stop_loss checks _usable_price itself and skips instead of comparing.
+        return price if price is not None else self.entry_price
+
+    def _usable_price(self, price_type: PriceType) -> Optional[Decimal]:
+        """
+        A price we can actually compare against, or None.
+
+        LastTrade stays at NaN until a trade prints into the order book, and some venues
+        never feed trades in at all — CoinDCX perpetuals among them. A NaN Decimal raises on
+        comparison rather than returning False, so this falls back to the mid price and
+        reports None only when nothing is usable. Never let a NaN reach a comparison: it
+        either crashes the executor or, worse, silently decides the stop loss was not hit.
+        """
+        for candidate in (price_type, PriceType.MidPrice):
+            try:
+                price = self.get_price(self.config.connector_name, self.config.trading_pair,
+                                       price_type=candidate)
+            except Exception:
+                continue
+            if price is None:
+                continue
+            price = Decimal(price)
+            if not price.is_nan() and price > Decimal("0"):
+                return price
+        return None
 
     @property
     def take_profit_price(self) -> Decimal:
@@ -280,7 +364,7 @@ class SimpleGridExecutor(ExecutorBase):
         if self._filled_side is not None:
             return
         for side, order in self._entry_orders.items():
-            if order and order.executed_amount_base > Decimal("0"):
+            if self._order_filled_base(order) > Decimal("0"):
                 self._on_entry_filled(side)
                 return
 
@@ -300,25 +384,114 @@ class SimpleGridExecutor(ExecutorBase):
                 self._cancel_order(order)
 
     def control_entry_orders(self):
+        """
+        Watch the entry levels and go with whichever the price reaches first.
+
+        Nothing rests in the book while we wait. The levels sit on the far side of the
+        market by design — a long entry above it, a short entry below — so a resting order
+        there would fill instantly at the wrong price. We watch instead, and send the order
+        once the market has actually got there.
+        """
         if self.config.entry_timeout is not None and \
                 self._strategy.current_timestamp - self.config.timestamp >= self.config.entry_timeout:
-            self.logger().info(f"Executor ID: {self.config.id} - entry timed out with no fill")
+            self.logger().info(f"Executor ID: {self.config.id} - entry timed out, no level reached")
             self._give_up_on_entry()
             return
 
-        for side in self.config.sides():
-            order = self._entry_orders[side]
-            if order is None:
-                self.place_entry_order(side)
-            elif self.config.chase_entry:
-                self._maybe_repost_entry(side)
+        if self._triggered_side is not None:
+            # Direction already settled; the other level is off the table. The entry order
+            # may still be sitting there unfilled though.
+            self._cross_unfilled_entry_if_stale()
+            return
 
-    def place_entry_order(self, side: TradeType):
+        reference = self._usable_price(self.config.trigger_price_type)
+        if reference is None:
+            self.logger().warning(
+                f"Executor ID: {self.config.id} - no usable {self.config.trigger_price_type.name} "
+                f"price; not entering this tick")
+            return
+        for side in self.config.sides():
+            if self._entry_orders[side] is not None:
+                continue
+            if self._entry_level_reached(side, reference):
+                self.logger().info(
+                    f"Executor ID: {self.config.id} - {side.name} level "
+                    f"{self._entry_target_price(side)} reached at {reference}; entering")
+                self.place_entry_order(side)
+                # Direction is settled the moment one level triggers; the other is dropped.
+                self._on_entry_triggered(side)
+                return
+
+    def _entry_level_reached(self, side: TradeType, reference: Decimal) -> bool:
+        """
+        A long triggers once the price has risen to its level, a short once it has fallen.
+
+        With enter_on_either_level a long also triggers on the level below, because a
+        buy-only chain has to be able to act on a fall as well as a rise.
+        """
+        level = self._entry_target_price(side)
+        if side == TradeType.BUY:
+            if reference >= level:
+                return True
+            return self.config.enter_on_either_level and reference <= self._opposite_level()
+        return reference <= level
+
+    def _opposite_level(self) -> Decimal:
+        """The level a step the other way, used when a buy-only chain watches both."""
+        base = self.config.entry_price
+        if base is None:
+            base = self._touch_price(TradeType.BUY)
+        return base * (1 - self.config.entry_offset_pct)
+
+    def _on_entry_triggered(self, side: TradeType):
+        """
+        Commit to a direction before the fill lands.
+
+        Waiting for the fill event would leave the opposite level live for another tick,
+        and in a fast move both could trigger.
+        """
+        if self._triggered_side is None:
+            self._triggered_side = side
+
+    def _cross_unfilled_entry_if_stale(self):
+        """
+        Take the price if a passive entry has waited too long.
+
+        A resting order only fills when the market comes back to it. When the market is
+        moving away — exactly the move a passive opening order is trying to join — it never
+        does, and the leg would expire having done nothing. After the configured wait we
+        cancel and cross the spread instead, accepting the taker fee to actually get in.
+        """
+        if self.config.entry_cross_after is None or self._entry_crossed:
+            return
+        side = self._triggered_side
+        order = self._entry_orders.get(side)
+        if order is None or order.order is None or not order.order.is_open:
+            return
+        if order.executed_amount_base > Decimal("0"):
+            return  # already going in; let the fill path finish it
+        placed_at = self._entry_placed_at.get(side)
+        if placed_at is None or \
+                self._strategy.current_timestamp - placed_at < self.config.entry_cross_after:
+            return
+
+        self.logger().info(
+            f"Executor ID: {self.config.id} - passive {side.name} entry unfilled after "
+            f"{self.config.entry_cross_after}s; crossing the spread")
+        self._cancel_order(order)
+        self._entry_crossed = True
+        # Overwrites the tracked order, so the cancel event for the old id no longer
+        # matches anything and cannot clear the new one.
+        self.place_entry_order(side, order_type=OrderType.MARKET)
+
+    def place_entry_order(self, side: TradeType, order_type: Optional[OrderType] = None):
+        # The level is already through the market, so this order crosses. Price is only a
+        # reference for limit types; market orders ignore it.
         price = self._entry_target_price(side)
         order_id = self.place_order(
             connector_name=self.config.connector_name,
             trading_pair=self.config.trading_pair,
-            order_type=self.config.entry_order_type,
+            order_type=order_type or self.config.entry_order_type,
             amount=self.config.amount,
             price=price,
             side=side,
@@ -326,60 +499,11 @@ class SimpleGridExecutor(ExecutorBase):
         )
         self._entry_orders[side] = TrackedOrder(order_id=order_id)
         self._quoted_price[side] = price
-        if self._first_quoted_price[side] is None:
-            self._first_quoted_price[side] = price
-        self._last_repost_timestamp[side] = self._strategy.current_timestamp
+        self._entry_placed_at[side] = self._strategy.current_timestamp
         self.logger().debug(f"Executor ID: {self.config.id} - placed {side} entry {order_id} at {price}")
 
-    def _maybe_repost_entry(self, side: TradeType):
-        """Re-place the entry when the touch price has drifted away from our quote."""
-        order = self._entry_orders[side]
-        if order is None or order.order is None or not order.order.is_open:
-            return
-        if order.executed_amount_base > Decimal("0"):
-            return  # partially filled: the fill path owns this order now
-
-        now = self._strategy.current_timestamp
-        if now - self._last_repost_timestamp[side] < self.config.min_repost_interval:
-            return
-
-        quoted = self._quoted_price[side]
-        touch = self._entry_target_price(side)
-        if quoted is None or quoted == Decimal("0"):
-            return
-        if abs(touch - quoted) / quoted < self.config.entry_repost_threshold:
-            return
-
-        if self._max_reposts_reached(side) or self._drift_cap_exceeded(side, touch):
-            self._give_up_on_entry()
-            return
-
-        self._cancel_order(order)
-        self._entry_orders[side] = None
-        self._repost_count[side] += 1
-        self._last_repost_timestamp[side] = now
-        self.logger().debug(
-            f"Executor ID: {self.config.id} - {side} touch moved {quoted} -> {touch}, re-quoting "
-            f"({self._repost_count[side]} re-posts)")
-
-    def _max_reposts_reached(self, side: TradeType) -> bool:
-        return self.config.max_entry_reposts is not None and \
-            self._repost_count[side] >= self.config.max_entry_reposts
-
-    def _drift_cap_exceeded(self, side: TradeType, touch: Decimal) -> bool:
-        """
-        True once the market has run far enough from our first quote that chasing it would
-        mean entering at a materially worse price than the leg was sized for.
-        """
-        if self.config.max_entry_drift is None:
-            return False
-        first = self._first_quoted_price[side]
-        if first is None or first == Decimal("0"):
-            return False
-        return abs(touch - first) / first > self.config.max_entry_drift
-
     def _give_up_on_entry(self):
-        """No position was ever opened, so there is nothing to unwind."""
+        """No level was reached, so no position was ever opened and nothing needs unwinding."""
         for order in self._entry_orders.values():
             if order and order.order and order.order.is_open:
                 self._cancel_order(order)
@@ -420,7 +544,17 @@ class SimpleGridExecutor(ExecutorBase):
             self._entry_remainder_cancelled = True
 
     def control_stop_loss(self):
-        reference = self._exit_reference_price()
+        price_type = self.config.trigger_price_type
+        if price_type in (PriceType.BestBid, PriceType.BestAsk):
+            price_type = PriceType.BestBid if self.side == TradeType.BUY else PriceType.BestAsk
+        reference = self._usable_price(price_type)
+        if reference is None:
+            # Skip rather than guess. Deciding "not breached" from missing data would leave a
+            # live position unprotected without saying so.
+            self.logger().warning(
+                f"Executor ID: {self.config.id} - no usable price to check the stop loss "
+                f"against; position is unprotected this tick")
+            return
         stop_price = self.stop_loss_price
         breached = reference <= stop_price if self.side == TradeType.BUY else reference >= stop_price
         if breached:
@@ -502,7 +636,13 @@ class SimpleGridExecutor(ExecutorBase):
     def open_and_close_volume_match(self) -> bool:
         if self.open_filled_amount == Decimal("0"):
             return True
-        return self._close_order is not None and self._close_order.is_filled
+        if self._close_order is None:
+            return False
+        if self._close_order.is_filled:
+            return True
+        # is_filled reads executed_amount_base, which stays zero when the close order's trade
+        # updates never arrived. Compare the amounts we trust, or shutdown never completes.
+        return self.close_filled_amount >= self.open_filled_amount
 
     async def control_shutdown_process(self):
         self.close_timestamp = self._strategy.current_timestamp
@@ -537,13 +677,18 @@ class SimpleGridExecutor(ExecutorBase):
         self._status = RunnableStatus.SHUTTING_DOWN
 
     async def validate_sufficient_balance(self):
-        # In both_oco only one side can end up filled, but both are live until one does,
-        # so the balance check has to cover every side we are about to quote.
-        candidates = []
+        """
+        Check each side we might take on its own, never the sum of them.
+
+        Only one entry order is ever sent: control_entry_orders latches _triggered_side on
+        the first level reached and puts the other off the table, and nothing rests in the
+        book before that. So the collateral needed is one leg's worth — but either side could
+        be the one that triggers, so each has to be affordable individually.
+        """
         for side in self.config.sides():
             price = self.config.entry_price if self.config.entry_price is not None else self._touch_price(side)
             if self.is_perpetual:
-                candidates.append(PerpetualOrderCandidate(
+                candidate = PerpetualOrderCandidate(
                     trading_pair=self.config.trading_pair,
                     is_maker=True,
                     order_type=self.config.entry_order_type,
@@ -551,21 +696,24 @@ class SimpleGridExecutor(ExecutorBase):
                     amount=self.config.amount,
                     price=price,
                     leverage=Decimal(self.config.leverage),
-                ))
+                )
             else:
-                candidates.append(OrderCandidate(
+                candidate = OrderCandidate(
                     trading_pair=self.config.trading_pair,
                     is_maker=True,
                     order_type=self.config.entry_order_type,
                     order_side=side,
                     amount=self.config.amount,
                     price=price,
-                ))
-        adjusted = self.adjust_order_candidates(self.config.connector_name, candidates)
-        if any(candidate.amount == Decimal("0") for candidate in adjusted):
-            self.close_type = CloseType.INSUFFICIENT_BALANCE
-            self.logger().error("Not enough budget to open the position.")
-            self.stop()
+                )
+            adjusted = self.adjust_order_candidates(self.config.connector_name, [candidate])
+            if any(entry.amount == Decimal("0") for entry in adjusted):
+                self.close_type = CloseType.INSUFFICIENT_BALANCE
+                self.logger().error(
+                    f"Not enough budget to open the position: one {side.name} leg of "
+                    f"{self.config.amount} at {price} does not fit.")
+                self.stop()
+                return
 
     # ------------------------------------------------------------------ events
 
@@ -611,7 +759,7 @@ class SimpleGridExecutor(ExecutorBase):
         if side is not None:
             # Cancelling the unfilled remainder of an entry is routine. The tracked order
             # has to survive it, because its fills are the record of the position we hold.
-            if self._entry_orders[side].executed_amount_base == Decimal("0"):
+            if self._order_filled_base(self._entry_orders[side]) == Decimal("0"):
                 self._failed_orders.append(self._entry_orders[side])
                 self._entry_orders[side] = None
             return
@@ -656,7 +804,7 @@ class SimpleGridExecutor(ExecutorBase):
             "take_profit_price": self.take_profit_price if self.side else None,
             "stop_loss_price": self.stop_loss_price if self.side else None,
             "trigger_price_type": self.config.trigger_price_type,
-            "entry_reposts": dict(self._repost_count),
+            "entry_levels": {s.name: self._entry_target_price(s) for s in self.config.sides()},
             "filled_amount": self.open_filled_amount,
             "current_retries": self._current_retries,
             "max_retries": self._max_retries,

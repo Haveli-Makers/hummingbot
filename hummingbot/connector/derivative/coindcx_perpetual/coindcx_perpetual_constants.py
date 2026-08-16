@@ -121,6 +121,8 @@ ORDER_STATE = {
 # Statuses queried when listing orders. Must be a COMMA-SEPARATED STRING: sending
 # the same values as a JSON array is rejected with HTTP 422 "Invalid Request".
 ALL_ORDER_STATUSES = "open,filled,partially_filled,partially_cancelled,cancelled,rejected,untriggered"
+# Statuses that still have quantity resting in the book, for get_open_orders.
+OPEN_ORDER_STATUSES = "open,partially_filled"
 
 # The list endpoints (orders, positions, transactions) are account-wide and paged;
 # none of them accepts a pair filter, so callers page through until the record is
@@ -154,6 +156,9 @@ ORDER_GONE_MESSAGE_HINTS = (
 PENDING_ORDER_EVENT_TTL = 15.0
 PENDING_ORDER_EVENT_RETRY_INTERVAL = 0.2
 MAX_PENDING_ORDER_EVENTS = 256
+# How many recent order-frame signatures to remember for duplicate suppression. Only needs
+# to outlive the window in which the venue repeats a frame, which is seconds.
+MAX_APPLIED_ORDER_EVENTS = 512
 
 RATE_LIMITS = [
     RateLimit(limit_id=ACTIVE_INSTRUMENTS_PATH_URL, limit=2000, time_interval=ONE_MINUTE),

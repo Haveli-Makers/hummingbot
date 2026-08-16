@@ -2,12 +2,15 @@ import asyncio
 import time
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from hummingbot.connector.derivative.coindcx_perpetual import coindcx_perpetual_constants as CONSTANTS
 from hummingbot.connector.derivative.coindcx_perpetual.coindcx_perpetual_derivative import CoindcxPerpetualDerivative
+from hummingbot.connector.perpetual_derivative_py_base import PerpetualDerivativePyBase
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PositionSide, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
+from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee
+from hummingbot.core.event.events import BuyOrderCreatedEvent, MarketEvent, OrderFilledEvent
 
 INSTRUMENT = {
     "pair": "B-BTC_USDT",
@@ -1082,6 +1085,104 @@ class CoindcxPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
         self._track(exchange_order_id="ex-known")
         self.exchange._process_order_event(self._fill_event(exchange_order_id="ex-other"))
         self.assertEqual(0, len(self.exchange._pending_order_events))
+
+    async def test_filled_frame_without_trades_fetches_the_fills_before_settling(self):
+        """
+        A FILLED status with no ``trades`` must not settle the order empty.
+
+        executed_amount_base is only written by trade updates, and the tracker stops
+        tracking an order the moment it settles — so settling first loses the size and any
+        strategy reading it believes it holds nothing while a real position is open.
+        """
+        self._bootstrap()
+        order = self._track(exchange_order_id="ex-1")
+        frame = self._fill_event()
+        frame["trades"] = []
+
+        with patch.object(self.exchange, "_all_trade_updates_for_order",
+                          new=AsyncMock(return_value=[self.exchange._trade_update_from_fill(
+                              {"fill_id": "f-1", "id": "ex-1", "pair": "B-BTC_USDT",
+                               "price": "60000", "quantity": "0.01", "fee_amount": "0.35",
+                               "timestamp": 1700000001000}, order)])) as fetch:
+            self.exchange._process_order_event(frame)
+            for _ in range(4):
+                await asyncio.sleep(0)
+
+        fetch.assert_awaited_once()
+        self.assertEqual(Decimal("0.01"), order.executed_amount_base)
+
+    async def test_repeated_order_frames_are_applied_once(self):
+        """
+        CoinDCX repeats frames. Applying one twice re-fires the created event, and
+        MarketsRecorder then fails on `UNIQUE constraint failed: Order.id`, which aborts
+        whatever was queued behind it on that frame.
+        """
+        self._bootstrap()
+        order = self._track(exchange_order_id="ex-1")
+
+        for _ in range(3):
+            self.exchange._process_order_event(self._fill_event())
+        await asyncio.sleep(0)
+
+        # One fill's worth of size, not three.
+        self.assertEqual(Decimal("0.01"), order.executed_amount_base)
+        self.assertEqual(1, len(self.exchange._applied_order_events))
+
+    def test_an_order_is_only_announced_as_created_once(self):
+        """
+        The REST placement response and the websocket frame can both drive an order out of
+        PENDING_CREATE and both fire the created event. MarketsRecorder writes a row per
+        event, so the second fails on `UNIQUE constraint failed: Order.id` and aborts
+        whatever was queued behind it.
+        """
+        self._bootstrap()
+        created = BuyOrderCreatedEvent(
+            timestamp=1700000000.0, type=OrderType.MARKET, trading_pair="BTC-USDT",
+            amount=Decimal("1"), price=Decimal("60000"), order_id="oid-1",
+            creation_timestamp=1700000000.0)
+
+        with patch.object(PerpetualDerivativePyBase, "trigger_event") as forwarded:
+            for _ in range(3):
+                self.exchange.trigger_event(MarketEvent.BuyOrderCreated, created)
+
+        self.assertEqual(1, forwarded.call_count, "created event escaped more than once")
+
+    def test_other_events_are_never_suppressed(self):
+        self._bootstrap()
+        filled = OrderFilledEvent(
+            timestamp=1700000000.0, order_id="oid-1", trading_pair="BTC-USDT",
+            trade_type=TradeType.BUY, order_type=OrderType.MARKET,
+            price=Decimal("60000"), amount=Decimal("1"),
+            trade_fee=AddedToCostTradeFee(flat_fees=[]))
+
+        with patch.object(PerpetualDerivativePyBase, "trigger_event") as forwarded:
+            for _ in range(3):
+                self.exchange.trigger_event(MarketEvent.OrderFilled, filled)
+
+        self.assertEqual(3, forwarded.call_count)
+
+    def test_a_frame_that_changes_nothing_is_not_pushed(self):
+        """
+        The REST placement response and the websocket both report a new order as open.
+        Pushing the second one lets both fire the created event, and MarketsRecorder then
+        fails its insert on `UNIQUE constraint failed: Order.id`.
+        """
+        self._bootstrap()
+        order = self._track(exchange_order_id="ex-1")
+        order.current_state = OrderState.OPEN
+
+        with patch.object(self.exchange._order_tracker, "process_order_update") as push:
+            self.exchange._apply_order_event(self._fill_event(status="open"), order)
+
+        push.assert_not_called()
+
+    def test_a_genuine_status_change_is_not_suppressed(self):
+        self._bootstrap()
+        self._track(exchange_order_id="ex-1")
+        self.exchange._process_order_event(self._fill_event(status="open"))
+        self.exchange._process_order_event(self._fill_event(status="filled"))
+        self.assertEqual(2, len(self.exchange._applied_order_events),
+                         "a real transition must still get through")
 
     def test_matched_events_still_apply_directly(self):
         self._bootstrap()

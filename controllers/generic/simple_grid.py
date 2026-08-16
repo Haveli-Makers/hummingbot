@@ -362,11 +362,15 @@ class SimpleGrid(ControllerBase):
             if self._anchor_price is None:
                 anchor += " (mid, no leg open yet)"
 
+        # Spot cannot short: it watches both levels and buys whichever the market reaches, so
+        # the lower one is a dip-buy. Calling it "short" would describe a trade the venue
+        # cannot make.
         watching = []
         if long_level:
-            watching.append(f"long above {long_level:.6f}")
+            watching.append(f"{'long' if self.is_perpetual else 'buy'} above {long_level:.6f}")
         if short_level:
-            watching.append(f"short below {short_level:.6f}")
+            watching.append(
+                f"{'short' if self.is_perpetual else 'buy the dip'} below {short_level:.6f}")
         gaps = [abs(level - mid_price) for level in (long_level, short_level) if level]
         if gaps:
             watching.append(f"distance to nearer level: {min(gaps) / mid_price:.4%}")

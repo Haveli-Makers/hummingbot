@@ -596,12 +596,10 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
     @property
     def status_dict(self) -> Dict[str, bool]:
         """
-        Readiness, plus a one-off note naming whatever is holding it up.
+        Readiness, plus a note naming whatever is holding it up.
 
-        A connector that never reports ready makes ScriptStrategyBase log "is not ready,
-        please wait" every second — hundreds of lines that bury real errors, with nothing
-        saying which check is failing. Naming it once costs nothing and turns an opaque
-        stall into a specific one.
+        An unready connector makes the strategy log "is not ready" every tick without
+        saying which check is failing. Logged only when the set changes.
         """
         status = super().status_dict
         blocked = sorted(key for key, ready in status.items() if not ready)
@@ -617,10 +615,8 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
         """
         Orders resting on the exchange right now.
 
-        Part of the standard connector surface, and previously unimplemented here — callers
-        got an AttributeError and had to reach into ``in_flight_orders`` instead, which only
-        knows about orders this session placed. This asks the exchange, so manual orders and
-        orders from a previous run are included too.
+        Asks the exchange rather than reading ``in_flight_orders``, so manual orders and
+        orders left by an earlier session are included.
         """
         orders: List[OpenOrder] = []
         payload = {"status": CONSTANTS.OPEN_ORDER_STATUSES,
@@ -1036,18 +1032,11 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
         """
         Announce an order's creation once, however many times the state machine says so.
 
-        Two paths drive an order from PENDING_CREATE to OPEN — the REST placement response
-        and the websocket frame — and they land far enough apart (~400ms observed) that both
-        can see PENDING_CREATE and both fire the created event. MarketsRecorder writes a row
-        per event, so the second one fails:
-
-            sqlite3.IntegrityError: UNIQUE constraint failed: Order.id
-
-        That surfaces as "Unexpected error while processing event 200/201" and aborts
-        anything queued behind it. Suppressing duplicate frames and no-op state updates did
-        not help, because the two firings come from different layers and neither sees the
-        other. An order is only ever created once, so enforce that where the event leaves the
-        connector rather than trying to make the two paths agree.
+        The REST placement response and the websocket frame both drive an order out of
+        PENDING_CREATE, and landing ~400ms apart they each fire the created event.
+        MarketsRecorder writes a row per event, so the second fails on a duplicate
+        Order.id and aborts whatever was queued behind it. The two paths cannot see each
+        other, so the constraint is enforced here, where they converge.
         """
         if event_tag in (MarketEvent.BuyOrderCreated, MarketEvent.SellOrderCreated):
             order_id = getattr(message, "order_id", None)
@@ -1135,17 +1124,8 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
         """
         Send an order update only when it actually changes the order's state.
 
-        The REST placement response and the websocket frame both report a new order as
-        open. ``process_order_update`` is scheduled rather than applied inline, so the two
-        can each read ``PENDING_CREATE`` before either writes, and both then fire
-        BuyOrderCreated/SellOrderCreated. MarketsRecorder inserts a row per created event
-        and the second one fails:
-
-            sqlite3.IntegrityError: UNIQUE constraint failed: Order.id
-
-        That exception surfaces as "Unexpected error while processing event 200/201" and
-        aborts anything queued behind it. Dropping no-op updates removes the second write
-        without needing the two paths to coordinate.
+        The venue repeats frames for an unchanged order, and each one would otherwise
+        schedule a tracker update that assigns the same values back.
         """
         update = self._order_update_from_payload(order, tracked_order)
         if update.new_state == tracked_order.current_state:
@@ -1158,12 +1138,9 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
         """
         Re-read balances as soon as an order settles.
 
-        Closing a position releases its margin, but the connector only learns that on its
-        next scheduled poll. Until then the budget check sees the pre-close figure, so the
-        controller's next leg is refused with "Not enough budget to open the position" even
-        though the wallet is free — three times in fifteen seconds after a take profit,
-        until the poll caught up. Orders settle rarely enough that refreshing on each one
-        costs nothing.
+        Closing a position releases margin, but the connector only learns that on its next
+        scheduled poll — until then a budget check sees the pre-close figure and refuses
+        an order the wallet can afford. Orders settle rarely enough for this to be cheap.
         """
         if not self._trading_required:
             return

@@ -18,7 +18,7 @@ KLINE_PUSH_WEB_SOCKET_TOPIC = "/contractMarket/limitCandle"
 INTERVALS = bidict({
     "1s": "1s",  # Implemented for resampling to 1s from trades in quants-lab
     "1m": "1min",
-    "3m": "3min",  
+    "3m": "3min",
     "5m": "5min",
     "15m": "15min",
     "30m": "30min",

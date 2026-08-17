@@ -13,9 +13,7 @@ from hummingbot.data_feed.candles_feed.bybit_perpetual_candles.bybit_perpetual_c
 from hummingbot.data_feed.candles_feed.bybit_spot_candles.bybit_spot_candles import BybitSpotCandles
 from hummingbot.data_feed.candles_feed.candles_base import CandlesBase
 from hummingbot.data_feed.candles_feed.coindcx_spot_candles.coindcx_spot_candles import CoinDCXSpotCandles
-from hummingbot.data_feed.candles_feed.coinex_perpetual_candles.coinex_perpetual_candles import (
-    CoinexPerpetualCandles,
-)
+from hummingbot.data_feed.candles_feed.coinex_perpetual_candles.coinex_perpetual_candles import CoinexPerpetualCandles
 from hummingbot.data_feed.candles_feed.coinex_spot_candles.coinex_spot_candles import CoinexSpotCandles
 from hummingbot.data_feed.candles_feed.coinswitch_spot_candles.coinswitch_spot_candles import CoinswitchSpotCandles
 from hummingbot.data_feed.candles_feed.csx_spot_candles.csx_spot_candles import CsxSpotCandles

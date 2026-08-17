@@ -59,7 +59,7 @@ class KucoinPerpetualCandles(CandlesBase):
 
     @property
     def candles_max_result_per_rest_request(self):
-        return CONSTANTS.MAX_RESULTS_PER_CANDLESTICK_REST_REQUEST
+        return max(1, CONSTANTS.MAX_RESULTS_PER_CANDLESTICK_REST_REQUEST // self._resample_ratio)
 
     @property
     def symbols_url(self):
@@ -105,6 +105,23 @@ class KucoinPerpetualCandles(CandlesBase):
     def _is_first_candle_not_included_in_rest_request(self):
         return False
 
+    def _resolve_native_interval(self) -> str:
+        if self.interval in CONSTANTS.GRANULARITIES:
+            return self.interval
+        target_minutes = self.interval_in_seconds // 60
+        for native, minutes in sorted(CONSTANTS.GRANULARITIES.items(), key=lambda kv: -kv[1]):
+            if minutes <= target_minutes and target_minutes % minutes == 0:
+                return native
+        raise ValueError(
+            f"KuCoin Futures cannot provide '{self.interval}' candles: none of its native "
+            f"granularities {sorted(CONSTANTS.GRANULARITIES.values())} (minutes) evenly divide it."
+        )
+
+    @property
+    def _resample_ratio(self) -> int:
+        native_interval = self._resolve_native_interval()
+        return self.interval_in_seconds // (CONSTANTS.GRANULARITIES[native_interval] * 60)
+
     def _get_rest_candles_params(self,
                                  start_time: Optional[int] = None,
                                  end_time: Optional[int] = None,
@@ -113,7 +130,8 @@ class KucoinPerpetualCandles(CandlesBase):
         For API documentation, please refer to:
         https://www.kucoin.com/docs/rest/futures-trading/market-data/get-klines
         """
-        granularity = CONSTANTS.GRANULARITIES[self.interval]
+        native_interval = self._resolve_native_interval()
+        granularity = CONSTANTS.GRANULARITIES[native_interval]
         now = self._round_timestamp_to_interval_multiple(self._time())
         granularity_limits = {
             1: 24,  # 1 minute granularity, 24 hours
@@ -128,19 +146,58 @@ class KucoinPerpetualCandles(CandlesBase):
         if granularity in granularity_limits:
             max_duration = granularity_limits[granularity] * 60  # convert days to minutes
             if (now - start_time) / 60 >= max_duration:
+                days = granularity_limits[granularity] // 24
+                if native_interval == self.interval:
+                    raise ValueError(
+                        f"{granularity}m granularity candles are only available for the last {days} days.")
                 raise ValueError(
-                    f"{granularity}m granularity candles are only available for the last {granularity_limits[granularity] // 24} days.")
+                    f"'{self.interval}' candles are only available for the last {days} days: KuCoin Futures has "
+                    f"no native {self.interval} granularity, so they are synthesized by resampling native "
+                    f"{granularity}m candles, which inherit the {granularity}m lookback limit.")
 
         params = {
             "symbol": self.symbols_dict[f"{self.kucoin_base_asset}-{self.quote_asset}"],
-            "granularity": CONSTANTS.GRANULARITIES[self.interval],
+            "granularity": granularity,
             "to": end_time * 1000,
         }
         return params
 
+    def _resample_candles(self, native_candles: List[List[float]]) -> List[List[float]]:
+        """Aggregate KuCoin Futures' native-granularity candles into self.interval bars."""
+        native_interval = self._resolve_native_interval()
+        if not native_candles or native_interval == self.interval:
+            return native_candles
+
+        grouped: Dict[float, List[List[float]]] = {}
+        for candle in native_candles:
+            bucket_ts = self._round_timestamp_to_interval_multiple(candle[0])
+            grouped.setdefault(bucket_ts, []).append(candle)
+
+        resampled: List[List[float]] = []
+        for bucket_ts in sorted(grouped.keys()):
+            bucket = sorted(grouped[bucket_ts], key=lambda c: c[0])
+            resampled.append([
+                bucket_ts,
+                bucket[0][1],
+                max(c[2] for c in bucket),
+                min(c[3] for c in bucket),
+                bucket[-1][4],
+                sum(c[5] for c in bucket),
+                0., 0., 0., 0.,
+            ])
+        return resampled
+
     def _parse_rest_candles(self, data: dict, end_time: Optional[int] = None) -> List[List[float]]:
-        return [[self.ensure_timestamp_in_seconds(row[0]), row[1], row[2], row[3], row[4], row[5], 0., 0., 0., 0.]
-                for row in data['data']]
+        native_candles = [
+            [self.ensure_timestamp_in_seconds(row[0]), float(row[1]), float(row[2]), float(row[3]), float(row[4]),
+             float(row[5]), 0., 0., 0., 0.]
+            for row in data['data']
+        ]
+        native_candles.sort(key=lambda x: x[0])
+        candles = self._resample_candles(native_candles)
+        if end_time:
+            candles = [c for c in candles if c[0] <= end_time]
+        return candles
 
     def ws_subscription_payload(self):
         topic_candle = f"{self.symbols_dict[self._ex_trading_pair]}_{CONSTANTS.INTERVALS[self.interval]}"

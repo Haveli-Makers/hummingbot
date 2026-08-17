@@ -12,6 +12,7 @@ KLINE_ENDPOINT_NAME = "spot@public.kline.v3.api.pb"
 
 INTERVALS = bidict({
     "1m": "1m",
+    "3m": "3m", 
     "5m": "5m",
     "15m": "15m",
     "30m": "30m",
@@ -21,6 +22,8 @@ INTERVALS = bidict({
     "1w": "1W",
     "1M": "1M"
 })
+
+NATIVE_INTERVALS = ["1M", "1w", "1d", "4h", "1h", "30m", "15m", "5m", "1m"]
 
 WS_INTERVALS = {
     "1m": "Min1",

@@ -13,6 +13,12 @@ from hummingbot.data_feed.candles_feed.bybit_perpetual_candles.bybit_perpetual_c
 from hummingbot.data_feed.candles_feed.bybit_spot_candles.bybit_spot_candles import BybitSpotCandles
 from hummingbot.data_feed.candles_feed.candles_base import CandlesBase
 from hummingbot.data_feed.candles_feed.coindcx_spot_candles.coindcx_spot_candles import CoinDCXSpotCandles
+from hummingbot.data_feed.candles_feed.coinex_perpetual_candles.coinex_perpetual_candles import (
+    CoinexPerpetualCandles,
+)
+from hummingbot.data_feed.candles_feed.coinex_spot_candles.coinex_spot_candles import CoinexSpotCandles
+from hummingbot.data_feed.candles_feed.coinswitch_spot_candles.coinswitch_spot_candles import CoinswitchSpotCandles
+from hummingbot.data_feed.candles_feed.csx_spot_candles.csx_spot_candles import CsxSpotCandles
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.data_feed.candles_feed.dexalot_spot_candles.dexalot_spot_candles import DexalotSpotCandles
 from hummingbot.data_feed.candles_feed.gate_io_perpetual_candles import GateioPerpetualCandles
@@ -28,6 +34,8 @@ from hummingbot.data_feed.candles_feed.mexc_perpetual_candles.mexc_perpetual_can
 from hummingbot.data_feed.candles_feed.mexc_spot_candles.mexc_spot_candles import MexcSpotCandles
 from hummingbot.data_feed.candles_feed.okx_perpetual_candles.okx_perpetual_candles import OKXPerpetualCandles
 from hummingbot.data_feed.candles_feed.okx_spot_candles.okx_spot_candles import OKXSpotCandles
+from hummingbot.data_feed.candles_feed.wazirx_spot_candles.wazirx_spot_candles import WazirXSpotCandles
+from hummingbot.data_feed.candles_feed.zebpay_spot_candles.zebpay_spot_candles import ZebpaySpotCandles
 
 
 class UnsupportedConnectorException(Exception):
@@ -69,6 +77,12 @@ class CandlesFactory:
         "bitmart_perpetual": BitmartPerpetualCandles,
         "btc_markets": BtcMarketsSpotCandles,
         "coindcx": CoinDCXSpotCandles,
+        "wazirx": WazirXSpotCandles,
+        "zebpay": ZebpaySpotCandles,
+        "coinex": CoinexSpotCandles,
+        "coinex_perpetual": CoinexPerpetualCandles,
+        "csx": CsxSpotCandles,
+        "coinswitch": CoinswitchSpotCandles,
     }
 
     @classmethod

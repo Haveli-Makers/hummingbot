@@ -507,7 +507,7 @@ class AjaibExchange(ExchangePyBase):
         remote_asset_names = set()
 
         account_info = await self._api_get(
-            path_url=CONSTANTS.PORTFOLIO_PATH_URL,
+            path_url=CONSTANTS.ACCOUNT_PATH_URL,
             is_auth_required=True)
 
         balances = account_info.get("balances", []) if isinstance(account_info, dict) else account_info

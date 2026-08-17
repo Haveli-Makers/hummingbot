@@ -8,38 +8,54 @@ EXCHANGE_NAME = "ajaib"
 # the actual REST/WSS hosts are fixed below.
 DEFAULT_DOMAIN = "ajaib"
 
-REST_URL = "https://api.kripto.ajaib.co.id"
-WSS_URL = "wss://stream.kripto.ajaib.co.id"
+REST_URL = "https://api.crypto.ajaib.co.id"
+WSS_URL = "wss://stream.crypto.ajaib.co.id"
 
-# Public market-data streams are subscribed to on /ws via a SUBSCRIBE message; the
-# private user-data stream connects to /ws/<listenKey>.
+# EVERY stream -- public market data included -- is accessed at /ws/<listenKey>.
+# Per the docs: "Streams are accessed at /ws/<listenKey>"; there is no open
+# public endpoint. Connecting to a bare /ws is rejected with HTTP 401, so the
+# order book data source needs a listenKey exactly as the user stream does.
+# Constraints: 1 listenKey per connection, max 1024 streams, 24h connection life.
 WS_PUBLIC_PATH = "/ws"
 WS_USER_PATH = "/ws"
+WS_MAX_STREAMS_PER_CONNECTION = 1024
 
 HBOT_ORDER_ID_PREFIX = "haveli-"
 # Ajaib expects ``newClientOrderId`` in UUIDv4 form; keep room for the prefix.
 MAX_ORDER_ID_LEN = 36
 
-# Generous recvWindow (ms) to tolerate the extra latency / clock skew introduced
-# by routing through an Indonesian proxy. Ajaib defaults to 5000 when omitted.
-RECV_WINDOW = 20000
+# recvWindow (ms). The docs state it defaults to 5000 and give no maximum, but
+# 5000 is in fact a hard CAP: verified against the live API, 5000 returns 200
+# while 6000 and every larger value are rejected with
+# ``-1021 Timestamp invalid or Timestamp for this request is outside of the
+# recvWindow``. Do not raise this to "tolerate proxy latency" -- it fails closed.
+RECV_WINDOW = 5000
+MAX_RECV_WINDOW = 5000
 
 # ---- Market info / public endpoints -----------------------------------------
 SERVER_TIME_PATH_URL = "/v1/time"
 EXCHANGE_INFO_PATH_URL = "/v1/exchange-info"
 KLINES_PATH_URL = "/v1/klines"
+DEPTH_PATH_URL = "/v1/depth"
+# Note the hyphen and the PLURAL ``symbols`` parameter (max 50 per call);
+# "/v1/ticker/bookTicker" does not exist and 404s at the gateway.
+BOOK_TICKER_PATH_URL = "/v1/ticker/book-ticker"
 
 # ---- Spot trading endpoints --------------------------------------------------
 CREATE_ORDER_PATH_URL = "/v1/order"
 ORDER_STATUS_PATH_URL = "/v1/order"
 CANCEL_ORDER_PATH_URL = "/v1/order"
+# Both require a ``symbol`` parameter -- calling them without one is rejected
+# with ``-1130 symbol is required``.
 OPEN_ORDERS_PATH_URL = "/v1/order/open"
 CANCEL_ALL_ORDERS_PATH_URL = "/v1/order/open"
 ALL_ORDERS_PATH_URL = "/v1/order/all"
 TRADES_PATH_URL = "/v1/trades"
 
 # ---- Wallet ------------------------------------------------------------------
-PORTFOLIO_PATH_URL = "/v1/portfolio"
+# GET /v1/account -> {"balances": [{"asset", "free", "locked"}, ...]}
+# ("/v1/portfolio" is not a route on this API and 404s at the gateway.)
+ACCOUNT_PATH_URL = "/v1/account"
 
 # ---- User data stream (listenKey) -------------------------------------------
 LISTEN_KEY_PATH_URL = "/auth/v1/listen-key"
@@ -95,7 +111,9 @@ RATE_LIMITS = [
     RateLimit(limit_id=OPEN_ORDERS_PATH_URL, limit=300, time_interval=ONE_MINUTE),
     RateLimit(limit_id=ALL_ORDERS_PATH_URL, limit=1200, time_interval=ONE_MINUTE),
     RateLimit(limit_id=TRADES_PATH_URL, limit=1200, time_interval=ONE_MINUTE),
-    RateLimit(limit_id=PORTFOLIO_PATH_URL, limit=1200, time_interval=ONE_MINUTE),
+    RateLimit(limit_id=DEPTH_PATH_URL, limit=1200, time_interval=ONE_MINUTE),
+    RateLimit(limit_id=BOOK_TICKER_PATH_URL, limit=1200, time_interval=ONE_MINUTE),
+    RateLimit(limit_id=ACCOUNT_PATH_URL, limit=1200, time_interval=ONE_MINUTE),
     RateLimit(limit_id=LISTEN_KEY_PATH_URL, limit=1200, time_interval=ONE_MINUTE),
 ]
 

@@ -37,6 +37,20 @@ class AjaibUtilsTests(TestCase):
         self.assertIn("ajaib_api_secret", fields)
         self.assertIn("ajaib_proxy_url", fields)
 
-    def test_proxy_field_is_not_a_connect_key(self):
+    def test_proxy_field_must_be_a_connect_key(self):
+        """
+        Connect keys are the only config fields forwarded to the connector
+        constructor. Flagged False, the proxy is prompted and stored but never
+        reaches the connector, so `connect ajaib` validates over a direct
+        connection and Ajaib rejects it 403 -- only the proxy IP is allowlisted.
+        """
         extra = ajaib_utils.AjaibConfigMap.model_fields["ajaib_proxy_url"].json_schema_extra
-        self.assertFalse(extra["is_connect_key"])
+        self.assertTrue(extra["is_connect_key"])
+
+    def test_every_prompted_field_reaches_the_connector(self):
+        for name, field in ajaib_utils.AjaibConfigMap.model_fields.items():
+            extra = field.json_schema_extra or {}
+            if extra.get("prompt_on_new"):
+                self.assertTrue(
+                    extra.get("is_connect_key"),
+                    f"{name} is prompted but not a connect key, so it is silently discarded")

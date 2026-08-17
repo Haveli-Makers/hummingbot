@@ -95,11 +95,16 @@ class AjaibConfigMap(BaseConnectorConfigMap):
         default=SecretStr(""),
         json_schema_extra={
             "prompt": lambda cm: (
-                "Enter a proxy URL to route Ajaib traffic through an Indonesian IP "
-                "(e.g. socks5://user:pass@host:1080), or leave blank to connect directly"
+                "Enter a proxy URL to route Ajaib traffic through an IP-allowlisted egress "
+                "(e.g. http://user:pass@host:3128), or leave blank to connect directly"
             ),
             "is_secure": True,
-            "is_connect_key": False,
+            # Must stay True. Fields flagged False are prompted and stored but
+            # DROPPED before reaching the connector constructor, so the proxy
+            # would be silently ignored and `connect ajaib` would validate the
+            # keys over a direct connection -- which Ajaib rejects with 403
+            # because only the proxy's IP is allowlisted.
+            "is_connect_key": True,
             "prompt_on_new": True,
         }
     )

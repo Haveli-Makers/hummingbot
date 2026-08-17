@@ -89,15 +89,28 @@ class AjaibAuth(AuthBase):
 
     def _sign(self, params: Dict[str, Any]) -> str:
         """
-        Sign the alphabetically-sorted, URL-encoded parameters and return the
+        Sign the parameters EXACTLY as they will be transmitted and return the
         base64-encoded signature.
+
+        The server verifies against the query string it receives, so the signed
+        bytes must match the wire order. Sorting here while sending the dict in
+        insertion order produced a valid-looking signature over a different
+        string and every request failed with ``-1022 Invalid signature``.
+        Ordering itself is not significant to Ajaib -- verified live, both
+        sorted and insertion order authenticate -- but signed and sent must
+        agree, so this signs the caller's order and never reorders.
         """
         if self._private_key is None:
             return ""
 
-        payload = urlencode(sorted(params.items())).encode("ascii")
+        payload = self.signature_payload(params).encode("ascii")
         signature = self._raw_sign(payload)
         return base64.b64encode(signature).decode("ascii")
+
+    @staticmethod
+    def signature_payload(params: Dict[str, Any]) -> str:
+        """The exact string that is signed, in transmission order."""
+        return urlencode(list(params.items()))
 
     def _raw_sign(self, payload: bytes) -> bytes:
         key = self._private_key

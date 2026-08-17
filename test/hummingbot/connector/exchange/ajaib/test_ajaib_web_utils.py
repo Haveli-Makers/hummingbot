@@ -7,7 +7,7 @@ from hummingbot.core.web_assistant.connections.connections_factory import Connec
 class AjaibWebUtilsTests(TestCase):
     def test_public_rest_url_uses_kripto_host(self):
         url = web_utils.public_rest_url(CONSTANTS.EXCHANGE_INFO_PATH_URL)
-        self.assertEqual("https://api.kripto.ajaib.co.id/v1/exchange-info", url)
+        self.assertEqual("https://api.crypto.ajaib.co.id/v1/exchange-info", url)
 
     def test_private_rest_url_matches_public(self):
         path = CONSTANTS.CREATE_ORDER_PATH_URL

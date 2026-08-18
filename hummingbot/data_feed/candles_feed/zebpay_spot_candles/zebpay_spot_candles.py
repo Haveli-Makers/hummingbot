@@ -3,16 +3,14 @@ import logging
 import time
 from typing import List, Optional
 
-from hummingbot.connector.exchange.coindcx.coindcx_utils import hb_pair_to_coindcx_pair
 from hummingbot.core.network_iterator import NetworkStatus
 from hummingbot.core.utils.async_utils import safe_ensure_future
-from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.data_feed.candles_feed.candles_base import CandlesBase
-from hummingbot.data_feed.candles_feed.coindcx_spot_candles import constants as CONSTANTS
+from hummingbot.data_feed.candles_feed.zebpay_spot_candles import constants as CONSTANTS
 from hummingbot.logger import HummingbotLogger
 
 
-class CoinDCXSpotCandles(CandlesBase):
+class ZebpaySpotCandles(CandlesBase):
     _logger: Optional[HummingbotLogger] = None
 
     @classmethod
@@ -30,15 +28,15 @@ class CoinDCXSpotCandles(CandlesBase):
 
     @property
     def name(self) -> str:
-        return f"coindcx_{self._trading_pair}"
+        return f"zebpay_{self._trading_pair}"
 
     @property
     def rest_url(self) -> str:
-        return CONSTANTS.PUBLIC_REST_URL
+        return CONSTANTS.REST_URL
 
     @property
     def wss_url(self):
-        return CONSTANTS.WSS_URL
+        return None
 
     @property
     def health_check_url(self) -> str:
@@ -46,7 +44,7 @@ class CoinDCXSpotCandles(CandlesBase):
 
     @property
     def candles_url(self) -> str:
-        return CONSTANTS.PUBLIC_REST_URL + CONSTANTS.CANDLES_ENDPOINT
+        return CONSTANTS.REST_URL + CONSTANTS.CANDLES_ENDPOINT
 
     @property
     def candles_endpoint(self) -> str:
@@ -66,9 +64,8 @@ class CoinDCXSpotCandles(CandlesBase):
 
     def _resolve_native_interval(self) -> str:
         """
-        CoinDCX's public candles REST endpoint only accepts a handful of native intervals
-        (CONSTANTS.NATIVE_INTERVALS). Resolve the largest one that evenly divides the
-        requested self.interval so it can be fetched and then resampled client-side.
+        Resolve the largest Zebpay-native interval (CONSTANTS.NATIVE_INTERVALS) that
+        evenly divides self.interval, so it can be fetched and resampled client-side.
         """
         target_seconds = self.interval_in_seconds
         for native in CONSTANTS.NATIVE_INTERVALS:
@@ -76,9 +73,9 @@ class CoinDCXSpotCandles(CandlesBase):
             if native_seconds <= target_seconds and target_seconds % native_seconds == 0:
                 return native
         raise ValueError(
-            f"CoinDCX cannot provide '{self.interval}' candles: its public API only supports "
-            f"{CONSTANTS.NATIVE_INTERVALS} as base intervals, and none of them evenly divide "
-            f"'{self.interval}'."
+            f"Zebpay cannot provide '{self.interval}' candles: its API only supports "
+            f"{CONSTANTS.NATIVE_INTERVALS} as base intervals, and none of them evenly "
+            f"divide '{self.interval}'."
         )
 
     @property
@@ -98,43 +95,7 @@ class CoinDCXSpotCandles(CandlesBase):
         return NetworkStatus.CONNECTED
 
     def get_exchange_trading_pair(self, trading_pair: str) -> str:
-        _, quote = trading_pair.split("-")
-        ecode = "I" if quote.upper() == "INR" else "B"
-        return hb_pair_to_coindcx_pair(trading_pair, ecode=ecode)
-
-    async def initialize_exchange_data(self):
-        try:
-            rest_assistant = await self._api_factory.get_rest_assistant()
-            markets = await rest_assistant.execute_request(
-                url=CONSTANTS.REST_URL + CONSTANTS.MARKETS_DETAILS_ENDPOINT,
-                throttler_limit_id=CONSTANTS.MARKETS_DETAILS_ENDPOINT,
-                method=RESTMethod.GET,
-            )
-
-            base, quote = self._trading_pair.split("-")
-            expected_ecode = "I" if quote.upper() == "INR" else "B"
-            ecode_prefix = f"{expected_ecode}-"
-            for market in markets:
-                if (market.get("target_currency_short_name") == base
-                        and market.get("base_currency_short_name") == quote
-                        and market.get("status") == "active"
-                        and market.get("pair", "").startswith(ecode_prefix)):
-                    self._ex_trading_pair = market["pair"]
-                    self.logger().info(
-                        f"CoinDCX candles pair resolved: {self._trading_pair} → {self._ex_trading_pair}"
-                    )
-                    return
-
-            self.logger().warning(
-                f"Could not resolve CoinDCX pair for {self._trading_pair} from markets details. "
-                f"Using default: {self._ex_trading_pair}"
-            )
-        except Exception as e:
-            self.logger().error(
-                f"Error initialising CoinDCX exchange data for {self._trading_pair}: {e}",
-                exc_info=True,
-            )
-            raise
+        return trading_pair.upper()
 
     async def fill_historical_candles(self):
         if self._historical_fill_in_progress:
@@ -237,22 +198,26 @@ class CoinDCXSpotCandles(CandlesBase):
         self,
         start_time: Optional[int] = None,
         end_time: Optional[int] = None,
-        limit: Optional[int] = CONSTANTS.MAX_RESULTS_PER_CANDLESTICK_REST_REQUEST,
+        limit: Optional[int] = None,
     ) -> dict:
+        now = int(self._time())
+        native_seconds = self.get_seconds_from_interval(self._native_interval)
         native_limit = (limit or CONSTANTS.MAX_RESULTS_PER_CANDLESTICK_REST_REQUEST) * self._resample_ratio
+        native_limit = min(native_limit, CONSTANTS.MAX_RESULTS_PER_CANDLESTICK_REST_REQUEST)
+
+        resolved_end_time = end_time if end_time else now
+        resolved_start_time = start_time if start_time else resolved_end_time - native_seconds * native_limit
+
         params: dict = {
-            "pair": self._ex_trading_pair,
+            "symbol": self._ex_trading_pair,
             "interval": self._native_interval,
-            "limit": min(native_limit, CONSTANTS.MAX_RESULTS_PER_CANDLESTICK_REST_REQUEST),
+            "startTime": int(resolved_start_time * 1000),
+            "endTime": int(resolved_end_time * 1000),
         }
-        if start_time:
-            params["startTime"] = int(start_time * 1000)
-        if end_time:
-            params["endTime"] = int(end_time * 1000)
         return params
 
     def _resample_candles(self, native_candles: List[List[float]]) -> List[List[float]]:
-        """Aggregate CoinDCX's native-interval candles into self.interval bars."""
+        """Aggregate Zebpay's native-interval candles into self.interval bars."""
         if not native_candles or self._native_interval == self.interval:
             return native_candles
 
@@ -279,29 +244,38 @@ class CoinDCXSpotCandles(CandlesBase):
         return resampled
 
     def _parse_rest_candles(
-        self, data: list, end_time: Optional[int] = None
+        self, data, end_time: Optional[int] = None
     ) -> List[List[float]]:
         if not data:
             return []
+        if isinstance(data, dict):
+            status_code = data.get("statusCode")
+            if status_code is not None and int(status_code) not in (200, 201):
+                self.logger().error(
+                    f"Zebpay: kline request failed (statusCode={status_code}): "
+                    f"{data.get('statusDescription')}"
+                )
+                return []
+            data = data.get("data") or []
 
         native_candles = []
         for row in data:
             try:
-                timestamp = self.ensure_timestamp_in_seconds(row["time"])
+                timestamp = self.ensure_timestamp_in_seconds(row[0])
                 native_candles.append([
                     timestamp,
-                    float(row["open"]),
-                    float(row["high"]),
-                    float(row["low"]),
-                    float(row["close"]),
-                    float(row["volume"]),
+                    float(row[1]),
+                    float(row[2]),
+                    float(row[3]),
+                    float(row[4]),
+                    float(row[5]),
                     0.0,
                     0.0,
                     0.0,
                     0.0,
                 ])
             except Exception as e:
-                self.logger().error(f"CoinDCX: error parsing candle row {row}: {e}")
+                self.logger().error(f"Zebpay: error parsing candle row {row}: {e}")
         native_candles.sort(key=lambda x: x[0])
 
         candles = self._resample_candles(native_candles)
@@ -316,19 +290,19 @@ class CoinDCXSpotCandles(CandlesBase):
             try:
                 await self._polling_task
             except asyncio.CancelledError:
-                self.logger().info("CoinDCX candles subscription cancelled.")
+                self.logger().info("Zebpay candles subscription cancelled.")
                 raise
 
     def ws_subscription_payload(self):
-        raise NotImplementedError("WebSocket not supported for CoinDCX candles; polling is used instead.")
+        raise NotImplementedError("WebSocket not supported for Zebpay candles; polling is used instead.")
 
     def _parse_websocket_message(self, data: dict):
-        raise NotImplementedError("WebSocket not supported for CoinDCX candles; polling is used instead.")
+        raise NotImplementedError("WebSocket not supported for Zebpay candles; polling is used instead.")
 
     async def _polling_loop(self):
         try:
             self.logger().info(
-                f"Starting CoinDCX candles polling for {self._trading_pair} [{self.interval}]"
+                f"Starting Zebpay candles polling for {self._trading_pair} [{self.interval}]"
             )
             await self._initialize_candles()
 
@@ -346,7 +320,7 @@ class CoinDCXSpotCandles(CandlesBase):
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    self.logger().exception(f"CoinDCX candles polling error: {e}")
+                    self.logger().exception(f"Zebpay candles polling error: {e}")
                     try:
                         await asyncio.wait_for(self._shutdown_event.wait(), timeout=5.0)
                         break
@@ -354,7 +328,7 @@ class CoinDCXSpotCandles(CandlesBase):
                         continue
         finally:
             self._is_running = False
-            self.logger().info("CoinDCX candles polling loop stopped.")
+            self.logger().info("Zebpay candles polling loop stopped.")
 
     async def _initialize_candles(self):
         try:
@@ -367,12 +341,12 @@ class CoinDCXSpotCandles(CandlesBase):
                 self._ws_candle_available.set()
                 safe_ensure_future(self.fill_historical_candles())
                 self.logger().info(
-                    f"CoinDCX candles seeded with {len(self._candles)} recent candles "
+                    f"Zebpay candles seeded with {len(self._candles)} recent candles "
                     f"for {self._trading_pair} [{self.interval}]; backfill scheduled."
                 )
         except Exception as e:
             self.logger().error(
-                f"Error initialising CoinDCX candles for {self._trading_pair}: {e}",
+                f"Error initialising Zebpay candles for {self._trading_pair}: {e}",
                 exc_info=True,
             )
 
@@ -391,7 +365,7 @@ class CoinDCXSpotCandles(CandlesBase):
             close_price = prev[4]
             heartbeat = [next_ts, close_price, close_price, close_price, close_price, 0.0, 0.0, 0.0, 0.0, 0.0]
             self._candles.append(heartbeat)
-            self.logger().debug(f"CoinDCX: inserted heartbeat candle at {next_ts}")
+            self.logger().debug(f"Zebpay: inserted heartbeat candle at {next_ts}")
             next_ts += self.interval_in_seconds
 
         self._candles.append(new_candle)
@@ -406,20 +380,23 @@ class CoinDCXSpotCandles(CandlesBase):
             heartbeat = [next_ts, prev_close, prev_close, prev_close, prev_close,
                          0.0, 0.0, 0.0, 0.0, 0.0]
             self._candles.append(heartbeat)
-            self.logger().debug(f"CoinDCX: heartbeat candle inserted at {next_ts}")
+            self.logger().debug(f"Zebpay: heartbeat candle inserted at {next_ts}")
             next_ts += self.interval_in_seconds
 
     async def _poll_and_update(self):
         try:
             rest_assistant = await self._api_factory.get_rest_assistant()
             limit = min(10 * self._resample_ratio, CONSTANTS.MAX_RESULTS_PER_CANDLESTICK_REST_REQUEST)
+            native_seconds = self.get_seconds_from_interval(self._native_interval)
+            now = int(self._time())
             data = await rest_assistant.execute_request(
                 url=self.candles_url,
                 throttler_limit_id=self._rest_throttler_limit_id,
                 params={
-                    "pair": self._ex_trading_pair,
+                    "symbol": self._ex_trading_pair,
                     "interval": self._native_interval,
-                    "limit": limit,
+                    "startTime": int((now - native_seconds * limit) * 1000),
+                    "endTime": int(now * 1000),
                 },
                 method=self._rest_method,
             )
@@ -444,4 +421,4 @@ class CoinDCXSpotCandles(CandlesBase):
             self._ensure_heartbeats_to_current_time()
 
         except Exception as e:
-            self.logger().error(f"CoinDCX candles poll error: {e}", exc_info=True)
+            self.logger().error(f"Zebpay candles poll error: {e}", exc_info=True)

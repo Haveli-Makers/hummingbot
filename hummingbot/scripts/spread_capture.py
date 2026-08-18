@@ -67,6 +67,7 @@ class SpreadCaptureConfig(BaseClientModel):
             "prompt_on_new": True,
             "input_type": "select",
             "options": list(DB_TARGETS),
+            "show_on_dashboard": False,
         },
     )
 

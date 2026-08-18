@@ -1,7 +1,10 @@
 import uuid
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
+from unittest import TestCase
 from unittest.mock import AsyncMock
+
+from bidict import bidict
 
 from hummingbot.connector.exchange.ajaib import ajaib_constants as CONSTANTS
 from hummingbot.connector.exchange.ajaib.ajaib_exchange import AjaibExchange
@@ -187,3 +190,89 @@ class AjaibExchangeTests(IsolatedAsyncioWrapperTestCase):
             [1700000000000, "100", "110", "90", "61234.5", "1000", 1700000059999]])
         price = await self.exchange._get_last_traded_price(self.trading_pair)
         self.assertEqual(61234.5, price)
+
+
+class AjaibOrderStateResolutionTests(TestCase):
+    """NEW means two different things depending on workingTime (docs > Definitions)."""
+
+    def _resolve(self, status, working_time, current=OrderState.PENDING_CREATE):
+        return AjaibExchange.resolve_order_state(status, working_time, current)
+
+    def test_new_with_zero_working_time_is_not_yet_open(self):
+        # "received by exchange but it is not valid yet" -- advertising this as
+        # OPEN tells a strategy the order can trade when it cannot.
+        self.assertEqual(OrderState.PENDING_CREATE, self._resolve('NEW', 0))
+        self.assertEqual(OrderState.PENDING_CREATE, self._resolve('NEW', '0'))
+        self.assertEqual(OrderState.PENDING_CREATE, self._resolve('NEW', None))
+
+    def test_new_with_working_time_is_open(self):
+        self.assertEqual(OrderState.OPEN, self._resolve('NEW', 1700000000000))
+        self.assertEqual(OrderState.OPEN, self._resolve('NEW', '1700000000000'))
+
+    def test_terminal_states_ignore_working_time(self):
+        self.assertEqual(OrderState.FILLED, self._resolve('FILLED', 0))
+        self.assertEqual(OrderState.CANCELED, self._resolve('PARTIALLY_EXPIRED', 0))
+        self.assertEqual(OrderState.FAILED, self._resolve('REJECTED', 0))
+
+    def test_unknown_status_keeps_the_current_state(self):
+        self.assertEqual(OrderState.OPEN, self._resolve('SOMETHING_NEW', 1, OrderState.OPEN))
+
+
+class AjaibCancelContractTests(IsolatedAsyncioWrapperTestCase):
+    """DELETE /v1/order requires newClientOrderId and returns the cancelled order."""
+
+    def setUp(self):
+        super().setUp()
+        self.trading_pair = "BTC-IDR"
+        self.exchange = AjaibExchange(
+            ajaib_api_key="k", ajaib_api_secret="", ajaib_proxy_url="",
+            trading_pairs=[self.trading_pair], trading_required=False)
+        self.exchange._set_trading_pair_symbol_map(bidict({"BTC_IDR": self.trading_pair}))
+
+    def _order(self):
+        return InFlightOrder(
+            client_order_id="11111111-1111-4111-8111-111111111111",
+            trading_pair=self.trading_pair, order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY, amount=Decimal("0.001"),
+            price=Decimal("1000000000"), creation_timestamp=1700000000.0,
+            exchange_order_id="ex-1")
+
+    async def test_cancel_sends_the_mandatory_new_client_order_id(self):
+        sent = {}
+
+        async def _delete(path_url, params, is_auth_required=False, **kw):
+            sent.update(params)
+            return {"status": "CANCELLED"}
+
+        self.exchange._api_delete = AsyncMock(side_effect=_delete)
+        order = self._order()
+        self.assertTrue(await self.exchange._place_cancel(order.client_order_id, order))
+
+        self.assertEqual("BTC_IDR", sent["symbol"])
+        self.assertEqual(order.client_order_id, sent["origClientOrderId"])
+        self.assertIn("newClientOrderId", sent, "newClientOrderId is MANDATORY per the docs")
+        # It identifies the CANCEL, so it must differ from the order's own id.
+        self.assertNotEqual(order.client_order_id, sent["newClientOrderId"])
+        uuid.UUID(sent["newClientOrderId"], version=4)
+
+    async def test_cancel_rejects_a_non_dict_response(self):
+        self.exchange._api_delete = AsyncMock(return_value=[{"msg": "nope"}])
+        with self.assertRaises(IOError):
+            await self.exchange._place_cancel("x", self._order())
+
+    async def test_cancel_rejects_a_non_cancelled_status(self):
+        self.exchange._api_delete = AsyncMock(return_value={"status": "NEW"})
+        with self.assertRaises(IOError):
+            await self.exchange._place_cancel("x", self._order())
+
+    async def test_partially_cancelled_counts_as_cancelled(self):
+        self.exchange._api_delete = AsyncMock(return_value={"status": "PARTIALLY_CANCELLED"})
+        self.assertTrue(await self.exchange._place_cancel("x", self._order()))
+
+    def test_order_not_found_matches_the_api_code_not_the_http_status(self):
+        ex = self.exchange
+        self.assertTrue(ex._is_order_not_found_during_cancelation_error(
+            IOError('HTTP status is 404. Error: {"code":-2013,"msg":"Order not found"}')))
+        # A gateway 404 for a wrong path must NOT read as "order already gone".
+        self.assertFalse(ex._is_order_not_found_during_cancelation_error(
+            IOError('HTTP 404. {"message":"no Route matched with those values"}')))

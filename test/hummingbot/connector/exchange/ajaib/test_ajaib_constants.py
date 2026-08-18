@@ -25,6 +25,22 @@ class AjaibConstantsTests(TestCase):
         self.assertLessEqual(CONSTANTS.RECV_WINDOW, CONSTANTS.MAX_RECV_WINDOW)
         self.assertEqual(5000, CONSTANTS.MAX_RECV_WINDOW)
 
+    def test_every_terminal_status_is_mapped(self):
+        """
+        An unmapped status falls back to the order's CURRENT state, and the REST
+        poll keeps returning that same status -- so a terminal order would never
+        settle. PARTIALLY_EXPIRED was missing and would have stranded orders.
+        """
+        for status in CONSTANTS.TERMINAL_ORDER_STATUSES:
+            self.assertIn(status, CONSTANTS.ORDER_STATE, f"{status} is unmapped")
+            self.assertIn(CONSTANTS.ORDER_STATE[status],
+                          {OrderState.FILLED, OrderState.CANCELED, OrderState.FAILED},
+                          f"{status} is terminal but maps to a non-terminal state")
+
+    def test_self_trade_prevention_outcomes_are_terminal(self):
+        for status in ("EXPIRED_IN_MATCH", "PARTIALLY_EXPIRED_IN_MATCH", "PARTIALLY_EXPIRED"):
+            self.assertEqual(OrderState.CANCELED, CONSTANTS.ORDER_STATE[status])
+
     def test_order_state_mapping(self):
         self.assertEqual(OrderState.OPEN, CONSTANTS.ORDER_STATE["NEW"])
         self.assertEqual(OrderState.FILLED, CONSTANTS.ORDER_STATE["FILLED"])

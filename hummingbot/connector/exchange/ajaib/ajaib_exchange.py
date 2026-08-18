@@ -13,7 +13,7 @@ from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
 from hummingbot.core.data_type.common import OrderType, TradeType
-from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate, TradeUpdate
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
@@ -235,10 +235,13 @@ class AjaibExchange(ExchangePyBase):
         ) or CONSTANTS.ORDER_NOT_EXIST_MESSAGE in str(status_update_exception)
 
     def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
-        exc_str = str(cancelation_exception)
+        exc_str = str(cancelation_exception).lower()
+        # Match on the API's own code (-2013) or message, not on the bare HTTP
+        # status: "404" appears in unrelated gateway errors ("no Route matched"),
+        # and mistaking one for "already gone" drops a live order from tracking.
         return (
-            str(CONSTANTS.ORDER_NOT_EXIST_ERROR_CODE) in exc_str
-            or CONSTANTS.ORDER_NOT_EXIST_MESSAGE in exc_str
+            str(CONSTANTS.ORDER_NOT_EXIST_API_CODE) in exc_str
+            or CONSTANTS.ORDER_NOT_EXIST_MESSAGE.lower() in exc_str
         )
 
     def _create_web_assistants_factory(self) -> WebAssistantsFactory:
@@ -310,9 +313,12 @@ class AjaibExchange(ExchangePyBase):
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair=tracked_order.trading_pair)
 
         # ``order_id`` is the UUIDv4 we sent as newClientOrderId == clientOrderId.
+        # ``newClientOrderId`` is MANDATORY here and identifies the CANCEL itself
+        # (not the order being cancelled), so it must be a fresh UUIDv4.
         api_params = {
             "symbol": symbol,
             "origClientOrderId": order_id,
+            "newClientOrderId": ajaib_utils.generate_client_order_id(),
         }
 
         cancel_result = await self._api_delete(
@@ -320,7 +326,16 @@ class AjaibExchange(ExchangePyBase):
             params=api_params,
             is_auth_required=True)
 
-        return cancel_result is not None
+        # Only an explicit cancelled/terminal status counts. Accepting "any
+        # non-null payload" would report an error body as a successful cancel and
+        # drop tracking of an order still resting on the exchange.
+        if isinstance(cancel_result, dict):
+            status = str(cancel_result.get("status", "")).upper()
+            if status in CONSTANTS.CANCEL_ACCEPTED_STATUSES:
+                return True
+            raise IOError(
+                f"Unexpected status cancelling order {order_id}: {cancel_result}")
+        raise IOError(f"Unexpected response cancelling order {order_id}: {cancel_result}")
 
     async def _format_trading_rules(self, exchange_info_dict: Dict[str, Any]) -> List[TradingRule]:
         symbols = exchange_info_dict.get("symbols", []) if isinstance(exchange_info_dict, dict) else exchange_info_dict
@@ -389,7 +404,8 @@ class AjaibExchange(ExchangePyBase):
                 update_ts = (event_ts * 1e-3) if event_ts else self._time_synchronizer.time()
 
                 status = event_message.get("X", "")
-                new_state = CONSTANTS.ORDER_STATE.get(status, tracked_order.current_state)
+                new_state = self.resolve_order_state(
+                    status, event_message.get("W"), tracked_order.current_state)
                 order_update = OrderUpdate(
                     trading_pair=tracked_order.trading_pair,
                     update_timestamp=update_ts,
@@ -490,7 +506,8 @@ class AjaibExchange(ExchangePyBase):
             is_auth_required=True)
 
         status = updated_order_data.get("status", "")
-        new_state = CONSTANTS.ORDER_STATE.get(status, tracked_order.current_state)
+        new_state = self.resolve_order_state(
+            status, updated_order_data.get("workingTime"), tracked_order.current_state)
 
         update_ts = updated_order_data.get("updateTime") or updated_order_data.get("time")
         order_update = OrderUpdate(
@@ -501,6 +518,26 @@ class AjaibExchange(ExchangePyBase):
             new_state=new_state,
         )
         return order_update
+
+    @staticmethod
+    def resolve_order_state(status: str, working_time: Any, current_state):
+        """
+        Map an Ajaib order status onto a Hummingbot order state.
+
+        ``NEW`` is two different things depending on ``workingTime`` (docs >
+        Definitions): zero means the exchange has received the order but it is
+        "not valid yet", non-zero means it reached the matching engine. Treating
+        the first case as OPEN advertises an order as live before it can trade.
+        """
+        state = CONSTANTS.ORDER_STATE.get(status, current_state)
+        if status == "NEW":
+            try:
+                is_working = working_time is not None and float(working_time) != 0
+            except (TypeError, ValueError):
+                is_working = False
+            if not is_working:
+                return OrderState.PENDING_CREATE
+        return state
 
     async def _update_balances(self):
         local_asset_names = set(self._account_balances.keys())

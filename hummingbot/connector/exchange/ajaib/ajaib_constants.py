@@ -96,9 +96,21 @@ ORDER_STATE = {
     "CANCELLED": OrderState.CANCELED,
     "REJECTED": OrderState.FAILED,
     "EXPIRED": OrderState.CANCELED,
+    # Self-Trade-Prevention outcomes and partial expiry. All are END states per
+    # the docs; leaving any of them unmapped strands the order in the tracker,
+    # because the status resolver falls back to the order's CURRENT state and
+    # the REST poll keeps returning the same unmapped status forever.
+    "PARTIALLY_EXPIRED": OrderState.CANCELED,
     "EXPIRED_IN_MATCH": OrderState.CANCELED,
     "PARTIALLY_EXPIRED_IN_MATCH": OrderState.CANCELED,
 }
+
+# Every terminal status the exchange can report, per docs > Definitions. Used to
+# assert the map above stays complete as the API evolves.
+TERMINAL_ORDER_STATUSES = (
+    "FILLED", "PARTIALLY_CANCELLED", "CANCELLED", "REJECTED", "EXPIRED",
+    "PARTIALLY_EXPIRED", "EXPIRED_IN_MATCH", "PARTIALLY_EXPIRED_IN_MATCH",
+)
 
 RATE_LIMITS = [
     RateLimit(limit_id=WS_CONNECTIONS_LIMIT_ID, limit=300, time_interval=ONE_MINUTE),
@@ -117,7 +129,14 @@ RATE_LIMITS = [
     RateLimit(limit_id=LISTEN_KEY_PATH_URL, limit=1200, time_interval=ONE_MINUTE),
 ]
 
+# DELETE /v1/order returns the cancelled order; treat only these as a real cancel.
+# PARTIALLY_CANCELLED is a legitimate outcome when part of the order had filled.
+CANCEL_ACCEPTED_STATUSES = ("CANCELLED", "CANCELED", "PARTIALLY_CANCELLED", "PENDING_CANCEL")
+
+# GET /v1/order for an unknown id answers HTTP 404 with {"code": -2013,
+# "msg": "Order not found"} -- verified live.
 ORDER_NOT_EXIST_ERROR_CODE = 404
+ORDER_NOT_EXIST_API_CODE = -2013
 ORDER_NOT_EXIST_MESSAGE = "Order not found"
 UNKNOWN_ORDER_ERROR_CODE = 400
 UNKNOWN_ORDER_MESSAGE = "Unknown order"

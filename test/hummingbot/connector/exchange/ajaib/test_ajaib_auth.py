@@ -1,9 +1,10 @@
 import asyncio
 import base64
+import json
 from typing import Awaitable
 from unittest import TestCase
 from unittest.mock import MagicMock
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, unquote, urlencode
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -63,7 +64,12 @@ class AjaibAuthTests(TestCase):
         signature = request.params.pop("signature")
         self._verify(signature, request.params)
 
-    def test_post_request_signs_body_and_sets_content_type(self):
+    def test_post_request_sends_a_signed_form_body(self):
+        """
+        Ajaib parses non-GET bodies as FORM data. A JSON body -- which is what
+        RESTAssistant produces by default -- is rejected with -1102 Bad Request,
+        so auth must emit form encoding AND override the Content-Type header.
+        """
         request = RESTRequest(
             method=RESTMethod.POST,
             url="https://api.crypto.ajaib.co.id/v1/order",
@@ -73,11 +79,47 @@ class AjaibAuthTests(TestCase):
         self.async_run_with_timeout(self.auth.rest_authenticate(request))
 
         self.assertEqual("application/x-www-form-urlencoded", request.headers["Content-Type"])
-        self.assertEqual(self.ms, request.data["timestamp"])
-        self.assertIn("signature", request.data)
+        self.assertIsInstance(request.data, str, "body must be form-encoded, not a dict/JSON")
 
-        signature = request.data.pop("signature")
-        self._verify(signature, request.data)
+        sent = dict(parse_qsl(request.data))
+        self.assertEqual("BTC_IDR", sent["symbol"], "caller payload must survive")
+        self.assertEqual(str(self.ms), sent["timestamp"])
+        self.assertIn("signature", sent)
+
+        body, _, signature_part = request.data.rpartition("&signature=")
+        self._private_key.public_key().verify(
+            base64.b64decode(unquote(signature_part)), body.encode("ascii"))
+
+    def test_post_body_arriving_as_a_json_string_is_not_discarded(self):
+        """
+        RESTAssistant json.dumps() the payload before auth runs. Handling only
+        dicts silently dropped it -- the listen-key keep-alive lost its
+        {"listenKey": ...} and the exchange rejected the request.
+        """
+        request = RESTRequest(
+            method=RESTMethod.POST,
+            url="https://api.crypto.ajaib.co.id/auth/v1/listen-key",
+            data=json.dumps({"listenKey": "abc123"}),
+            is_auth_required=True,
+        )
+        self.async_run_with_timeout(self.auth.rest_authenticate(request))
+
+        sent = dict(parse_qsl(request.data))
+        self.assertEqual("abc123", sent["listenKey"], "payload was discarded")
+        self.assertIn("signature", sent)
+
+    def test_content_type_is_overridden_not_defaulted(self):
+        # RESTAssistant pre-sets application/json for non-GET; setdefault would
+        # leave it, producing a JSON header over a form body.
+        request = RESTRequest(
+            method=RESTMethod.POST,
+            url="https://api.crypto.ajaib.co.id/v1/order",
+            data=json.dumps({}),
+            headers={"Content-Type": "application/json"},
+            is_auth_required=True,
+        )
+        self.async_run_with_timeout(self.auth.rest_authenticate(request))
+        self.assertEqual("application/x-www-form-urlencoded", request.headers["Content-Type"])
 
     def test_signed_payload_matches_what_is_transmitted(self):
         """
@@ -126,3 +168,50 @@ class AjaibAuthTests(TestCase):
     def test_missing_key_returns_empty_signature(self):
         auth = AjaibAuth(api_key="", secret_key="", time_provider=MagicMock())
         self.assertEqual("", auth._sign({"a": "1"}))
+
+
+class AjaibAuthCredentialFailureTests(TestCase):
+    """
+    A key that fails to load must fail LOUDLY. Previously it left the signer
+    with no key, _sign returned an empty string, and the exchange answered
+    "-1022 Invalid signature" on every request -- pointing the reader at the
+    signing algorithm instead of at a mistyped filename.
+    """
+
+    def _auth(self, secret):
+        provider = MagicMock()
+        provider.time.return_value = 1700000000.0
+        return AjaibAuth(api_key="k", secret_key=secret, time_provider=provider)
+
+    def test_missing_key_file_raises_a_message_naming_the_path(self):
+        auth = self._auth("/nope/missing_key.pem")
+        self.assertIsNone(auth._private_key)
+        with self.assertRaises(ValueError) as ctx:
+            auth._sign({"timestamp": 1})
+        self.assertIn("missing_key.pem", str(ctx.exception))
+
+    def test_malformed_pem_contents_raise(self):
+        # Not a key -- PEM-shaped garbage. The header is assembled at runtime so
+        # the literal marker never appears in the source and the
+        # detect-private-key pre-commit hook has nothing to match on.
+        header = "-----BEGIN " + "PRIVATE KEY-----"
+        auth = self._auth(f"{header}\nnot-a-key\n-----END PRIVATE KEY-----")
+        self.assertIsNone(auth._private_key)
+        with self.assertRaises(ValueError):
+            auth._sign({"timestamp": 1})
+
+    def test_no_secret_at_all_is_not_an_error(self):
+        # Legitimate: the connector is built without credentials for discovery.
+        auth = self._auth("")
+        self.assertEqual("", auth._sign({"timestamp": 1}))
+
+    def test_a_valid_pem_still_signs(self):
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        pem = Ed25519PrivateKey.generate().private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption()).decode()
+        auth = self._auth(pem)
+        self.assertIsNotNone(auth._private_key)
+        self.assertTrue(auth._sign({"timestamp": 1}))

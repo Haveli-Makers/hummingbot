@@ -7,9 +7,19 @@ EXCHANGE_NAME = "ajaib"
 # as a label threaded through the base class / data sources for compatibility, but
 # the actual REST/WSS hosts are fixed below.
 DEFAULT_DOMAIN = "ajaib"
+TESTNET_DOMAIN = "ajaib_testnet"
 
 REST_URL = "https://api.crypto.ajaib.co.id"
 WSS_URL = "wss://stream.crypto.ajaib.co.id"
+
+# Testnet shares the mainnet path layout on its own hosts. Both resolve to the
+# same address; access is allowlisted SEPARATELY from mainnet, so an IP cleared
+# for production is not automatically cleared here.
+TESTNET_REST_URL = "https://testnet.api.crypto.ajaib.co.id"
+TESTNET_WSS_URL = "wss://testnet.stream.crypto.ajaib.co.id"
+
+REST_URLS = {DEFAULT_DOMAIN: REST_URL, TESTNET_DOMAIN: TESTNET_REST_URL}
+WSS_URLS = {DEFAULT_DOMAIN: WSS_URL, TESTNET_DOMAIN: TESTNET_WSS_URL}
 
 # EVERY stream -- public market data included -- is accessed at /ws/<listenKey>.
 # Per the docs: "Streams are accessed at /ws/<listenKey>"; there is no open
@@ -40,6 +50,9 @@ DEPTH_PATH_URL = "/v1/depth"
 # Note the hyphen and the PLURAL ``symbols`` parameter (max 50 per call);
 # "/v1/ticker/bookTicker" does not exist and 404s at the gateway.
 BOOK_TICKER_PATH_URL = "/v1/ticker/book-ticker"
+# "Maximum symbols that can be fetched is 50." The value is a JSON array string,
+# e.g. symbols=["BTC_IDR","ETH_IDR"] (a comma-separated list also works).
+BOOK_TICKER_MAX_SYMBOLS = 50
 
 # ---- Spot trading endpoints --------------------------------------------------
 CREATE_ORDER_PATH_URL = "/v1/order"

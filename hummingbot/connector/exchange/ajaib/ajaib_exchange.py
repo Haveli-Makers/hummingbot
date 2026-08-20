@@ -1,5 +1,6 @@
 import asyncio
-from decimal import Decimal
+import json
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
 from bidict import bidict
@@ -26,9 +27,13 @@ class AjaibExchange(ExchangePyBase):
     Ajaib (Coin Exchange) Open API connector implementation.
 
     The Ajaib Open API (https://ajaib.gitbook.io/ajaib-exchange-open-api) is a
-    Binance-style REST + WebSocket API with Ed25519 request signing. Ajaib
-    geo-blocks non-Indonesian IPs, so an Indonesian proxy can be supplied via
-    ``ajaib_proxy_url`` (see ``docs/PROXY_SERVER_GUIDE.md``).
+    Binance-style REST + WebSocket API with Ed25519 request signing.
+
+    API access is restricted by IP ALLOWLIST, so traffic normally has to be
+    routed through a cleared egress via ``ajaib_proxy_url`` (see
+    ``docs/PROXY_SERVER_GUIDE.md``). Mainnet and testnet are allowlisted
+    separately. Every REST endpoint is signed -- there are no anonymous public
+    endpoints -- and ``recvWindow`` is capped at 5000ms by the server.
     """
 
     UPDATE_ORDER_STATUS_MIN_INTERVAL = 10.0
@@ -178,9 +183,12 @@ class AjaibExchange(ExchangePyBase):
         """
         Returns a list of ``{symbol, bidPrice, askPrice, lastPrice}`` dicts.
 
-        The Ajaib Open API exposes no public depth/ticker REST endpoint, so the
-        last close from ``/v1/klines`` is used as the reference price (bid == ask
-        == last). Consumed by ``AjaibRateSource``.
+        Sourced from ``/v1/ticker/book-ticker``, which returns a real bid and
+        ask and accepts up to 50 symbols per request. The previous
+        implementation issued one ``/v1/klines`` call PER SYMBOL (~53 sequential
+        requests on mainnet) and reported the close as bid, ask and last alike,
+        so the oracle always saw a zero spread. Klines remains the per-symbol
+        fallback for anything book-ticker does not return.
         """
         if not self._keys_configured:
             self.logger().warning("Ajaib API keys not configured. Cannot fetch prices.")
@@ -191,22 +199,52 @@ class AjaibExchange(ExchangePyBase):
                    if ajaib_utils.is_exchange_information_valid(s)]
 
         results: List[Dict[str, str]] = []
-        for symbol in symbols:
+        covered = set()
+
+        batch_size = CONSTANTS.BOOK_TICKER_MAX_SYMBOLS
+        for start in range(0, len(symbols), batch_size):
+            batch = symbols[start:start + batch_size]
             try:
-                klines = await self._api_get(
-                    path_url=CONSTANTS.KLINES_PATH_URL,
-                    params={"symbol": symbol, "interval": "1m", "limit": 1},
+                tickers = await self._api_get(
+                    path_url=CONSTANTS.BOOK_TICKER_PATH_URL,
+                    params={"symbols": json.dumps(batch)},
                     is_auth_required=True)
-                if klines and len(klines) > 0:
-                    last_price = str(klines[0][4])
-                    results.append({
-                        "symbol": symbol,
-                        "bidPrice": last_price,
-                        "askPrice": last_price,
-                        "lastPrice": last_price,
-                    })
-            except Exception as e:
-                self.logger().debug(f"Failed to fetch kline price for {symbol}: {e}")
+            except Exception as exception:
+                self.logger().debug(
+                    f"book-ticker batch {start // batch_size} failed: {exception}")
+                continue
+
+            for ticker in tickers if isinstance(tickers, list) else []:
+                if not isinstance(ticker, dict):
+                    continue
+                symbol = ticker.get("symbol")
+                bid, ask = ticker.get("bidPrice"), ticker.get("askPrice")
+                mid = self._mid_or_side(bid, ask)
+                if not symbol or mid <= 0:
+                    continue
+                covered.add(symbol)
+                results.append({
+                    "symbol": symbol,
+                    # A one-sided book quotes only one side; report the side that
+                    # exists rather than a zero that reads as a real price.
+                    "bidPrice": str(bid if self._decimal_or_zero(bid) > 0 else mid),
+                    "askPrice": str(ask if self._decimal_or_zero(ask) > 0 else mid),
+                    "lastPrice": str(mid),
+                })
+
+        for symbol in (s for s in symbols if s not in covered):
+            try:
+                price = await self._price_from_klines(symbol)
+            except Exception as exception:
+                self.logger().debug(f"Failed to fetch kline price for {symbol}: {exception}")
+                continue
+            if price > 0:
+                results.append({
+                    "symbol": symbol,
+                    "bidPrice": str(price),
+                    "askPrice": str(price),
+                    "lastPrice": str(price),
+                })
 
         return results
 
@@ -230,9 +268,13 @@ class AjaibExchange(ExchangePyBase):
         return False
 
     def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
-        return str(CONSTANTS.ORDER_NOT_EXIST_ERROR_CODE) in str(
-            status_update_exception
-        ) or CONSTANTS.ORDER_NOT_EXIST_MESSAGE in str(status_update_exception)
+        # Match the API's own code (-2013 NO_SUCH_ORDER) or message, never the
+        # bare HTTP status: the gateway also answers 404 for an unknown route
+        # ("no Route matched"), and reading that as "order gone" would drop a
+        # live order from tracking.
+        exc = str(status_update_exception).lower()
+        return (str(CONSTANTS.ORDER_NOT_EXIST_API_CODE) in exc
+                or CONSTANTS.ORDER_NOT_EXIST_MESSAGE.lower() in exc)
 
     def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
         exc_str = str(cancelation_exception).lower()
@@ -279,6 +321,29 @@ class AjaibExchange(ExchangePyBase):
         is_maker = is_maker if is_maker is not None else (order_type is OrderType.LIMIT_MAKER)
         return DeductedFromReturnsTradeFee(percent=self.estimate_fee_pct(is_maker))
 
+    @staticmethod
+    def _is_server_side_error(exception: Exception) -> bool:
+        """
+        True for HTTP 5XX, which Ajaib documents as "the issue is on our server
+        side ... the execution status is UNKNOWN and could have been a success".
+        """
+        text = str(exception)
+        return any(f"HTTP status is {code}" in text for code in range(500, 512))
+
+    async def _find_order_by_client_id(self, client_order_id: str) -> Optional[Dict[str, Any]]:
+        """Look an order up by the client id we minted, or None if absent."""
+        try:
+            return await self._api_get(
+                path_url=CONSTANTS.ORDER_STATUS_PATH_URL,
+                params={"origClientOrderId": client_order_id},
+                is_auth_required=True)
+        except Exception as exception:
+            if self._is_order_not_found_during_status_update_error(exception):
+                return None
+            self.logger().warning(
+                f"Could not confirm whether {client_order_id} exists: {exception}")
+            return None
+
     async def _place_order(self,
                            order_id: str,
                            trading_pair: str,
@@ -299,10 +364,29 @@ class AjaibExchange(ExchangePyBase):
             "newClientOrderId": order_id,
         }
 
-        order_result = await self._api_post(
-            path_url=CONSTANTS.CREATE_ORDER_PATH_URL,
-            data=api_params,
-            is_auth_required=True)
+        try:
+            order_result = await self._api_post(
+                path_url=CONSTANTS.CREATE_ORDER_PATH_URL,
+                data=api_params,
+                is_auth_required=True)
+        except Exception as exception:
+            # Ajaib's docs are explicit: "HTTP 5XX return codes are used for
+            # internal errors; ... It is important to NOT treat this as a failure
+            # operation; the execution status is UNKNOWN and could have been a
+            # success." Marking the order FAILED here would leave a live order on
+            # the exchange that we no longer track, and a retry would double up.
+            if not self._is_server_side_error(exception):
+                raise
+            self.logger().warning(
+                f"Ajaib returned a server-side error placing {order_id}; the order MAY have "
+                f"been accepted. Checking by client order id before deciding. Error: {exception}")
+            existing = await self._find_order_by_client_id(order_id)
+            if existing is None:
+                raise
+            self.logger().warning(
+                f"Order {order_id} WAS created despite the server error "
+                f"(exchange id {existing.get('orderId')}); adopting it.")
+            order_result = existing
 
         o_id = str(order_result.get("orderId", ""))
         transact_time = order_result.get("time", self._time_synchronizer.time() * 1e3) * 1e-3
@@ -394,11 +478,23 @@ class AjaibExchange(ExchangePyBase):
                 if event_type != CONSTANTS.WS_EXECUTION_REPORT_EVENT_TYPE:
                     continue
 
-                client_order_id = event_message.get("c", "")
+                client_order_id = self.execution_report_client_order_id(event_message)
                 exchange_order_id = str(event_message.get("i", ""))
                 tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
                 if tracked_order is None:
+                    # Fall back to the exchange id: a fast fill can arrive before
+                    # _place_order has recorded the client id against the order.
+                    tracked_order = next(
+                        (o for o in self._order_tracker.all_updatable_orders.values()
+                         if o.exchange_order_id == exchange_order_id and exchange_order_id),
+                        None)
+                if tracked_order is None:
+                    self.logger().debug(
+                        f"Ignoring executionReport for untracked order "
+                        f"(c={event_message.get('c')!r} C={event_message.get('C')!r} "
+                        f"i={exchange_order_id!r} X={event_message.get('X')!r}).")
                     continue
+                client_order_id = tracked_order.client_order_id
 
                 event_ts = event_message.get("T") or event_message.get("E")
                 update_ts = (event_ts * 1e-3) if event_ts else self._time_synchronizer.time()
@@ -418,11 +514,14 @@ class AjaibExchange(ExchangePyBase):
                 # The execution report carries no commission, so emit the fill
                 # amount in real time with an estimated fee; the authoritative
                 # commission/tax is reconciled from ``/v1/trades`` polling.
-                fill_qty = Decimal(str(event_message.get("l", "0")))
-                if fill_qty > 0:
-                    fill_price = Decimal(str(event_message.get("L", "0")))
-                    fill_quote = event_message.get("Y")
-                    fill_quote_amount = Decimal(str(fill_quote)) if fill_quote is not None else fill_qty * fill_price
+                # l/L/Y are blank ("") on non-trade events and are being migrated
+                # to "0", so both shapes must parse to zero rather than raise.
+                fill_qty = self._decimal_or_zero(event_message.get("l"))
+                trade_id = str(event_message.get("t", ""))
+                # "t" is -1 when the event is not a trade (Open API changes).
+                if fill_qty > 0 and trade_id not in ("", "-1"):
+                    fill_price = self._decimal_or_zero(event_message.get("L"))
+                    fill_quote_amount = self._decimal_or_zero(event_message.get("Y")) or fill_qty * fill_price
                     is_maker = bool(event_message.get("m", False))
 
                     fee = TradeFeeBase.new_spot_fee(
@@ -433,7 +532,7 @@ class AjaibExchange(ExchangePyBase):
                     )
 
                     trade_update = TradeUpdate(
-                        trade_id=str(event_message.get("t", "")),
+                        trade_id=trade_id,
                         client_order_id=client_order_id,
                         exchange_order_id=exchange_order_id,
                         trading_pair=tracked_order.trading_pair,
@@ -520,6 +619,35 @@ class AjaibExchange(ExchangePyBase):
         return order_update
 
     @staticmethod
+    def _decimal_or_zero(value: Any) -> Decimal:
+        """Execution-report numeric fields arrive blank on non-trade events."""
+        try:
+            text = str(value).strip()
+            return Decimal(text) if text else Decimal("0")
+        except (TypeError, ValueError, InvalidOperation):
+            return Decimal("0")
+
+    @staticmethod
+    def execution_report_client_order_id(event: Dict[str, Any]) -> str:
+        """
+        Pull OUR order's client id out of an executionReport.
+
+        The field that carries it moves depending on the event (Open API
+        changes > Execution Report WS):
+
+          * any event except CANCELLED -- ``c`` is the ClientOrderId and ``C``
+            is an empty string.
+          * CANCELLED -- ``c`` is the *newClientOrderId* that identified the
+            CANCEL request, and ``C`` is the original ClientOrderId.
+
+        So reading ``c`` unconditionally silently drops every cancellation:
+        it holds the cancel's own UUID, which matches no tracked order.
+        ``C`` when populated, ``c`` otherwise, covers both shapes.
+        """
+        original = str(event.get("C") or "").strip()
+        return original or str(event.get("c") or "")
+
+    @staticmethod
     def resolve_order_state(status: str, working_time: Any, current_state):
         """
         Map an Ajaib order status onto a Hummingbot order state.
@@ -591,16 +719,74 @@ class AjaibExchange(ExchangePyBase):
         self._set_trading_pair_symbol_map(mapping)
 
     async def _get_last_traded_price(self, trading_pair: str) -> float:
-        try:
-            symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-            klines = await self._api_get(
-                path_url=CONSTANTS.KLINES_PATH_URL,
-                params={"symbol": symbol, "interval": "1m", "limit": 1},
-                is_auth_required=True)
+        """
+        Last traded price, falling back across the three sources Ajaib offers.
 
-            if klines and len(klines) > 0:
-                return float(klines[0][4])
+        ``/v1/klines`` is the natural source but is not always available (it
+        returns 503 on testnet), and a single failing endpoint used to make the
+        connector report 0.0 -- which silently disables anything that sizes or
+        prices from it. ``/v1/ticker/book-ticker`` gives a live bid/ask and
+        ``/v1/depth`` the raw book, so either can stand in.
+        """
+        symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+
+        for source in (self._price_from_klines,
+                       self._price_from_book_ticker,
+                       self._price_from_depth):
+            try:
+                price = await source(symbol)
+            except Exception as exception:
+                self.logger().debug(
+                    f"{source.__name__} failed for {trading_pair}: {exception}")
+                continue
+            if price > 0:
+                return price
+
+        self.logger().error(
+            f"No price available for {trading_pair}: klines, book-ticker and depth all failed.")
+        return 0.0
+
+    async def _price_from_klines(self, symbol: str) -> float:
+        klines = await self._api_get(
+            path_url=CONSTANTS.KLINES_PATH_URL,
+            params={"symbol": symbol, "interval": "1m", "limit": 1},
+            is_auth_required=True)
+        # [openTime, open, high, low, CLOSE, volume, closeTime]
+        return float(klines[0][4]) if klines else 0.0
+
+    async def _price_from_book_ticker(self, symbol: str) -> float:
+        # Note the PLURAL "symbols" parameter -- "symbol" is rejected.
+        tickers = await self._api_get(
+            path_url=CONSTANTS.BOOK_TICKER_PATH_URL,
+            params={"symbols": symbol},
+            is_auth_required=True)
+        for ticker in tickers if isinstance(tickers, list) else [tickers]:
+            if not isinstance(ticker, dict) or ticker.get("symbol") != symbol:
+                continue
+            return self._mid_or_side(ticker.get("bidPrice"), ticker.get("askPrice"))
+        return 0.0
+
+    async def _price_from_depth(self, symbol: str) -> float:
+        book = await self._api_get(
+            path_url=CONSTANTS.DEPTH_PATH_URL,
+            params={"symbol": symbol, "limit": 5},
+            is_auth_required=True)
+        if not isinstance(book, dict):
             return 0.0
-        except Exception as e:
-            self.logger().error(f"Error getting last traded price: {e}")
-            return 0.0
+        bids, asks = book.get("bids") or [], book.get("asks") or []
+        return self._mid_or_side(bids[0][0] if bids else None,
+                                 asks[0][0] if asks else None)
+
+    @staticmethod
+    def _mid_or_side(bid: Any, ask: Any) -> float:
+        """
+        Mid price when both sides quote, otherwise whichever side exists.
+
+        A one-sided book is normal on a thin market (testnet BTC_IDR currently
+        has bids and no asks); averaging in a zero would halve the price.
+        """
+        bid_price = float(AjaibExchange._decimal_or_zero(bid))
+        ask_price = float(AjaibExchange._decimal_or_zero(ask))
+        if bid_price > 0 and ask_price > 0:
+            return (bid_price + ask_price) / 2
+        return bid_price or ask_price or 0.0

@@ -2,7 +2,7 @@ import asyncio
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from hummingbot.connector.exchange.ajaib import ajaib_constants as CONSTANTS
+from hummingbot.connector.exchange.ajaib import ajaib_constants as CONSTANTS, ajaib_web_utils as web_utils
 from hummingbot.connector.exchange.ajaib.ajaib_order_book import AjaibOrderBook
 from hummingbot.connector.exchange.ajaib.ajaib_utils import hb_pair_to_ajaib_symbol
 from hummingbot.core.data_type.order_book_message import OrderBookMessage
@@ -52,7 +52,7 @@ class AjaibAPIOrderBookDataSource(OrderBookTrackerDataSource):
     async def _connected_websocket_assistant(self) -> WSAssistant:
         ws: WSAssistant = await self._api_factory.get_ws_assistant()
         await ws.connect(
-            ws_url=f"{CONSTANTS.WSS_URL}{CONSTANTS.WS_PUBLIC_PATH}",
+            ws_url=f"{web_utils.wss_url(self._domain)}{CONSTANTS.WS_PUBLIC_PATH}",
             ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL,
         )
         return ws

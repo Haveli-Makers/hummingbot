@@ -276,3 +276,202 @@ class AjaibCancelContractTests(IsolatedAsyncioWrapperTestCase):
         # A gateway 404 for a wrong path must NOT read as "order already gone".
         self.assertFalse(ex._is_order_not_found_during_cancelation_error(
             IOError('HTTP 404. {"message":"no Route matched with those values"}')))
+
+
+class AjaibExecutionReportTests(TestCase):
+    """
+    Field semantics from "Open API changes": on CANCELLED events the client
+    order id moves from "c" to "C", and "c" carries the CANCEL's own id.
+    """
+
+    def _coid(self, event):
+        return AjaibExchange.execution_report_client_order_id(event)
+
+    def test_normal_event_uses_c(self):
+        # Non-CANCELLED: c = ClientOrderId, C = "".
+        self.assertEqual("order-1", self._coid({"X": "FILLED", "c": "order-1", "C": ""}))
+        self.assertEqual("order-1", self._coid({"X": "NEW", "c": "order-1"}))
+
+    def test_cancelled_event_uses_C_not_c(self):
+        """
+        Reading "c" here would return the cancel request's UUID, match no
+        tracked order, and silently drop every cancellation.
+        """
+        event = {"X": "CANCELLED", "c": "cancel-req-uuid", "C": "order-1"}
+        self.assertEqual("order-1", self._coid(event))
+        self.assertNotEqual("cancel-req-uuid", self._coid(event))
+
+    def test_blank_C_is_ignored(self):
+        self.assertEqual("order-1", self._coid({"c": "order-1", "C": "   "}))
+        self.assertEqual("order-1", self._coid({"c": "order-1", "C": None}))
+
+    def test_missing_fields_do_not_raise(self):
+        self.assertEqual("", self._coid({}))
+
+
+class AjaibExecutionReportNumericTests(TestCase):
+    """l / L / Y arrive blank on non-trade events and are migrating to "0"."""
+
+    def _dec(self, value):
+        return AjaibExchange._decimal_or_zero(value)
+
+    def test_blank_parses_to_zero(self):
+        for blank in ("", "   ", None):
+            self.assertEqual(Decimal("0"), self._dec(blank))
+
+    def test_zero_string_parses_to_zero(self):
+        self.assertEqual(Decimal("0"), self._dec("0"))
+
+    def test_real_values_parse(self):
+        self.assertEqual(Decimal("0.5"), self._dec("0.5"))
+        self.assertEqual(Decimal("1000000"), self._dec(1000000))
+
+    def test_garbage_does_not_raise(self):
+        self.assertEqual(Decimal("0"), self._dec("not-a-number"))
+
+
+class AjaibPriceFallbackTests(IsolatedAsyncioWrapperTestCase):
+    """
+    /v1/klines is 503 on testnet. A single failing source used to make the
+    connector report 0.0, which silently disables anything that prices or
+    sizes from it -- including the order-lifecycle test.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.trading_pair = "BTC-IDR"
+        self.exchange = AjaibExchange(
+            ajaib_api_key="k", ajaib_api_secret="", ajaib_proxy_url="",
+            trading_pairs=[self.trading_pair], trading_required=False)
+        self.exchange._set_trading_pair_symbol_map(bidict({"BTC_IDR": self.trading_pair}))
+
+    def _responder(self, klines=None, book=None, depth=None):
+        async def _get(path_url, params=None, is_auth_required=False, **kw):
+            if path_url == CONSTANTS.KLINES_PATH_URL:
+                if isinstance(klines, Exception):
+                    raise klines
+                return klines
+            if path_url == CONSTANTS.BOOK_TICKER_PATH_URL:
+                if isinstance(book, Exception):
+                    raise book
+                return book
+            if path_url == CONSTANTS.DEPTH_PATH_URL:
+                if isinstance(depth, Exception):
+                    raise depth
+                return depth
+            raise AssertionError(f"unexpected path {path_url}")
+        return AsyncMock(side_effect=_get)
+
+    async def test_klines_is_preferred_when_available(self):
+        self.exchange._api_get = self._responder(
+            klines=[[1, "1", "2", "3", "1234567", "5", 9]])
+        self.assertEqual(1234567.0, await self.exchange._get_last_traded_price(self.trading_pair))
+
+    async def test_falls_back_to_book_ticker_when_klines_fails(self):
+        self.exchange._api_get = self._responder(
+            klines=IOError("HTTP status is 503. Error: no healthy upstream"),
+            book=[{"symbol": "BTC_IDR", "bidPrice": "100", "askPrice": "200"}])
+        self.assertEqual(150.0, await self.exchange._get_last_traded_price(self.trading_pair))
+
+    async def test_one_sided_book_uses_the_side_that_quotes(self):
+        # Testnet BTC_IDR currently has bids and no asks; averaging in a zero
+        # would report half the real price.
+        self.exchange._api_get = self._responder(
+            klines=IOError("503"),
+            book=[{"symbol": "BTC_IDR", "bidPrice": "100000", "askPrice": "0"}])
+        self.assertEqual(100000.0, await self.exchange._get_last_traded_price(self.trading_pair))
+
+    async def test_falls_back_to_depth_when_klines_and_ticker_fail(self):
+        self.exchange._api_get = self._responder(
+            klines=IOError("503"), book=IOError("503"),
+            depth={"lastUpdateId": 1, "bids": [["90", "1"]], "asks": [["110", "1"]]})
+        self.assertEqual(100.0, await self.exchange._get_last_traded_price(self.trading_pair))
+
+    async def test_returns_zero_only_when_every_source_fails(self):
+        self.exchange._api_get = self._responder(
+            klines=IOError("503"), book=IOError("503"), depth=IOError("503"))
+        self.assertEqual(0.0, await self.exchange._get_last_traded_price(self.trading_pair))
+
+    async def test_empty_klines_does_not_stop_the_fallback(self):
+        # A 200 with no candles is not an error, but it is not a price either.
+        self.exchange._api_get = self._responder(
+            klines=[], book=[{"symbol": "BTC_IDR", "bidPrice": "50", "askPrice": "70"}])
+        self.assertEqual(60.0, await self.exchange._get_last_traded_price(self.trading_pair))
+
+    async def test_book_ticker_ignores_other_symbols(self):
+        self.exchange._api_get = self._responder(
+            klines=IOError("503"),
+            book=[{"symbol": "ETH_IDR", "bidPrice": "1", "askPrice": "2"}],
+            depth={"bids": [["777", "1"]], "asks": []})
+        self.assertEqual(777.0, await self.exchange._get_last_traded_price(self.trading_pair))
+
+
+class AjaibServerErrorOnPlacementTests(IsolatedAsyncioWrapperTestCase):
+    """
+    Ajaib docs: "HTTP 5XX return codes are used for internal errors ... It is
+    important to NOT treat this as a failure operation; the execution status is
+    UNKNOWN and could have been a success."
+
+    Marking such an order FAILED would strand a live order on the exchange and
+    let a retry place a duplicate.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.trading_pair = "BTC-IDR"
+        self.exchange = AjaibExchange(
+            ajaib_api_key="k", ajaib_api_secret="", ajaib_proxy_url="",
+            trading_pairs=[self.trading_pair], trading_required=False)
+        self.exchange._set_trading_pair_symbol_map(bidict({"BTC_IDR": self.trading_pair}))
+        self.coid = "33333333-3333-4333-8333-333333333333"
+
+    async def _place(self):
+        return await self.exchange._place_order(
+            order_id=self.coid, trading_pair=self.trading_pair,
+            amount=Decimal("0.001"), trade_type=TradeType.BUY,
+            order_type=OrderType.LIMIT, price=Decimal("1000000000"))
+
+    def test_5xx_is_recognised_as_server_side(self):
+        for code in (500, 502, 503):
+            self.assertTrue(AjaibExchange._is_server_side_error(
+                IOError(f"HTTP status is {code}. Error: boom")), code)
+
+    def test_4xx_is_not_server_side(self):
+        for code in (400, 401, 403, 404, 429):
+            self.assertFalse(AjaibExchange._is_server_side_error(
+                IOError(f"HTTP status is {code}. Error: nope")), code)
+
+    async def test_order_that_survived_a_500_is_adopted_not_failed(self):
+        self.exchange._api_post = AsyncMock(
+            side_effect=IOError('HTTP status is 500. Error: {"code":-1000,"msg":"unknown"}'))
+        self.exchange._api_get = AsyncMock(return_value={
+            "orderId": "srv-1", "clientOrderId": self.coid, "time": 1700000000000})
+
+        exchange_id, _ = await self._place()
+        self.assertEqual("srv-1", exchange_id,
+                         "an order that actually got created must be adopted, not failed")
+
+    async def test_order_genuinely_lost_after_500_still_raises(self):
+        self.exchange._api_post = AsyncMock(
+            side_effect=IOError("HTTP status is 500. Error: unknown"))
+        self.exchange._api_get = AsyncMock(
+            side_effect=IOError('HTTP status is 404. Error: {"code":-2013,"msg":"Order not found"}'))
+        with self.assertRaises(IOError):
+            await self._place()
+
+    async def test_4xx_raises_immediately_without_a_lookup(self):
+        # A malformed request is a real failure; do not go hunting for an order.
+        self.exchange._api_post = AsyncMock(
+            side_effect=IOError('HTTP status is 400. Error: {"code":-1102,"msg":"Bad Request"}'))
+        self.exchange._api_get = AsyncMock(
+            side_effect=AssertionError("must not look the order up on a 4xx"))
+        with self.assertRaises(IOError):
+            await self._place()
+
+    def test_order_not_found_uses_the_api_code_not_the_http_status(self):
+        ex = self.exchange
+        self.assertTrue(ex._is_order_not_found_during_status_update_error(
+            IOError('HTTP status is 404. Error: {"code":-2013,"msg":"Order not found"}')))
+        # A gateway 404 for a wrong path is NOT "order gone".
+        self.assertFalse(ex._is_order_not_found_during_status_update_error(
+            IOError('HTTP 404. {"message":"no Route matched with those values"}')))

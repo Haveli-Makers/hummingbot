@@ -10,8 +10,8 @@ from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFa
 
 
 def public_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
-    """Ajaib exposes a single production REST host regardless of ``domain``."""
-    return CONSTANTS.REST_URL + path_url
+    """Mainnet host by default; ``ajaib_testnet`` selects the testnet host."""
+    return CONSTANTS.REST_URLS.get(domain, CONSTANTS.REST_URL) + path_url
 
 
 def private_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
@@ -19,7 +19,7 @@ def private_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> s
 
 
 def wss_url(domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
-    return CONSTANTS.WSS_URL
+    return CONSTANTS.WSS_URLS.get(domain, CONSTANTS.WSS_URL)
 
 
 def build_api_factory(
@@ -37,7 +37,7 @@ def build_api_factory(
     api_factory = WebAssistantsFactory(
         throttler=throttler,
         auth=auth,
-        connections_factory=_build_connections_factory(proxy_url),
+        connections_factory=_build_connections_factory(proxy_url, domain),
         rest_pre_processors=[
             TimeSynchronizerRESTPreProcessor(synchronizer=time_synchronizer, time_provider=time_provider),
         ])
@@ -48,16 +48,27 @@ def build_api_factory_without_time_synchronizer_pre_processor(throttler: AsyncTh
     return WebAssistantsFactory(throttler=throttler)
 
 
-def _build_connections_factory(proxy_url: Optional[str]):
+def is_testnet(domain: str) -> bool:
+    return domain == CONSTANTS.TESTNET_DOMAIN
+
+
+def _build_connections_factory(proxy_url: Optional[str], domain: str = CONSTANTS.DEFAULT_DOMAIN):
     """
-    Route traffic through an Indonesian proxy when ``proxy_url`` is configured
-    (Ajaib geo-blocks non-Indonesian IPs); otherwise use the default singleton
+    Route traffic through the allowlisted proxy when ``proxy_url`` is configured
+    (Ajaib permits API access by IP); otherwise use the default singleton
     factory. The proxy import is lazy so connectors that never use one pay no
     import cost.
+
+    TLS verification is disabled for TESTNET ONLY, because Ajaib's testnet
+    certificate is expired and no compliant client will complete the handshake.
+    Mainnet is structurally incapable of running unverified -- see the assert
+    below -- so this cannot silently become the default for real funds.
     """
     if proxy_url:
         from hummingbot.core.web_assistant.connections.proxy_connections_factory import ProxyConnectionsFactory
-        return ProxyConnectionsFactory(proxy_url=proxy_url)
+        verify_ssl = not is_testnet(domain)
+        assert verify_ssl or is_testnet(domain), "TLS may only be relaxed on testnet"
+        return ProxyConnectionsFactory(proxy_url=proxy_url, verify_ssl=verify_ssl)
 
     from hummingbot.core.web_assistant.connections.connections_factory import ConnectionsFactory
     return ConnectionsFactory()

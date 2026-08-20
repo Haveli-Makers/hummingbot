@@ -55,11 +55,17 @@ class AjaibAPIUserStreamDataSource(UserStreamTrackerDataSource):
         rest_assistant = await self._api_factory.get_rest_assistant()
         while True:
             try:
+                # Must be SIGNED, not just API-key-headered. Verified live:
+                # an unsigned POST (with or without Content-Type) is rejected
+                # 400 -1102 "Bad Request", while a signed form body returns the
+                # key. is_auth_required routes it through AjaibAuth, which puts
+                # timestamp/recvWindow/signature in the form body for POSTs.
                 data = await rest_assistant.execute_request(
                     url=web_utils.public_rest_url(path_url=CONSTANTS.LISTEN_KEY_PATH_URL, domain=self._domain),
                     method=RESTMethod.POST,
+                    data={},
                     throttler_limit_id=CONSTANTS.LISTEN_KEY_PATH_URL,
-                    headers=self._auth.header_for_authentication(),
+                    is_auth_required=True,
                 )
                 return data["listenKey"]
             except asyncio.CancelledError:
@@ -83,7 +89,7 @@ class AjaibAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 method=RESTMethod.PUT,
                 return_err=True,
                 throttler_limit_id=CONSTANTS.LISTEN_KEY_PATH_URL,
-                headers=self._auth.header_for_authentication(),
+                is_auth_required=True,
             )
             if isinstance(data, dict) and "code" in data:
                 self.logger().warning(f"Failed to refresh the listen key {self._current_listen_key}: {data}")
@@ -138,7 +144,8 @@ class AjaibAPIUserStreamDataSource(UserStreamTrackerDataSource):
         await self._listen_key_initialized_event.wait()
 
         ws: WSAssistant = await self._api_factory.get_ws_assistant()
-        url = f"{CONSTANTS.WSS_URL}{CONSTANTS.WS_USER_PATH}/{self._current_listen_key}"
+        url = (f"{web_utils.wss_url(self._domain)}{CONSTANTS.WS_USER_PATH}"
+               f"/{self._current_listen_key}")
         await ws.connect(ws_url=url, ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL)
         self.logger().info("Successfully connected to user stream...")
         return ws

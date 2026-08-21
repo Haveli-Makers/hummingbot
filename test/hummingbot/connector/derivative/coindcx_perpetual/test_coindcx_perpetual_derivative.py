@@ -165,6 +165,35 @@ class CoindcxPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(60000.0, order["price"])
         self.assertEqual(0.01, order["total_quantity"])
 
+    async def _captured_order(self, position_action):
+        self._bootstrap()
+        captured = {}
+
+        async def fake_post(path_url, data, is_auth_required):
+            captured["data"] = data
+            return [{"id": "uuid-1", "created_at": 1700000000000}]
+
+        self.exchange._api_post = AsyncMock(side_effect=fake_post)
+        await self.exchange._place_order(
+            order_id="haveli-1", trading_pair=self.trading_pair, amount=Decimal("0.01"),
+            trade_type=TradeType.SELL, order_type=OrderType.LIMIT, price=Decimal("60000"),
+            position_action=position_action)
+        return captured["data"]["order"]
+
+    async def test_closing_orders_are_sent_reduce_only(self):
+        """
+        Without reduce_only the venue treats a close as a new opposite position and asks for
+        margin the wallet does not have, so closing fails with "Insufficient funds" precisely
+        when the position is large relative to the account.
+        """
+        order = await self._captured_order(PositionAction.CLOSE)
+        self.assertIs(True, order[CONSTANTS.REDUCE_ONLY_FIELD])
+
+    async def test_opening_orders_are_not_reduce_only(self):
+        for action in (PositionAction.OPEN, PositionAction.NIL):
+            order = await self._captured_order(action)
+            self.assertNotIn(CONSTANTS.REDUCE_ONLY_FIELD, order)
+
     async def test_place_order_sends_the_connectors_current_leverage(self):
         """
         The order carries ex.get_leverage(pair), which reads PerpetualTrading's

@@ -93,6 +93,9 @@ SIDE_SELL = "sell"
 
 ORDER_TYPE_LIMIT = "limit_order"
 ORDER_TYPE_MARKET = "market_order"
+# Marks an order as closing an existing position rather than opening a new one, so the
+# venue releases margin instead of demanding it.
+REDUCE_ONLY_FIELD = "reduce_only"
 
 TIME_IN_FORCE_GTC = "good_till_cancel"
 

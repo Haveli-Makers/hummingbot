@@ -510,6 +510,11 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
             "notification": CONSTANTS.NO_NOTIFICATION,
             "margin_currency_short_name": self._margin_currency,
         }
+        if position_action is PositionAction.CLOSE:
+            # Without this the venue treats a close as a fresh opposite position and demands
+            # margin for it, so closing fails with "Insufficient funds" exactly when the
+            # position is large relative to the wallet — the moment you most need to get out.
+            order[CONSTANTS.REDUCE_ONLY_FIELD] = True
         if order_type is not OrderType.MARKET:
             order["price"] = float(price)
             # CoinDCX rejects time_in_force on market orders.

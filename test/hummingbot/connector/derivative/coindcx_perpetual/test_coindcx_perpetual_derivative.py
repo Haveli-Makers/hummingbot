@@ -1308,3 +1308,54 @@ class CoindcxPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
             {"currency_short_name": "USDT", "balance": "10", "locked_balance": "2"})
         self.assertEqual(Decimal("10"), self.exchange._account_available_balances["USDT"])
         self.assertEqual(Decimal("12"), self.exchange._account_balances["USDT"])
+
+    # ---- persisted tracking state ---------------------------------------------
+
+    def _tracked(self, client_order_id, exchange_order_id, state):
+        order = InFlightOrder(
+            client_order_id=client_order_id,
+            trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.SELL,
+            amount=Decimal("0.01"),
+            price=Decimal("60000"),
+            creation_timestamp=1700000000.0,
+            exchange_order_id=exchange_order_id,
+            initial_state=state,
+        )
+        return order
+
+    def test_an_order_the_venue_never_accepted_is_not_persisted(self):
+        """
+        A rejected order gets no exchange order id, and CoinDCX has no client-order-id to look
+        it up by instead — so there is nothing to reconcile against, ever. Saving it means the
+        next run restores it, polls it until the not-found counter trips, and warns that it
+        cannot be cancelled, for as many restarts as it takes someone to notice.
+        """
+        rejected = self._tracked("haveli-rejected", None, OrderState.FAILED)
+        self.exchange._order_tracker._lost_orders[rejected.client_order_id] = rejected
+
+        self.assertNotIn("haveli-rejected", self.exchange.tracking_states)
+
+    def test_a_failure_that_does_have_an_exchange_id_is_kept(self):
+        """That one can still be checked against the venue, so it is worth carrying over."""
+        failed = self._tracked("haveli-failed", "ex-9", OrderState.FAILED)
+        self.exchange._order_tracker._lost_orders[failed.client_order_id] = failed
+
+        self.assertIn("haveli-failed", self.exchange.tracking_states)
+
+    def test_an_order_still_awaiting_its_exchange_id_is_kept(self):
+        """
+        Dropping these would risk hiding a position: the venue may have accepted the order
+        while we missed the reply. Only outright failures are safe to forget.
+        """
+        pending = self._tracked("haveli-pending", None, OrderState.PENDING_CREATE)
+        self.exchange._order_tracker.start_tracking_order(pending)
+
+        self.assertIn("haveli-pending", self.exchange.tracking_states)
+
+    def test_a_live_order_is_still_persisted(self):
+        live = self._tracked("haveli-open", "ex-2", OrderState.OPEN)
+        self.exchange._order_tracker.start_tracking_order(live)
+
+        self.assertIn("haveli-open", self.exchange.tracking_states)

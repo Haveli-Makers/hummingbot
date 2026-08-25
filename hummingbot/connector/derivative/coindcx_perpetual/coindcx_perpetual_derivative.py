@@ -171,6 +171,29 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
     def funding_fee_poll_interval(self) -> int:
         return CONSTANTS.FUNDING_FEE_POLL_INTERVAL
 
+    @property
+    def tracking_states(self) -> Dict[str, Any]:
+        """
+        Persist only the orders CoinDCX actually acknowledged.
+
+        An order the venue rejected at creation never receives an exchange order id, and
+        CoinDCX has no client-order-id to look it up by instead — so there is nothing at the
+        exchange with that identity to reconcile against, now or ever. The base class keeps
+        it anyway (failed orders are held as "lost" and lost orders are saved), so the next
+        run restores it, polls it until the not-found counter trips, logs it as lost, and
+        warns that it cannot be cancelled. That noise then outlives the incident by however
+        many restarts it takes for someone to clear the database by hand.
+
+        Orders that failed WITH an exchange id are kept, because those can still be checked,
+        and so are orders still awaiting one — dropping those could hide a position the venue
+        accepted while we missed the reply.
+        """
+        return {
+            client_order_id: order.to_json()
+            for client_order_id, order in self._order_tracker.all_updatable_orders.items()
+            if order.exchange_order_id is not None or not order.is_failure
+        }
+
     def supported_order_types(self) -> List[OrderType]:
         # CoinDCX futures instruments report allow_post_only == false, so
         # LIMIT_MAKER cannot be honoured.

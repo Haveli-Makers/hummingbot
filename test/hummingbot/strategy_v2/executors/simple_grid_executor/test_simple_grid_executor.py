@@ -7,7 +7,7 @@ from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, PriceType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, TradeUpdate
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount
-from hummingbot.core.event.events import BuyOrderCompletedEvent, OrderCancelledEvent
+from hummingbot.core.event.events import OrderCancelledEvent, SellOrderCompletedEvent
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 from hummingbot.strategy_v2.executors.simple_grid_executor.data_types import (
     SimpleGridBarriers,
@@ -16,7 +16,7 @@ from hummingbot.strategy_v2.executors.simple_grid_executor.data_types import (
 )
 from hummingbot.strategy_v2.executors.simple_grid_executor.simple_grid_executor import SimpleGridExecutor
 from hummingbot.strategy_v2.models.base import RunnableStatus
-from hummingbot.strategy_v2.models.executors import CloseType
+from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
 
 START_TS = 1234567890
 
@@ -43,10 +43,16 @@ class TestSimpleGridExecutor(IsolatedAsyncioWrapperTestCase):
     def create_mock_strategy(self):
         strategy = MagicMock(spec=ScriptStrategyBase)
         type(strategy).current_timestamp = PropertyMock(return_value=START_TS)
-        strategy.buy.side_effect = ["OID-BUY-1", "OID-BUY-2", "OID-BUY-3"]
-        strategy.sell.side_effect = ["OID-SELL-1", "OID-SELL-2", "OID-SELL-3"]
+        strategy.buy.side_effect = [f"OID-BUY-{i}" for i in range(1, 10)]
+        strategy.sell.side_effect = [f"OID-SELL-{i}" for i in range(1, 10)]
         strategy.cancel.return_value = None
-        strategy.connectors = {"coindcx_perpetual": MagicMock(spec=ExchangePyBase)}
+        connector = MagicMock(spec=ExchangePyBase)
+        # Quantization is identity here; the tests are about which price we choose, not
+        # about tick rounding.
+        connector.quantize_order_price.side_effect = lambda trading_pair, price: price
+        connector.quantize_order_amount.side_effect = lambda trading_pair, amount: amount
+        connector.supported_order_types.return_value = [OrderType.LIMIT, OrderType.MARKET]
+        strategy.connectors = {"coindcx_perpetual": connector, "binance": connector}
         return strategy
 
     # ------------------------------------------------------------------ helpers
@@ -56,6 +62,7 @@ class TestSimpleGridExecutor(IsolatedAsyncioWrapperTestCase):
         rules = MagicMock(spec=TradingRule)
         rules.min_order_size = Decimal("0.1")
         rules.min_notional_size = Decimal("1")
+        rules.min_price_increment = Decimal("0.01")
         return rules
 
     @staticmethod
@@ -67,9 +74,11 @@ class TestSimpleGridExecutor(IsolatedAsyncioWrapperTestCase):
             trading_pair="BTC-USDT",
             entry_mode=SimpleGridEntryMode.LONG_ONLY,
             amount=Decimal("1"),
-            # Default to entering at the anchor, so barrier tests are not also testing
-            # trigger arithmetic. The trigger tests set a step explicitly.
-            entry_offset_pct=Decimal("0"),
+            entry_price=Decimal("100"),
+            # Wide enough that the default 99/101 book sits inside it, so tests that are not
+            # about the band are not silently gated by it.
+            entry_band_pct=Decimal("0.05"),
+            trigger_price_type=PriceType.MidPrice,
             barriers=SimpleGridBarriers(take_profit=Decimal("0.05"), stop_loss=Decimal("0.02")),
         )
         params.update(overrides)
@@ -124,509 +133,839 @@ class TestSimpleGridExecutor(IsolatedAsyncioWrapperTestCase):
         ))
         return order
 
-    def set_quantize(self, value):
-        self.strategy.connectors["coindcx_perpetual"].quantize_order_amount.return_value = Decimal(value)
+    def track(self, executor, slot, order_id, side, amount="1", price="100",
+              state=OrderState.OPEN, filled=None, fill_price=None):
+        """Attach a tracked order to one of the executor's slots, optionally pre-filled."""
+        order = self.register(self.in_flight(order_id, side, amount=amount, price=price, state=state))
+        if filled is not None:
+            self.fill(order, filled, fill_price or price)
+        tracked = TrackedOrder(order_id=order_id)
+        tracked.order = order
+        if slot == "entry":
+            executor._entry_orders[side] = tracked
+        else:
+            setattr(executor, slot, tracked)
+        return tracked
 
-    # ------------------------------------------------------------------ properties
+    def open_long(self, executor, amount="1", price="99"):
+        """Put the executor into a filled long position entered at `price`."""
+        self.track(executor, "entry", "OID-BUY-1", TradeType.BUY,
+                   amount=amount, price=price, filled=amount, fill_price=price)
+        executor._filled_side = TradeType.BUY
+        return executor
+
+    def open_short(self, executor, amount="1", price="101"):
+        self.track(executor, "entry", "OID-SELL-1", TradeType.SELL,
+                   amount=amount, price=price, filled=amount, fill_price=price)
+        executor._filled_side = TradeType.SELL
+        return executor
+
+    @staticmethod
+    def order_args(call):
+        """ExecutorBase.place_order calls strategy.buy/sell positionally."""
+        _connector, _pair, amount, order_type, price, position_action = call.args
+        return {"amount": amount, "order_type": order_type, "price": price,
+                "position_action": position_action}
+
+    @staticmethod
+    def cancel_event(order_id):
+        return OrderCancelledEvent(timestamp=START_TS, order_id=order_id, exchange_order_id=f"E{order_id}")
+
+    # ------------------------------------------------------------------ the anchor and the bracket
 
     @patch.object(SimpleGridExecutor, "get_trading_rules")
     @patch.object(SimpleGridExecutor, "get_price")
-    def test_barrier_prices_long(self, mock_price, rules_mock):
+    def test_bracket_is_measured_from_the_anchor_not_the_fill(self, mock_price, rules_mock):
+        """The whole point of a passive entry: a better fill is kept, not given back."""
         mock_price.side_effect = self.price_feed()
         rules_mock.return_value = self.trading_rules()
-        executor = SimpleGridExecutor(self.strategy, self.config(entry_price=Decimal("100")))
-        self.assertEqual(executor.side, TradeType.BUY)
-        self.assertEqual(executor.entry_price, Decimal("100"))
+        executor = self.running_executor(self.config())
+        self.open_long(executor, price="99")
+
+        self.assertEqual(executor.entry_price, Decimal("99"))
+        # 5% and 2% of the ANCHOR (100), not of the fill (99).
         self.assertEqual(executor.take_profit_price, Decimal("105.00"))
         self.assertEqual(executor.stop_loss_price, Decimal("98.00"))
-        self.assertEqual(executor.close_order_side, TradeType.SELL)
 
     @patch.object(SimpleGridExecutor, "get_trading_rules")
     @patch.object(SimpleGridExecutor, "get_price")
-    def test_barrier_prices_short_are_mirrored(self, mock_price, rules_mock):
+    def test_bracket_prices_short_are_mirrored(self, mock_price, rules_mock):
         mock_price.side_effect = self.price_feed()
         rules_mock.return_value = self.trading_rules()
-        executor = SimpleGridExecutor(self.strategy, self.config(
-            entry_mode=SimpleGridEntryMode.SHORT_ONLY, entry_price=Decimal("100")))
-        self.assertEqual(executor.side, TradeType.SELL)
+        executor = self.running_executor(self.config(entry_mode=SimpleGridEntryMode.SHORT_ONLY))
+        self.open_short(executor, price="101")
+
         self.assertEqual(executor.take_profit_price, Decimal("95.00"))
         self.assertEqual(executor.stop_loss_price, Decimal("102.00"))
-        self.assertEqual(executor.close_order_side, TradeType.BUY)
-
-    # ------------------------------------------------------------------ entry triggers
 
     @patch.object(SimpleGridExecutor, "get_trading_rules")
     @patch.object(SimpleGridExecutor, "get_price")
-    async def test_levels_sit_above_and_below_the_anchor(self, mock_price, rules_mock):
-        """
-        The worked example: anchor 100, step 2% -> long level 102, short level 98.
-
-        Note the direction. This strategy enters with the move, so the long level is ABOVE
-        the anchor and the short level BELOW it.
-        """
-        mock_price.side_effect = self.price_feed(last_trade="100")
+    async def test_anchor_freezes_on_the_first_tick_when_none_is_supplied(self, mock_price, rules_mock):
         rules_mock.return_value = self.trading_rules()
-        executor = self.running_executor(self.config(
-            entry_mode=SimpleGridEntryMode.BOTH_OCO,
-            entry_price=Decimal("100"),
-            entry_offset_pct=Decimal("0.02")))
-        self.assertEqual(executor._entry_target_price(TradeType.BUY), Decimal("102.00"))
-        self.assertEqual(executor._entry_target_price(TradeType.SELL), Decimal("98.00"))
+        mock_price.side_effect = self.price_feed(mid="100")
+        executor = self.running_executor(self.config(entry_price=None))
 
-    @patch.object(SimpleGridExecutor, "get_trading_rules")
-    @patch.object(SimpleGridExecutor, "get_price")
-    async def test_nothing_is_placed_until_a_level_is_reached(self, mock_price, rules_mock):
-        """No order rests in the book while we wait — the executor only watches."""
-        mock_price.side_effect = self.price_feed(last_trade="100")
-        rules_mock.return_value = self.trading_rules()
-        executor = self.running_executor(self.config(
-            entry_mode=SimpleGridEntryMode.BOTH_OCO,
-            entry_price=Decimal("100"),
-            entry_offset_pct=Decimal("0.02")))
         await executor.control_task()
-        self.strategy.buy.assert_not_called()
-        self.strategy.sell.assert_not_called()
-        self.assertIsNone(executor._triggered_side)
+        self.assertEqual(executor.anchor_price, Decimal("100"))
+
+        # The market moves; the anchor must not follow it, or the exits would drift with it.
+        mock_price.side_effect = self.price_feed(best_bid="109", best_ask="111", mid="110")
+        await executor.control_task()
+        self.assertEqual(executor.anchor_price, Decimal("100"))
+
+    # ------------------------------------------------------------------ maker entries
 
     @patch.object(SimpleGridExecutor, "get_trading_rules")
     @patch.object(SimpleGridExecutor, "get_price")
-    async def test_rising_price_takes_the_long_side(self, mock_price, rules_mock):
-        mock_price.side_effect = self.price_feed(last_trade="102")
+    def test_long_entry_rests_at_the_best_bid(self, mock_price, rules_mock):
+        mock_price.side_effect = self.price_feed(best_bid="99", best_ask="101")
         rules_mock.return_value = self.trading_rules()
-        executor = self.running_executor(self.config(
-            entry_mode=SimpleGridEntryMode.BOTH_OCO,
-            entry_price=Decimal("100"),
-            entry_offset_pct=Decimal("0.02")))
-        await executor.control_task()
-        self.assertEqual(executor._triggered_side, TradeType.BUY)
+        executor = self.running_executor(self.config())
+
+        executor.control_entry_orders()
+
         self.strategy.buy.assert_called_once()
+        self.assertEqual(self.order_args(self.strategy.buy.call_args)["price"], Decimal("99"))
+        self.assertEqual(self.order_args(self.strategy.buy.call_args)["order_type"], OrderType.LIMIT)
         self.strategy.sell.assert_not_called()
 
     @patch.object(SimpleGridExecutor, "get_trading_rules")
     @patch.object(SimpleGridExecutor, "get_price")
-    async def test_falling_price_takes_the_short_side(self, mock_price, rules_mock):
-        mock_price.side_effect = self.price_feed(last_trade="98")
+    def test_short_entry_rests_at_the_best_ask(self, mock_price, rules_mock):
+        mock_price.side_effect = self.price_feed(best_bid="99", best_ask="101")
         rules_mock.return_value = self.trading_rules()
-        executor = self.running_executor(self.config(
-            entry_mode=SimpleGridEntryMode.BOTH_OCO,
-            entry_price=Decimal("100"),
-            entry_offset_pct=Decimal("0.02")))
-        await executor.control_task()
-        self.assertEqual(executor._triggered_side, TradeType.SELL)
+        executor = self.running_executor(self.config(entry_mode=SimpleGridEntryMode.SHORT_ONLY))
+
+        executor.control_entry_orders()
+
         self.strategy.sell.assert_called_once()
+        self.assertEqual(self.order_args(self.strategy.sell.call_args)["price"], Decimal("101"))
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_both_oco_rests_one_maker_order_on_each_side_of_the_book(self, mock_price, rules_mock):
+        mock_price.side_effect = self.price_feed(best_bid="99", best_ask="101")
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(self.config(entry_mode=SimpleGridEntryMode.BOTH_OCO))
+
+        executor.control_entry_orders()
+
+        self.assertEqual(self.order_args(self.strategy.buy.call_args)["price"], Decimal("99"))
+        self.assertEqual(self.order_args(self.strategy.sell.call_args)["price"], Decimal("101"))
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_post_only_is_used_where_the_venue_supports_it(self, mock_price, rules_mock):
+        mock_price.side_effect = self.price_feed()
+        rules_mock.return_value = self.trading_rules()
+        self.strategy.connectors["coindcx_perpetual"].supported_order_types.return_value = [
+            OrderType.LIMIT, OrderType.LIMIT_MAKER, OrderType.MARKET]
+        executor = self.running_executor(self.config())
+
+        executor.control_entry_orders()
+
+        self.assertEqual(self.order_args(self.strategy.buy.call_args)["order_type"], OrderType.LIMIT_MAKER)
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_plain_limit_where_post_only_is_not_offered(self, mock_price, rules_mock):
+        """CoinDCX futures report allow_post_only == false; LIMIT_MAKER would be rejected."""
+        mock_price.side_effect = self.price_feed()
+        rules_mock.return_value = self.trading_rules()
+        self.strategy.connectors["coindcx_perpetual"].supported_order_types.return_value = [
+            OrderType.LIMIT, OrderType.MARKET]
+        executor = self.running_executor(self.config())
+
+        executor.control_entry_orders()
+
+        self.assertEqual(self.order_args(self.strategy.buy.call_args)["order_type"], OrderType.LIMIT)
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_price_improvement_moves_the_quote_towards_the_spread(self, mock_price, rules_mock):
+        mock_price.side_effect = self.price_feed(best_bid="100", best_ask="102")
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(self.config(entry_price_improvement_pct=Decimal("0.001")))
+
+        executor.control_entry_orders()
+
+        # A buy improves by bidding higher, not lower.
+        self.assertEqual(self.order_args(self.strategy.buy.call_args)["price"], Decimal("100.100"))
+
+    # ------------------------------------------------------------------ the band
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_no_entry_is_placed_outside_the_band(self, mock_price, rules_mock):
+        """A fill out here would land past its own stop loss and close instantly."""
+        mock_price.side_effect = self.price_feed(best_bid="97", best_ask="99", mid="98")
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(self.config(entry_band_pct=Decimal("0.005")))
+
+        executor.control_entry_orders()
+
         self.strategy.buy.assert_not_called()
 
     @patch.object(SimpleGridExecutor, "get_trading_rules")
     @patch.object(SimpleGridExecutor, "get_price")
-    async def test_only_one_side_is_ever_taken(self, mock_price, rules_mock):
-        """Once a level triggers the direction is settled, even if the other is reached."""
-        mock_price.side_effect = self.price_feed(last_trade="102")
+    def test_a_resting_entry_is_pulled_when_the_touch_leaves_the_band(self, mock_price, rules_mock):
         rules_mock.return_value = self.trading_rules()
-        executor = self.running_executor(self.config(
-            entry_mode=SimpleGridEntryMode.BOTH_OCO,
-            entry_price=Decimal("100"),
-            entry_offset_pct=Decimal("0.02")))
-        await executor.control_task()
-        mock_price.side_effect = self.price_feed(last_trade="98")
-        await executor.control_task()
-        self.assertEqual(executor._triggered_side, TradeType.BUY)
-        self.strategy.sell.assert_not_called()
-
-    @patch.object(SimpleGridExecutor, "get_trading_rules")
-    @patch.object(SimpleGridExecutor, "get_price")
-    async def test_zero_step_enters_immediately_at_the_anchor(self, mock_price, rules_mock):
-        """How spot re-enters after a stop loss: no waiting for a move that may not come."""
-        mock_price.side_effect = self.price_feed(last_trade="100")
-        rules_mock.return_value = self.trading_rules()
-        executor = self.running_executor(self.config(
-            entry_price=Decimal("100"), entry_offset_pct=Decimal("0")))
-        await executor.control_task()
-        self.assertEqual(executor._triggered_side, TradeType.BUY)
+        mock_price.side_effect = self.price_feed(best_bid="99.9", best_ask="100.1", mid="100")
+        executor = self.running_executor(self.config(entry_band_pct=Decimal("0.005")))
+        executor.control_entry_orders()
         self.strategy.buy.assert_called_once()
+        self.track(executor, "entry", "OID-BUY-1", TradeType.BUY, price="99.9")
 
-    @patch.object(SimpleGridExecutor, "get_trading_rules")
-    @patch.object(SimpleGridExecutor, "get_price")
-    async def test_passive_entry_crosses_the_spread_once_it_has_waited(self, mock_price, rules_mock):
-        """
-        A resting order only fills if the market comes back to it. In a market moving away
-        it never does, so after the wait we take the price rather than miss the move.
-        """
-        mock_price.side_effect = self.price_feed(best_bid="100", last_trade="100")
-        rules_mock.return_value = self.trading_rules()
-        executor = self.running_executor(self.config(
-            entry_order_type=OrderType.LIMIT, entry_offset_pct=Decimal("0"),
-            entry_cross_after=30))
-        await executor.control_task()
-        first_id = executor._entry_orders[TradeType.BUY].order_id
-        executor._entry_orders[TradeType.BUY].order = self.in_flight(first_id, TradeType.BUY)
-
-        # Still inside the wait: leave it alone.
-        type(self.strategy).current_timestamp = PropertyMock(return_value=START_TS + 10)
-        await executor.control_task()
-        self.assertEqual(executor._entry_orders[TradeType.BUY].order_id, first_id)
-
-        type(self.strategy).current_timestamp = PropertyMock(return_value=START_TS + 31)
-        await executor.control_task()
+        mock_price.side_effect = self.price_feed(best_bid="97", best_ask="97.2", mid="97.1")
+        executor.control_entry_orders()
 
         self.strategy.cancel.assert_called_once()
-        self.assertNotEqual(executor._entry_orders[TradeType.BUY].order_id, first_id)
-        self.assertEqual(self.strategy.buy.call_args.args[3], OrderType.MARKET)
+        self.assertEqual(self.strategy.cancel.call_args.kwargs["order_id"], "OID-BUY-1")
 
     @patch.object(SimpleGridExecutor, "get_trading_rules")
     @patch.object(SimpleGridExecutor, "get_price")
-    async def test_passive_entry_waits_when_no_cross_time_is_set(self, mock_price, rules_mock):
-        mock_price.side_effect = self.price_feed(best_bid="100", last_trade="100")
+    def test_the_entry_returns_once_the_price_comes_back_into_the_band(self, mock_price, rules_mock):
         rules_mock.return_value = self.trading_rules()
-        executor = self.running_executor(self.config(
-            entry_order_type=OrderType.LIMIT, entry_offset_pct=Decimal("0"),
-            entry_cross_after=None))
-        await executor.control_task()
-        first_id = executor._entry_orders[TradeType.BUY].order_id
-        executor._entry_orders[TradeType.BUY].order = self.in_flight(first_id, TradeType.BUY)
+        executor = self.running_executor(self.config(entry_band_pct=Decimal("0.005")))
 
-        type(self.strategy).current_timestamp = PropertyMock(return_value=START_TS + 9999)
-        await executor.control_task()
-
-        self.strategy.cancel.assert_not_called()
-        self.assertEqual(executor._entry_orders[TradeType.BUY].order_id, first_id)
-
-    @patch.object(SimpleGridExecutor, "get_trading_rules")
-    @patch.object(SimpleGridExecutor, "get_price")
-    async def test_nan_trigger_price_falls_back_to_mid(self, mock_price, rules_mock):
-        """
-        LastTrade is NaN until a trade prints into the book, and CoinDCX perpetuals never
-        feed one. A NaN Decimal raises on comparison, so this used to kill the executor.
-        """
-        rules_mock.return_value = self.trading_rules()
-
-        def feed(_c, _p, price_type=PriceType.MidPrice):
-            if price_type == PriceType.LastTrade:
-                return Decimal("NaN")
-            return {PriceType.BestBid: Decimal("100"), PriceType.BestAsk: Decimal("100"),
-                    PriceType.MidPrice: Decimal("103")}[price_type]
-
-        mock_price.side_effect = feed
-        executor = self.running_executor(self.config(
-            entry_price=Decimal("100"), entry_offset_pct=Decimal("0.02"),
-            trigger_price_type=PriceType.LastTrade))
-
-        await executor.control_task()
-
-        # Mid of 103 is past the 102 long level, so it entered rather than crashing.
-        self.assertEqual(executor._triggered_side, TradeType.BUY)
-
-    @patch.object(SimpleGridExecutor, "get_trading_rules")
-    @patch.object(SimpleGridExecutor, "get_price")
-    async def test_no_usable_price_skips_the_tick_instead_of_crashing(self, mock_price, rules_mock):
-        """With nothing usable we do nothing — never guess, never raise."""
-        rules_mock.return_value = self.trading_rules()
-        mock_price.side_effect = lambda _c, _p, price_type=None: Decimal("NaN")
-        executor = self.running_executor(self.config(
-            entry_price=Decimal("100"), entry_offset_pct=Decimal("0.02"),
-            trigger_price_type=PriceType.LastTrade))
-
-        await executor.control_task()
-
-        self.assertIsNone(executor._triggered_side)
+        mock_price.side_effect = self.price_feed(best_bid="97", best_ask="97.2", mid="97.1")
+        executor.control_entry_orders()
         self.strategy.buy.assert_not_called()
 
-    @patch.object(SimpleGridExecutor, "get_trading_rules")
-    @patch.object(SimpleGridExecutor, "get_price")
-    async def test_stop_loss_skips_rather_than_guessing_on_a_bad_price(self, mock_price, rules_mock):
-        """
-        Deciding "not breached" from missing data would leave a live position unprotected
-        without saying so, so the check is skipped and logged instead.
-        """
-        rules_mock.return_value = self.trading_rules()
-        self.set_quantize("1")
-        mock_price.side_effect = self.price_feed(best_bid="100", last_trade="100")
-        executor = self.running_executor(self.config(trigger_price_type=PriceType.LastTrade))
-        await executor.control_task()
-        executor._entry_orders[TradeType.BUY].order = self.fill(
-            self.in_flight("OID-BUY-1", TradeType.BUY, amount="1", price="100"), "1", "100")
+        mock_price.side_effect = self.price_feed(best_bid="99.8", best_ask="100.2", mid="100")
+        executor.control_entry_orders()
+        self.assertEqual(self.order_args(self.strategy.buy.call_args)["price"], Decimal("99.8"))
 
-        mock_price.side_effect = lambda _c, _p, price_type=None: Decimal("NaN")
-        await executor.control_task()
-
-        self.assertIsNone(executor.close_type)
-        self.assertEqual(executor._status, RunnableStatus.RUNNING)
+    # ------------------------------------------------------------------ re-quoting
 
     @patch.object(SimpleGridExecutor, "get_trading_rules")
     @patch.object(SimpleGridExecutor, "get_price")
-    async def test_symmetric_exit_bracket_after_a_long_fill(self, mock_price, rules_mock):
-        """Long from 98 with a 2% bracket exits at 100 (limit) or 96 (watched trigger)."""
-        mock_price.side_effect = self.price_feed(last_trade="98", best_bid="98", best_ask="98.1")
+    def test_entry_is_requoted_once_the_touch_moves_past_the_threshold(self, mock_price, rules_mock):
         rules_mock.return_value = self.trading_rules()
-        self.set_quantize("1")
-        executor = self.running_executor(self.config(
-            entry_price=Decimal("98"),
-            entry_offset_pct=Decimal("0"),
-            barriers=SimpleGridBarriers(take_profit=Decimal("0.0204"), stop_loss=Decimal("0.0204"))))
-        await executor.control_task()
-        executor._entry_orders[TradeType.BUY].order = self.fill(
-            self.in_flight("OID-BUY-1", TradeType.BUY, amount="1", price="98"), "1", "98")
-        await executor.control_task()
+        mock_price.side_effect = self.price_feed(best_bid="99", best_ask="101")
+        executor = self.running_executor(self.config(entry_requote_pct=Decimal("0.001")))
+        self.track(executor, "entry", "OID-BUY-1", TradeType.BUY, price="99")
 
-        self.assertAlmostEqual(float(executor.take_profit_price), 100.0, places=1)
-        self.assertAlmostEqual(float(executor.stop_loss_price), 96.0, places=1)
+        # Threshold is 0.001 * 100 = 0.1; the bid moved 0.5.
+        mock_price.side_effect = self.price_feed(best_bid="99.5", best_ask="101")
+        executor.control_entry_orders()
+
+        self.strategy.cancel.assert_called_once()
 
     @patch.object(SimpleGridExecutor, "get_trading_rules")
     @patch.object(SimpleGridExecutor, "get_price")
-    async def test_entry_timeout_closes_with_no_position(self, mock_price, rules_mock):
-        """The level is never reached, so nothing is ever opened and nothing to unwind."""
-        # Anchor 100 with a 2% step needs 102 to go long; the market never gets there.
-        mock_price.side_effect = self.price_feed(best_bid="100", best_ask="100", last_trade="100")
+    def test_entry_is_left_alone_while_the_touch_barely_moves(self, mock_price, rules_mock):
+        """Re-posting on every book tick is rate limit spent to gain nothing."""
         rules_mock.return_value = self.trading_rules()
-        executor = self.running_executor(self.config(
-            entry_price=Decimal("100"), entry_offset_pct=Decimal("0.02"), entry_timeout=60))
-        await executor.control_task()
+        executor = self.running_executor(self.config(entry_requote_pct=Decimal("0.001")))
+        self.track(executor, "entry", "OID-BUY-1", TradeType.BUY, price="99")
+
+        mock_price.side_effect = self.price_feed(best_bid="99.05", best_ask="101")
+        executor.control_entry_orders()
+
+        self.strategy.cancel.assert_not_called()
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_a_partly_filled_entry_is_never_requoted(self, mock_price, rules_mock):
+        """Cancelling it would strand the fills and move the position under the exits."""
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(self.config(entry_requote_pct=Decimal("0.001")))
+        self.track(executor, "entry", "OID-BUY-1", TradeType.BUY, price="99",
+                   filled="0.4", fill_price="99")
+
+        mock_price.side_effect = self.price_feed(best_bid="99.9", best_ask="101")
+        executor.control_entry_orders()
+
+        self.strategy.cancel.assert_not_called()
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_a_pending_cancel_is_not_sent_twice(self, mock_price, rules_mock):
+        """The order stays open until the venue acknowledges; re-sending races our own replacement."""
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(self.config(entry_requote_pct=Decimal("0.001")))
+        self.track(executor, "entry", "OID-BUY-1", TradeType.BUY, price="99")
+
+        mock_price.side_effect = self.price_feed(best_bid="99.5", best_ask="101")
+        executor.control_entry_orders()
+        executor.control_entry_orders()
+        executor.control_entry_orders()
+
+        self.assertEqual(self.strategy.cancel.call_count, 1)
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_the_slot_is_freed_by_the_cancel_and_requoted_next_tick(self, mock_price, rules_mock):
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(self.config(entry_requote_pct=Decimal("0.001")))
+        self.track(executor, "entry", "OID-BUY-1", TradeType.BUY, price="99")
+        mock_price.side_effect = self.price_feed(best_bid="99.5", best_ask="101")
+        executor.control_entry_orders()
+
+        executor.process_order_canceled_event(None, MagicMock(), self.cancel_event("OID-BUY-1"))
         self.assertIsNone(executor._entry_orders[TradeType.BUY])
 
-        type(self.strategy).current_timestamp = PropertyMock(return_value=START_TS + 61)
-        await executor.control_task()
+        executor.control_entry_orders()
+        self.assertEqual(self.order_args(self.strategy.buy.call_args)["price"], Decimal("99.5"))
 
-        self.assertEqual(executor.close_type, CloseType.EXPIRED)
-        self.assertIsNone(executor._close_order)
-        self.assertEqual(executor.open_filled_amount, Decimal("0"))
-
-    # ------------------------------------------------------------------ barriers
+    # ------------------------------------------------------------------ first fill wins
 
     @patch.object(SimpleGridExecutor, "get_trading_rules")
     @patch.object(SimpleGridExecutor, "get_price")
-    async def test_partial_fill_arms_take_profit_on_the_filled_amount(self, mock_price, rules_mock):
+    def test_the_first_fill_cancels_the_other_side(self, mock_price, rules_mock):
         mock_price.side_effect = self.price_feed()
         rules_mock.return_value = self.trading_rules()
-        self.set_quantize("0.4")
-        executor = self.running_executor(self.config())
-        await executor.control_task()
-        executor._entry_orders[TradeType.BUY].order = self.fill(
-            self.in_flight("OID-BUY-1", TradeType.BUY, amount="1", price="100"), "0.4", "100")
+        executor = self.running_executor(self.config(entry_mode=SimpleGridEntryMode.BOTH_OCO))
+        self.track(executor, "entry", "OID-BUY-1", TradeType.BUY, price="99",
+                   filled="1", fill_price="99")
+        self.track(executor, "entry", "OID-SELL-1", TradeType.SELL, price="101")
 
-        await executor.control_task()
+        executor._detect_entry_fill()
 
-        self.assertEqual(executor._filled_side, TradeType.BUY)
-        self.assertEqual(executor.open_filled_amount, Decimal("0.4"))
-        self.assertEqual(executor._take_profit_order.order_id, "OID-SELL-1")
-        self.assertEqual(self.strategy.sell.call_args.args[2], Decimal("0.4"))
-        self.assertEqual(self.strategy.sell.call_args.args[4], Decimal("105.00"))
+        self.assertEqual(executor.side, TradeType.BUY)
+        self.strategy.cancel.assert_called_once()
+        self.assertEqual(self.strategy.cancel.call_args.kwargs["order_id"], "OID-SELL-1")
 
     @patch.object(SimpleGridExecutor, "get_trading_rules")
     @patch.object(SimpleGridExecutor, "get_price")
-    async def test_stop_loss_fires_on_configured_trigger_price(self, mock_price, rules_mock):
-        rules_mock.return_value = self.trading_rules()
-        self.set_quantize("1")
-        # The level has to be reached before anything opens, so trigger the entry first.
-        mock_price.side_effect = self.price_feed(best_bid="100", last_trade="100")
-        executor = self.running_executor(self.config(trigger_price_type=PriceType.LastTrade))
-        await executor.control_task()
-        executor._entry_orders[TradeType.BUY].order = self.fill(
-            self.in_flight("OID-BUY-1", TradeType.BUY, amount="1", price="100"), "1", "100")
-
-        # Now the last trade prints below the stop while the book is still intact.
-        mock_price.side_effect = self.price_feed(best_bid="99", last_trade="97.5")
-        await executor.control_task()
-
-        self.assertEqual(executor.close_type, CloseType.STOP_LOSS)
-        self.assertEqual(executor._status, RunnableStatus.SHUTTING_DOWN)
-        self.assertIsNotNone(executor._close_order)
-
-    @patch.object(SimpleGridExecutor, "get_trading_rules")
-    @patch.object(SimpleGridExecutor, "get_price")
-    async def test_stop_loss_holds_when_trigger_price_is_above_the_stop(self, mock_price, rules_mock):
-        mock_price.side_effect = self.price_feed(best_bid="97", last_trade="99")
-        rules_mock.return_value = self.trading_rules()
-        self.set_quantize("1")
-        executor = self.running_executor(self.config(trigger_price_type=PriceType.LastTrade))
-        await executor.control_task()
-        executor._entry_orders[TradeType.BUY].order = self.fill(
-            self.in_flight("OID-BUY-1", TradeType.BUY, amount="1", price="100"), "1", "100")
-
-        await executor.control_task()
-
-        self.assertIsNone(executor.close_type)
-        self.assertEqual(executor._take_profit_order.order_id, "OID-SELL-1")
-
-    @patch.object(SimpleGridExecutor, "get_trading_rules")
-    @patch.object(SimpleGridExecutor, "get_price")
-    async def test_take_profit_fill_reports_close_price_and_type(self, mock_price, rules_mock):
+    def test_only_one_side_is_ever_taken(self, mock_price, rules_mock):
         mock_price.side_effect = self.price_feed()
         rules_mock.return_value = self.trading_rules()
-        self.set_quantize("1")
-        executor = self.running_executor(self.config())
-        await executor.control_task()
-        executor._entry_orders[TradeType.BUY].order = self.fill(
-            self.in_flight("OID-BUY-1", TradeType.BUY, amount="1", price="100"), "1", "100")
-        await executor.control_task()
+        executor = self.running_executor(self.config(entry_mode=SimpleGridEntryMode.BOTH_OCO))
+        self.track(executor, "entry", "OID-BUY-1", TradeType.BUY, filled="1", fill_price="99")
+        executor._detect_entry_fill()
 
-        executor._take_profit_order.order = self.register(self.fill(
-            self.in_flight("OID-SELL-1", TradeType.SELL, amount="1", price="105"), "1", "105", trade_id="2"))
-        executor.process_order_completed_event(
-            None, None, BuyOrderCompletedEvent(
-                timestamp=START_TS, order_id="OID-SELL-1", base_asset="BTC", quote_asset="USDT",
-                base_asset_amount=Decimal("1"), quote_asset_amount=Decimal("105"),
-                order_type=OrderType.LIMIT))
+        # A late fill on the losing side must not flip the direction.
+        self.track(executor, "entry", "OID-SELL-1", TradeType.SELL, filled="1", fill_price="101")
+        executor._detect_entry_fill()
+
+        self.assertEqual(executor.side, TradeType.BUY)
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_both_sides_filling_reports_the_net_position(self, mock_price, rules_mock):
+        """A cancel can lose the race; the venue nets what is left, so we must too."""
+        mock_price.side_effect = self.price_feed()
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(self.config(entry_mode=SimpleGridEntryMode.BOTH_OCO))
+        self.track(executor, "entry", "OID-BUY-1", TradeType.BUY, filled="1", fill_price="99")
+        executor._filled_side = TradeType.BUY
+        self.track(executor, "entry", "OID-SELL-1", TradeType.SELL, filled="0.4", fill_price="101")
+
+        self.assertEqual(executor.open_filled_amount, Decimal("0.6"))
+
+    # ------------------------------------------------------------------ take profit
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_take_profit_rests_at_the_anchor_based_price(self, mock_price, rules_mock):
+        mock_price.side_effect = self.price_feed()
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(self.config())
+        self.open_long(executor, price="99")
+
+        executor.control_barriers()
+
+        self.strategy.sell.assert_called_once()
+        self.assertEqual(self.order_args(self.strategy.sell.call_args)["price"], Decimal("105.00"))
+        self.assertEqual(self.order_args(self.strategy.sell.call_args)["order_type"], OrderType.LIMIT)
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_partial_fill_arms_take_profit_on_the_filled_amount(self, mock_price, rules_mock):
+        mock_price.side_effect = self.price_feed()
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(self.config())
+        self.track(executor, "entry", "OID-BUY-1", TradeType.BUY, price="99",
+                   filled="0.5", fill_price="99")
+        executor._filled_side = TradeType.BUY
+
+        executor.control_barriers()
+
+        self.assertEqual(self.order_args(self.strategy.sell.call_args)["amount"], Decimal("0.5"))
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_take_profit_fill_reports_close_price_and_type(self, mock_price, rules_mock):
+        mock_price.side_effect = self.price_feed()
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(self.config())
+        self.open_long(executor, price="99")
+        self.track(executor, "_take_profit_order", "OID-SELL-1", TradeType.SELL,
+                   price="105", filled="1", fill_price="105", state=OrderState.FILLED)
+
+        executor.process_order_completed_event(None, MagicMock(), SellOrderCompletedEvent(
+            timestamp=START_TS, order_id="OID-SELL-1", base_asset="BTC", quote_asset="USDT",
+            base_asset_amount=Decimal("1"), quote_asset_amount=Decimal("105"),
+            order_type=OrderType.LIMIT))
 
         self.assertEqual(executor.close_type, CloseType.TAKE_PROFIT)
         self.assertEqual(executor.close_price, Decimal("105"))
-        self.assertEqual(executor.get_custom_info()["close_price"], Decimal("105"))
-        self.assertEqual(executor.trade_pnl_pct, Decimal("0.05"))
-
-    # ------------------------------------------------------------------ regressions
+        self.assertEqual(executor._status, RunnableStatus.SHUTTING_DOWN)
 
     @patch.object(SimpleGridExecutor, "get_trading_rules")
     @patch.object(SimpleGridExecutor, "get_price")
-    async def test_cancelling_a_partially_filled_entry_keeps_the_position(self, mock_price, rules_mock):
-        """
-        Cancelling the unfilled remainder must not discard the tracked order, because its
-        fills are the only record of the position we are holding.
-        """
+    def test_entry_remainder_is_only_cancelled_once(self, mock_price, rules_mock):
         mock_price.side_effect = self.price_feed()
         rules_mock.return_value = self.trading_rules()
-        self.set_quantize("0.4")
         executor = self.running_executor(self.config())
-        await executor.control_task()
-        executor._entry_orders[TradeType.BUY].order = self.fill(
-            self.in_flight("OID-BUY-1", TradeType.BUY, amount="1", price="100"), "0.4", "100")
+        self.track(executor, "entry", "OID-BUY-1", TradeType.BUY, price="99",
+                   filled="0.5", fill_price="99")
         executor._filled_side = TradeType.BUY
 
-        executor.process_order_canceled_event(
-            None, None, OrderCancelledEvent(timestamp=START_TS, order_id="OID-BUY-1"))
+        executor.control_barriers()
+        executor.control_barriers()
 
-        self.assertIsNotNone(executor._entry_orders[TradeType.BUY])
-        self.assertEqual(executor.open_filled_amount, Decimal("0.4"))
+        cancels = [c for c in self.strategy.cancel.call_args_list
+                   if c.kwargs["order_id"] == "OID-BUY-1"]
+        self.assertEqual(len(cancels), 1)
 
-    @patch.object(SimpleGridExecutor, "get_trading_rules")
-    @patch.object(SimpleGridExecutor, "get_price")
-    async def test_entry_filled_without_trade_updates_still_arms_the_exit(self, mock_price, rules_mock):
-        """
-        A venue can report an order FILLED while its trade updates are still in flight,
-        leaving executed_amount_base at zero and every size derived from it collapsing too.
-
-        The completion event carries zero amounts here because that is what the venue
-        produces: ClientOrderTracker builds it from the same empty field, so it cannot be
-        used to recover the size.
-        """
-        mock_price.side_effect = self.price_feed()
-        rules_mock.return_value = self.trading_rules()
-        self.set_quantize("1")
-        executor = self.running_executor(self.config())
-        await executor.control_task()
-
-        order = self.register(self.in_flight(
-            "OID-BUY-1", TradeType.BUY, amount="1", price="100", state=OrderState.FILLED))
-        executor._entry_orders[TradeType.BUY].order = order
-        # The precondition that broke it: terminal state, nothing filled as far as the
-        # order object is concerned.
-        self.assertEqual(order.executed_amount_base, Decimal("0"))
-
-        executor.process_order_completed_event(
-            None, None, BuyOrderCompletedEvent(
-                timestamp=START_TS, order_id="OID-BUY-1", base_asset="BTC", quote_asset="USDT",
-                base_asset_amount=Decimal("0"), quote_asset_amount=Decimal("0"),
-                order_type=OrderType.MARKET))
-
-        self.assertEqual(executor._filled_side, TradeType.BUY)
-        self.assertEqual(executor.open_filled_amount, Decimal("1"))
-        self.assertEqual(executor.entry_price, Decimal("100"))
-
-        await executor.control_task()
-        self.assertIsNotNone(executor._take_profit_order)
+    # ------------------------------------------------------------------ the chasing stop loss
 
     @patch.object(SimpleGridExecutor, "get_trading_rules")
     @patch.object(SimpleGridExecutor, "get_price")
-    async def test_entry_remainder_is_only_cancelled_once(self, mock_price, rules_mock):
-        """
-        The order stays open until the venue acknowledges the cancel, so re-sending it on
-        every tick would burn rate limit for nothing.
-        """
-        mock_price.side_effect = self.price_feed()
+    def test_stop_loss_leaves_passively_at_the_touch_and_pulls_the_take_profit(self, mock_price, rules_mock):
         rules_mock.return_value = self.trading_rules()
-        self.set_quantize("0.4")
         executor = self.running_executor(self.config())
-        await executor.control_task()
-        executor._entry_orders[TradeType.BUY].order = self.register(self.fill(
-            self.in_flight("OID-BUY-1", TradeType.BUY, amount="1", price="100"), "0.4", "100"))
+        self.open_long(executor, price="99")
+        tp = self.track(executor, "_take_profit_order", "OID-SELL-1", TradeType.SELL, price="105")
 
-        await executor.control_task()
-        await executor.control_task()
-        await executor.control_task()
+        # Anchor 100, stop loss 2% -> level 98. Mid reaches it.
+        mock_price.side_effect = self.price_feed(best_bid="97.9", best_ask="98.1", mid="98")
+        executor.control_barriers()
 
-        entry_cancels = [c for c in self.strategy.cancel.call_args_list
-                         if c.kwargs.get("order_id") == "OID-BUY-1"]
-        self.assertEqual(len(entry_cancels), 1)
+        self.assertTrue(executor._stop_loss_triggered)
+        # The take profit must not be able to fill behind us.
+        self.assertIn("OID-SELL-1", [c.kwargs["order_id"] for c in self.strategy.cancel.call_args_list])
+
+        # The exit follows that cancel, and rests one tick above the best bid — maker, and
+        # the best offer in the book.
+        tp.order.current_state = OrderState.CANCELED
+        executor.process_order_canceled_event(None, MagicMock(), self.cancel_event("OID-SELL-1"))
+        self.assertEqual(self.order_args(self.strategy.sell.call_args)["price"], Decimal("97.91"))
+        self.assertEqual(self.order_args(self.strategy.sell.call_args)["order_type"], OrderType.LIMIT)
 
     @patch.object(SimpleGridExecutor, "get_trading_rules")
     @patch.object(SimpleGridExecutor, "get_price")
-    async def test_cancelling_an_unfilled_entry_clears_the_slot(self, mock_price, rules_mock):
+    def test_the_chase_follows_the_book_down(self, mock_price, rules_mock):
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(
+            self.config(barriers=SimpleGridBarriers(
+                take_profit=Decimal("0.05"), stop_loss=Decimal("0.02"),
+                stop_loss_requote_pct=Decimal("0.0005"), stop_loss_max_drift_pct=Decimal("0.05"))))
+        self.open_long(executor, price="99")
+        executor._stop_loss_triggered = True
+        executor._stop_loss_trigger_price = Decimal("98")
+        self.track(executor, "_sl_chase_order", "OID-SELL-2", TradeType.SELL, price="98.1")
+
+        # Threshold is 0.0005 * 98 = 0.049; the ask fell by 1.0.
+        mock_price.side_effect = self.price_feed(best_bid="96.9", best_ask="97.1", mid="97")
+        executor.control_barriers()
+
+        self.assertEqual(self.strategy.cancel.call_args.kwargs["order_id"], "OID-SELL-2")
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_the_chase_never_retreats_upwards(self, mock_price, rules_mock):
+        """
+        Ratcheted on purpose. If the sell followed the ask back up it would stay ahead of the
+        market forever and a recovery would never fill it; left where it is, the rebound runs
+        into it and the leg closes, which is what a stop is for.
+        """
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(
+            self.config(barriers=SimpleGridBarriers(
+                take_profit=Decimal("0.05"), stop_loss=Decimal("0.02"),
+                stop_loss_max_drift_pct=Decimal("0.05"))))
+        self.open_long(executor, price="99")
+        executor._stop_loss_triggered = True
+        executor._stop_loss_trigger_price = Decimal("98")
+        self.track(executor, "_sl_chase_order", "OID-SELL-2", TradeType.SELL, price="98.1")
+
+        mock_price.side_effect = self.price_feed(best_bid="98.9", best_ask="99.1", mid="99")
+        executor.control_barriers()
+
+        cancelled = [c.kwargs["order_id"] for c in self.strategy.cancel.call_args_list]
+        self.assertNotIn("OID-SELL-2", cancelled)
+        self.assertEqual(executor._sl_chase_order.order.price, Decimal("98.1"))
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_a_recovery_does_not_trip_the_drift_cap(self, mock_price, rules_mock):
+        """Only movement away from the stop counts; marketing out on a rebound is the worst case."""
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(
+            self.config(barriers=SimpleGridBarriers(
+                take_profit=Decimal("0.05"), stop_loss=Decimal("0.02"),
+                stop_loss_max_drift_pct=Decimal("0.005"))))
+        self.open_long(executor, price="99")
+        executor._stop_loss_triggered = True
+        executor._stop_loss_trigger_price = Decimal("98")
+        self.track(executor, "_sl_chase_order", "OID-SELL-2", TradeType.SELL, price="98.1")
+
+        # 2% above the stop level — far past the 0.5% cap, but in our favour.
+        mock_price.side_effect = self.price_feed(best_bid="99.9", best_ask="100.1", mid="100")
+        executor.control_barriers()
+
+        self.assertEqual(executor._status, RunnableStatus.RUNNING)
+        self.assertIsNone(executor.close_type)
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_the_chase_gives_up_and_takes_the_market_past_the_drift_cap(self, mock_price, rules_mock):
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(
+            self.config(barriers=SimpleGridBarriers(
+                take_profit=Decimal("0.05"), stop_loss=Decimal("0.02"),
+                stop_loss_max_drift_pct=Decimal("0.005"))))
+        self.open_long(executor, price="99")
+        executor._stop_loss_triggered = True
+        executor._stop_loss_trigger_price = Decimal("98")
+        chase = self.track(executor, "_sl_chase_order", "OID-SELL-2", TradeType.SELL, price="98.1")
+
+        # 97.4 is 0.61% below the stop level of 98, past the 0.5% cap.
+        mock_price.side_effect = self.price_feed(best_bid="97.3", best_ask="97.5", mid="97.4")
+        executor.control_barriers()
+
+        self.assertEqual(executor.close_type, CloseType.STOP_LOSS)
+        self.assertEqual(executor._status, RunnableStatus.SHUTTING_DOWN)
+        # The passive chase order is pulled first; the crossing exit follows its cancel.
+        self.assertTrue(executor._close_pending)
+        chase.order.current_state = OrderState.CANCELED
+        executor.process_order_canceled_event(None, MagicMock(), self.cancel_event("OID-SELL-2"))
+
+        close = self.order_args(self.strategy.sell.call_args)
+        self.assertEqual(close["order_type"], OrderType.LIMIT)
+        self.assertLess(close["price"], Decimal("97.3"), "the exit has to cross, not rest")
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_chasing_can_be_switched_off_for_a_straight_crossing_exit(self, mock_price, rules_mock):
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(
+            self.config(barriers=SimpleGridBarriers(
+                take_profit=Decimal("0.05"), stop_loss=Decimal("0.02"), stop_loss_chase=False)))
+        self.open_long(executor, price="99")
+
+        mock_price.side_effect = self.price_feed(best_bid="97.9", best_ask="98.1", mid="98")
+        executor.control_barriers()
+
+        self.assertEqual(executor.close_type, CloseType.STOP_LOSS)
+        close = self.order_args(self.strategy.sell.call_args)
+        self.assertEqual(close["order_type"], OrderType.LIMIT)
+        # 20 ticks through the bid at 97.90, so it crosses instead of resting.
+        self.assertEqual(close["price"], Decimal("97.70"))
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_a_short_stop_triggers_above_the_anchor_and_exits_inside_the_spread(self, mock_price, rules_mock):
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(
+            self.config(entry_mode=SimpleGridEntryMode.SHORT_ONLY,
+                        barriers=SimpleGridBarriers(
+                            take_profit=Decimal("0.05"), stop_loss=Decimal("0.02"),
+                            stop_loss_max_drift_pct=Decimal("0.05"))))
+        self.open_short(executor, price="101")
+
+        # Anchor 100, short stop 2% above -> 102.
+        mock_price.side_effect = self.price_feed(best_bid="101.9", best_ask="102.1", mid="102")
+        executor.control_barriers()
+
+        self.assertTrue(executor._stop_loss_triggered)
+        # One tick below the best ask, not down at the bid.
+        self.assertEqual(self.order_args(self.strategy.buy.call_args)["price"], Decimal("102.09"))
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_a_filled_chase_order_closes_the_leg_as_a_stop_loss(self, mock_price, rules_mock):
         mock_price.side_effect = self.price_feed()
         rules_mock.return_value = self.trading_rules()
         executor = self.running_executor(self.config())
-        await executor.control_task()
-        executor._entry_orders[TradeType.BUY].order = self.in_flight("OID-BUY-1", TradeType.BUY)
+        self.open_long(executor, price="99")
+        executor._stop_loss_triggered = True
+        executor._stop_loss_trigger_price = Decimal("98")
+        self.track(executor, "_sl_chase_order", "OID-SELL-2", TradeType.SELL, price="98.1",
+                   filled="1", fill_price="98.1", state=OrderState.FILLED)
 
-        executor.process_order_canceled_event(
-            None, None, OrderCancelledEvent(timestamp=START_TS, order_id="OID-BUY-1"))
+        executor.process_order_completed_event(None, MagicMock(), SellOrderCompletedEvent(
+            timestamp=START_TS, order_id="OID-SELL-2", base_asset="BTC", quote_asset="USDT",
+            base_asset_amount=Decimal("1"), quote_asset_amount=Decimal("98.1"),
+            order_type=OrderType.LIMIT))
 
-        self.assertIsNone(executor._entry_orders[TradeType.BUY])
+        self.assertEqual(executor.close_type, CloseType.STOP_LOSS)
+        self.assertEqual(executor.close_price, Decimal("98.1"))
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_partial_fills_from_abandoned_chase_attempts_still_count(self, mock_price, rules_mock):
+        """
+        The controller anchors the next leg on close_price, so an exit spread across several
+        re-quotes has to report the volume weighted average, not just the last order.
+        """
+        mock_price.side_effect = self.price_feed()
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(self.config())
+        self.open_long(executor, amount="2", price="99")
+        executor._stop_loss_triggered = True
+        executor._stop_loss_trigger_price = Decimal("98")
+
+        # First attempt takes half at 98.1, then is cancelled by a re-quote. Its fills are
+        # retired but still count towards the exit.
+        first = self.track(executor, "_sl_chase_order", "OID-SELL-2", TradeType.SELL, amount="2",
+                           price="98.1", filled="1", fill_price="98.1")
+        first.order.current_state = OrderState.CANCELED
+        executor.process_order_canceled_event(None, MagicMock(), self.cancel_event("OID-SELL-2"))
+        self.assertIn(first, executor._spent_exit_orders)
+
+        # Second attempt takes the rest lower down.
+        self.track(executor, "_sl_chase_order", "OID-SELL-3", TradeType.SELL, amount="1",
+                   price="97.1", filled="1", fill_price="97.1")
+
+        self.assertEqual(executor.close_filled_amount, Decimal("2"))
+        self.assertEqual(executor.close_price, Decimal("97.6"))  # (98.1 + 97.1) / 2
+
+    # ------------------------------------------------------------------ prices that are not there
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_nan_trigger_price_falls_back_to_mid(self, mock_price, rules_mock):
+        """CoinDCX perpetuals never publish a last trade, so LastTrade sits at NaN forever."""
+        rules_mock.return_value = self.trading_rules()
+        prices = {
+            PriceType.BestBid: Decimal("97.9"),
+            PriceType.BestAsk: Decimal("98.1"),
+            PriceType.LastTrade: Decimal("NaN"),
+            PriceType.MidPrice: Decimal("98"),
+        }
+        mock_price.side_effect = lambda _c, _p, price_type=PriceType.MidPrice: prices[price_type]
+        executor = self.running_executor(self.config(trigger_price_type=PriceType.LastTrade))
+        self.open_long(executor, price="99")
+
+        executor.control_barriers()
+
+        self.assertTrue(executor._stop_loss_triggered)
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_no_usable_price_skips_the_tick_instead_of_crashing(self, mock_price, rules_mock):
+        rules_mock.return_value = self.trading_rules()
+        mock_price.side_effect = lambda _c, _p, price_type=PriceType.MidPrice: Decimal("NaN")
+        executor = self.running_executor(self.config())
+
+        executor.control_entry_orders()
+
+        self.strategy.buy.assert_not_called()
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_stop_loss_skips_rather_than_guessing_on_a_bad_price(self, mock_price, rules_mock):
+        """Deciding 'not breached' from missing data leaves a position silently unprotected."""
+        rules_mock.return_value = self.trading_rules()
+        mock_price.side_effect = lambda _c, _p, price_type=PriceType.MidPrice: Decimal("NaN")
+        executor = self.running_executor(self.config())
+        self.open_long(executor, price="99")
+
+        executor.control_stop_loss()
+
+        self.assertFalse(executor._stop_loss_triggered)
+        self.assertEqual(executor._status, RunnableStatus.RUNNING)
 
     # ------------------------------------------------------------------ lifecycle
 
     @patch.object(SimpleGridExecutor, "get_trading_rules")
     @patch.object(SimpleGridExecutor, "get_price")
-    def test_early_stop_moves_to_shutting_down(self, mock_price, rules_mock):
+    def test_entry_timeout_closes_with_no_position(self, mock_price, rules_mock):
         mock_price.side_effect = self.price_feed()
         rules_mock.return_value = self.trading_rules()
-        executor = self.running_executor(self.config())
-        executor.early_stop()
-        self.assertEqual(executor.close_type, CloseType.EARLY_STOP)
+        executor = self.running_executor(self.config(entry_timeout=10))
+        self.track(executor, "entry", "OID-BUY-1", TradeType.BUY, price="99")
+        type(self.strategy).current_timestamp = PropertyMock(return_value=START_TS + 30)
+
+        executor.control_entry_orders()
+
+        self.assertEqual(executor.close_type, CloseType.EXPIRED)
+        self.assertEqual(executor.open_filled_amount, Decimal("0"))
         self.assertEqual(executor._status, RunnableStatus.SHUTTING_DOWN)
 
     @patch.object(SimpleGridExecutor, "get_trading_rules")
     @patch.object(SimpleGridExecutor, "get_price")
-    def test_early_stop_keeping_position(self, mock_price, rules_mock):
+    def test_entry_filled_without_trade_updates_still_arms_the_exit(self, mock_price, rules_mock):
+        """
+        executed_amount_base is only populated by trade updates. CoinDCX marked an entry
+        FILLED while its fills were still in flight, so every size derived from it collapsed
+        to zero, no take profit was placed, and a real position sat unprotected.
+        """
         mock_price.side_effect = self.price_feed()
         rules_mock.return_value = self.trading_rules()
         executor = self.running_executor(self.config())
-        executor.early_stop(keep_position=True)
-        self.assertEqual(executor.close_type, CloseType.POSITION_HOLD)
+        order = self.register(self.in_flight("OID-BUY-1", TradeType.BUY, amount="1", price="99",
+                                             state=OrderState.FILLED))
+        tracked = TrackedOrder(order_id="OID-BUY-1")
+        tracked.order = order
+        executor._entry_orders[TradeType.BUY] = tracked
 
-    @patch.object(SimpleGridExecutor, "validate_sufficient_balance")
+        self.assertEqual(order.executed_amount_base, Decimal("0"))  # the venue told us nothing
+        executor._detect_entry_fill()
+        executor.control_barriers()
+
+        self.assertEqual(executor.side, TradeType.BUY)
+        self.assertEqual(executor.open_filled_amount, Decimal("1"))
+        self.strategy.sell.assert_called_once()
+        self.assertEqual(self.order_args(self.strategy.sell.call_args)["price"], Decimal("105.00"))
+
     @patch.object(SimpleGridExecutor, "get_trading_rules")
     @patch.object(SimpleGridExecutor, "get_price")
-    async def test_both_oco_refused_on_a_spot_connector(self, mock_price, rules_mock, _):
+    def test_cancelling_a_partly_filled_entry_keeps_the_position(self, mock_price, rules_mock):
+        """Its fills are the only record of what we hold; dropping it would lose the position."""
         mock_price.side_effect = self.price_feed()
         rules_mock.return_value = self.trading_rules()
-        self.strategy.connectors = {"binance": MagicMock(spec=ExchangePyBase)}
-        executor = SimpleGridExecutor(self.strategy, self.config(
-            connector_name="binance", entry_mode=SimpleGridEntryMode.BOTH_OCO,
-            entry_offset_pct=Decimal("0.02")))
+        executor = self.running_executor(self.config())
+        self.track(executor, "entry", "OID-BUY-1", TradeType.BUY, price="99",
+                   filled="0.5", fill_price="99")
+        executor._filled_side = TradeType.BUY
 
-        await executor.on_start()
+        executor.process_order_canceled_event(None, MagicMock(), self.cancel_event("OID-BUY-1"))
+
+        self.assertIsNotNone(executor._entry_orders[TradeType.BUY])
+        self.assertEqual(executor.open_filled_amount, Decimal("0.5"))
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_cancelling_an_unfilled_entry_clears_the_slot(self, mock_price, rules_mock):
+        mock_price.side_effect = self.price_feed()
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(self.config())
+        self.track(executor, "entry", "OID-BUY-1", TradeType.BUY, price="99")
+
+        executor.process_order_canceled_event(None, MagicMock(), self.cancel_event("OID-BUY-1"))
+
+        self.assertIsNone(executor._entry_orders[TradeType.BUY])
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_early_stop_flattens_the_position_without_waiting_for_a_control_tick(
+            self, mock_price, rules_mock):
+        """
+        The framework calls early_stop, waits a bounded few seconds, then tears the connectors
+        down. The cancel goes out immediately and the close follows the moment the venue
+        acknowledges it — roughly a tenth of a second, not the tick or two it would take if
+        this were left to the shutdown loop.
+        """
+        mock_price.side_effect = self.price_feed()
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(self.config())
+        self.open_long(executor, price="99")
+        tp = self.track(executor, "_take_profit_order", "OID-SELL-1", TradeType.SELL, price="105")
+        self.strategy.sell.reset_mock()
+
+        executor.early_stop()
+
+        self.assertEqual(executor.close_type, CloseType.EARLY_STOP)
+        self.assertEqual(executor._status, RunnableStatus.SHUTTING_DOWN)
+        self.assertIn("OID-SELL-1", [c.kwargs["order_id"] for c in self.strategy.cancel.call_args_list])
+        self.assertTrue(executor._close_pending)
+
+        tp.order.current_state = OrderState.CANCELED
+        executor.process_order_canceled_event(None, MagicMock(), self.cancel_event("OID-SELL-1"))
+
+        close = self.order_args(self.strategy.sell.call_args)
+        self.assertEqual(close["order_type"], OrderType.LIMIT)
+        self.assertEqual(close["amount"], Decimal("1"))
+        self.assertLess(close["price"], Decimal("99"), "the exit has to cross, not rest")
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_early_stop_with_nothing_open_just_cancels(self, mock_price, rules_mock):
+        mock_price.side_effect = self.price_feed()
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(self.config())
+        self.track(executor, "entry", "OID-BUY-1", TradeType.BUY, price="99")
+
+        executor.early_stop()
+
+        self.assertEqual(executor.close_type, CloseType.EARLY_STOP)
+        self.assertEqual(self.strategy.cancel.call_args.kwargs["order_id"], "OID-BUY-1")
+        self.strategy.sell.assert_not_called()
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_early_stop_keeping_position_does_not_close_anything(self, mock_price, rules_mock):
+        """Handing the position on is the one case where not flattening is the point."""
+        mock_price.side_effect = self.price_feed()
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(self.config())
+        self.open_long(executor, price="99")
+
+        executor.early_stop(keep_position=True)
+
+        self.assertEqual(executor.close_type, CloseType.POSITION_HOLD)
+        self.assertEqual(executor._status, RunnableStatus.SHUTTING_DOWN)
+        self.strategy.sell.assert_not_called()
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_stopping_with_a_position_still_open_is_logged_loudly(self, mock_price, rules_mock):
+        """Nothing else is watching it once we are gone, so it cannot be left silent."""
+        mock_price.side_effect = self.price_feed()
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(self.config())
+        self.open_long(executor, price="99")
+
+        with patch.object(executor.logger(), "error") as error:
+            executor.stop()
+
+        self.assertEqual(error.call_count, 1)
+        self.assertIn("STILL OPEN", error.call_args.args[0])
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_a_clean_stop_says_nothing(self, mock_price, rules_mock):
+        mock_price.side_effect = self.price_feed()
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(self.config())
+        self.open_long(executor, price="99")
+        self.track(executor, "_close_order", "OID-SELL-2", TradeType.SELL,
+                   price="98", filled="1", fill_price="98", state=OrderState.FILLED)
+
+        with patch.object(executor.logger(), "error") as error:
+            executor.stop()
+
+        error.assert_not_called()
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    async def test_both_oco_refused_on_a_spot_connector(self, mock_price, rules_mock):
+        mock_price.side_effect = self.price_feed()
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(
+            self.config(connector_name="binance", entry_mode=SimpleGridEntryMode.BOTH_OCO))
+
+        with patch.object(SimpleGridExecutor, "stop") as stop_mock:
+            await executor.on_start()
 
         self.assertEqual(executor.close_type, CloseType.FAILED)
-        self.assertEqual(executor._status, RunnableStatus.TERMINATED)
+        stop_mock.assert_called_once()
+
+    # ------------------------------------------------------------------ balance
 
     @patch.object(SimpleGridExecutor, "adjust_order_candidates")
     @patch.object(SimpleGridExecutor, "get_trading_rules")
     @patch.object(SimpleGridExecutor, "get_price")
     async def test_both_oco_budgets_one_leg_not_two(self, mock_price, rules_mock, adjust_mock):
         """
-        Only one entry order is ever sent, so both_oco must not reserve collateral twice.
-
-        Budgeting both sides together makes an affordable leg fail as if it were double the
-        size, and every executor terminates with INSUFFICIENT_BALANCE.
+        Both sides do rest at once, but only one can ever become a position. Budgeting them
+        together refused legs that fit perfectly well — a 7 USDT leg checked as 14.
         """
         mock_price.side_effect = self.price_feed()
         rules_mock.return_value = self.trading_rules()
-        executor = self.running_executor(self.config(
-            entry_mode=SimpleGridEntryMode.BOTH_OCO, entry_offset_pct=Decimal("0.02")))
         adjust_mock.side_effect = lambda _connector, candidates: candidates
+        executor = self.running_executor(self.config(entry_mode=SimpleGridEntryMode.BOTH_OCO))
 
         await executor.validate_sufficient_balance()
 
         self.assertNotEqual(executor.close_type, CloseType.INSUFFICIENT_BALANCE)
-        # One call per side, each carrying a single candidate — never both summed together.
-        self.assertEqual(adjust_mock.call_count, 2)
+        # One candidate per call, never both summed into one.
         for call in adjust_mock.call_args_list:
             self.assertEqual(len(call.args[1]), 1)
 
@@ -636,25 +975,521 @@ class TestSimpleGridExecutor(IsolatedAsyncioWrapperTestCase):
     async def test_a_leg_that_does_not_fit_is_still_refused(self, mock_price, rules_mock, adjust_mock):
         mock_price.side_effect = self.price_feed()
         rules_mock.return_value = self.trading_rules()
-        executor = self.running_executor(self.config())
 
-        def _zero(_connector, candidates):
+        def zero_out(_connector, candidates):
             for candidate in candidates:
                 candidate.amount = Decimal("0")
             return candidates
 
-        adjust_mock.side_effect = _zero
+        adjust_mock.side_effect = zero_out
+        executor = self.running_executor(self.config())
 
-        await executor.validate_sufficient_balance()
+        with patch.object(SimpleGridExecutor, "stop"):
+            await executor.validate_sufficient_balance()
 
         self.assertEqual(executor.close_type, CloseType.INSUFFICIENT_BALANCE)
+
+    # ------------------------------------------------------------------ reporting
 
     @patch.object(SimpleGridExecutor, "get_trading_rules")
     @patch.object(SimpleGridExecutor, "get_price")
     def test_custom_info_carries_what_the_controller_needs(self, mock_price, rules_mock):
         mock_price.side_effect = self.price_feed()
         rules_mock.return_value = self.trading_rules()
-        executor = SimpleGridExecutor(self.strategy, self.config(entry_price=Decimal("100")))
+        executor = self.running_executor(self.config())
+        self.open_long(executor, price="99")
+
         info = executor.get_custom_info()
-        for key in ("side", "close_price", "close_type", "entry_price", "take_profit_price", "stop_loss_price"):
-            self.assertIn(key, info)
+
+        self.assertEqual(info["side"], TradeType.BUY)
+        self.assertEqual(info["anchor_price"], Decimal("100"))
+        self.assertEqual(info["entry_price"], Decimal("99"))
+        self.assertEqual(info["take_profit_price"], Decimal("105.00"))
+        self.assertEqual(info["stop_loss_price"], Decimal("98.00"))
+        self.assertFalse(info["stop_loss_triggered"])
+        self.assertIn("close_price", info)
+        self.assertIn("close_type", info)
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_custom_info_reports_where_the_entries_are_resting(self, mock_price, rules_mock):
+        """Nothing sits at a level any more, so this is how a watching leg proves it is alive."""
+        mock_price.side_effect = self.price_feed(best_bid="99", best_ask="101")
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(self.config(entry_mode=SimpleGridEntryMode.BOTH_OCO))
+
+        executor.control_entry_orders()
+        info = executor.get_custom_info()
+
+        self.assertEqual(info["resting_entries"], {"BUY": Decimal("99"), "SELL": Decimal("101")})
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_a_missing_order_book_is_reported_once_not_every_tick(self, mock_price, rules_mock):
+        """
+        Every entry is priced off the touch, so no book means no orders at all — and a silent
+        executor looks identical to one waiting patiently for the market.
+        """
+        rules_mock.return_value = self.trading_rules()
+        prices = {
+            PriceType.BestBid: Decimal("NaN"),
+            PriceType.BestAsk: Decimal("NaN"),
+            PriceType.LastTrade: Decimal("100"),
+            PriceType.MidPrice: Decimal("100"),
+        }
+        mock_price.side_effect = lambda _c, _p, price_type=PriceType.MidPrice: prices[price_type]
+        executor = self.running_executor(self.config())
+
+        with patch.object(executor.logger(), "warning") as warn:
+            executor.control_entry_orders()
+            executor.control_entry_orders()
+            executor.control_entry_orders()
+
+        self.strategy.buy.assert_not_called()
+        self.assertEqual(warn.call_count, 1)
+        self.assertIn("order book has not arrived", warn.call_args.args[0])
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_the_book_coming_back_resumes_quoting(self, mock_price, rules_mock):
+        rules_mock.return_value = self.trading_rules()
+        prices = {
+            PriceType.BestBid: Decimal("NaN"),
+            PriceType.BestAsk: Decimal("NaN"),
+            PriceType.LastTrade: Decimal("100"),
+            PriceType.MidPrice: Decimal("100"),
+        }
+        mock_price.side_effect = lambda _c, _p, price_type=PriceType.MidPrice: prices[price_type]
+        executor = self.running_executor(self.config())
+        executor.control_entry_orders()
+        self.strategy.buy.assert_not_called()
+
+        mock_price.side_effect = self.price_feed(best_bid="99.9", best_ask="100.1")
+        executor.control_entry_orders()
+
+        self.assertEqual(self.order_args(self.strategy.buy.call_args)["price"], Decimal("99.9"))
+
+    # ------------------------------------------------------------------ aggressive maker exits
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_a_long_exits_one_tick_above_the_best_bid(self, mock_price, rules_mock):
+        """
+        Best bid + one tick, not the best ask. Both earn the maker fee, but this one is the
+        best offer in the book and fills first — and an exit that never fills just chases the
+        market down into the drift cap.
+        """
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(
+            self.config(barriers=SimpleGridBarriers(
+                take_profit=Decimal("0.05"), stop_loss=Decimal("0.02"),
+                stop_loss_max_drift_pct=Decimal("0.05"))))
+        self.open_long(executor, price="99")
+
+        # Wide book so the two candidate prices are clearly different.
+        mock_price.side_effect = self.price_feed(best_bid="97.50", best_ask="98.50", mid="98")
+        executor.control_barriers()
+
+        self.assertEqual(self.order_args(self.strategy.sell.call_args)["price"], Decimal("97.51"))
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_a_short_exits_one_tick_below_the_best_ask(self, mock_price, rules_mock):
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(
+            self.config(entry_mode=SimpleGridEntryMode.SHORT_ONLY,
+                        barriers=SimpleGridBarriers(
+                            take_profit=Decimal("0.05"), stop_loss=Decimal("0.02"),
+                            stop_loss_max_drift_pct=Decimal("0.05"))))
+        self.open_short(executor, price="101")
+
+        mock_price.side_effect = self.price_feed(best_bid="101.50", best_ask="102.50", mid="102")
+        executor.control_barriers()
+
+        self.assertEqual(self.order_args(self.strategy.buy.call_args)["price"], Decimal("102.49"))
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_the_exit_offset_can_be_backed_off_from_the_touch(self, mock_price, rules_mock):
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(
+            self.config(barriers=SimpleGridBarriers(
+                take_profit=Decimal("0.05"), stop_loss=Decimal("0.02"),
+                stop_loss_maker_offset_ticks=5,
+                stop_loss_max_drift_pct=Decimal("0.05"))))
+        self.open_long(executor, price="99")
+
+        mock_price.side_effect = self.price_feed(best_bid="97.50", best_ask="98.50", mid="98")
+        executor.control_barriers()
+
+        # bid + 5 ticks: further from the market, better price, further back in the queue.
+        self.assertEqual(self.order_args(self.strategy.sell.call_args)["price"], Decimal("97.55"))
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_on_a_one_tick_spread_the_exit_lands_on_our_own_touch(self, mock_price, rules_mock):
+        """XRP-USDT trades a one-tick spread, where the aggressive price IS the far touch."""
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(
+            self.config(barriers=SimpleGridBarriers(
+                take_profit=Decimal("0.05"), stop_loss=Decimal("0.02"),
+                stop_loss_max_drift_pct=Decimal("0.05"))))
+        self.open_long(executor, price="99")
+
+        mock_price.side_effect = self.price_feed(best_bid="97.99", best_ask="98.00", mid="98")
+        executor.control_barriers()
+
+        self.assertEqual(self.order_args(self.strategy.sell.call_args)["price"], Decimal("98.00"))
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_the_exit_never_crosses_even_if_quantization_rounds_the_wrong_way(self, mock_price, rules_mock):
+        """A 'maker' order that crosses pays taker, fills worse, and on a post-only venue is rejected."""
+        rules_mock.return_value = self.trading_rules()
+        # Quantize hard onto a coarse grid so the computed price would land back on the bid.
+        connector = self.strategy.connectors["coindcx_perpetual"]
+        connector.quantize_order_price.side_effect = \
+            lambda trading_pair, price: Decimal(price).quantize(Decimal("1"))
+        executor = self.running_executor(
+            self.config(barriers=SimpleGridBarriers(
+                take_profit=Decimal("0.05"), stop_loss=Decimal("0.02"),
+                stop_loss_max_drift_pct=Decimal("0.05"))))
+        self.open_long(executor, price="99")
+
+        mock_price.side_effect = self.price_feed(best_bid="97.50", best_ask="98.50", mid="98")
+        executor.control_barriers()
+
+        price = self.order_args(self.strategy.sell.call_args)["price"]
+        self.assertGreater(price, Decimal("97.50"), "a sell at or below the best bid crosses")
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_the_entry_stays_at_its_own_touch_not_the_aggressive_price(self, mock_price, rules_mock):
+        """
+        Entries are not in a hurry. We are choosing to be filled at a good price, so the
+        patient side of the book is right — the aggressive price is for getting OUT.
+        """
+        mock_price.side_effect = self.price_feed(best_bid="97.50", best_ask="98.50", mid="98")
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(self.config(entry_price=Decimal("98")))
+
+        executor.control_entry_orders()
+
+        self.assertEqual(self.order_args(self.strategy.buy.call_args)["price"], Decimal("97.50"))
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_an_entry_improvement_is_clamped_so_it_cannot_cross(self, mock_price, rules_mock):
+        mock_price.side_effect = self.price_feed(best_bid="97.50", best_ask="98.50", mid="98")
+        rules_mock.return_value = self.trading_rules()
+        # 5% above the bid is 102.375 — right through the ask and into taker territory.
+        executor = self.running_executor(
+            self.config(entry_price=Decimal("98"), entry_price_improvement_pct=Decimal("0.05")))
+
+        executor.control_entry_orders()
+
+        self.assertEqual(self.order_args(self.strategy.buy.call_args)["price"], Decimal("98.49"))
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_early_stop_does_not_overwrite_a_take_profit_that_already_fired(self, mock_price, rules_mock):
+        """
+        The orchestrator calls early_stop on everything not yet TERMINATED, so a leg that has
+        just won lands here too. Relabelling it would report a win as an early stop and cost
+        the controller both its tally and its anchor.
+        """
+        mock_price.side_effect = self.price_feed()
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(self.config())
+        self.open_long(executor, price="99")
+        self.track(executor, "_take_profit_order", "OID-SELL-1", TradeType.SELL,
+                   price="105", filled="1", fill_price="105", state=OrderState.FILLED)
+        executor.process_order_completed_event(None, MagicMock(), SellOrderCompletedEvent(
+            timestamp=START_TS, order_id="OID-SELL-1", base_asset="BTC", quote_asset="USDT",
+            base_asset_amount=Decimal("1"), quote_asset_amount=Decimal("105"),
+            order_type=OrderType.LIMIT))
+        self.strategy.sell.reset_mock()
+
+        executor.early_stop()
+
+        self.assertEqual(executor.close_type, CloseType.TAKE_PROFIT)
+        self.strategy.sell.assert_not_called()
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_early_stop_twice_does_not_send_two_close_orders(self, mock_price, rules_mock):
+        mock_price.side_effect = self.price_feed()
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(self.config())
+        self.open_long(executor, price="99")
+
+        executor.early_stop()
+        executor.early_stop()
+
+        self.assertEqual(self.strategy.sell.call_count, 1)
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_early_stop_covers_a_position_a_held_leg_left_behind(self, mock_price, rules_mock):
+        """An expired leg that somehow holds stock still has to be flattened, not relabelled."""
+        mock_price.side_effect = self.price_feed()
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(self.config())
+        self.open_long(executor, price="99")
+        executor.close_type = CloseType.EXPIRED
+        executor._status = RunnableStatus.SHUTTING_DOWN
+
+        executor.early_stop()
+
+        self.assertEqual(executor.close_type, CloseType.EXPIRED)
+        self.assertEqual(self.order_args(self.strategy.sell.call_args)["order_type"], OrderType.LIMIT)
+
+    # ------------------------------------------------------------------ the urgent exit
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_the_urgent_exit_is_a_crossing_limit_not_a_market_order(self, mock_price, rules_mock):
+        """
+        CoinDCX answers a reduce_only market order with
+            400 "Reduce Only Order is only applicable for Limit Order"
+        and the connector must send reduce_only or the venue demands margin for a fresh
+        opposite position. A limit priced through the book satisfies both.
+        """
+        mock_price.side_effect = self.price_feed(best_bid="97.50", best_ask="98.50", mid="98")
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(self.config())
+        self.open_long(executor, price="99")
+
+        executor.place_close_order_and_cancel_open_orders(close_type=CloseType.STOP_LOSS)
+
+        close = self.order_args(self.strategy.sell.call_args)
+        self.assertEqual(close["order_type"], OrderType.LIMIT)
+        # 20 ticks of 0.01 through the bid.
+        self.assertEqual(close["price"], Decimal("97.30"))
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_a_short_urgent_exit_crosses_upward_through_the_ask(self, mock_price, rules_mock):
+        mock_price.side_effect = self.price_feed(best_bid="97.50", best_ask="98.50", mid="98")
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(self.config(entry_mode=SimpleGridEntryMode.SHORT_ONLY))
+        self.open_short(executor, price="99")
+
+        executor.place_close_order_and_cancel_open_orders(close_type=CloseType.STOP_LOSS)
+
+        close = self.order_args(self.strategy.buy.call_args)
+        self.assertEqual(close["order_type"], OrderType.LIMIT)
+        self.assertEqual(close["price"], Decimal("98.70"))
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_market_closes_are_still_available_for_venues_that_take_them(self, mock_price, rules_mock):
+        mock_price.side_effect = self.price_feed()
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(
+            self.config(barriers=SimpleGridBarriers(
+                take_profit=Decimal("0.05"), stop_loss=Decimal("0.02"),
+                close_order_type=OrderType.MARKET)))
+        self.open_long(executor, price="99")
+
+        executor.place_close_order_and_cancel_open_orders(close_type=CloseType.STOP_LOSS)
+
+        self.assertEqual(self.order_args(self.strategy.sell.call_args)["order_type"], OrderType.MARKET)
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_the_chase_gets_a_go_even_when_the_price_is_already_through_the_level(
+            self, mock_price, rules_mock):
+        """
+        A tick only notices the stop once the price is past it. Charging that gap to the
+        patience budget meant a tight cap skipped the chase entirely and went straight to a
+        crossing order every single time — which is what happened live.
+        """
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(
+            self.config(barriers=SimpleGridBarriers(
+                take_profit=Decimal("0.05"), stop_loss=Decimal("0.02"),
+                stop_loss_max_drift_pct=Decimal("0.0003"))))
+        self.open_long(executor, price="99")
+
+        # Stop level is 98.00; the tick lands at 97.90, already 0.10% through it — far more
+        # than the 0.03% cap.
+        mock_price.side_effect = self.price_feed(best_bid="97.89", best_ask="97.91", mid="97.90")
+        executor.control_barriers()
+
+        self.assertTrue(executor._stop_loss_triggered)
+        self.assertEqual(executor._status, RunnableStatus.RUNNING, "should still be chasing")
+        close = self.order_args(self.strategy.sell.call_args)
+        self.assertEqual(close["order_type"], OrderType.LIMIT)
+        self.assertEqual(close["price"], Decimal("97.90"), "a passive exit one tick above the bid")
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_the_cap_still_bites_on_drift_after_the_stop_fired(self, mock_price, rules_mock):
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(
+            self.config(barriers=SimpleGridBarriers(
+                take_profit=Decimal("0.05"), stop_loss=Decimal("0.02"),
+                stop_loss_max_drift_pct=Decimal("0.005"))))
+        self.open_long(executor, price="99")
+        mock_price.side_effect = self.price_feed(best_bid="97.89", best_ask="97.91", mid="97.90")
+        executor.control_barriers()
+        self.assertEqual(executor._status, RunnableStatus.RUNNING)
+
+        # Another 0.6% below where the stop actually fired, past the 0.5% cap.
+        mock_price.side_effect = self.price_feed(best_bid="97.28", best_ask="97.30", mid="97.29")
+        executor.control_barriers()
+
+        self.assertEqual(executor.close_type, CloseType.STOP_LOSS)
+        self.assertEqual(executor._status, RunnableStatus.SHUTTING_DOWN)
+
+    # ------------------------------------------------------------------ the close race
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_the_close_waits_for_a_resting_exit_to_be_cancelled(self, mock_price, rules_mock):
+        """
+        A cancel is a request, not an instant. While the reduce-only take profit is still
+        live, a second reduce-only order for the same position makes it two-for-one and the
+        venue refuses with "Insufficient funds" — one retry burned for nothing.
+        """
+        mock_price.side_effect = self.price_feed()
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(self.config())
+        self.open_long(executor, price="99")
+        self.track(executor, "_take_profit_order", "OID-SELL-1", TradeType.SELL, price="105")
+        self.strategy.sell.reset_mock()
+
+        executor.place_close_order_and_cancel_open_orders(close_type=CloseType.EARLY_STOP)
+
+        self.assertIn("OID-SELL-1", [c.kwargs["order_id"] for c in self.strategy.cancel.call_args_list])
+        self.strategy.sell.assert_not_called()
+        self.assertTrue(executor._close_pending)
+        self.assertEqual(executor.close_type, CloseType.EARLY_STOP)
+        self.assertEqual(executor._status, RunnableStatus.SHUTTING_DOWN)
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_the_close_goes_out_the_moment_the_cancel_is_acknowledged(self, mock_price, rules_mock):
+        mock_price.side_effect = self.price_feed()
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(self.config())
+        self.open_long(executor, price="99")
+        tp = self.track(executor, "_take_profit_order", "OID-SELL-1", TradeType.SELL, price="105")
+        self.strategy.sell.reset_mock()
+        executor.place_close_order_and_cancel_open_orders(close_type=CloseType.EARLY_STOP)
+
+        tp.order.current_state = OrderState.CANCELED
+        executor.process_order_canceled_event(None, MagicMock(), self.cancel_event("OID-SELL-1"))
+
+        self.assertFalse(executor._close_pending)
+        close = self.order_args(self.strategy.sell.call_args)
+        self.assertEqual(close["order_type"], OrderType.LIMIT)
+        self.assertEqual(close["amount"], Decimal("1"))
+        self.assertIsNotNone(executor._close_order)
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_the_close_goes_out_at_once_when_nothing_is_resting(self, mock_price, rules_mock):
+        """No conflict to wait for, so waiting would only delay the exit."""
+        mock_price.side_effect = self.price_feed()
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(self.config())
+        self.open_long(executor, price="99")
+        self.strategy.sell.reset_mock()
+
+        executor.place_close_order_and_cancel_open_orders(close_type=CloseType.EARLY_STOP)
+
+        self.assertFalse(executor._close_pending)
+        self.assertEqual(self.strategy.sell.call_count, 1)
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    async def test_the_shutdown_loop_covers_a_cancel_that_is_never_acknowledged(
+            self, mock_price, rules_mock):
+        """The position must not stay uncovered because a confirmation went missing."""
+        mock_price.side_effect = self.price_feed()
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(self.config())
+        self.open_long(executor, price="99")
+        tp = self.track(executor, "_take_profit_order", "OID-SELL-1", TradeType.SELL, price="105")
+        self.strategy.sell.reset_mock()
+        executor.place_close_order_and_cancel_open_orders(close_type=CloseType.EARLY_STOP)
+        self.strategy.sell.assert_not_called()
+
+        # The venue closed it but no event ever reached us; the next shutdown pass notices.
+        tp.order.current_state = OrderState.CANCELED
+
+        async def _no_sleep(_delay):
+            return None
+
+        executor._sleep = _no_sleep
+        await executor.control_shutdown_process()
+
+        self.assertEqual(self.strategy.sell.call_count, 1)
+        self.assertIsNotNone(executor._close_order)
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_the_chase_waits_for_the_take_profit_cancel(self, mock_price, rules_mock):
+        """
+        Live, the chase went out one millisecond after the cancel was acknowledged and the
+        venue still refused it: two reduce-only orders for one position. The retry a second
+        later crossed the spread and paid taker — the exact fee the chase exists to avoid.
+        """
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(
+            self.config(barriers=SimpleGridBarriers(
+                take_profit=Decimal("0.05"), stop_loss=Decimal("0.02"),
+                stop_loss_max_drift_pct=Decimal("0.05"))))
+        self.open_long(executor, price="99")
+        self.track(executor, "_take_profit_order", "OID-SELL-1", TradeType.SELL, price="105")
+        self.strategy.sell.reset_mock()
+
+        mock_price.side_effect = self.price_feed(best_bid="97.9", best_ask="98.1", mid="98")
+        executor.control_barriers()
+
+        self.assertTrue(executor._stop_loss_triggered)
+        self.assertIn("OID-SELL-1", [c.kwargs["order_id"] for c in self.strategy.cancel.call_args_list])
+        self.strategy.sell.assert_not_called()
+        self.assertIsNone(executor._sl_chase_order)
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_the_chase_goes_in_the_moment_that_cancel_lands(self, mock_price, rules_mock):
+        """Not on the next tick: a second of standing still is what turned it into a taker."""
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(
+            self.config(barriers=SimpleGridBarriers(
+                take_profit=Decimal("0.05"), stop_loss=Decimal("0.02"),
+                stop_loss_max_drift_pct=Decimal("0.05"))))
+        self.open_long(executor, price="99")
+        tp = self.track(executor, "_take_profit_order", "OID-SELL-1", TradeType.SELL, price="105")
+        self.strategy.sell.reset_mock()
+        mock_price.side_effect = self.price_feed(best_bid="97.9", best_ask="98.1", mid="98")
+        executor.control_barriers()
+
+        tp.order.current_state = OrderState.CANCELED
+        executor.process_order_canceled_event(None, MagicMock(), self.cancel_event("OID-SELL-1"))
+
+        self.assertIsNotNone(executor._sl_chase_order)
+        chase = self.order_args(self.strategy.sell.call_args)
+        self.assertEqual(chase["order_type"], OrderType.LIMIT)
+        self.assertEqual(chase["price"], Decimal("97.91"), "one tick above the bid — maker")
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_nothing_resting_means_the_chase_goes_straight_in(self, mock_price, rules_mock):
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(
+            self.config(barriers=SimpleGridBarriers(
+                take_profit=Decimal("0.05"), stop_loss=Decimal("0.02"),
+                stop_loss_max_drift_pct=Decimal("0.05"))))
+        self.open_long(executor, price="99")
+        self.strategy.sell.reset_mock()
+
+        mock_price.side_effect = self.price_feed(best_bid="97.9", best_ask="98.1", mid="98")
+        executor.control_barriers()
+
+        self.assertIsNotNone(executor._sl_chase_order)
+        self.assertEqual(self.order_args(self.strategy.sell.call_args)["price"], Decimal("97.91"))

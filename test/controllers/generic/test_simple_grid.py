@@ -4,7 +4,7 @@ from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCa
 from unittest.mock import MagicMock
 
 from controllers.generic.simple_grid import SimpleGrid, SimpleGridConfig
-from hummingbot.core.data_type.common import OrderType, TradeType
+from hummingbot.core.data_type.common import OrderType, PriceType, TradeType
 from hummingbot.data_feed.market_data_provider import MarketDataProvider
 from hummingbot.strategy_v2.executors.simple_grid_executor.data_types import (
     SimpleGridBarriers,
@@ -69,10 +69,10 @@ class TestSimpleGrid(IsolatedAsyncioWrapperTestCase):
         info.close_type = None
         return info
 
-    # ------------------------------------------------------------------ entry levels
+    # ------------------------------------------------------------------ direction
 
-    def test_perpetual_watches_both_directions(self):
-        """The market decides: whichever level it reaches first sets the direction."""
+    def test_perpetual_opening_leg_offers_both_sides(self):
+        """A maker order on each side of the book; whichever gets hit sets the run's side."""
         controller = self.controller()
         config = controller.determine_executor_actions()[0].executor_config
         self.assertEqual(config.entry_mode, SimpleGridEntryMode.BOTH_OCO)
@@ -82,53 +82,68 @@ class TestSimpleGrid(IsolatedAsyncioWrapperTestCase):
         config = controller.determine_executor_actions()[0].executor_config
         self.assertEqual(config.entry_mode, SimpleGridEntryMode.LONG_ONLY)
 
-    def test_spot_opens_the_chain_with_a_passive_buy_at_the_touch(self):
-        """
-        Spot's first order goes in straight away, passively, just below the ask — it can
-        only go long, so there is no direction to wait for. The chain proper starts from
-        wherever that fills.
-        """
-        controller = self.controller(connector_name="binance")
+    def test_the_side_locks_to_whichever_filled_first(self):
+        controller = self.controller()
+        controller.executors_info = [
+            self.closed_leg("leg-1", CloseType.TAKE_PROFIT, side=TradeType.SELL, net_pnl_quote="1")]
+        config = controller.determine_executor_actions()[0].executor_config
+        self.assertEqual(controller._locked_side, TradeType.SELL)
+        self.assertEqual(config.entry_mode, SimpleGridEntryMode.SHORT_ONLY)
+
+    def test_a_locked_long_run_stays_long_after_a_stop_loss(self):
+        """The first fill decides the direction, not the outcome of each leg."""
+        controller = self.controller(stop_when_losses_outnumber_wins=False)
+        controller.executors_info = [
+            self.closed_leg("leg-1", CloseType.STOP_LOSS, side=TradeType.BUY, net_pnl_quote="-1")]
         config = controller.determine_executor_actions()[0].executor_config
         self.assertEqual(config.entry_mode, SimpleGridEntryMode.LONG_ONLY)
-        self.assertEqual(config.entry_offset_pct, Decimal("0"))
-        self.assertIsNone(config.entry_price)  # executor prices it off the live touch
-        self.assertEqual(config.entry_order_type, OrderType.LIMIT)
 
-    def test_futures_first_leg_waits_for_the_market_to_pick_a_side(self):
-        """A perp can go either way, so the wait is what decides the direction."""
-        controller = self.controller(take_profit=Decimal("0.02"))
-        config = controller.determine_executor_actions()[0].executor_config
-        self.assertEqual(config.entry_mode, SimpleGridEntryMode.BOTH_OCO)
-        self.assertEqual(config.entry_offset_pct, Decimal("0.02"))
-        self.assertEqual(config.entry_price, Decimal("100"))
-        self.assertEqual(config.entry_order_type, OrderType.MARKET)
-
-    def test_spot_second_leg_goes_back_to_waiting_for_the_step(self):
-        """The passive opening applies only to the first leg."""
-        controller = self.controller(connector_name="binance", take_profit=Decimal("0.02"))
+    def test_a_locked_short_run_stays_short_after_a_take_profit(self):
+        controller = self.controller()
         controller.executors_info = [
-            self.closed_leg("leg-1", CloseType.TAKE_PROFIT, close_price="102", net_pnl_quote="1")]
+            self.closed_leg("leg-1", CloseType.TAKE_PROFIT, side=TradeType.SELL, net_pnl_quote="1")]
+        controller.determine_executor_actions()
+        controller.executors_info.append(
+            self.closed_leg("leg-2", CloseType.TAKE_PROFIT, side=TradeType.SELL, net_pnl_quote="1"))
         config = controller.determine_executor_actions()[0].executor_config
-        self.assertEqual(config.entry_offset_pct, Decimal("0.02"))
-        self.assertEqual(config.entry_price, Decimal("102"))
+        self.assertEqual(config.entry_mode, SimpleGridEntryMode.SHORT_ONLY)
 
-    def test_entry_step_defaults_to_the_take_profit_distance(self):
-        """So a winning leg lands exactly on the next entry level."""
-        controller = self.controller(take_profit=Decimal("0.02"))
-        config = controller.determine_executor_actions()[0].executor_config
-        self.assertEqual(config.entry_offset_pct, Decimal("0.02"))
+    def test_the_lock_is_only_set_once(self):
+        """A stray later leg on the other side must not be able to turn the run around."""
+        controller = self.controller()
+        controller.executors_info = [
+            self.closed_leg("leg-1", CloseType.TAKE_PROFIT, side=TradeType.SELL, net_pnl_quote="1")]
+        controller.determine_executor_actions()
+        controller.executors_info.append(
+            self.closed_leg("leg-2", CloseType.TAKE_PROFIT, side=TradeType.BUY, net_pnl_quote="1"))
+        controller.determine_executor_actions()
+        self.assertEqual(controller._locked_side, TradeType.SELL)
 
-    def test_entry_step_can_be_set_independently(self):
-        controller = self.controller(take_profit=Decimal("0.02"), entry_step=Decimal("0.01"))
+    def test_a_leg_that_never_traded_does_not_lock_the_side(self):
+        controller = self.controller(cooldown_after_reanchor=0)
+        leg = self.closed_leg("leg-1", CloseType.EXPIRED, side=TradeType.SELL, net_pnl_quote="0")
+        leg.filled_amount_quote = Decimal("0")
+        controller.executors_info = [leg]
         config = controller.determine_executor_actions()[0].executor_config
-        self.assertEqual(config.entry_offset_pct, Decimal("0.01"))
+        self.assertIsNone(controller._locked_side)
+        self.assertEqual(config.entry_mode, SimpleGridEntryMode.BOTH_OCO)
 
-    def test_take_profit_and_stop_loss_pass_through_separately(self):
-        controller = self.controller(take_profit=Decimal("0.02"), stop_loss=Decimal("0.03"))
+    def test_locking_can_be_switched_off(self):
+        controller = self.controller(lock_side_after_first_fill=False)
+        controller.executors_info = [
+            self.closed_leg("leg-1", CloseType.TAKE_PROFIT, side=TradeType.SELL, net_pnl_quote="1")]
         config = controller.determine_executor_actions()[0].executor_config
-        self.assertEqual(config.barriers.take_profit, Decimal("0.02"))
-        self.assertEqual(config.barriers.stop_loss, Decimal("0.03"))
+        self.assertIsNone(controller._locked_side)
+        self.assertEqual(config.entry_mode, SimpleGridEntryMode.BOTH_OCO)
+
+    def test_spot_never_offers_both_sides_even_once_locked(self):
+        controller = self.controller(connector_name="binance")
+        controller.executors_info = [
+            self.closed_leg("leg-1", CloseType.TAKE_PROFIT, side=TradeType.BUY, net_pnl_quote="1")]
+        config = controller.determine_executor_actions()[0].executor_config
+        self.assertEqual(config.entry_mode, SimpleGridEntryMode.LONG_ONLY)
+
+    # ------------------------------------------------------------------ the anchor
 
     def test_first_leg_anchors_on_the_current_price(self):
         self.market_data_provider.get_price_by_type.return_value = Decimal("100")
@@ -145,9 +160,8 @@ class TestSimpleGrid(IsolatedAsyncioWrapperTestCase):
 
     def test_a_leg_that_never_traded_does_not_move_the_anchor(self):
         """
-        Spot in a falling market never reaches its up-trigger, so legs close having done
-        nothing. If those moved the anchor the grid would walk down the market with no
-        fills behind it.
+        A maker entry that is never filled closes having done nothing. Letting it move the
+        anchor would walk the grid across the market with no fills behind it.
         """
         controller = self.controller()
         leg = self.closed_leg("leg-1", CloseType.EARLY_STOP, close_price="85", net_pnl_quote="0")
@@ -165,46 +179,49 @@ class TestSimpleGrid(IsolatedAsyncioWrapperTestCase):
         self.assertIsNone(controller._anchor_price)
         self.assertEqual(controller._wins + controller._losses, 0)
 
-    # ------------------------------------------------------------------ spot re-entry
+    # ------------------------------------------------------------------ settings passed through
 
-    def test_spot_buys_whichever_level_the_market_reaches(self):
-        """
-        Spot cannot short, so instead of only watching the level above it watches both and
-        buys either one: a step up joins the rise, a step down buys the dip. Without this it
-        would sit idle through every fall waiting for a rise to buy into.
-        """
-        controller = self.controller(connector_name="binance", take_profit=Decimal("0.02"),
-                                     stop_when_losses_outnumber_wins=False)
-        controller.executors_info = [
-            self.closed_leg("leg-1", CloseType.STOP_LOSS, close_price="98", net_pnl_quote="-1")]
+    def test_take_profit_and_stop_loss_pass_through_separately(self):
+        controller = self.controller(take_profit=Decimal("0.02"), stop_loss=Decimal("0.03"))
         config = controller.determine_executor_actions()[0].executor_config
-        self.assertTrue(config.enter_on_either_level)
-        self.assertEqual(config.entry_offset_pct, Decimal("0.02"))
-        self.assertEqual(config.entry_mode, SimpleGridEntryMode.LONG_ONLY)
+        self.assertEqual(config.barriers.take_profit, Decimal("0.02"))
+        self.assertEqual(config.barriers.stop_loss, Decimal("0.03"))
 
-    def test_futures_only_watches_its_own_side_of_each_level(self):
-        """A perp does not need it: it can just go short when the lower level is reached."""
-        controller = self.controller(stop_when_losses_outnumber_wins=False)
-        controller.executors_info = [
-            self.closed_leg("leg-1", CloseType.STOP_LOSS, net_pnl_quote="-1")]
+    def test_the_maker_entry_settings_reach_the_executor(self):
+        controller = self.controller(entry_band_pct=Decimal("0.004"),
+                                     entry_requote_pct=Decimal("0.0002"),
+                                     entry_price_improvement_pct=Decimal("0.0001"))
         config = controller.determine_executor_actions()[0].executor_config
-        self.assertFalse(config.enter_on_either_level)
+        self.assertEqual(config.entry_band_pct, Decimal("0.004"))
+        self.assertEqual(config.entry_requote_pct, Decimal("0.0002"))
+        self.assertEqual(config.entry_price_improvement_pct, Decimal("0.0001"))
 
-    def test_spot_waits_for_the_step_after_a_take_profit(self):
-        controller = self.controller(connector_name="binance", take_profit=Decimal("0.02"))
-        controller.executors_info = [
-            self.closed_leg("leg-1", CloseType.TAKE_PROFIT, net_pnl_quote="1")]
+    def test_the_stop_loss_chase_settings_reach_the_executor(self):
+        controller = self.controller(stop_loss_chase=True,
+                                     stop_loss_requote_pct=Decimal("0.0003"),
+                                     stop_loss_max_drift_pct=Decimal("0.008"))
         config = controller.determine_executor_actions()[0].executor_config
-        self.assertEqual(config.entry_offset_pct, Decimal("0.02"))
+        self.assertTrue(config.barriers.stop_loss_chase)
+        self.assertEqual(config.barriers.stop_loss_requote_pct, Decimal("0.0003"))
+        self.assertEqual(config.barriers.stop_loss_max_drift_pct, Decimal("0.008"))
 
-    def test_perpetual_still_waits_for_the_step_after_a_stop_loss(self):
-        """A perp can flip direction, so it has no reason to re-enter at the anchor."""
-        controller = self.controller(take_profit=Decimal("0.02"),
-                                     stop_when_losses_outnumber_wins=False)
-        controller.executors_info = [
-            self.closed_leg("leg-1", CloseType.STOP_LOSS, net_pnl_quote="-1")]
+    def test_the_stop_loss_chase_can_be_switched_off(self):
+        controller = self.controller(stop_loss_chase=False)
         config = controller.determine_executor_actions()[0].executor_config
-        self.assertEqual(config.entry_offset_pct, Decimal("0.02"))
+        self.assertFalse(config.barriers.stop_loss_chase)
+
+    def test_the_trigger_price_defaults_to_mid(self):
+        """CoinDCX perpetuals never publish a last trade, so LastTrade would silently be mid."""
+        controller = self.controller()
+        config = controller.determine_executor_actions()[0].executor_config
+        self.assertEqual(config.trigger_price_type, PriceType.MidPrice)
+
+    def test_the_leg_amount_is_the_quote_size_over_the_anchor(self):
+        controller = self.controller(order_amount_quote=Decimal("100"))
+        controller.executors_info = [
+            self.closed_leg("leg-1", CloseType.TAKE_PROFIT, close_price="50")]
+        config = controller.determine_executor_actions()[0].executor_config
+        self.assertEqual(config.amount, Decimal("2"))
 
     # ------------------------------------------------------------------ pacing
 
@@ -361,3 +378,243 @@ class TestSimpleGrid(IsolatedAsyncioWrapperTestCase):
         await controller.update_processed_data()
         self.assertEqual(controller.processed_data["anchor_price"], Decimal("98"))
         self.assertFalse(controller.processed_data["halted"])
+
+    def test_the_entry_band_defaults_to_a_fraction_of_the_step(self):
+        """
+        A band as wide as the step is a losing bracket before the leg starts: the entry can
+        fill at the edge with its take profit already on top of it and its stop loss two
+        steps away.
+        """
+        controller = self.controller(take_profit=Decimal("0.005"))
+        config = controller.determine_executor_actions()[0].executor_config
+        self.assertEqual(config.entry_band_pct, Decimal("0.001"))
+
+    def test_the_entry_band_can_be_set_outright(self):
+        controller = self.controller(take_profit=Decimal("0.005"), entry_band_pct=Decimal("0.0004"))
+        config = controller.determine_executor_actions()[0].executor_config
+        self.assertEqual(config.entry_band_pct, Decimal("0.0004"))
+
+    def test_the_band_fraction_is_configurable(self):
+        controller = self.controller(take_profit=Decimal("0.01"),
+                                     entry_band_fraction_of_step=Decimal("0.5"))
+        config = controller.determine_executor_actions()[0].executor_config
+        self.assertEqual(config.entry_band_pct, Decimal("0.005"))
+
+    def test_status_reports_how_far_the_price_has_left_the_anchor_behind(self):
+        """
+        Nothing rests in the book while the price is outside the band, so without this number
+        a strategy that a trend has left behind looks identical to one that is just waiting.
+        """
+        controller = self.controller(take_profit=Decimal("0.005"))
+        controller.executors_info = [
+            self.closed_leg("leg-1", CloseType.STOP_LOSS, close_price="100", net_pnl_quote="-1")]
+        controller.determine_executor_actions()
+        self.market_data_provider.get_price_by_type.return_value = Decimal("130")
+
+        status = "\n".join(controller.to_format_status())
+
+        self.assertIn("30.00% from the anchor", status)
+
+    def test_status_does_not_cry_stale_while_the_price_is_near_the_anchor(self):
+        controller = self.controller(take_profit=Decimal("0.005"))
+        controller.executors_info = [
+            self.closed_leg("leg-1", CloseType.STOP_LOSS, close_price="100", net_pnl_quote="-1")]
+        controller.determine_executor_actions()
+        self.market_data_provider.get_price_by_type.return_value = Decimal("100.05")
+
+        self.assertNotIn("STALE", "\n".join(controller.to_format_status()))
+
+    # ------------------------------------------------------------------ re-anchoring
+
+    def test_an_entry_that_timed_out_re_anchors_the_next_leg_to_the_market(self):
+        """
+        Breaks the deadlock. The anchor only moves on a trade and no trade can happen while
+        the price is outside the band around that anchor, so a trend would otherwise leave
+        the strategy waiting for a price it will never see again.
+        """
+        controller = self.controller(cooldown_after_reanchor=0)
+        controller.executors_info = [
+            self.closed_leg("leg-1", CloseType.STOP_LOSS, close_price="130", net_pnl_quote="-1")]
+        controller.determine_executor_actions()
+        self.assertEqual(controller._anchor_price, Decimal("130"))
+
+        # The price runs away and the maker entry never fills.
+        expired = self.closed_leg("leg-2", CloseType.EXPIRED, close_price="173", net_pnl_quote="0")
+        expired.filled_amount_quote = Decimal("0")
+        controller.executors_info.append(expired)
+        self.market_data_provider.get_price_by_type.return_value = Decimal("173")
+
+        config = controller.determine_executor_actions()[0].executor_config
+
+        self.assertEqual(controller._anchor_price, Decimal("173"))
+        self.assertEqual(config.entry_price, Decimal("173"))
+        self.assertEqual(controller._reanchors, 1)
+
+    def test_the_re_anchor_uses_the_live_price_not_the_expired_legs_close(self):
+        """An unfilled leg's close price is just the mid at the time; it is not a chain link."""
+        controller = self.controller(cooldown_after_reanchor=0)
+        expired = self.closed_leg("leg-1", CloseType.EXPIRED, close_price="150", net_pnl_quote="0")
+        expired.filled_amount_quote = Decimal("0")
+        controller.executors_info = [expired]
+        self.market_data_provider.get_price_by_type.return_value = Decimal("173")
+
+        config = controller.determine_executor_actions()[0].executor_config
+
+        self.assertEqual(config.entry_price, Decimal("173"))
+
+    def test_re_anchoring_waits_out_its_own_cooldown(self):
+        """It deliberately allows an entry right after a big move, so it must not be instant."""
+        controller = self.controller(cooldown_after_reanchor=90)
+        expired = self.closed_leg("leg-1", CloseType.EXPIRED, net_pnl_quote="0")
+        expired.filled_amount_quote = Decimal("0")
+        controller.executors_info = [expired]
+
+        self.assertEqual(controller.determine_executor_actions(), [])
+        self.now = START_TS + 30
+        self.assertEqual(controller.determine_executor_actions(), [])
+        self.now = START_TS + 95
+        self.assertEqual(len(controller.determine_executor_actions()), 1)
+
+    def test_re_anchoring_can_be_switched_off(self):
+        controller = self.controller(reanchor_on_entry_timeout=False, cooldown_after_reanchor=0)
+        controller.executors_info = [
+            self.closed_leg("leg-1", CloseType.STOP_LOSS, close_price="130", net_pnl_quote="-1")]
+        controller.determine_executor_actions()
+
+        expired = self.closed_leg("leg-2", CloseType.EXPIRED, net_pnl_quote="0")
+        expired.filled_amount_quote = Decimal("0")
+        controller.executors_info.append(expired)
+        self.market_data_provider.get_price_by_type.return_value = Decimal("173")
+
+        config = controller.determine_executor_actions()[0].executor_config
+
+        self.assertEqual(controller._anchor_price, Decimal("130"))
+        self.assertEqual(config.entry_price, Decimal("130"))
+        self.assertEqual(controller._reanchors, 0)
+
+    def test_a_leg_that_traded_still_anchors_on_where_it_closed(self):
+        """Re-anchoring must not loosen the ordinary rule; the chain still follows the exits."""
+        controller = self.controller()
+        controller.executors_info = [
+            self.closed_leg("leg-1", CloseType.TAKE_PROFIT, close_price="102", net_pnl_quote="1")]
+        self.market_data_provider.get_price_by_type.return_value = Decimal("173")
+
+        config = controller.determine_executor_actions()[0].executor_config
+
+        self.assertEqual(config.entry_price, Decimal("102"))
+        self.assertEqual(controller._reanchors, 0)
+
+    def test_an_early_stop_does_not_re_anchor(self):
+        """Only the entry timeout re-anchors; being stopped by hand is not a fresh start."""
+        controller = self.controller(cooldown_after_reanchor=0)
+        controller.executors_info = [
+            self.closed_leg("leg-1", CloseType.STOP_LOSS, close_price="130", net_pnl_quote="-1")]
+        controller.determine_executor_actions()
+
+        stopped = self.closed_leg("leg-2", CloseType.EARLY_STOP, net_pnl_quote="0")
+        stopped.filled_amount_quote = Decimal("0")
+        controller.executors_info.append(stopped)
+        self.market_data_provider.get_price_by_type.return_value = Decimal("173")
+
+        config = controller.determine_executor_actions()[0].executor_config
+
+        self.assertEqual(config.entry_price, Decimal("130"))
+        self.assertEqual(controller._reanchors, 0)
+
+    def test_the_entry_timeout_has_a_default_and_reaches_the_executor(self):
+        """Without one the maker entry rests forever and no leg ever ends."""
+        controller = self.controller()
+        config = controller.determine_executor_actions()[0].executor_config
+        self.assertEqual(config.entry_timeout, 300)
+
+    def test_status_says_re_anchoring_rather_than_stale_when_it_is_armed(self):
+        controller = self.controller(take_profit=Decimal("0.005"))
+        controller.executors_info = [
+            self.closed_leg("leg-1", CloseType.STOP_LOSS, close_price="100", net_pnl_quote="-1")]
+        controller.determine_executor_actions()
+        self.market_data_provider.get_price_by_type.return_value = Decimal("130")
+
+        status = "\n".join(controller.to_format_status())
+
+        self.assertIn("Adrift", status)
+        self.assertIn("re-anchoring in up to 300s", status)
+        self.assertNotIn("STALE", status)
+
+    def test_status_still_says_stale_when_re_anchoring_is_off(self):
+        controller = self.controller(take_profit=Decimal("0.005"),
+                                     reanchor_on_entry_timeout=False)
+        controller.executors_info = [
+            self.closed_leg("leg-1", CloseType.STOP_LOSS, close_price="100", net_pnl_quote="-1")]
+        controller.determine_executor_actions()
+        self.market_data_provider.get_price_by_type.return_value = Decimal("130")
+
+        self.assertIn("STALE", "\n".join(controller.to_format_status()))
+
+    # ------------------------------------------------------------------ failing legs
+
+    def failed_leg(self, executor_id, close_type, filled="0"):
+        leg = self.closed_leg(executor_id, close_type, net_pnl_quote="0")
+        leg.filled_amount_quote = Decimal(filled)
+        return leg
+
+    def test_repeated_legs_that_never_trade_halt_instead_of_retrying_forever(self):
+        """
+        A live run logged 'Not enough budget' once a second for two minutes: a stranded
+        position held the margin, so every new leg was refused the moment it was created.
+        """
+        controller = self.controller(max_consecutive_failed_legs=3, cooldown_after_reanchor=0)
+        controller.executors_info = [
+            self.failed_leg(f"leg-{i}", CloseType.INSUFFICIENT_BALANCE) for i in range(1, 4)]
+
+        actions = controller.determine_executor_actions()
+
+        self.assertEqual(actions, [])
+        self.assertTrue(controller.is_halted)
+        self.assertIn("failed before trading", controller._halt_reason)
+
+    def test_a_leg_that_trades_clears_the_failure_streak(self):
+        controller = self.controller(max_consecutive_failed_legs=3, cooldown_after_reanchor=0)
+        controller.executors_info = [
+            self.failed_leg("leg-1", CloseType.INSUFFICIENT_BALANCE),
+            self.failed_leg("leg-2", CloseType.INSUFFICIENT_BALANCE),
+            self.closed_leg("leg-3", CloseType.TAKE_PROFIT, net_pnl_quote="1"),
+        ]
+
+        controller.determine_executor_actions()
+
+        self.assertEqual(controller._consecutive_failed_legs, 0)
+        self.assertFalse(controller.is_halted)
+
+    def test_a_leg_that_failed_after_trading_halts_at_once(self):
+        """
+        Its close order never landed, so a real position may still be open. Opening more legs
+        on top of it is the worst thing the controller could do next.
+        """
+        controller = self.controller()
+        controller.executors_info = [self.failed_leg("leg-1", CloseType.FAILED, filled="100")]
+
+        actions = controller.determine_executor_actions()
+
+        self.assertEqual(actions, [])
+        self.assertTrue(controller.is_halted)
+        self.assertIn("position may still be open", controller._halt_reason)
+
+    def test_a_leg_that_failed_without_trading_does_not_halt_on_its_own(self):
+        controller = self.controller(max_consecutive_failed_legs=5, cooldown_after_reanchor=0)
+        controller.executors_info = [self.failed_leg("leg-1", CloseType.FAILED)]
+
+        controller.determine_executor_actions()
+
+        self.assertFalse(controller.is_halted)
+        self.assertEqual(controller._consecutive_failed_legs, 1)
+
+    def test_the_close_slippage_budget_reaches_the_executor(self):
+        controller = self.controller(close_slippage_ticks=35)
+        config = controller.determine_executor_actions()[0].executor_config
+        self.assertEqual(config.barriers.close_slippage_ticks, 35)
+
+    def test_the_urgent_exit_defaults_to_a_crossing_limit(self):
+        """CoinDCX rejects reduce_only market orders, and a close must carry reduce_only."""
+        controller = self.controller()
+        config = controller.determine_executor_actions()[0].executor_config
+        self.assertEqual(config.barriers.close_order_type, OrderType.LIMIT)

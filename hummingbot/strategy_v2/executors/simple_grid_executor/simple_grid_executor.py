@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from decimal import Decimal
-from typing import Dict, List, Optional, Set, Union
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.core.data_type.common import OrderType, PositionAction, PriceType, TradeType
@@ -74,6 +74,11 @@ class SimpleGridExecutor(ExecutorBase):
         self._filled_side: Optional[TradeType] = None
         self._entry_remainder_cancelled = False
 
+        # Entries the venue told us it cancelled, kept under watch because that claim is not
+        # always true, and the ones that went on to fill anyway and are now really ours.
+        self._cancelled_entries: List[Tuple[TradeType, TrackedOrder, float]] = []
+        self._adopted_entries: List[Tuple[TradeType, TrackedOrder]] = []
+
         # Order ids we have already asked to cancel. An order stays open until the venue
         # acknowledges, and re-sending the cancel every tick would burn rate limit and race
         # our own replacements.
@@ -98,6 +103,12 @@ class SimpleGridExecutor(ExecutorBase):
         # place_close_order_and_cancel_open_orders.
         self._close_pending = False
         self._close_pending_price: Decimal = Decimal("NaN")
+
+        # Backoff for placing a reduce-only exit after cancelling another one. The venue
+        # needs a moment to release the collateral; see cancel_settle_delay.
+        self._exit_retry_delay: float = config.cancel_settle_delay
+        self._exit_blocked_until: float = 0.0
+        self._exit_retry_task: Optional[asyncio.Task] = None
 
         # Orders already warned about in _order_filled_base, so the warning is logged once
         # each rather than on every tick.
@@ -186,8 +197,29 @@ class SimpleGridExecutor(ExecutorBase):
             return in_flight.price
         return None
 
+    def _entry_orders_for_side(self, side: TradeType) -> List[TrackedOrder]:
+        """Everything that opened this side — the live slot plus any adopted late fill."""
+        orders = []
+        slot = self._entry_orders.get(side)
+        if slot is not None:
+            orders.append(slot)
+        orders.extend(order for adopted_side, order in self._adopted_entries if adopted_side == side)
+        return orders
+
     def _executed_amount(self, side: TradeType) -> Decimal:
-        return self._order_filled_base(self._entry_orders.get(side))
+        return sum((self._order_filled_base(order) for order in self._entry_orders_for_side(side)),
+                   Decimal("0"))
+
+    def _weighted_avg_price(self, orders: List[TrackedOrder]) -> Optional[Decimal]:
+        filled = Decimal("0")
+        notional = Decimal("0")
+        for order in orders:
+            amount = self._order_filled_base(order)
+            price = self._order_avg_price(order)
+            if amount > Decimal("0") and price is not None:
+                filled += amount
+                notional += amount * price
+        return notional / filled if filled > Decimal("0") else None
 
     @property
     def open_filled_amount(self) -> Decimal:
@@ -234,7 +266,7 @@ class SimpleGridExecutor(ExecutorBase):
     def entry_price(self) -> Decimal:
         """Average price actually paid, falling back to the anchor before anything fills."""
         if self._filled_side is not None:
-            price = self._order_avg_price(self._entry_orders[self._filled_side])
+            price = self._weighted_avg_price(self._entry_orders_for_side(self._filled_side))
             if price is not None:
                 return price
         return self._anchor if self._anchor is not None else self._reference_or_entry()
@@ -247,17 +279,8 @@ class SimpleGridExecutor(ExecutorBase):
         A chased stop loss can fill across several orders at different prices, and the
         controller anchors the next leg on this number, so a single order's price will not do.
         """
-        filled = Decimal("0")
-        notional = Decimal("0")
-        for order in self._exit_orders():
-            amount = self._order_filled_base(order)
-            price = self._order_avg_price(order)
-            if amount > Decimal("0") and price is not None:
-                filled += amount
-                notional += amount * price
-        if filled > Decimal("0"):
-            return notional / filled
-        return self._exit_reference_price()
+        price = self._weighted_avg_price(self._exit_orders())
+        return price if price is not None else self._exit_reference_price()
 
     @property
     def open_filled_amount_quote(self) -> Decimal:
@@ -526,6 +549,9 @@ class SimpleGridExecutor(ExecutorBase):
     # ------------------------------------------------------------------ control loop
 
     async def control_task(self):
+        # Before anything else, and in every state: a late fill during shutdown is exactly
+        # the case that strands a position.
+        self._reap_cancelled_entries()
         if self.status == RunnableStatus.RUNNING:
             self._ensure_anchor()
             self._detect_entry_fill()
@@ -572,6 +598,36 @@ class SimpleGridExecutor(ExecutorBase):
 
     # ------------------------------------------------------------------ entry
 
+    def _reap_cancelled_entries(self):
+        """
+        Watch what the venue told us was gone.
+
+        A cancel is a claim. CoinDCX has confirmed one and then filled the same order thirty
+        seconds later — and because the executor had already let go of it, the fill matched
+        nothing, no exits were armed, and the shutdown flatten saw a position of zero while a
+        real one sat on the venue. Anything that fills while it is still under watch is ours,
+        and gets its exits like any other entry.
+        """
+        if not self._cancelled_entries:
+            return
+        still_watching = []
+        for side, order, cancelled_at in self._cancelled_entries:
+            if self._order_filled_base(order) > Decimal("0"):
+                self._adopted_entries.append((side, order))
+                self.logger().warning(
+                    f"Executor ID: {self.config.id} - order {order.order_id} FILLED after the "
+                    f"venue confirmed it cancelled. Adopting it: this is a real position and it "
+                    f"is being given its exits.")
+                if self._filled_side is None:
+                    self._on_entry_filled(side)
+                continue
+            if self._strategy.current_timestamp - cancelled_at >= \
+                    self.config.cancelled_entry_watch_seconds:
+                self._failed_orders.append(order)
+                continue
+            still_watching.append((side, order, cancelled_at))
+        self._cancelled_entries = still_watching
+
     def _detect_entry_fill(self):
         """
         Latch the winning side.
@@ -592,7 +648,8 @@ class SimpleGridExecutor(ExecutorBase):
         self._filled_side = side
         self.logger().info(
             f"Executor ID: {self.config.id} - entry filled on {side.name} at "
-            f"{self._order_avg_price(self._entry_orders[side])}; cancelling the opposite side")
+            f"{self._weighted_avg_price(self._entry_orders_for_side(side))}; "
+            f"cancelling the opposite side")
         self._cancel_losing_entries()
 
     def _cancel_losing_entries(self):
@@ -811,6 +868,8 @@ class SimpleGridExecutor(ExecutorBase):
         # a second is long enough for the book to move the exit from maker to taker.
         if any(order is not self._sl_chase_order for order in self._resting_orders()):
             return
+        if self._exit_placement_blocked():
+            return
         desired = self._maker_exit_price(exit_side)
         if desired is None:
             return
@@ -949,6 +1008,53 @@ class SimpleGridExecutor(ExecutorBase):
             f"Executor ID: {self.config.id} - closing {self.amount_to_close} at "
             f"{close_price} ({order_type.name}) — {self.close_type}")
 
+    def _arm_exit_placement(self, after_refusal: bool = False):
+        """
+        Schedule the passive exit, giving the venue time to let go of what we just cancelled.
+
+        Not on the next control tick: that is a full second, and a second of a falling market
+        is what turns a patient exit into one that crosses. A short scheduled wait puts the
+        order in as soon as it can actually be accepted.
+        """
+        if after_refusal:
+            self._exit_retry_delay = min(self._exit_retry_delay * 2,
+                                         self.config.exit_retry_max_delay)
+        delay = self._exit_retry_delay
+        self._exit_blocked_until = self._strategy.current_timestamp + delay
+        if self._exit_retry_task is not None and not self._exit_retry_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop (tests, teardown). The control tick covers it instead — check
+            # for the loop before building the coroutine, or it is left orphaned.
+            self._exit_retry_task = None
+            return
+        self._exit_retry_task = loop.create_task(self._place_exit_after(delay))
+
+    async def _place_exit_after(self, delay: float):
+        try:
+            await self._sleep(delay)
+            self._place_scheduled_exit()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.logger().exception(
+                f"Executor ID: {self.config.id} - scheduled exit placement failed")
+
+    def _place_scheduled_exit(self):
+        """Whichever exit is owed — the deferred close first, then the chase."""
+        self._exit_blocked_until = 0.0
+        self._place_pending_close_if_clear()
+        self._resume_stop_loss_chase_if_clear()
+
+    def _exit_placement_blocked(self) -> bool:
+        return self._strategy.current_timestamp < self._exit_blocked_until
+
+    def _reset_exit_backoff(self):
+        self._exit_retry_delay = self.config.cancel_settle_delay
+        self._exit_blocked_until = 0.0
+
     def _resume_stop_loss_chase_if_clear(self):
         """
         Put the chasing exit in as soon as the take profit is out of the way.
@@ -960,6 +1066,8 @@ class SimpleGridExecutor(ExecutorBase):
         if not self._stop_loss_triggered or self._status != RunnableStatus.RUNNING:
             return
         if self._close_pending or self._close_order is not None:
+            return
+        if self._exit_placement_blocked():
             return
         if not self.config.barriers.stop_loss_chase or self._sl_chase_order is not None:
             return
@@ -975,7 +1083,7 @@ class SimpleGridExecutor(ExecutorBase):
         """Send the deferred close once nothing of ours is resting at the venue any more."""
         if not self._close_pending or self._close_order is not None:
             return
-        if self._has_resting_orders():
+        if self._exit_placement_blocked() or self._has_resting_orders():
             return
         if self.amount_to_close < self.trading_rules.min_order_size:
             self._close_pending = False
@@ -1062,6 +1170,27 @@ class SimpleGridExecutor(ExecutorBase):
         else:
             self.place_close_order_and_cancel_open_orders(close_type=self.close_type)
 
+    def _venue_holds_a_position(self) -> Optional[bool]:
+        """
+        Whether the exchange says we hold anything on this pair.
+
+        None when we cannot tell. A caller must treat that like a yes: being silent about a
+        position that might be open is the wrong way to be wrong.
+        """
+        try:
+            connector = self.connectors[self.config.connector_name]
+            positions = getattr(connector, "account_positions", None)
+            if positions is None:
+                return None
+            for position in positions.values():
+                if position.trading_pair != self.config.trading_pair:
+                    continue
+                if position.amount and abs(position.amount) > Decimal("0"):
+                    return True
+            return False
+        except Exception:
+            return None
+
     def early_stop(self, keep_position: bool = False):
         """
         Wind the leg down in this call, not over the next few control ticks.
@@ -1109,14 +1238,26 @@ class SimpleGridExecutor(ExecutorBase):
             remaining = self.amount_to_close
             if remaining >= self.trading_rules.min_order_size \
                     and self.close_type != CloseType.POSITION_HOLD:
-                self.logger().error(
-                    f"Executor ID: {self.config.id} - stopping with {remaining} "
-                    f"{self.config.trading_pair} STILL OPEN ({self.close_type}). The stop loss "
-                    f"runs in this process, so nothing is watching this position now. Close it "
-                    f"by hand and check the account.")
+                if self._venue_holds_a_position() is False:
+                    # Our books and the venue disagree, and the venue is the one that decides.
+                    # Saying "close it by hand" about a position that does not exist spends
+                    # the credibility of the one message that has to be believed.
+                    self.logger().info(
+                        f"Executor ID: {self.config.id} - our books show {remaining} "
+                        f"{self.config.trading_pair} outstanding, but the venue reports no "
+                        f"position. Treating it as already closed — most likely a fill we were "
+                        f"told had been cancelled.")
+                else:
+                    self.logger().error(
+                        f"Executor ID: {self.config.id} - stopping with {remaining} "
+                        f"{self.config.trading_pair} STILL OPEN ({self.close_type}). The stop "
+                        f"loss runs in this process, so nothing is watching this position now. "
+                        f"Close it by hand and check the account.")
         except Exception:
             # Never let a diagnostic stop the executor from shutting down.
             pass
+        if self._exit_retry_task is not None and not self._exit_retry_task.done():
+            self._exit_retry_task.cancel()
         super().stop()
 
     async def validate_sufficient_balance(self):
@@ -1164,7 +1305,10 @@ class SimpleGridExecutor(ExecutorBase):
     # ------------------------------------------------------------------ events
 
     def _tracked_orders(self) -> List[Optional[TrackedOrder]]:
-        return list(self._entry_orders.values()) + self._exit_orders()
+        # Cancelled-but-watched orders belong here too, or their late fill never reaches us.
+        watched = [order for _, order, _ in self._cancelled_entries]
+        adopted = [order for _, order in self._adopted_entries]
+        return list(self._entry_orders.values()) + watched + adopted + self._exit_orders()
 
     def update_tracked_orders_with_order_id(self, order_id: str):
         in_flight_order = self.get_in_flight_order(self.config.connector_name, order_id)
@@ -1181,12 +1325,19 @@ class SimpleGridExecutor(ExecutorBase):
 
     def process_order_created_event(self, _, market, event: Union[BuyOrderCreatedEvent, SellOrderCreatedEvent]):
         self.update_tracked_orders_with_order_id(event.order_id)
+        # The venue accepted it, so whatever was holding the collateral has let go.
+        if (self._sl_chase_order and self._sl_chase_order.order_id == event.order_id) or \
+                (self._close_order and self._close_order.order_id == event.order_id):
+            self._reset_exit_backoff()
 
     def process_order_filled_event(self, _, market, event: OrderFilledEvent):
         self.update_tracked_orders_with_order_id(event.order_id)
         side = self._entry_side_for_order_id(event.order_id)
         if side is not None:
             self._on_entry_filled(side)
+            return
+        # Might be one the venue said it had cancelled. Do not wait for the next tick.
+        self._reap_cancelled_entries()
 
     def process_order_completed_event(self, _, market, event: Union[BuyOrderCompletedEvent, SellOrderCompletedEvent]):
         self.update_tracked_orders_with_order_id(event.order_id)
@@ -1214,7 +1365,9 @@ class SimpleGridExecutor(ExecutorBase):
             # tracked order only survives if it has fills, because those are the record of
             # the position we hold; otherwise the slot is freed for the next quote.
             if self._order_filled_base(self._entry_orders[side]) == Decimal("0"):
-                self._failed_orders.append(self._entry_orders[side])
+                # Freed for the next quote, but not forgotten — see _reap_cancelled_entries.
+                self._cancelled_entries.append(
+                    (side, self._entry_orders[side], self._strategy.current_timestamp))
                 self._entry_orders[side] = None
                 self._entry_quoted_price[side] = None
             return
@@ -1228,17 +1381,26 @@ class SimpleGridExecutor(ExecutorBase):
         elif self._close_order and self._close_order.order_id == event.order_id:
             self._failed_orders.append(self._close_order)
             self._close_order = None
-        # The cancel we were waiting on may have been the last one.
-        self._place_pending_close_if_clear()
-        self._resume_stop_loss_chase_if_clear()
+        # The cancel we were waiting on may have been the last one — but the venue needs a
+        # moment to release its collateral before it will accept the replacement.
+        if (self._close_pending or self._stop_loss_triggered) and not self._has_resting_orders():
+            self._arm_exit_placement()
 
     def _retire_exit_order(self, order: TrackedOrder):
-        """Keep a cancelled exit only if it filled something; its fills reduced the position."""
-        if self._order_filled_base(order) > Decimal("0"):
-            if order not in self._spent_exit_orders:
-                self._spent_exit_orders.append(order)
-        else:
-            self._failed_orders.append(order)
+        """
+        Keep every cancelled exit, whether or not it shows fills yet.
+
+        A cancel is a claim, not a fact. CoinDCX has filled a chasing exit and reported its
+        cancel as successful in the same instant — and judging by whether the order shows
+        fills at that moment throws away the ones that fill a heartbeat later. The executor
+        then believes it still holds a position it has already closed, and burns its retries
+        being refused by a venue that has nothing left to reduce.
+
+        An unfilled order contributes nothing to the close accounting, so keeping it costs
+        nothing; keeping it is the only thing that catches the late fill.
+        """
+        if order not in self._spent_exit_orders:
+            self._spent_exit_orders.append(order)
 
     def process_order_failed_event(self, _, market, event: MarketOrderFailureEvent):
         self._cancel_requested.discard(event.order_id)
@@ -1259,14 +1421,19 @@ class SimpleGridExecutor(ExecutorBase):
             self._failed_orders.append(self._sl_chase_order)
             self._sl_chase_order = None
             self._current_retries += 1
-            self.logger().error(f"Stop loss exit failed {event.order_id}. "
-                                f"Retrying {self._current_retries}/{self._max_retries}")
+            self._arm_exit_placement(after_refusal=True)
+            self.logger().error(
+                f"Stop loss exit failed {event.order_id}. Retrying in "
+                f"{self._exit_retry_delay:.2f}s ({self._current_retries}/{self._max_retries})")
         elif self._close_order and self._close_order.order_id == event.order_id:
             self._failed_orders.append(self._close_order)
             self._close_order = None
+            self._close_pending = True
             self._current_retries += 1
-            self.logger().error(f"Close order failed {event.order_id}. "
-                                f"Retrying {self._current_retries}/{self._max_retries}")
+            self._arm_exit_placement(after_refusal=True)
+            self.logger().error(
+                f"Close order failed {event.order_id}. Retrying in "
+                f"{self._exit_retry_delay:.2f}s ({self._current_retries}/{self._max_retries})")
 
     # ------------------------------------------------------------------ reporting
 

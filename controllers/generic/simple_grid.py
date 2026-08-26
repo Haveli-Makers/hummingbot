@@ -3,9 +3,20 @@ from typing import List, Optional, Set
 
 from pydantic import Field, field_validator
 
-from hummingbot.core.data_type.common import MarketDict, PositionMode, PriceType, TradeType
+from hummingbot.core.data_type.common import (
+    MarketDict,
+    PositionAction,
+    PositionMode,
+    PositionSide,
+    PriceType,
+    TradeType,
+)
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy_v2.controllers import ControllerBase, ControllerConfigBase
+from hummingbot.strategy_v2.executors.order_executor.data_types import (
+    ExecutionStrategy,
+    OrderExecutorConfig,
+)
 from hummingbot.strategy_v2.executors.simple_grid_executor.data_types import (
     SimpleGridBarriers,
     SimpleGridEntryMode,
@@ -81,6 +92,12 @@ class SimpleGridConfig(ControllerConfigBase):
     # 1 = LIMIT (PriceType-style int parsing does not apply here; OrderType parses by value).
     close_slippage_ticks: int = Field(default=20, json_schema_extra={"is_updatable": True})
 
+    # CoinDCX acknowledges a cancel before it releases the collateral behind it, so an exit
+    # sent on the acknowledgement is still refused as a second reduce-only order. Wait this
+    # long on purpose; every refusal doubles it, capped at exit_retry_max_delay.
+    cancel_settle_delay: float = Field(default=0.25, json_schema_extra={"is_updatable": True})
+    exit_retry_max_delay: float = Field(default=2.0, json_schema_extra={"is_updatable": True})
+
     stop_loss_chase: bool = Field(default=True, json_schema_extra={"is_updatable": True})
     # Ticks inside the OPPOSITE touch: a sell one tick above the best bid, a buy one tick
     # below the best ask. The most aggressive a maker order can be — best offer in the book,
@@ -115,6 +132,19 @@ class SimpleGridConfig(ControllerConfigBase):
     #    forever — which is what a stranded position looks like from the inside, because the
     #    position holds the margin the next leg needs.
     max_consecutive_failed_legs: int = Field(default=5, json_schema_extra={"is_updatable": True})
+
+    # 4. The venue holds a position no leg claims. The stop loss lives in this process, so an
+    #    unowned position has nothing watching it — the single most dangerous state this
+    #    strategy can be in, and the one that survives every other guard.
+    reconcile_positions: bool = Field(default=True, json_schema_extra={"is_updatable": True})
+    #    How long the venue and our own books must disagree before we act. An executor that
+    #    has just filled takes a moment to report it, and flattening a leg that was about to
+    #    announce itself would be worse than the problem.
+    orphan_grace_seconds: float = Field(default=10.0, json_schema_extra={"is_updatable": True})
+    #    Close it as well as halting. Only ever applies to a position that appeared while this
+    #    controller was running and watching a flat account — a position that was already
+    #    there when we started is somebody else's and is never touched.
+    flatten_orphan_positions: bool = Field(default=True, json_schema_extra={"is_updatable": True})
     stop_when_losses_outnumber_wins: bool = Field(default=False, json_schema_extra={"is_updatable": True})
     #    Grace period, in closed legs, before that count check applies. Without it a single
     #    losing first leg already satisfies "losses >= wins and down", and the strategy
@@ -162,6 +192,10 @@ class SimpleGrid(ControllerBase):
         self._cooldown_seconds: int = 0
 
         self._consecutive_failed_legs: int = 0
+        # Reconciliation against what the venue actually holds.
+        self._seen_flat_since_start: bool = False
+        self._orphan_since: Optional[float] = None
+        self._orphan_flatten_sent: bool = False
         self._reanchor_pending: bool = False
         self._reanchors: int = 0
 
@@ -224,6 +258,11 @@ class SimpleGrid(ControllerBase):
 
     def determine_executor_actions(self) -> List[ExecutorAction]:
         self._absorb_closed_executors()
+
+        # Before anything else: does the venue agree with us about what we hold?
+        reconciliation = self._reconcile_positions()
+        if reconciliation:
+            return reconciliation
 
         if self.is_halted or self.config.manual_kill_switch:
             return []
@@ -303,6 +342,122 @@ class SimpleGrid(ControllerBase):
             self._cooldown_seconds = self._cooldown_for(executor.close_type, timed_out_unfilled)
             self._evaluate_halt_conditions()
 
+    # ------------------------------------------------------------------ reconciliation
+
+    def _venue_position(self):
+        """What the exchange says we are holding on our pair, or None if flat."""
+        try:
+            connector = self.market_data_provider.connectors.get(self.config.connector_name)
+            if connector is None:
+                return None
+            for position in connector.account_positions.values():
+                if position.trading_pair != self.config.trading_pair:
+                    continue
+                if position.amount and abs(position.amount) > Decimal("0"):
+                    return position
+        except Exception:
+            # Reconciliation is a safety net; it must never be the thing that breaks a tick.
+            return None
+        return None
+
+    def _claimed_amount(self) -> Decimal:
+        """How much of a position the live legs believe they are holding."""
+        total = Decimal("0")
+        for executor in self.executors_info:
+            if not executor.is_active:
+                continue
+            filled = executor.custom_info.get("filled_amount") or Decimal("0")
+            total += abs(Decimal(str(filled)))
+        return total
+
+    def _reconcile_positions(self) -> List[ExecutorAction]:
+        """
+        Compare the venue's books with our own, and act when they disagree.
+
+        Every other guard trusts our own record of what happened. This one does not — it asks
+        the exchange. A position that no leg claims has no take profit, no stop loss and
+        nothing that will close it at shutdown, because the stop loss only ever existed inside
+        this process. It is the state that costs real money while nobody is looking.
+        """
+        if not self.config.reconcile_positions:
+            return []
+        position = self._venue_position()
+        if position is None:
+            self._seen_flat_since_start = True
+            self._orphan_since = None
+            return []
+        if self._claimed_amount() > Decimal("0"):
+            self._orphan_since = None
+            return []
+
+        now = self.market_data_provider.time()
+        if self._orphan_since is None:
+            self._orphan_since = now
+            return []
+        if now - self._orphan_since < self.config.orphan_grace_seconds:
+            return []
+
+        if not self.is_halted:
+            self._halt_reason = (
+                f"the venue holds {position.amount} {self.config.trading_pair} that no leg "
+                f"claims. Nothing is watching that position — its stop loss only ever existed "
+                f"in this process")
+            self.logger().error(f"SimpleGrid halted: {self._halt_reason}")
+
+        if self._orphan_flatten_sent or not self.config.flatten_orphan_positions:
+            return []
+        if not self._seen_flat_since_start:
+            # It was already there when we started, so it is not ours to close.
+            self.logger().error(
+                "SimpleGrid will NOT close this position: the account was never seen flat "
+                "since start, so it predates this run. Close it by hand if it is yours.")
+            self._orphan_flatten_sent = True
+            return []
+
+        config = self._build_flatten_config(position)
+        if config is None:
+            return []
+        self._orphan_flatten_sent = True
+        self.logger().warning(
+            f"SimpleGrid is closing the unclaimed {position.amount} "
+            f"{self.config.trading_pair} at {config.price}")
+        return [CreateExecutorAction(controller_id=self.config.id, executor_config=config)]
+
+    def _build_flatten_config(self, position) -> Optional[OrderExecutorConfig]:
+        """A crossing limit, for the same reason the executor's own urgent exit is one."""
+        mid = self.market_data_provider.get_price_by_type(
+            self.config.connector_name, self.config.trading_pair, PriceType.MidPrice)
+        if not mid or mid <= Decimal("0"):
+            return None
+        long_position = (position.position_side == PositionSide.LONG
+                         if position.position_side is not None else position.amount > Decimal("0"))
+        side = TradeType.SELL if long_position else TradeType.BUY
+        slippage = self._tick_size() * self.config.close_slippage_ticks
+        if slippage <= Decimal("0"):
+            slippage = mid * Decimal("0.002")
+        price = mid - slippage if side == TradeType.SELL else mid + slippage
+        return OrderExecutorConfig(
+            timestamp=self.market_data_provider.time(),
+            controller_id=self.config.id,
+            connector_name=self.config.connector_name,
+            trading_pair=self.config.trading_pair,
+            side=side,
+            amount=abs(position.amount),
+            position_action=PositionAction.CLOSE,
+            execution_strategy=ExecutionStrategy.LIMIT,
+            price=price,
+            leverage=self.config.leverage,
+        )
+
+    def _tick_size(self) -> Decimal:
+        try:
+            connector = self.market_data_provider.connectors.get(self.config.connector_name)
+            rule = connector.trading_rules[self.config.trading_pair]
+            tick = rule.min_price_increment
+            return tick if isinstance(tick, Decimal) and tick > Decimal("0") else Decimal("0")
+        except Exception:
+            return Decimal("0")
+
     def _cooldown_for(self, close_type: Optional[CloseType], timed_out_unfilled: bool) -> int:
         if timed_out_unfilled and self.config.reanchor_on_entry_timeout:
             return self.config.cooldown_after_reanchor
@@ -374,6 +529,8 @@ class SimpleGrid(ControllerBase):
             entry_requote_pct=self.config.entry_requote_pct,
             entry_price_improvement_pct=self.config.entry_price_improvement_pct,
             entry_timeout=self.config.entry_timeout,
+            cancel_settle_delay=self.config.cancel_settle_delay,
+            exit_retry_max_delay=self.config.exit_retry_max_delay,
             trigger_price_type=self.config.trigger_price_type,
             barriers=SimpleGridBarriers(
                 take_profit=self.config.take_profit,

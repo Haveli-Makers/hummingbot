@@ -160,6 +160,28 @@ class SimpleGridExecutorConfig(ExecutorConfigBase):
     # Give up if the entry is never filled within this many seconds.
     entry_timeout: Optional[int] = None
 
+    # How long to keep watching an entry the venue said it cancelled.
+    #
+    # A cancel is a claim, not a fact. CoinDCX has acknowledged a cancel and then filled the
+    # same order thirty seconds later — leaving a real position that nothing was tracking,
+    # with no take profit, no stop loss, and invisible to the shutdown flatten. While an
+    # order is watched, a fill on it is still ours and its exits still get armed.
+    cancelled_entry_watch_seconds: float = 60.0
+
+    # How long to let the venue release the collateral behind a cancelled reduce-only order
+    # before sending its replacement.
+    #
+    # CoinDCX acknowledges a cancel BEFORE it frees the margin. An exit sent on the
+    # acknowledgement is still seen as a second reduce-only order against the same position
+    # and refused with "Insufficient funds" — measured live, ~100ms after the ack was not
+    # enough. Waiting a moment on purpose is cheaper than a rejection, because a rejection
+    # costs a whole control tick and the price moves inside it.
+    cancel_settle_delay: float = 0.25
+
+    # Every refusal doubles that wait, capped here. A stop that cannot place its exit is the
+    # worst thing this executor does, so the ceiling stays low enough to keep trying often.
+    exit_retry_max_delay: float = 2.0
+
     # On a partial fill the barriers arm against whatever filled; the unfilled remainder
     # is cancelled by default so take profit and stop loss stay pinned to one entry price.
     cancel_remainder_on_partial_fill: bool = True
@@ -179,6 +201,13 @@ class SimpleGridExecutorConfig(ExecutorConfigBase):
     def validate_amount(cls, value: Decimal) -> Decimal:
         if value <= Decimal("0"):
             raise ValueError("amount must be greater than zero")
+        return value
+
+    @field_validator("cancel_settle_delay", "exit_retry_max_delay")
+    @classmethod
+    def validate_delays(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("retry delays cannot be negative")
         return value
 
     @field_validator("entry_price_improvement_pct", "entry_requote_pct")

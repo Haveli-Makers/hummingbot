@@ -1,10 +1,17 @@
 import asyncio
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, PropertyMock
 
 from controllers.generic.simple_grid import SimpleGrid, SimpleGridConfig
-from hummingbot.core.data_type.common import OrderType, PriceType, TradeType
+from hummingbot.connector.derivative.position import Position
+from hummingbot.core.data_type.common import (
+    OrderType,
+    PositionAction,
+    PositionSide,
+    PriceType,
+    TradeType,
+)
 from hummingbot.data_feed.market_data_provider import MarketDataProvider
 from hummingbot.strategy_v2.executors.simple_grid_executor.data_types import (
     SimpleGridBarriers,
@@ -618,3 +625,158 @@ class TestSimpleGrid(IsolatedAsyncioWrapperTestCase):
         controller = self.controller()
         config = controller.determine_executor_actions()[0].executor_config
         self.assertEqual(config.barriers.close_order_type, OrderType.LIMIT)
+
+    # ------------------------------------------------------------------ venue reconciliation
+
+    def set_venue(self, amount=None, side=PositionSide.LONG, pair="BTC-USDT"):
+        """Point the controller at a connector reporting this position (or none)."""
+        connector = MagicMock()
+        connector.account_positions = {}
+        if amount is not None:
+            connector.account_positions = {pair: Position(
+                trading_pair=pair, position_side=side, unrealized_pnl=Decimal("0"),
+                entry_price=Decimal("100"), amount=Decimal(amount), leverage=Decimal("1"))}
+        rule = MagicMock()
+        rule.min_price_increment = Decimal("0.01")
+        connector.trading_rules = {pair: rule}
+        self.market_data_provider.connectors = {"coindcx_perpetual": connector}
+        return connector
+
+    def live_leg_holding(self, amount="1"):
+        leg = self.active_leg("live-1")
+        leg.custom_info = dict(leg.custom_info)
+        leg.custom_info["filled_amount"] = Decimal(amount)
+        return leg
+
+    def past_the_grace(self, controller, seconds=11):
+        self.now = START_TS + seconds
+        return controller.determine_executor_actions()
+
+    def test_a_flat_account_is_recorded_so_a_later_position_is_known_to_be_ours(self):
+        controller = self.controller()
+        self.set_venue(amount=None)
+
+        controller.determine_executor_actions()
+
+        self.assertTrue(controller._seen_flat_since_start)
+
+    def test_a_position_a_live_leg_claims_is_left_alone(self):
+        controller = self.controller()
+        self.set_venue(amount="0.008")
+        controller.executors_info = [self.live_leg_holding("0.008")]
+
+        self.past_the_grace(controller)
+
+        self.assertFalse(controller.is_halted)
+        self.assertIsNone(controller._orphan_since)
+
+    def test_an_unclaimed_position_is_given_a_grace_period_first(self):
+        """A leg that has just filled takes a moment to say so; acting at once would be worse."""
+        controller = self.controller()
+        self.set_venue(amount=None)
+        controller.determine_executor_actions()
+        self.set_venue(amount="0.008")
+
+        controller.determine_executor_actions()
+
+        self.assertFalse(controller.is_halted)
+        self.assertEqual(controller._orphan_since, START_TS)
+
+    def test_an_unclaimed_position_halts_the_controller(self):
+        controller = self.controller()
+        self.set_venue(amount=None)
+        controller.determine_executor_actions()
+        self.set_venue(amount="0.008")
+        controller.determine_executor_actions()
+
+        self.past_the_grace(controller)
+
+        self.assertTrue(controller.is_halted)
+        self.assertIn("no leg claims", controller._halt_reason)
+
+    def test_an_unclaimed_position_is_closed_with_a_crossing_limit(self):
+        """The step that removes the manual cleanup."""
+        controller = self.controller(close_slippage_ticks=20)
+        self.set_venue(amount=None)
+        controller.determine_executor_actions()
+        self.set_venue(amount="0.008")
+        controller.determine_executor_actions()
+
+        actions = self.past_the_grace(controller)
+
+        self.assertEqual(len(actions), 1)
+        config = actions[0].executor_config
+        self.assertEqual(config.side, TradeType.SELL, "a long is closed by selling")
+        self.assertEqual(config.amount, Decimal("0.008"))
+        self.assertEqual(config.position_action, PositionAction.CLOSE)
+        # mid 100 less 20 ticks of 0.01 — it crosses rather than resting.
+        self.assertEqual(config.price, Decimal("99.80"))
+
+    def test_a_short_orphan_is_closed_by_buying(self):
+        controller = self.controller()
+        self.set_venue(amount=None)
+        controller.determine_executor_actions()
+        self.set_venue(amount="-0.008", side=PositionSide.SHORT)
+        controller.determine_executor_actions()
+
+        config = self.past_the_grace(controller)[0].executor_config
+
+        self.assertEqual(config.side, TradeType.BUY)
+        self.assertEqual(config.amount, Decimal("0.008"))
+        self.assertEqual(config.price, Decimal("100.20"))
+
+    def test_a_position_that_predates_the_run_is_never_touched(self):
+        """
+        The account is shared with hand-run tests. A position that was already there when we
+        started is somebody else's, and closing it would be worse than leaving it.
+        """
+        controller = self.controller()
+        self.set_venue(amount="0.008")   # already there on the very first tick
+        controller.determine_executor_actions()
+
+        actions = self.past_the_grace(controller)
+
+        self.assertEqual(actions, [])
+        self.assertTrue(controller.is_halted, "it still halts and says so")
+
+    def test_the_flatten_is_only_sent_once(self):
+        controller = self.controller()
+        self.set_venue(amount=None)
+        controller.determine_executor_actions()
+        self.set_venue(amount="0.008")
+        controller.determine_executor_actions()
+        self.assertEqual(len(self.past_the_grace(controller)), 1)
+
+        self.assertEqual(self.past_the_grace(controller, seconds=12), [])
+
+    def test_flattening_can_be_switched_off_while_the_halt_stays(self):
+        controller = self.controller(flatten_orphan_positions=False)
+        self.set_venue(amount=None)
+        controller.determine_executor_actions()
+        self.set_venue(amount="0.008")
+        controller.determine_executor_actions()
+
+        actions = self.past_the_grace(controller)
+
+        self.assertEqual(actions, [])
+        self.assertTrue(controller.is_halted)
+
+    def test_reconciliation_can_be_switched_off_entirely(self):
+        controller = self.controller(reconcile_positions=False)
+        self.set_venue(amount="0.008")
+
+        self.past_the_grace(controller)
+
+        self.assertFalse(controller.is_halted)
+
+    def test_a_connector_that_cannot_be_read_does_not_break_the_tick(self):
+        """The safety net must never be the thing that takes the strategy down."""
+        controller = self.controller()
+        broken = MagicMock()
+        type(broken).account_positions = PropertyMock(side_effect=RuntimeError("no connection"))
+        self.market_data_provider.connectors = {"coindcx_perpetual": broken}
+
+        actions = controller.determine_executor_actions()
+
+        self.assertFalse(controller.is_halted)
+        self.assertEqual(len(actions), 1, "it carries on opening legs")

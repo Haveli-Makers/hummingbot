@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from decimal import Decimal
 from unittest.mock import AsyncMock, patch
@@ -165,6 +166,40 @@ class ZebpayExchangeBalanceTests(unittest.IsolatedAsyncioTestCase):
             await self.exchange._update_balances()
         self.assertEqual(Decimal("1"), self.exchange._account_balances.get("BTC"))
 
+    async def test_update_balances_unparseable_non_empty_list_keeps_balances(self):
+        # REGRESSION: the guard used to ask "is the payload NOT a list?", so a NON-EMPTY
+        # list whose items all fail to parse (renamed field, partial-outage body) slipped
+        # through — it IS a list — and the stale-removal loop wiped every tracked balance.
+        # The strategy then sees zero funds and stops sizing orders. The guard now asks
+        # "is the payload POSITIVELY empty?" instead, so this keeps the last known state.
+        self.exchange._account_balances["BTC"] = Decimal("1")
+        self.exchange._account_available_balances["BTC"] = Decimal("1")
+        with patch.object(self.exchange, "_api_get", new_callable=AsyncMock) as mock_get:
+            # "symbol"/"amount" instead of the expected "currency"/"total" keys.
+            mock_get.return_value = {"data": [{"symbol": "BTC", "amount": "1.0"}], "statusCode": 200}
+            await self.exchange._update_balances()
+        self.assertEqual(Decimal("1"), self.exchange._account_balances.get("BTC"))
+        self.assertEqual(Decimal("1"), self.exchange._account_available_balances.get("BTC"))
+
+    async def test_update_balances_empty_dict_payload_keeps_balances(self):
+        # {"data": {}} carries no balance list at all — degenerate, not an empty account.
+        self.exchange._account_balances["BTC"] = Decimal("1")
+        self.exchange._account_available_balances["BTC"] = Decimal("1")
+        with patch.object(self.exchange, "_api_get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = {"data": {}, "statusCode": 200}
+            await self.exchange._update_balances()
+        self.assertEqual(Decimal("1"), self.exchange._account_balances.get("BTC"))
+
+    async def test_update_balances_empty_nested_list_reflects_empty_account(self):
+        # The dict-shaped empty account ({"balances": []}) is still POSITIVELY empty and
+        # must wipe, just like the bare {"data": []} form.
+        self.exchange._account_balances["BTC"] = Decimal("1")
+        self.exchange._account_available_balances["BTC"] = Decimal("1")
+        with patch.object(self.exchange, "_api_get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = {"data": {"balances": []}, "statusCode": 200}
+            await self.exchange._update_balances()
+        self.assertNotIn("BTC", self.exchange._account_balances)
+
     async def test_update_balances_business_error_does_not_wipe(self):
         self.exchange._account_balances["BTC"] = Decimal("1")
         self.exchange._account_available_balances["BTC"] = Decimal("1")
@@ -317,6 +352,154 @@ class ZebpayExchangeOrderTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.exchange, "_iter_user_event_queue", return_value=_async_gen([event])):
             await self.exchange._user_stream_event_listener()
         self.assertEqual(Decimal("0.5"), order.executed_amount_base)
+
+    async def test_idless_fill_trade_ids_are_stable_across_reordered_polls(self):
+        # REGRESSION: the fallback trade_id for a fill with no native id used to be
+        # f"{order_id}-{len(trade_updates)}" — its INDEX in the response. If /fills came
+        # back in a different order on a later poll, that index moved to a different
+        # fill: the reused id was deduped away and the other fill looked new and was
+        # applied twice, double-counting executed_amount_base. Ids are now derived from
+        # the fill's own content, so reordering the same fills yields the same ids.
+        order = InFlightOrder(
+            client_order_id="ZEBtest", exchange_order_id="ord-1", trading_pair="BTC-INR",
+            order_type=OrderType.LIMIT, trade_type=TradeType.BUY, amount=Decimal("1.0"),
+            price=Decimal("100"), creation_timestamp=1_700_000_000.0,
+        )
+        f1 = {"price": "100", "amount": "0.3", "fees": "0.1",
+              "feeCurrency": "INR", "createdAt": 1_700_000_001_000}
+        f2 = {"price": "101", "amount": "0.4", "fees": "0.1",
+              "feeCurrency": "INR", "createdAt": 1_700_000_002_000}
+
+        ids_first = [u.trade_id for u in self.exchange._build_trade_updates_from_fills(order, [f1])]
+        ids_reordered = [u.trade_id for u in self.exchange._build_trade_updates_from_fills(order, [f2, f1])]
+
+        # f1 keeps the same id no matter where it sits in the list.
+        self.assertEqual(ids_first[0], ids_reordered[1])
+        # ...and f2 gets its own distinct id rather than inheriting f1's slot.
+        self.assertNotEqual(ids_reordered[0], ids_reordered[1])
+        self.assertNotIn("ord-1-0", ids_reordered)
+
+    async def test_idless_identical_fills_get_distinct_ids(self):
+        # Two fills identical in every field must still be counted separately, so the
+        # content-derived id carries an occurrence suffix.
+        order = InFlightOrder(
+            client_order_id="ZEBtest", exchange_order_id="ord-1", trading_pair="BTC-INR",
+            order_type=OrderType.LIMIT, trade_type=TradeType.BUY, amount=Decimal("1.0"),
+            price=Decimal("100"), creation_timestamp=1_700_000_000.0,
+        )
+        fill = {"price": "100", "amount": "0.3", "fees": "0.1",
+                "feeCurrency": "INR", "createdAt": 1_700_000_001_000}
+        ids = [u.trade_id for u in self.exchange._build_trade_updates_from_fills(order, [dict(fill), dict(fill)])]
+        self.assertEqual(2, len(set(ids)))
+
+    async def test_native_fill_id_still_preferred(self):
+        order = InFlightOrder(
+            client_order_id="ZEBtest", exchange_order_id="ord-1", trading_pair="BTC-INR",
+            order_type=OrderType.LIMIT, trade_type=TradeType.BUY, amount=Decimal("1.0"),
+            price=Decimal("100"), creation_timestamp=1_700_000_000.0,
+        )
+        updates = self.exchange._build_trade_updates_from_fills(
+            order, [{"id": "f1", "price": "100", "amount": "0.3", "createdAt": 1}]
+        )
+        self.assertEqual("f1", updates[0].trade_id)
+
+    async def test_terminal_order_update_records_final_fill_before_untracking(self):
+        # REGRESSION: a terminal order_update untracks the order, and an untracked order
+        # is invisible to the independent account-trades poll (it iterates
+        # in_flight_orders). A fill landing in the same ~2s window the order settled was
+        # therefore never recorded and executed_amount_base stayed under-reported for
+        # good. The listener now pulls the outstanding fills BEFORE processing the
+        # terminal update. (CSX already had this fix; Zebpay did not.)
+        order = InFlightOrder(
+            client_order_id="ZEBtest", exchange_order_id="ord-1", trading_pair="BTC-INR",
+            order_type=OrderType.LIMIT, trade_type=TradeType.BUY, amount=Decimal("1.0"),
+            price=Decimal("100"), creation_timestamp=1_700_000_000.0,
+        )
+        self.exchange._order_tracker.start_tracking_order(order)
+        # The settled-order fast path reports FILLED with cumulative filled=1.0, but
+        # nothing has been applied to the order yet.
+        event = {"event": "order_update", "data": [{
+            "orderId": "ord-1", "status": "FILLED", "filled": "1.0",
+            "updatedAt": 1_700_000_002_000,
+        }]}
+        fills_resp = {"data": {"fills": [{
+            "id": "f-final", "price": "100", "amount": "1.0", "fees": "0.1",
+            "feeCurrency": "INR", "createdAt": 1_700_000_001_000,
+        }]}}
+        with patch.object(self.exchange, "_api_get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = fills_resp
+            with patch.object(self.exchange, "_iter_user_event_queue", return_value=_async_gen([event])):
+                await self.exchange._user_stream_event_listener()
+        # process_order_update defers via safe_ensure_future; let it run.
+        await asyncio.sleep(0.01)
+
+        self.assertEqual(Decimal("1.0"), order.executed_amount_base)
+        self.assertEqual(OrderState.FILLED, order.current_state)
+
+    async def test_terminal_filled_without_filled_field_still_fetches_fills(self):
+        # A FILLED payload that omits the cumulative `filled` field must still trigger
+        # the fills fetch — the order says it is done while we have applied less than
+        # its full amount, so something is outstanding.
+        order = InFlightOrder(
+            client_order_id="ZEBtest", exchange_order_id="ord-1", trading_pair="BTC-INR",
+            order_type=OrderType.LIMIT, trade_type=TradeType.BUY, amount=Decimal("1.0"),
+            price=Decimal("100"), creation_timestamp=1_700_000_000.0,
+        )
+        self.exchange._order_tracker.start_tracking_order(order)
+        event = {"event": "order_update", "data": [{
+            "orderId": "ord-1", "status": "FILLED", "updatedAt": 1_700_000_002_000,
+        }]}  # note: no "filled" key
+        fills_resp = {"data": {"fills": [{
+            "id": "f-final", "price": "100", "amount": "1.0", "fees": "0.1",
+            "feeCurrency": "INR", "createdAt": 1_700_000_001_000,
+        }]}}
+        with patch.object(self.exchange, "_api_get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = fills_resp
+            with patch.object(self.exchange, "_iter_user_event_queue", return_value=_async_gen([event])):
+                await self.exchange._user_stream_event_listener()
+        self.assertEqual(Decimal("1.0"), order.executed_amount_base)
+
+    async def test_terminal_order_update_skips_fills_fetch_when_nothing_outstanding(self):
+        # A clean cancel with no unapplied fill must not cost an extra /fills request.
+        order = InFlightOrder(
+            client_order_id="ZEBtest", exchange_order_id="ord-1", trading_pair="BTC-INR",
+            order_type=OrderType.LIMIT, trade_type=TradeType.BUY, amount=Decimal("1.0"),
+            price=Decimal("100"), creation_timestamp=1_700_000_000.0,
+        )
+        self.exchange._order_tracker.start_tracking_order(order)
+        event = {"event": "order_update", "data": [{
+            "orderId": "ord-1", "status": "CANCELLED", "filled": "0",
+            "updatedAt": 1_700_000_002_000,
+        }]}
+        with patch.object(self.exchange, "_api_get", new_callable=AsyncMock) as mock_get:
+            with patch.object(self.exchange, "_iter_user_event_queue", return_value=_async_gen([event])):
+                await self.exchange._user_stream_event_listener()
+        mock_get.assert_not_called()
+
+    async def test_terminal_order_update_still_settles_when_fills_fetch_fails(self):
+        # A failing fills fetch must never block the terminal transition — an order
+        # tracked forever is worse than one missed fill (the status poll retries).
+        order = InFlightOrder(
+            client_order_id="ZEBtest", exchange_order_id="ord-1", trading_pair="BTC-INR",
+            order_type=OrderType.LIMIT, trade_type=TradeType.BUY, amount=Decimal("1.0"),
+            price=Decimal("100"), creation_timestamp=1_700_000_000.0,
+        )
+        self.exchange._order_tracker.start_tracking_order(order)
+        event = {"event": "order_update", "data": [{
+            "orderId": "ord-1", "status": "FILLED", "filled": "1.0",
+            "updatedAt": 1_700_000_002_000,
+        }]}
+        with patch.object(self.exchange, "_api_get", new_callable=AsyncMock) as mock_get:
+            mock_get.side_effect = IOError("fills endpoint down")
+            with patch.object(self.exchange._order_tracker, "process_order_update") as mock_update:
+                with patch.object(self.exchange, "_iter_user_event_queue", return_value=_async_gen([event])):
+                    with self.assertLogs(level="WARNING") as cm:
+                        await self.exchange._user_stream_event_listener()
+
+        # The failure is reported, but the terminal OrderUpdate is still submitted.
+        self.assertTrue(any("Could not record final fills" in line for line in cm.output))
+        mock_update.assert_called_once()
+        self.assertEqual(OrderState.FILLED, mock_update.call_args.kwargs["order_update"].new_state)
 
     async def test_request_order_status_timestamp_in_seconds_not_divided(self):
         # A seconds-scale timestamp (< 1e12) must not be divided by 1000.

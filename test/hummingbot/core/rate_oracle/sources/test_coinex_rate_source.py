@@ -1,3 +1,4 @@
+import asyncio
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from unittest.mock import AsyncMock
@@ -5,7 +6,10 @@ from unittest.mock import AsyncMock
 from bidict import bidict
 
 from hummingbot.core.rate_oracle.rate_oracle import RATE_ORACLE_SOURCES
-from hummingbot.core.rate_oracle.sources.coinex_rate_source import CoinexRateSource
+from hummingbot.core.rate_oracle.sources.coinex_rate_source import (
+    MAX_CONCURRENT_DEPTH_REQUESTS,
+    CoinexRateSource,
+)
 
 
 class CoinexRateSourceTest(IsolatedAsyncioWrapperTestCase):
@@ -126,3 +130,48 @@ class CoinexRateSourceTest(IsolatedAsyncioWrapperTestCase):
         ba = await rs.get_bid_ask_prices(quote_token="USDT")
         self.assertIn("BTC-USDT", ba)
         self.assertNotIn("BTC-USDC", ba)
+
+    # ── Concurrency is capped, not unbounded ────────────────────────────────────
+    async def test_bid_ask_caps_concurrent_depth_requests(self):
+        # The pair universe here is every CoinEx market matching the quote token —
+        # hundreds for USDT. The throttler paces the request RATE but not concurrency,
+        # so an uncapped gather opens that many sockets at once every 30s refresh.
+        pair_count = MAX_CONCURRENT_DEPTH_REQUESTS * 3
+        symbol_map = {f"TOK{i}USDT": f"TOK{i}-USDT" for i in range(pair_count)}
+        depth = {pair: {"bids": [["1", "1"]], "asks": [["2", "1"]]} for pair in symbol_map.values()}
+
+        ex = self._fake_exchange_for_bid_ask(symbol_map, depth)
+        in_flight = 0
+        peak = 0
+
+        async def counting_snapshot(trading_pair):
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0)  # yield so others can pile up if uncapped
+            in_flight -= 1
+            return depth[trading_pair]
+
+        ex.get_order_book_snapshot = AsyncMock(side_effect=counting_snapshot)
+
+        ba = await self._rate_source_with(ex).get_bid_ask_prices()
+        self.assertEqual(pair_count, len(ba), "every pair should still be fetched")
+        self.assertLessEqual(peak, MAX_CONCURRENT_DEPTH_REQUESTS)
+
+    async def test_bid_ask_logs_when_every_pair_fails(self):
+        # Per-pair isolation would otherwise degrade a systemic block (WAF, IP ban)
+        # into a quietly near-empty result with nothing above debug level.
+        rs = self._rate_source_with(self._fake_exchange_for_bid_ask(
+            {"BTCUSDT": "BTC-USDT", "ETHUSDT": "ETH-USDT"}, {}))  # no depth for anything
+        with self.assertLogs(level="ERROR") as cm:
+            self.assertEqual({}, await rs.get_bid_ask_prices())
+        self.assertTrue(any("Every pair failed" in line for line in cm.output))
+
+    async def test_bid_ask_warns_on_partial_failure(self):
+        depth = {"BTC-USDT": {"bids": [["61990", "1"]], "asks": [["62010", "1"]]}}
+        rs = self._rate_source_with(self._fake_exchange_for_bid_ask(
+            {"BTCUSDT": "BTC-USDT", "ETHUSDT": "ETH-USDT"}, depth))
+        with self.assertLogs(level="WARNING") as cm:
+            ba = await rs.get_bid_ask_prices()
+        self.assertIn("BTC-USDT", ba)
+        self.assertTrue(any("1/2 pairs" in line for line in cm.output))

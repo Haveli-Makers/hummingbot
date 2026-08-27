@@ -3,6 +3,7 @@ import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from hummingbot.connector.exchange.csx import csx_constants as CONSTANTS
+from hummingbot.connector.exchange.csx.csx_utils import unwrap_data
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.order_book_message import OrderBookMessage, OrderBookMessageType
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
@@ -139,10 +140,18 @@ class CsxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 await asyncio.sleep(5.0)
 
     async def _fetch_order_book_snapshots(self):
+        # One depth request per pair, fired TOGETHER. At the 2s cadence a serial loop
+        # costs pairs x latency (worse through the proxy) and self-throttles further
+        # behind its own interval as pairs are added. Per-pair failures are isolated.
         snapshot_queue = self._message_queue[self._snapshot_messages_queue_key]
-        for trading_pair in self._trading_pairs:
+        raws = await safe_gather(
+            *(self._request_order_book_snapshot(tp) for tp in self._trading_pairs),
+            return_exceptions=True,
+        )
+        for trading_pair, raw in zip(self._trading_pairs, raws):
             try:
-                raw = await self._request_order_book_snapshot(trading_pair)
+                if isinstance(raw, Exception):
+                    raise raw
                 data = self._extract_depth_data(raw)
                 ts = self._time()
                 snapshot_queue.put_nowait({
@@ -155,29 +164,39 @@ class CsxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 self.logger().warning(f"Error fetching order-book snapshot for {trading_pair}: {exc}")
 
     async def _fetch_public_trades(self):
+        # Concurrent for the same reason as the depth poll above.
         trade_queue = self._message_queue[self._trade_messages_queue_key]
-        for trading_pair in self._trading_pairs:
+        responses = await safe_gather(
+            *(self._request_public_trades(tp) for tp in self._trading_pairs),
+            return_exceptions=True,
+        )
+        for trading_pair, trades_resp in zip(self._trading_pairs, responses):
             try:
-                try:
-                    instrument = await self._connector.exchange_symbol_associated_to_pair(
-                        trading_pair=trading_pair
-                    )
-                except KeyError:
-                    instrument = trading_pair.replace("-", "/")
-
-                trades_resp = await self._connector._api_get(
-                    path_url=CONSTANTS.TRADES_PATH_URL,
-                    params={"instrument": instrument},
-                    is_auth_required=False,
-                )
+                if isinstance(trades_resp, Exception):
+                    raise trades_resp
                 trades = (
-                    trades_resp if isinstance(trades_resp, list) else trades_resp.get("data", [])
+                    trades_resp if isinstance(trades_resp, list) else unwrap_data(trades_resp)
                 )
+                if not isinstance(trades, list):
+                    continue
                 for trade in trades:
-                    trade["_trading_pair"] = trading_pair
-                    trade_queue.put_nowait(trade)
+                    if isinstance(trade, dict):
+                        trade["_trading_pair"] = trading_pair
+                        trade_queue.put_nowait(trade)
             except Exception as exc:
                 self.logger().warning(f"Error fetching trades for {trading_pair}: {exc}")
+
+    async def _request_public_trades(self, trading_pair: str):
+        """GET the recent public trades for one pair. Raises on failure (caller isolates)."""
+        try:
+            instrument = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+        except KeyError:
+            instrument = trading_pair.replace("-", "/")
+        return await self._connector._api_get(
+            path_url=CONSTANTS.TRADES_PATH_URL,
+            params={"instrument": instrument},
+            is_auth_required=False,
+        )
 
     # ── Message parsers ────────────────────────────────────────────────────────
 

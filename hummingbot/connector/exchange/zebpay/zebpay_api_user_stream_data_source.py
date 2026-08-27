@@ -59,15 +59,31 @@ class ZebpayAPIUserStreamDataSource(UserStreamTrackerDataSource):
         )
 
     async def _poll_forever(self, poll_coro, output: asyncio.Queue, interval: float, label: str) -> None:
-        """Run a single data-type poll on a fixed cadence; isolate its failures."""
+        """
+        Run a single data-type poll on a fixed cadence; isolate its failures.
+
+        On repeated failures the cadence backs off exponentially (up to
+        ``MAX_POLL_BACKOFF_INTERVAL``) and resets on the first success. These loops
+        run independently, so without a backoff a sustained auth/connectivity outage
+        would have all three of them retrying every 2-3s each — multiplying request
+        volume at exactly the moment the exchange is already unhealthy.
+        """
+        consecutive_failures = 0
         while True:
             try:
                 await poll_coro(output)
+                consecutive_failures = 0
+                delay = interval
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                self.logger().warning(f"Zebpay {label} poll error: {exc}")
-            await asyncio.sleep(interval)
+                consecutive_failures += 1
+                delay = min(interval * (2 ** consecutive_failures), CONSTANTS.MAX_POLL_BACKOFF_INTERVAL)
+                self.logger().warning(
+                    f"Zebpay {label} poll error (attempt {consecutive_failures}, "
+                    f"retrying in {delay:.0f}s): {exc}"
+                )
+            await asyncio.sleep(delay)
 
     async def _poll_balance(self, output: asyncio.Queue) -> None:
         balance_resp = await self._connector._api_get(
@@ -80,27 +96,24 @@ class ZebpayAPIUserStreamDataSource(UserStreamTrackerDataSource):
     async def _poll_active_orders(self, output: asyncio.Queue) -> None:
         active_orders: list = []
         active_ids: set = set()
-        for trading_pair in self._trading_pairs:
-            try:
-                try:
-                    symbol = await self._connector.exchange_symbol_associated_to_pair(
-                        trading_pair=trading_pair
-                    )
-                except KeyError:
-                    symbol = trading_pair
-                orders_resp = await self._connector._api_get(
-                    path_url=CONSTANTS.ORDERS_PATH_URL,
-                    params={"symbol": symbol, "status": CONSTANTS.ORDER_STATUS_ACTIVE},
-                    is_auth_required=True,
-                )
-                self._last_recv_time = time.time()
-                for order in self._extract_orders(orders_resp):
-                    active_orders.append(order)
-                    oid = str(order.get("orderId") or order.get("id") or "")
-                    if oid:
-                        active_ids.add(oid)
-            except Exception as exc:
-                self.logger().warning(f"Zebpay open-orders poll error for {trading_pair}: {exc}")
+
+        # One request per tracked pair, fired TOGETHER rather than in sequence: at a
+        # 2s cadence a serial loop costs pairs x latency and falls behind its own
+        # interval as more pairs are tracked. Per-pair failures are isolated.
+        responses = await safe_gather(
+            *(self._fetch_active_orders_for_pair(tp) for tp in self._trading_pairs),
+            return_exceptions=True,
+        )
+        for trading_pair, orders_resp in zip(self._trading_pairs, responses):
+            if isinstance(orders_resp, Exception):
+                self.logger().warning(f"Zebpay open-orders poll error for {trading_pair}: {orders_resp}")
+                continue
+            self._last_recv_time = time.time()
+            for order in self._extract_orders(orders_resp):
+                active_orders.append(order)
+                oid = str(order.get("orderId") or order.get("id") or "")
+                if oid:
+                    active_ids.add(oid)
 
         # status=ACTIVE hides terminal orders, so a filled/cancelled order simply
         # drops out and would never emit a terminal update via the stream. Fetch the
@@ -110,6 +123,18 @@ class ZebpayAPIUserStreamDataSource(UserStreamTrackerDataSource):
         merged = active_orders + settled
         if merged:
             await output.put({"event": "order_update", "data": merged})
+
+    async def _fetch_active_orders_for_pair(self, trading_pair: str):
+        """GET the ACTIVE orders for one pair. Raises on failure (caller isolates)."""
+        try:
+            symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+        except KeyError:
+            symbol = trading_pair
+        return await self._connector._api_get(
+            path_url=CONSTANTS.ORDERS_PATH_URL,
+            params={"symbol": symbol, "status": CONSTANTS.ORDER_STATUS_ACTIVE},
+            is_auth_required=True,
+        )
 
     async def _poll_account_trades(self, output: asyncio.Queue) -> None:
         """
@@ -121,14 +146,30 @@ class ZebpayAPIUserStreamDataSource(UserStreamTrackerDataSource):
         if self._connector is None:
             return
         orders = [o for o in self._connector.in_flight_orders.values() if o.exchange_order_id]
-        fills_by_order: list = []
-        for order in orders:
-            try:
-                resp = await self._connector._api_get(
+        if not orders:
+            return
+
+        # Fire the per-order requests TOGETHER. Sequentially this is N x latency per
+        # cycle (worse through the IP-whitelist proxy), so past a handful of orders the
+        # loop falls behind its own 2s cadence; the connector throttler still bounds
+        # the actual request rate. Per-order failures are isolated.
+        responses = await safe_gather(
+            *(
+                self._connector._api_get(
                     path_url=CONSTANTS.ORDER_FILLS_PATH_URL,
                     params={"orderId": order.exchange_order_id},
                     is_auth_required=True,
                 )
+                for order in orders
+            ),
+            return_exceptions=True,
+        )
+
+        fills_by_order: list = []
+        for order, resp in zip(orders, responses):
+            try:
+                if isinstance(resp, Exception):
+                    raise resp
                 raise_for_status(resp)
                 data = unwrap_data(resp)
                 fills = data.get("fills", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])

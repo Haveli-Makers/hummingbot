@@ -132,10 +132,18 @@ class ZebpayAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 await asyncio.sleep(5.0)
 
     async def _fetch_order_book_snapshots(self):
+        # One depth request per pair, fired TOGETHER. At the 2s cadence a serial loop
+        # costs pairs x latency and self-throttles further behind its own interval as
+        # pairs are added. Per-pair failures are isolated.
         snapshot_queue = self._message_queue[self._snapshot_messages_queue_key]
-        for trading_pair in self._trading_pairs:
+        raws = await safe_gather(
+            *(self._request_order_book_snapshot(tp) for tp in self._trading_pairs),
+            return_exceptions=True,
+        )
+        for trading_pair, raw in zip(self._trading_pairs, raws):
             try:
-                raw = await self._request_order_book_snapshot(trading_pair)
+                if isinstance(raw, Exception):
+                    raise raw
                 data = self._extract_depth_data(raw)
                 ts = self._time()
                 snapshot_queue.put_nowait({
@@ -148,18 +156,16 @@ class ZebpayAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 self.logger().warning(f"Error fetching Zebpay order book for {trading_pair}: {exc}")
 
     async def _fetch_public_trades(self):
+        # Concurrent for the same reason as the depth poll above.
         trade_queue = self._message_queue[self._trade_messages_queue_key]
-        for trading_pair in self._trading_pairs:
+        responses = await safe_gather(
+            *(self._request_public_trades(tp) for tp in self._trading_pairs),
+            return_exceptions=True,
+        )
+        for trading_pair, trades_resp in zip(self._trading_pairs, responses):
             try:
-                try:
-                    symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-                except KeyError:
-                    symbol = trading_pair
-                trades_resp = await self._connector._api_get(
-                    path_url=CONSTANTS.TRADES_PATH_URL,
-                    params={"symbol": symbol},
-                    is_auth_required=False,
-                )
+                if isinstance(trades_resp, Exception):
+                    raise trades_resp
                 trades = unwrap_data(trades_resp)
                 trades = trades if isinstance(trades, list) else []
                 for trade in trades:
@@ -168,6 +174,18 @@ class ZebpayAPIOrderBookDataSource(OrderBookTrackerDataSource):
                         trade_queue.put_nowait(trade)
             except Exception as exc:
                 self.logger().warning(f"Error fetching Zebpay trades for {trading_pair}: {exc}")
+
+    async def _request_public_trades(self, trading_pair: str):
+        """GET the recent public trades for one pair. Raises on failure (caller isolates)."""
+        try:
+            symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+        except KeyError:
+            symbol = trading_pair
+        return await self._connector._api_get(
+            path_url=CONSTANTS.TRADES_PATH_URL,
+            params={"symbol": symbol},
+            is_auth_required=False,
+        )
 
     # ── Message parsers ────────────────────────────────────────────────────────
 

@@ -225,6 +225,31 @@ class CsxExchangeBalanceTests(IsolatedAsyncioWrapperTestCase):
 
         self.assertNotIn("STALE", self.exchange._account_balances)
 
+    async def test_update_balances_degenerate_payload_keeps_balances(self):
+        # A payload with no Available/Locked section at all is a transient hiccup, not
+        # a real empty account. Without this guard the stale-removal loop wiped every
+        # tracked balance and the strategy would see zero funds. (Same class of bug as
+        # the Zebpay balance guard; CSX only escaped it for the {"data": null} shape,
+        # by way of an AttributeError.)
+        self.exchange._account_balances["BTC"] = Decimal("1")
+        self.exchange._account_available_balances["BTC"] = Decimal("1")
+        for payload in ({"data": {}}, {"data": None}, {}):
+            with self.subTest(payload=payload):
+                with patch.object(self.exchange, "_api_get", new_callable=AsyncMock) as mock_get:
+                    mock_get.return_value = payload
+                    await self.exchange._update_balances()
+                self.assertEqual(Decimal("1"), self.exchange._account_balances.get("BTC"))
+
+    async def test_update_balances_genuinely_empty_account_still_wipes(self):
+        # A REAL empty account still carries the keys — it must wipe, or the strategy
+        # keeps sizing orders against funds it no longer has.
+        self.exchange._account_balances["BTC"] = Decimal("1")
+        self.exchange._account_available_balances["BTC"] = Decimal("1")
+        with patch.object(self.exchange, "_api_get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = {"data": {"Available": {}, "Locked": {}}}
+            await self.exchange._update_balances()
+        self.assertNotIn("BTC", self.exchange._account_balances)
+
 
 class CsxExchangeOrderTests(IsolatedAsyncioWrapperTestCase):
 

@@ -489,6 +489,10 @@ class ZebpayExchange(ExchangePyBase):
         emissions are deduped by InFlightOrder.update_with_trade_update.
         """
         trade_updates: List[TradeUpdate] = []
+        # Occurrence counter for the id-less fallback below, so two fills that are
+        # identical in every field still get distinct ids. Keyed by content, not by
+        # arrival order, so the numbering is stable across polls.
+        synthetic_seq: Dict[str, int] = {}
         for fill in fills:
             if not isinstance(fill, dict):
                 continue
@@ -503,9 +507,23 @@ class ZebpayExchange(ExchangePyBase):
                 flat_fees=[TokenAmount(amount=str_to_decimal(fill.get("fees", "0")), token=fee_token)],
             )
             ts_raw = fill.get("createdAt") or fill.get("timestamp") or 0
+            native_id = fill.get("id", fill.get("tradeId"))
+            if native_id is not None and str(native_id) != "":
+                trade_id = str(native_id)
+            else:
+                # No native id. The id MUST be derived from the fill's own content,
+                # never from its index in this response: /fills is not guaranteed to
+                # return items in a stable order across polls, and an index-derived id
+                # would then be reassigned to a different fill — the already-seen id
+                # gets silently deduped away while the other fill looks new and is
+                # applied a second time, double-counting executed_amount_base.
+                key = f"{order.exchange_order_id}-{ts_raw}-{fill_price}-{fill_base}"
+                seq = synthetic_seq.get(key, 0)
+                synthetic_seq[key] = seq + 1
+                trade_id = f"{key}-{seq}"
             trade_updates.append(
                 TradeUpdate(
-                    trade_id=str(fill.get("id", fill.get("tradeId", f"{order.exchange_order_id}-{len(trade_updates)}"))),
+                    trade_id=trade_id,
                     client_order_id=order.client_order_id,
                     exchange_order_id=str(order.exchange_order_id),
                     trading_pair=order.trading_pair,
@@ -527,20 +545,27 @@ class ZebpayExchange(ExchangePyBase):
             response = await self._api_get(path_url=CONSTANTS.BALANCE_PATH_URL, is_auth_required=True)
             # Surface an HTTP-200 business error rather than parsing it as empty.
             raise_for_status(response)
-            from hummingbot.connector.exchange.zebpay.zebpay_utils import parse_balance_response
+            from hummingbot.connector.exchange.zebpay.zebpay_utils import (
+                is_empty_balance_payload,
+                parse_balance_response,
+            )
             parsed = parse_balance_response(response)
 
             # Distinguish a genuinely-empty account from a degenerate response.
-            # Zebpay replies with an empty LIST ({"data": []}) when the account holds
-            # nothing — that must be reflected (the stale-removal loop wipes the old
-            # balances), otherwise the strategy keeps sizing orders against funds it no
-            # longer has. Any OTHER empty shape (null / non-list — a transient hiccup,
-            # already harmless after parse_balance_response's guard) is treated as
-            # degenerate and the last known balances are kept. Business errors raise via
-            # raise_for_status above and never reach here.
-            if not parsed and not isinstance(unwrap_data(response), list):
+            # Zebpay replies with an EMPTY ITEM LIST ({"data": []}) when the account
+            # holds nothing — that must be reflected (the stale-removal loop below
+            # wipes the old balances), otherwise the strategy keeps sizing orders
+            # against funds it no longer has. Every other way of parsing to nothing —
+            # data:null, {"data": {}}, or a NON-EMPTY list whose items we could not
+            # parse (a renamed field, a partial-outage payload) — is degenerate, and
+            # the last known balances are kept. Checking "is the payload positively
+            # empty" rather than "is it not a list" matters: a non-empty unparseable
+            # list is a list, so a not-a-list test lets it through and wipes every
+            # tracked balance. Business errors raise via raise_for_status above.
+            if not parsed and not is_empty_balance_payload(response):
                 self.logger().warning(
-                    "Zebpay balance payload was degenerate (not an empty list); keeping last known balances."
+                    "Zebpay balance payload was degenerate (parsed no assets but was not an "
+                    f"empty balance list): {response!r}. Keeping last known balances."
                 )
                 return
 
@@ -591,22 +616,23 @@ class ZebpayExchange(ExchangePyBase):
 
                 elif event_type == "trade_update":
                     # Realtime account fills from the user-stream account-trades poll.
+                    # Index once per event batch: ClientOrderTracker rebuilds this map
+                    # on every property access, so resolving it inside the loop would
+                    # be an O(entries x tracked-orders) scan every poll cycle.
+                    fillable_by_exchange_id = self._order_tracker.all_fillable_orders_by_exchange_order_id
                     for entry in event.get("data") or []:
                         if not isinstance(entry, dict):
                             continue
                         exchange_order_id = str(entry.get("orderId") or "")
                         fills = entry.get("fills") or []
-                        tracked = None
-                        for o in self._order_tracker.all_fillable_orders.values():
-                            if o.exchange_order_id == exchange_order_id:
-                                tracked = o
-                                break
+                        tracked = fillable_by_exchange_id.get(exchange_order_id)
                         if tracked is None:
                             continue
                         for trade_update in self._build_trade_updates_from_fills(tracked, fills):
                             self._order_tracker.process_trade_update(trade_update)
 
                 elif event_type == "order_update":
+                    updatable_by_exchange_id = self._order_tracker.all_updatable_orders_by_exchange_order_id
                     for order_data in event.get("data") or []:
                         if not isinstance(order_data, dict):
                             continue
@@ -618,10 +644,7 @@ class ZebpayExchange(ExchangePyBase):
                         if client_order_id:
                             tracked = self._order_tracker.all_updatable_orders.get(client_order_id)
                         if tracked is None and exchange_order_id:
-                            for o in self._order_tracker.all_updatable_orders.values():
-                                if o.exchange_order_id == exchange_order_id:
-                                    tracked = o
-                                    break
+                            tracked = updatable_by_exchange_id.get(exchange_order_id)
                         if tracked is None:
                             continue
 
@@ -632,8 +655,42 @@ class ZebpayExchange(ExchangePyBase):
                             new_state = tracked.current_state
 
                         from hummingbot.core.data_type.in_flight_order import OrderState
-                        if new_state == OrderState.OPEN and str_to_decimal(order_data.get("filled", "0")) > 0:
+                        filled_qty = str_to_decimal(order_data.get("filled", "0"))
+                        if new_state == OrderState.OPEN and filled_qty > 0:
                             new_state = OrderState.PARTIALLY_FILLED
+
+                        # Record any outstanding fill BEFORE a terminal transition stops
+                        # tracking the order. process_order_update untracks on a terminal
+                        # state, and an untracked order is invisible to the independent
+                        # account-trades poll (it iterates in_flight_orders) — so a fill
+                        # landing in the same ~2s window the order settles would never be
+                        # recorded and executed_amount_base would stay under-reported for
+                        # the life of the bot. Gated on the payload's own cumulative
+                        # `filled` exceeding what we have applied, so a clean cancel with
+                        # nothing outstanding costs no extra request; the fills' trade-id
+                        # dedup makes it a no-op if the poll already caught them.
+                        is_terminal = new_state in (
+                            OrderState.FILLED, OrderState.CANCELED, OrderState.FAILED
+                        )
+                        has_outstanding_fill = (
+                            filled_qty > tracked.executed_amount_base
+                            # ...or the payload omitted `filled` but says the order is
+                            # fully filled while we have applied less than its amount.
+                            or (new_state == OrderState.FILLED
+                                and tracked.executed_amount_base < tracked.amount)
+                        )
+                        if is_terminal and has_outstanding_fill:
+                            try:
+                                for trade_update in await self._all_trade_updates_for_order(tracked):
+                                    self._order_tracker.process_trade_update(trade_update)
+                            except Exception as exc:
+                                # Never let a fills-fetch failure block the terminal
+                                # transition: leaving the order tracked forever is worse
+                                # than a missed fill, and the status poll retries.
+                                self.logger().warning(
+                                    f"Could not record final fills for Zebpay order "
+                                    f"{exchange_order_id} before it settled: {exc}"
+                                )
 
                         ts_raw = order_data.get("updatedAt") or order_data.get("timestamp") or 0
                         order_update = OrderUpdate(

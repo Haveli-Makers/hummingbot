@@ -11,6 +11,7 @@ from hummingbot.connector.exchange.csx import csx_constants as CONSTANTS, csx_we
 from hummingbot.connector.exchange.csx.csx_api_order_book_data_source import CsxAPIOrderBookDataSource
 from hummingbot.connector.exchange.csx.csx_api_user_stream_data_source import CsxAPIUserStreamDataSource
 from hummingbot.connector.exchange.csx.csx_auth import CsxAuth
+from hummingbot.connector.exchange.csx.csx_utils import unwrap_data
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
@@ -533,7 +534,7 @@ class CsxExchange(ExchangePyBase):
             is_auth_required=True,
         )
         # CSX cancel response: {"data": {"cancelled": true, "info": {...}}, "message": "..."}
-        data = result.get("data", result) if isinstance(result, dict) else {}
+        data = unwrap_data(result) if isinstance(result, dict) else {}
         if data.get("cancelled") is True or data.get("canceled") is True:
             return True
         status = (data.get("status") or result.get("status") or "").upper()
@@ -555,7 +556,7 @@ class CsxExchange(ExchangePyBase):
         )
         if not isinstance(result, dict):
             return {}
-        return result if "orderId" in result else result.get("data", result)
+        return unwrap_data(result, identity_key="orderId")
 
     def _cache_order_data(self, exchange_order_id: str, order_data: Dict[str, Any]) -> None:
         now = time.monotonic()
@@ -680,10 +681,26 @@ class CsxExchange(ExchangePyBase):
 
             # CSX wraps the payload in a "data" key:
             #   {"data": {"Available": {...}, "Locked": {...}}, "message": "..."}
-            balance_data = response.get("data", response) if isinstance(response, dict) else {}
+            balance_data = unwrap_data(response) if isinstance(response, dict) else {}
+            if not isinstance(balance_data, dict):
+                balance_data = {}
             available = balance_data.get("Available") or {}
             locked = balance_data.get("Locked") or {}
             all_assets = set(available.keys()) | set(locked.keys())
+
+            # Distinguish a genuinely-empty account from a degenerate response before
+            # the stale-removal loop below wipes every tracked balance. A real empty
+            # account still CARRIES the Available/Locked keys (they are just empty
+            # objects); a payload missing both — {"data": null}, {"data": {}}, a
+            # partial-outage body — parses to the same "no assets" and must instead
+            # keep the last known balances, or the strategy sees zero funds and stops
+            # sizing orders. Mirrors the Zebpay guard in zebpay_exchange._update_balances.
+            if not all_assets and not ("Available" in balance_data or "Locked" in balance_data):
+                self.logger().warning(
+                    "CSX balance payload was degenerate (no Available/Locked section): "
+                    f"{response!r}. Keeping last known balances."
+                )
+                return
 
             for asset in all_assets:
                 free = Decimal(str(available.get(asset, "0")))
@@ -733,9 +750,10 @@ class CsxExchange(ExchangePyBase):
                 event_type = event.get("event")
 
                 if event_type == "balance_update":
-                    balance_data = event.get("data") or {}
                     # Unwrap CSX's "data" envelope if the raw response was forwarded
-                    balance_data = balance_data.get("data", balance_data) if isinstance(balance_data, dict) else {}
+                    balance_data = unwrap_data(event.get("data") or {})
+                    if not isinstance(balance_data, dict):
+                        balance_data = {}
                     available = balance_data.get("Available") or {}
                     locked = balance_data.get("Locked") or {}
                     all_assets = set(available.keys()) | set(locked.keys())
@@ -751,15 +769,15 @@ class CsxExchange(ExchangePyBase):
                     # Each entry is a GET /orders/{id} payload with the cumulative
                     # filledQuantity; the helper turns it into the incremental fill,
                     # deduped by trade id so re-emitting the same cumulative is a no-op.
+                    # Index once per event batch: ClientOrderTracker rebuilds this map
+                    # on every property access, so resolving it inside the loop would
+                    # be an O(entries x tracked-orders) scan every poll cycle.
+                    fillable_by_exchange_id = self._order_tracker.all_fillable_orders_by_exchange_order_id
                     for order_data in event.get("data") or []:
                         if not isinstance(order_data, dict):
                             continue
                         exchange_order_id = str(order_data.get("orderId", order_data.get("order_id", "")))
-                        tracked = None
-                        for o in self._order_tracker.all_fillable_orders.values():
-                            if o.exchange_order_id == exchange_order_id:
-                                tracked = o
-                                break
+                        tracked = fillable_by_exchange_id.get(exchange_order_id)
                         if tracked is None:
                             continue
                         trade_update = self._build_trade_update_from_order_data(tracked, order_data)
@@ -767,6 +785,7 @@ class CsxExchange(ExchangePyBase):
                             self._order_tracker.process_trade_update(trade_update)
 
                 elif event_type == "order_update":
+                    updatable_by_exchange_id = self._order_tracker.all_updatable_orders_by_exchange_order_id
                     for order_data in event.get("data") or []:
                         client_order_id = order_data.get("clientOrderId") or order_data.get("client_order_id")
                         exchange_order_id = str(order_data.get("orderId", order_data.get("order_id", "")))
@@ -779,10 +798,7 @@ class CsxExchange(ExchangePyBase):
                         if client_order_id:
                             tracked = self._order_tracker.all_updatable_orders.get(client_order_id)
                         if tracked is None and exchange_order_id:
-                            for o in self._order_tracker.all_updatable_orders.values():
-                                if o.exchange_order_id == exchange_order_id:
-                                    tracked = o
-                                    break
+                            tracked = updatable_by_exchange_id.get(exchange_order_id)
                         if tracked is None:
                             continue
 

@@ -13,6 +13,7 @@ from hummingbot.core.rate_oracle.sources.binance_us_rate_source import BinanceUS
 from hummingbot.core.rate_oracle.sources.coin_cap_rate_source import CoinCapRateSource
 from hummingbot.core.rate_oracle.sources.coin_gecko_rate_source import CoinGeckoRateSource
 from hummingbot.core.rate_oracle.sources.coinbase_advanced_trade_rate_source import CoinbaseAdvancedTradeRateSource
+from hummingbot.core.rate_oracle.sources.coindcx_perpetual_rate_source import CoinDCXPerpetualRateSource
 from hummingbot.core.rate_oracle.sources.coindcx_rate_source import CoindcxRateSource
 from hummingbot.core.rate_oracle.sources.coinex_rate_source import CoinexRateSource
 from hummingbot.core.rate_oracle.sources.coinswitch_rate_source import CoinswitchRateSource
@@ -38,6 +39,7 @@ RATE_ORACLE_SOURCES = {
     "coin_cap": CoinCapRateSource,
     "coinswitch": CoinswitchRateSource,
     "coindcx": CoindcxRateSource,
+    "coindcx_perpetual": CoinDCXPerpetualRateSource,
     "csx": CsxRateSource,
     "coinex": CoinexRateSource,
     "kucoin": KucoinRateSource,

@@ -13,8 +13,11 @@ from hummingbot.core.rate_oracle.sources.binance_us_rate_source import BinanceUS
 from hummingbot.core.rate_oracle.sources.coin_cap_rate_source import CoinCapRateSource
 from hummingbot.core.rate_oracle.sources.coin_gecko_rate_source import CoinGeckoRateSource
 from hummingbot.core.rate_oracle.sources.coinbase_advanced_trade_rate_source import CoinbaseAdvancedTradeRateSource
+from hummingbot.core.rate_oracle.sources.coindcx_perpetual_rate_source import CoinDCXPerpetualRateSource
 from hummingbot.core.rate_oracle.sources.coindcx_rate_source import CoindcxRateSource
+from hummingbot.core.rate_oracle.sources.coinex_rate_source import CoinexRateSource
 from hummingbot.core.rate_oracle.sources.coinswitch_rate_source import CoinswitchRateSource
+from hummingbot.core.rate_oracle.sources.csx_rate_source import CsxRateSource
 from hummingbot.core.rate_oracle.sources.cube_rate_source import CubeRateSource
 from hummingbot.core.rate_oracle.sources.derive_rate_source import DeriveRateSource
 from hummingbot.core.rate_oracle.sources.dexalot_rate_source import DexalotRateSource
@@ -24,6 +27,7 @@ from hummingbot.core.rate_oracle.sources.kucoin_rate_source import KucoinRateSou
 from hummingbot.core.rate_oracle.sources.mexc_rate_source import MexcRateSource
 from hummingbot.core.rate_oracle.sources.rate_source_base import RateSourceBase
 from hummingbot.core.rate_oracle.sources.wazirx_rate_source import WazirxRateSource
+from hummingbot.core.rate_oracle.sources.zebpay_rate_source import ZebpayRateSource
 from hummingbot.core.rate_oracle.utils import find_rate
 from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.logger import HummingbotLogger
@@ -35,6 +39,9 @@ RATE_ORACLE_SOURCES = {
     "coin_cap": CoinCapRateSource,
     "coin_switch": CoinswitchRateSource,
     "coindcx": CoindcxRateSource,
+    "coindcx_perpetual": CoinDCXPerpetualRateSource,
+    "csx": CsxRateSource,
+    "coinex": CoinexRateSource,
     "kucoin": KucoinRateSource,
     "ascend_ex": AscendExRateSource,
     "gate_io": GateIoRateSource,
@@ -45,6 +52,7 @@ RATE_ORACLE_SOURCES = {
     "derive": DeriveRateSource,
     "mexc": MexcRateSource,
     "wazirx": WazirxRateSource,
+    "zebpay": ZebpayRateSource,
 }
 
 

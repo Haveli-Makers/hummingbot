@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -33,6 +34,8 @@ _logger = logging.getLogger(__name__)
 class CoinswitchExchange(ExchangePyBase):
     UPDATE_ORDER_STATUS_MIN_INTERVAL = 10.0
     web_utils = web_utils
+    # How long an unmatched order frame is held waiting for its placement response.
+    DEFERRED_ORDER_FRAME_TTL = 15.0
 
     def __init__(self,
                  coinswitch_api_key: str,
@@ -64,6 +67,17 @@ class CoinswitchExchange(ExchangePyBase):
         self._trading_pairs = trading_pairs
         self._exchange = exchange
         self._last_trades_poll_timestamp = 1.0
+        # Order frames whose exchange_order_id was not yet tracked when they arrived.
+        # A marketable order can be executed and pushed on /orderupdates BEFORE the
+        # REST place_order response returns and sets exchange_order_id, and CoinSwitch
+        # has no per-order trades endpoint to re-deliver that fill — so the frame is
+        # held here and replayed rather than dropped. {exchange_order_id: (deadline, frame)}
+        self._deferred_order_frames: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        # Exchange order ids for which the REST trades endpoint has actually returned
+        # fills. Those are authoritative and carry the venue's real trade_id, so the
+        # websocket must stop synthesizing cumulative-keyed fills for them or the same
+        # execution gets recorded twice under two different id spaces.
+        self._rest_fill_order_ids: set = set()
 
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
@@ -528,9 +542,20 @@ class CoinswitchExchange(ExchangePyBase):
                     for asset_key, asset_val in event_message.items():
                         if asset_key == "event" or not isinstance(asset_val, dict):
                             continue
+                        # Require the field to be PRESENT before writing. Defaulting a
+                        # missing key to 0 means a partial frame, an envelope key, or a
+                        # future rename overwrites a real cached balance with zero, and
+                        # the bot then refuses to trade on a spurious "insufficient
+                        # balance" until the next REST poll. Degrade to "no update".
+                        if "free_balance" not in asset_val:
+                            self.logger().debug(
+                                f"Skipping CoinSwitch balance entry '{asset_key}': no "
+                                f"free_balance field (keys={sorted(asset_val)})."
+                            )
+                            continue
                         asset = asset_key.upper()
-                        free = Decimal(str(asset_val.get("free_balance", 0)))
-                        locked = Decimal(str(asset_val.get("locked_balance", 0)))
+                        free = Decimal(str(asset_val.get("free_balance") or "0"))
+                        locked = Decimal(str(asset_val.get("locked_balance") or "0"))
                         self._account_available_balances[asset] = free
                         self._account_balances[asset] = free + locked
 
@@ -545,58 +570,129 @@ class CoinswitchExchange(ExchangePyBase):
                     if new_state is None or not exchange_order_id:
                         continue  # subscribe ack / unknown status
 
-                    # WS carries no client order id — match by exchange order id.
-                    tracked_order = next(
-                        (o for o in self._order_tracker.all_updatable_orders.values()
-                         if o.exchange_order_id == exchange_order_id),
-                        None,
-                    )
-                    if tracked_order is None:
-                        continue
+                    # Replay any frames that arrived before their order was tracked,
+                    # then handle this one. Doing it here (rather than on a timer)
+                    # keeps the retry on the same task with no extra machinery.
+                    for frame in self._due_deferred_frames():
+                        self._process_order_frame(frame)
 
-                    update_ts = float(event_message.get("O") or event_message.get("E") or 0) / 1000.0
-
-                    # CoinSwitch has no separate trade stream — synthesize the fill
-                    # from the cumulative executed qty (z), emitting only the new
-                    # delta vs what's already recorded. Process the fill BEFORE the
-                    # order state so a terminal (EXECUTED) update isn't completed
-                    # with "incomplete information".
-                    filled_total = Decimal(str(event_message.get("z", "0")))
-                    delta = filled_total - tracked_order.executed_amount_base
-                    if delta > Decimal("0"):
-                        avg_price = Decimal(str(
-                            event_message.get("v") or event_message.get("p") or "0"))
-                        fee = TradeFeeBase.new_spot_fee(
-                            fee_schema=self.trade_fee_schema(),
-                            trade_type=tracked_order.trade_type,
-                        )
-                        trade_update = TradeUpdate(
-                            trade_id=f"{exchange_order_id}-{filled_total}",
-                            client_order_id=tracked_order.client_order_id,
-                            exchange_order_id=exchange_order_id,
-                            trading_pair=tracked_order.trading_pair,
-                            fee=fee,
-                            fill_base_amount=delta,
-                            fill_quote_amount=delta * avg_price,
-                            fill_price=avg_price,
-                            fill_timestamp=update_ts,
-                        )
-                        self._order_tracker.process_trade_update(trade_update)
-
-                    order_update = OrderUpdate(
-                        trading_pair=tracked_order.trading_pair,
-                        update_timestamp=update_ts,
-                        new_state=new_state,
-                        client_order_id=tracked_order.client_order_id,
-                        exchange_order_id=exchange_order_id,
-                    )
-                    self._order_tracker.process_order_update(order_update=order_update)
+                    if not self._process_order_frame(event_message):
+                        # Not tracked yet: the /orderupdates push beat the REST
+                        # place_order response that assigns exchange_order_id. Hold
+                        # the frame briefly instead of dropping it — CoinSwitch has
+                        # no per-order trades endpoint, so nothing would ever
+                        # re-deliver this fill and the order would complete with
+                        # executed_amount_base == 0.
+                        self._defer_order_frame(exchange_order_id, event_message)
 
             except asyncio.CancelledError:
                 raise
             except Exception:
                 self.logger().error("Unexpected error in user stream listener loop.", exc_info=True)
                 await self._sleep(5.0)
+
+    # ── Order-frame handling ───────────────────────────────────────────────────
+
+    def _defer_order_frame(self, exchange_order_id: str, frame: Dict[str, Any]) -> None:
+        """Hold an unmatched order frame for a short retry window (latest wins)."""
+        self._deferred_order_frames[exchange_order_id] = (
+            time.time() + self.DEFERRED_ORDER_FRAME_TTL, frame)
+
+    def _due_deferred_frames(self) -> List[Dict[str, Any]]:
+        """Pop deferred frames worth retrying, discarding any past their TTL."""
+        now = time.time()
+        due, expired = [], []
+        for oid, (deadline, frame) in list(self._deferred_order_frames.items()):
+            if now > deadline:
+                expired.append(oid)
+            else:
+                due.append(frame)
+        for oid in expired:
+            self._deferred_order_frames.pop(oid, None)
+            self.logger().warning(
+                f"Discarding CoinSwitch order frame for {oid}: never matched a tracked "
+                f"order within {self.DEFERRED_ORDER_FRAME_TTL}s."
+            )
+        return due
+
+    def _process_order_frame(self, event_message: Dict[str, Any]) -> bool:
+        """
+        Apply one /orderupdates frame. Returns False if the order is not tracked yet,
+        so the caller can defer and retry.
+        """
+        status = event_message.get("X")
+        exchange_order_id = str(event_message.get("i", ""))
+        new_state = CONSTANTS.ORDER_STATE.get(status) if status else None
+        if new_state is None or not exchange_order_id:
+            return True  # nothing actionable; do not defer
+
+        # WS carries no client order id — match by exchange order id. The tracker
+        # already maintains this map pre-indexed, which is cheaper and clearer than
+        # a hand-rolled linear scan over all_updatable_orders.
+        tracked_order = self._order_tracker.all_updatable_orders_by_exchange_order_id.get(
+            exchange_order_id)
+        if tracked_order is None:
+            return False
+
+        self._deferred_order_frames.pop(exchange_order_id, None)
+        update_ts = float(event_message.get("O") or event_message.get("E") or 0) / 1000.0
+
+        # CoinSwitch has no separate trade stream — synthesize the fill from the
+        # cumulative executed qty (z), emitting only the new delta vs what's already
+        # recorded. Process the fill BEFORE the order state so a terminal (EXECUTED)
+        # update isn't completed with "incomplete information".
+        filled_total = Decimal(str(event_message.get("z") or "0"))
+        delta = filled_total - tracked_order.executed_amount_base
+        # Skip synthesis once REST has proven it returns real trades for this order:
+        # those carry the venue's own trade_id, which can never dedup against a
+        # cumulative-keyed synthetic id, so emitting both records one execution twice.
+        if delta > Decimal("0") and exchange_order_id not in self._rest_fill_order_ids:
+            avg_price = Decimal(str(
+                event_message.get("v") or event_message.get("p") or "0"))
+            fee = self._synthetic_fill_fee(tracked_order, delta, avg_price)
+            trade_update = TradeUpdate(
+                trade_id=f"{exchange_order_id}-{filled_total}",
+                client_order_id=tracked_order.client_order_id,
+                exchange_order_id=exchange_order_id,
+                trading_pair=tracked_order.trading_pair,
+                fee=fee,
+                fill_base_amount=delta,
+                fill_quote_amount=delta * avg_price,
+                fill_price=avg_price,
+                fill_timestamp=update_ts,
+            )
+            self._order_tracker.process_trade_update(trade_update)
+
+        order_update = OrderUpdate(
+            trading_pair=tracked_order.trading_pair,
+            update_timestamp=update_ts,
+            new_state=new_state,
+            client_order_id=tracked_order.client_order_id,
+            exchange_order_id=exchange_order_id,
+        )
+        self._order_tracker.process_order_update(order_update=order_update)
+        return True
+
+    def _synthetic_fill_fee(self, order: InFlightOrder, amount: Decimal,
+                            price: Decimal) -> TradeFeeBase:
+        """
+        Fee for a websocket-synthesized fill.
+
+        The /orderupdates frame carries no commission field, so the fee is MODELLED
+        from the connector's fee schema rather than left empty. Emitting a bare
+        ``new_spot_fee`` with no percent_token and no flat_fees reports zero, which
+        keeps ``order.cumulative_fee_paid`` at 0 for the whole lifetime of every
+        order and silently understates costs in PnL and performance reporting —
+        CoinSwitch's websocket is the only fill source, so nothing else corrects it.
+        """
+        fee_pct = self.estimate_fee_pct(order.order_type is OrderType.LIMIT_MAKER)
+        return TradeFeeBase.new_spot_fee(
+            fee_schema=self.trade_fee_schema(),
+            trade_type=order.trade_type,
+            percent=fee_pct,
+            percent_token=order.quote_asset,
+            flat_fees=[TokenAmount(amount=fee_pct * amount * price, token=order.quote_asset)],
+        )
 
     async def _format_trading_rules(self, exchange_info_dict: Dict[str, Any]) -> List[TradingRule]:
         """
@@ -669,6 +765,23 @@ class CoinswitchExchange(ExchangePyBase):
                 if response and "data" in response:
                     order_data = response.get("data", {})
                     trades = order_data.get("trades", [])
+
+                    if trades:
+                        # REST returned real trades for this order, so it — not the
+                        # websocket's cumulative-keyed synthesis — is the source of
+                        # truth from here on. The two id spaces cannot dedup against
+                        # each other, so without this the same execution would be
+                        # recorded twice and the order would over-fill. Today this
+                        # endpoint returns nothing for CoinSwitch spot; the guard is
+                        # here so a venue fix or a different symbol cannot silently
+                        # corrupt fill accounting.
+                        if str(order.exchange_order_id) not in self._rest_fill_order_ids:
+                            self.logger().info(
+                                f"CoinSwitch REST trades are now available for order "
+                                f"{order.exchange_order_id}; using them as the authoritative "
+                                f"fill source and stopping websocket fill synthesis for it."
+                            )
+                        self._rest_fill_order_ids.add(str(order.exchange_order_id))
 
                     for trade in trades:
                         fee = TradeFeeBase.new_spot_fee(

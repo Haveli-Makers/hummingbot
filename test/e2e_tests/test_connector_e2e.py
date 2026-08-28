@@ -125,6 +125,10 @@ class ExchangeConfig:
     order_propagation_wait: int
     cancel_propagation_wait: int
     ready_timeout: int
+    # True ONLY for venues that genuinely have no per-order trades REST endpoint
+    # (CoinSwitch). For every other connector an empty REST trade history is a
+    # real failure of the fill pipeline and must fail the suite, not skip it.
+    no_rest_trade_history: bool = False
 
 
 def _get_configured_exchanges() -> List[ExchangeConfig]:
@@ -154,6 +158,8 @@ def _get_configured_exchanges() -> List[ExchangeConfig]:
             order_propagation_wait=int(_env.get(f"{pfx}ORDER_PROPAGATION_WAIT") or str(_DEFAULT_ORDER_WAIT)),
             cancel_propagation_wait=int(_env.get(f"{pfx}CANCEL_PROPAGATION_WAIT") or str(_DEFAULT_CANCEL_WAIT)),
             ready_timeout=int(_env.get(f"{pfx}READY_TIMEOUT") or str(_DEFAULT_READY_WAIT)),
+            no_rest_trade_history=(
+                (_env.get(f"{pfx}NO_REST_TRADE_HISTORY") or "").strip().lower() == "true"),
         ))
     return sorted(configs, key=lambda c: c.key)
 
@@ -727,12 +733,13 @@ async def verify_personal_trades_cache(cx: ConnectorWrapper, order) -> None:
     for one order.  When REST trade history is available it cross-checks that the
     cached filled amount doesn't exceed what REST confirms.
 
-    If the connector's REST trade endpoint returns nothing, the cross-check is
-    SKIPPED rather than failed: some venues (e.g. CoinSwitch) have no per-order
-    trades endpoint, so fills come only from the websocket and there is no REST
-    source to reconcile against. In that case the per-fill field validation in
-    test_08 is the verification; an empty REST result is not evidence the cache
-    is wrong.
+    An empty REST result is only tolerated for a connector explicitly declared as
+    having no per-order trades endpoint (``NO_REST_TRADE_HISTORY=true`` in .env,
+    which is CoinSwitch today). For every other venue an empty result IS the
+    failure: it means the REST fill path returned nothing for an order we know
+    filled. Skipping unconditionally removed the only reconciliation of the fills
+    CoinSwitch now synthesizes from `z`, and hid a genuinely broken REST fill path
+    on CoinDCX/WazirX behind the same warning.
     """
     trade_fn = getattr(cx.connector, "_all_trade_updates_for_order", None)
     if trade_fn is None:
@@ -749,10 +756,21 @@ async def verify_personal_trades_cache(cx: ConnectorWrapper, order) -> None:
         cx.log(f"personal-trades cache check skipped — REST fetch failed: {exc}", "warning")
         return
     if not rest_trades:
-        cx.log(f"personal-trades REST cross-check skipped — {cx.cfg.connector_name} returned no "
-               "REST trade history for this order (no per-order trades endpoint); WS-sourced "
-               "fills can't be reconciled against REST here.", "warning")
-        return
+        if cx.cfg.no_rest_trade_history:
+            cx.log(f"personal-trades REST cross-check skipped — {cx.cfg.connector_name} is "
+                   "declared NO_REST_TRADE_HISTORY (no per-order trades endpoint); WS-sourced "
+                   "fills can't be reconciled against REST here.", "warning")
+            return
+        cx.log_check("personal_trades_cache_vs_REST",
+                     actual=f"cache_filled={cached_amount} REST_trades=0",
+                     expected="REST returns the fills for a filled order")
+        assert False, (
+            f"[{cx.cfg.connector_name}] REST trade history returned NO trades for "
+            f"{order.client_order_id}, but the in-memory cache holds {cached_amount} filled. "
+            f"The REST fill path is broken. If this venue genuinely has no per-order trades "
+            f"endpoint, set {cx.cfg.key}_NO_REST_TRADE_HISTORY=true in .env to declare that "
+            f"explicitly instead of skipping every connector's cross-check."
+        )
     rest_amount = sum((t.fill_base_amount for t in rest_trades), Decimal("0"))
     cx.log_check("personal_trades_cache_vs_REST",
                  actual=f"cache_filled={cached_amount} REST_filled={rest_amount}",

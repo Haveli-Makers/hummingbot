@@ -2,7 +2,7 @@ import asyncio
 import re
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from typing import Optional
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from aioresponses import aioresponses
 
@@ -227,3 +227,75 @@ class WazirxUserStreamDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(1, msg_queue.qsize())
         msg = msg_queue.get_nowait()
         self.assertEqual(unknown_event, msg)
+
+
+class WazirxUserStreamReviewFixTests(IsolatedAsyncioWrapperTestCase):
+    """
+    Regression cover for the PR #34 review findings on the WazirX account websocket.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.source = WazirxAPIUserStreamDataSource(auth=MagicMock())
+
+    # ── Finding 4: only real account data may look "healthy" ─────────────────
+    async def test_last_recv_time_only_advances_for_stream_frames(self):
+        # Stamping every TEXT frame made a FAILED SUBSCRIBE look healthy: the 30s
+        # app-level ping keeps producing pongs, so _is_user_stream_initialized()
+        # reports ready and _get_poll_interval() picks LONG_POLL_INTERVAL — REST
+        # polling slows down while zero account data is arriving.
+        q = asyncio.Queue()
+        self.assertEqual(0.0, self.source.last_recv_time)
+
+        for noise in ({"event": "pong"},
+                      {"event": "subscribed", "streams": ["orderUpdate"]}):
+            self.source._handle_frame(noise, q)
+        self.assertEqual(0.0, self.source.last_recv_time,
+                         "a pong/ack must not make a dead stream look alive")
+        self.assertTrue(q.empty())
+
+        self.source._handle_frame({"stream": "ownTrade", "data": {"t": "1"}}, q)
+        self.assertGreater(self.source.last_recv_time, 0.0)
+        self.assertEqual(1, q.qsize())
+
+    async def test_error_frame_is_logged_and_forces_reconnect(self):
+        # A rejected auth_key arrives as an error frame. Previously it was silently
+        # discarded and the socket sat open forever delivering nothing.
+        q = asyncio.Queue()
+        with self.assertLogs(level="ERROR") as cm:
+            should_reconnect = self.source._handle_frame(
+                {"event": "error", "message": "invalid auth_key"}, q)
+        self.assertTrue(should_reconnect)
+        self.assertTrue(any("NOT flowing" in line for line in cm.output))
+        self.assertEqual(0.0, self.source.last_recv_time)
+
+    async def test_unrecognised_frame_is_warned_not_silent(self):
+        q = asyncio.Queue()
+        with self.assertLogs(level="WARNING") as cm:
+            self.source._handle_frame({"something": "unexpected"}, q)
+        self.assertTrue(any("Unrecognised" in line for line in cm.output))
+
+    # ── Finding 8: shutdown must not be delayed by the backoff sleep ─────────
+    async def test_cancellation_does_not_pay_the_reconnect_backoff(self):
+        # The 5s backoff used to sit in the `finally`, so it ran on the
+        # CancelledError path too — UserStreamTracker.stop() cancels this task and
+        # awaits it, adding ~5s to every connector stop/restart.
+        slept = []
+
+        async def record_sleep(d):
+            slept.append(d)
+            await asyncio.sleep(0)
+
+        self.source._auth.get_ws_auth_key = AsyncMock(side_effect=asyncio.CancelledError())
+        with patch.object(self.source, "_sleep", side_effect=record_sleep):
+            with self.assertRaises(asyncio.CancelledError):
+                await self.source.listen_for_user_stream(asyncio.Queue())
+        self.assertEqual([], slept, "backoff slept while shutting down")
+
+    async def test_reconnect_requests_a_fresh_auth_key(self):
+        # A cached key can be nearly expired by the time a reconnect re-subscribes.
+        self.source._auth.get_ws_auth_key = AsyncMock(side_effect=asyncio.CancelledError())
+        with patch.object(self.source, "_sleep", new=AsyncMock()):
+            with self.assertRaises(asyncio.CancelledError):
+                await self.source.listen_for_user_stream(asyncio.Queue())
+        self.source._auth.get_ws_auth_key.assert_awaited_with(force_refresh=True)

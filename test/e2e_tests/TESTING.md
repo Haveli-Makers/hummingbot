@@ -95,7 +95,26 @@ BINANCE_EDIT_PRICE_MULTIPLIER=0.78     # applied to buy price in edit test
 # Per-exchange timing (override global defaults)
 BINANCE_ORDER_PROPAGATION_WAIT=10      # seconds to wait for order in in_flight_orders
 BINANCE_CANCEL_PROPAGATION_WAIT=15     # seconds to wait for cancelled order to leave
+
+# Venue capability flags
+COINSWITCH_NO_REST_TRADE_HISTORY=true  # see below — set ONLY when truly unsupported
 ```
+
+#### `{KEY}_NO_REST_TRADE_HISTORY`
+
+Declares that the venue has **no per-order trades REST endpoint**, so fills can only
+come from the websocket and there is nothing to reconcile them against. Set it for
+CoinSwitch; leave it unset everywhere else.
+
+It matters because `verify_personal_trades_cache` cross-checks in-memory fills against
+REST trade history. When REST returns nothing:
+
+* **flag set** → the cross-check is skipped (expected for that venue);
+* **flag unset** → the test **fails**, because an empty REST result for an order that
+  demonstrably filled means the REST fill path is broken.
+
+Skipping unconditionally would hide a genuinely broken fill path on CoinDCX/WazirX
+behind the same warning that is legitimate for CoinSwitch.
 
 ### Global timing defaults
 

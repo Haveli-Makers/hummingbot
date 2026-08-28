@@ -58,13 +58,14 @@ class WazirxAPIUserStreamDataSource(UserStreamTrackerDataSource):
             ping_task: Optional[asyncio.Task] = None
             try:
                 # auth_key is required on the subscribe frame for private streams.
-                auth_key = await self._auth.get_ws_auth_key()
+                # force_refresh: a cached key can be nearly expired by the time a
+                # reconnect re-subscribes, which would silently fail the subscribe.
+                auth_key = await self._auth.get_ws_auth_key(force_refresh=True)
 
                 session = aiohttp.ClientSession()
                 # heartbeat=None: WazirX expects an application-level ping
                 # ({"event": "ping"}) rather than a websocket-protocol ping.
                 self._ws = await session.ws_connect(CONSTANTS.WSS_URL, heartbeat=None)
-                self._last_recv_time = time.time()
 
                 await self._ws.send_json({
                     "event": "subscribe",
@@ -80,15 +81,14 @@ class WazirxAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
                 async for msg in self._ws:
                     if msg.type == aiohttp.WSMsgType.TEXT:
-                        self._last_recv_time = time.time()
                         try:
                             data = json.loads(msg.data)
                         except Exception:
+                            self.logger().warning(
+                                f"WazirX user stream sent a non-JSON frame: {msg.data!r}")
                             continue
-                        # Forward only stream data; ignore subscribe/unsubscribe
-                        # acks, pongs and errors (those carry "event", no "stream").
-                        if isinstance(data, dict) and data.get("stream"):
-                            output.put_nowait(data)
+                        if self._handle_frame(data, output):
+                            break  # subscribe was rejected — reconnect
                     elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                         break
 
@@ -99,6 +99,9 @@ class WazirxAPIUserStreamDataSource(UserStreamTrackerDataSource):
                     "Error in WazirX user stream. Reconnecting in 5s.", exc_info=True
                 )
             finally:
+                # NOTE: no backoff sleep in this finally. UserStreamTracker.stop()
+                # cancels this task and awaits it, so a sleep here would run on the
+                # CancelledError path too and add ~5s to every connector stop/restart.
                 if ping_task is not None:
                     ping_task.cancel()
                 if self._ws is not None:
@@ -109,7 +112,44 @@ class WazirxAPIUserStreamDataSource(UserStreamTrackerDataSource):
                     self._ws = None
                 if session is not None:
                     await session.close()
-                await self._sleep(5.0)
+            # Reached only on a normal break/exception, never on cancellation.
+            await self._sleep(5.0)
+
+    def _handle_frame(self, data: Any, output: asyncio.Queue) -> bool:
+        """
+        Route one decoded frame. Returns True if the socket should be torn down.
+
+        Only frames carrying ``stream`` are real account data, and ONLY those may
+        refresh ``last_recv_time``. Stamping it for every TEXT frame made a failed
+        subscribe look healthy: the 30s app-level ping keeps producing pongs, so
+        ``_is_user_stream_initialized()`` reports ready and ``_get_poll_interval()``
+        picks LONG_POLL_INTERVAL — REST polling slows down while zero account data
+        is arriving. That is the exact silent-stale-cache failure this connector's
+        rewrite set out to remove.
+        """
+        if not isinstance(data, dict):
+            return False
+
+        if data.get("stream"):
+            self._last_recv_time = time.time()
+            output.put_nowait(data)
+            return False
+
+        event = str(data.get("event") or "")
+        if event == "pong":
+            return False
+        if event in ("subscribed", "unsubscribed", "subscribe", "unsubscribe"):
+            self.logger().info(f"WazirX user stream {event}: {data}")
+            return False
+        if event == "error" or "error" in data:
+            # A rejected auth_key lands here. Surface it loudly and force a
+            # reconnect (with a fresh key) instead of sitting on a dead socket.
+            self.logger().error(
+                f"WazirX user stream error frame — account data is NOT flowing: {data}")
+            return True
+
+        self.logger().warning(f"Unrecognised WazirX user stream frame (ignored): {data}")
+        return False
 
     async def _ping_loop(self):
         try:

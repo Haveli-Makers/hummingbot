@@ -94,10 +94,19 @@ class WazirxAuth(AuthBase):
         request.headers = headers
         return request
 
-    async def get_ws_auth_key(self) -> str:
+    async def get_ws_auth_key(self, force_refresh: bool = False) -> str:
+        """
+        Return a websocket auth key, minting a new one when the cached key is stale.
+
+        ``force_refresh`` bypasses the cache. The reconnect path uses it: WazirX
+        issues a fresh validity window per request, so a key cached earlier in the
+        session can be nearly expired by the time a reconnect re-subscribes with it,
+        and the subscribe would then fail silently.
+        """
         current_time = time.time()
 
-        if self._auth_key and (current_time - self._auth_key_timestamp) < self.AUTH_TOKEN_TIMEOUT:
+        if (not force_refresh and self._auth_key
+                and (current_time - self._auth_key_timestamp) < self.AUTH_TOKEN_TIMEOUT):
             return self._auth_key
 
         url = f"{CONSTANTS.REST_URL}{CONSTANTS.CREATE_AUTH_TOKEN_PATH_URL}"

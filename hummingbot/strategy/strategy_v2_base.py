@@ -447,7 +447,7 @@ class StrategyV2Base(ScriptStrategyBase):
             lines.extend(controller.to_format_status())
 
             # Last 6 executors table
-            executors_list = self.get_executors_by_controller(controller_id)
+            executors_list = self.get_executors_by_controller(controller_id) if controller.show_executors_data else []
             if executors_list:
                 lines.append("\n  Recent Executors (Last 6):")
                 # Sort by timestamp and take last 6
@@ -464,7 +464,7 @@ class StrategyV2Base(ScriptStrategyBase):
                 lines.append("  No executors found.")
 
             # Positions table
-            positions = self.get_positions_by_controller(controller_id)
+            positions = self.get_positions_by_controller(controller_id) if controller.show_positions_data else []
             if positions:
                 lines.append("\n  Positions Held:")
                 positions_data = []

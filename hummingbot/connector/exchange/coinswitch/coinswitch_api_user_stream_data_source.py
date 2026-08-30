@@ -58,10 +58,15 @@ class CoinswitchAPIUserStreamDataSource(UserStreamTrackerDataSource):
             self.logger().warning("CoinSwitch order-updates stream disconnected")
 
         @client.on(CONSTANTS.ORDER_UPDATE_EVENT_TYPE, namespace=namespace)
-        async def on_order_update(message):
+        async def on_order_update(data):
+            if "message" in data:
+                return
             self._last_recv_time = time.time()
-            if isinstance(message, dict):
-                message["event"] = CONSTANTS.ORDER_UPDATE_EVENT_TYPE
+            if isinstance(data, dict):
+                message = {
+                    "data": data,
+                    "event": CONSTANTS.ORDER_UPDATE_EVENT_TYPE
+                }
             await output.put(message)
 
         @client.on("error", namespace=namespace)
@@ -90,10 +95,17 @@ class CoinswitchAPIUserStreamDataSource(UserStreamTrackerDataSource):
             self.logger().warning("CoinSwitch balance-updates stream disconnected")
 
         @client.on(CONSTANTS.BALANCE_UPDATE_EVENT_TYPE, namespace=namespace)
-        async def on_balance_update(message):
+        async def on_balance_update(data):
+            if "message" in data:
+                return
             self._last_recv_time = time.time()
-            if isinstance(message, dict):
-                message["event"] = CONSTANTS.BALANCE_UPDATE_EVENT_TYPE
+            if isinstance(data, dict):
+                message = {
+                    "data": data,
+                    "event": CONSTANTS.BALANCE_UPDATE_EVENT_TYPE
+                }
+            else:
+                message = data
             await output.put(message)
 
         @client.on("error", namespace=namespace)

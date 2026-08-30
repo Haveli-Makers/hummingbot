@@ -833,7 +833,12 @@ class MQTTGateway(Node):
         if with_health:
             self._start_health_monitoring_loop()
 
-        self.run()
+        # Start the commlib node non-blocking. The default run() (wait=True) busy-waits
+        # on the main thread (`while not self.health: time.sleep(0.01)`) until the node
+        # reports healthy, which freezes the asyncio event loop this is running in and
+        # prevents the UI/strategy from ever starting. Readiness is instead tracked by
+        # Hummingbot's own async health monitor (_monitor_health_loop / _check_connections).
+        self.run(wait=False)
         self.broadcast_status_update("online", msg_type="availability")
 
     def stop(self, with_health: bool = True):
@@ -880,6 +885,12 @@ class MQTTLogHandler(logging.Handler):
         if threading.current_thread() != threading.main_thread():  # pragma: no cover
             self._ev_loop.call_soon_threadsafe(self.emit, record)
             return
+        # Drop records that arrive before the MQTT transport has connected
+        # (e.g. commlib's "Starting Node" log fires during run() before the
+        # publisher's client exists), which would otherwise raise inside
+        # publish() and crash the bridge startup.
+        if not self.log_pub._transport.is_connected:
+            return
         msg_str = self.format(record)
         msg = LogMessage(
             timestamp=time.time(),
@@ -889,7 +900,12 @@ class MQTTLogHandler(logging.Handler):
             logger_name=record.name
 
         )
-        self.log_pub.publish(msg)
+        try:
+            self.log_pub.publish(msg)
+        except Exception:
+            # Never let a transient publish failure propagate into the
+            # logging machinery and tear down the MQTT bridge.
+            pass
 
 
 class MQTTExternalEvents:
@@ -1173,7 +1189,7 @@ class EMTopicPublisher:
 
     def send(self, topic: str, msg: Dict[str, Any]):
         if threading.current_thread() != threading.main_thread():  # pragma: no cover
-            asyncio.get_event_loop().call_soon_threadsafe(self.send, msg)
+            asyncio.get_event_loop().call_soon_threadsafe(self.send, topic, msg)
             return
         _topic = self._make_topic(topic)
         self._pub.publish(msg, _topic)

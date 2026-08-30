@@ -28,6 +28,7 @@ SUPPORTED_CONNECTORS = [
     "zebpay",
     "csx",
     "coinex",
+    "coinswitch",
 ]
 
 

@@ -1,3 +1,4 @@
+import asyncio
 from decimal import Decimal
 from functools import lru_cache
 from typing import Dict, List, Optional, Tuple, Union
@@ -11,6 +12,7 @@ from hummingbot.core.event.event_forwarder import SourceInfoEventForwarder
 from hummingbot.core.event.events import (
     BuyOrderCompletedEvent,
     BuyOrderCreatedEvent,
+    ExecutorEvent,
     MarketEvent,
     MarketOrderFailureEvent,
     OrderCancelledEvent,
@@ -31,16 +33,22 @@ class ExecutorBase(RunnableBase):
     Base class for all executors. Executors are responsible for executing orders based on the strategy.
     """
 
-    def __init__(self, strategy: ScriptStrategyBase, connectors: List[str], config: ExecutorConfigBase, update_interval: float = 0.5):
+    def __init__(self, strategy: ScriptStrategyBase, connectors: List[str], config: ExecutorConfigBase,
+                 update_interval: float = 0.5, wait_on_executor_id: Optional[str] = None):
         """
         Initializes the executor with the given strategy, connectors and update interval.
 
         :param strategy: The strategy to be used by the executor.
         :param connectors: The connectors to be used by the executor.
         :param update_interval: The update interval for the executor.
+        :param wait_on_executor_id: If set, on_start() will block until the executor with this ID fires
+                                    EXECUTOR_TERMINATED before validating balance or placing orders.
         """
         super().__init__(update_interval)
         self.config = config
+        self._wait_on_executor_id: Optional[str] = wait_on_executor_id
+        self._predecessor_terminated: asyncio.Event = asyncio.Event()
+        self._predecessor_forwarder: Optional[SourceInfoEventForwarder] = None
         self.close_type: Optional[CloseType] = None
         self.close_timestamp: Optional[float] = None
         self._strategy: ScriptStrategyBase = strategy
@@ -169,11 +177,22 @@ class ExecutorBase(RunnableBase):
         self.close_timestamp = self._strategy.current_timestamp
         super().stop()
         self.unregister_events()
+        self._strategy.trigger_event(ExecutorEvent.EXECUTOR_TERMINATED, self.executor_info)
+
+    def _handle_predecessor_terminated(self, _, __, event):
+        if event.id == self._wait_on_executor_id:
+            self._predecessor_terminated.set()
+            self._strategy.remove_listener(ExecutorEvent.EXECUTOR_TERMINATED, self._predecessor_forwarder)
 
     async def on_start(self):
         """
-        Called when the executor is started.
+        Called when the executor is started. If wait_on_executor_id is set, blocks until that executor
+        fires EXECUTOR_TERMINATED before validating balance or placing orders.
         """
+        if self._wait_on_executor_id is not None:
+            self._predecessor_forwarder = SourceInfoEventForwarder(self._handle_predecessor_terminated)
+            self._strategy.add_listener(ExecutorEvent.EXECUTOR_TERMINATED, self._predecessor_forwarder)
+            await self._predecessor_terminated.wait()
         await self.validate_sufficient_balance()
 
     def on_stop(self):
@@ -312,6 +331,21 @@ class ExecutorBase(RunnableBase):
         """
         return self.connectors[connector_name].trading_rules[trading_pair]
 
+    def get_orderbook_level(self, connector_name: str, trading_pair: str, side: TradeType, level: int = 0) -> Optional[tuple[Decimal, Decimal]]:
+        """Return (price, qty) for the Nth order book level, or None if unavailable."""
+        try:
+            order_book = self.get_order_book(connector_name, trading_pair)
+            if order_book is None:
+                return None
+            side_df = order_book.snapshot[0] if side == TradeType.BUY else order_book.snapshot[1]
+            if len(side_df) > level:
+                row = side_df.iloc[level]
+                return Decimal(str(row['price'])), Decimal(str(row['amount']))
+            return None
+        except Exception as e:
+            self.logger().error(f"Error getting order book level {level}: {e}")
+            return None
+
     def get_order_book(self, connector_name: str, trading_pair: str):
         """
         Retrieves the order book for the specified trading pair from the specified connector.
@@ -320,7 +354,7 @@ class ExecutorBase(RunnableBase):
         :param trading_pair: The trading pair.
         :return: The order book.
         """
-        return self.connectors[connector_name].get_order_book(connector_name, trading_pair)
+        return self.connectors[connector_name].get_order_book(trading_pair)
 
     def get_balance(self, connector_name: str, asset: str):
         """

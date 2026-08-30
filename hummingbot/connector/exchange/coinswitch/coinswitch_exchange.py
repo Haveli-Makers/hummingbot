@@ -522,33 +522,33 @@ class CoinswitchExchange(ExchangePyBase):
 
                 if event_type == CONSTANTS.BALANCE_UPDATE_EVENT_TYPE:
                     balance_data = event_message.get("data", [])
-                    for asset_data in balance_data:
-                        asset = asset_data.get("currency", "").upper()
-                        free = Decimal(str(asset_data.get("main_balance", 0)))
-                        locked = Decimal(str(asset_data.get("blocked_balance_order", 0)))
+                    for asset, asset_data in balance_data.items():
+                        token = asset.upper()
+                        free = Decimal(str(asset_data.get("free_balance", 0)))
+                        locked = Decimal(str(asset_data.get("locked_balance", 0)))
                         total = free + locked
-                        self._account_balances[asset] = total
-                        self._account_available_balances[asset] = free
+                        self._account_balances[token] = total
+                        self._account_available_balances[token] = free
 
                 elif event_type == CONSTANTS.ORDER_UPDATE_EVENT_TYPE:
-                    orders_data = event_message.get("data", [])
-                    for order_data in orders_data:
-                        client_order_id = order_data.get("client_order_id")
-                        exchange_order_id = str(order_data.get("order_id", ""))
-                        status = order_data.get("status", "")
+                    order_data = event_message.get("data", [])
+                    self.logger().debug(f"Order Data: {order_data}")
 
-                        tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
-                        if tracked_order is not None:
-                            new_state = CONSTANTS.ORDER_STATE.get(status)
-                            if new_state is not None:
-                                order_update = OrderUpdate(
-                                    trading_pair=tracked_order.trading_pair,
-                                    update_timestamp=float(order_data.get("updated_time", 0)) / 1000.0,
-                                    new_state=new_state,
-                                    client_order_id=client_order_id,
-                                    exchange_order_id=exchange_order_id,
-                                )
-                                self._order_tracker.process_order_update(order_update=order_update)
+                    exchange_order_id = str(order_data.get("i", ""))
+                    status = order_data.get("X", "")
+
+                    tracked_order = self._order_tracker.fetch_order(exchange_order_id=exchange_order_id)
+                    if tracked_order is not None:
+                        new_state = CONSTANTS.ORDER_STATE.get(status)
+                        if new_state is not None:
+                            order_update = OrderUpdate(
+                                trading_pair=tracked_order.trading_pair,
+                                update_timestamp=float(order_data.get("O", 0)) / 1000.0,
+                                new_state=new_state,
+                                client_order_id=tracked_order.client_order_id,
+                                exchange_order_id=exchange_order_id,
+                            )
+                            self._order_tracker.process_order_update(order_update=order_update)
 
             except asyncio.CancelledError:
                 raise

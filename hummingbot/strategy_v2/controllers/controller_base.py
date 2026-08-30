@@ -2,7 +2,7 @@ import asyncio
 import importlib
 import inspect
 from decimal import Decimal
-from typing import TYPE_CHECKING, Callable, List
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 from pydantic import ConfigDict, Field, field_validator
 
@@ -142,6 +142,17 @@ class ControllerBase(RunnableBase):
         self.processed_data = {}
         self.executors_update_event = asyncio.Event()
         self.executors_info_queue = asyncio.Queue()
+        self.mqtt_enabled: bool = False
+        self._mqtt_publisher = None
+        self._last_published_performance: Optional[Any] = None
+
+    @property
+    def show_executors_data(self) -> bool:
+        return True
+
+    @property
+    def show_positions_data(self) -> bool:
+        return True
 
     def start(self):
         """
@@ -153,6 +164,25 @@ class ControllerBase(RunnableBase):
             self.executors_update_event.set()
             safe_ensure_future(self.control_loop())
         self.initialize_candles()
+        self.initialize_mqtt()
+
+    def initialize_mqtt(self):
+        """
+        Set up the MQTT publisher for streaming controller data, if the MQTT bridge is
+        enabled. Topics are rooted on the bot prefix (``{namespace}/{instance_id}``):
+        ``{namespace}/{instance_id}/controllers/{controller_id}/{market_data|account_data|performance_data}``.
+        """
+        if self._mqtt_publisher is not None:
+            return
+        try:
+            from hummingbot.client.hummingbot_application import HummingbotApplication
+            app = HummingbotApplication.main_application()
+            if app._mqtt is not None:
+                from hummingbot.remote_iface.mqtt import EMTopicPublisher
+                self.mqtt_enabled = True
+                self._mqtt_publisher = EMTopicPublisher(use_bot_prefix=True)
+        except Exception as e:
+            self.logger().error(f"Error initializing MQTT publisher: {e}", exc_info=True)
 
     def initialize_candles(self):
         for candles_config in self.config.candles_config:
@@ -171,6 +201,7 @@ class ControllerBase(RunnableBase):
     async def control_task(self):
         if self.market_data_provider.ready and self.executors_update_event.is_set():
             await self.update_processed_data()
+            self.publish_mqtt_data()
             executor_actions: List[ExecutorAction] = self.determine_executor_actions()
             if len(executor_actions) > 0:
                 self.logger().debug(f"Sending actions: {executor_actions}")
@@ -206,3 +237,66 @@ class ControllerBase(RunnableBase):
         controller to be displayed in the UI.
         """
         return []
+
+    # ------------------------------------------------------------------
+    # MQTT data publishing
+    # ------------------------------------------------------------------
+
+    @property
+    def mqtt_market_data(self) -> Optional[Dict[str, Any]]:
+        """
+        Override to publish controller-specific market data (e.g. best bid, best ask, spread).
+        Return None to skip publishing market data.
+        """
+        return None
+
+    @property
+    def mqtt_account_data(self) -> Optional[Dict[str, Any]]:
+        """
+        Override to publish controller-specific account data (e.g. active orders).
+        Return None to skip publishing account data.
+        """
+        return None
+
+    @property
+    def mqtt_performance_data(self) -> Optional[Dict[str, Any]]:
+        """
+        Override to publish controller-specific performance data (e.g. PnL, unrealized PnL, TDS, cashflow).
+        Return None to skip publishing performance data.
+        """
+        return None
+
+    @property
+    def mqtt_performance_signature(self) -> Optional[Any]:
+        """
+        Override to return a stable value used to decide whether performance data changed
+        enough to republish. Defaults to the full performance payload (republish on any
+        change). Return a coarser fingerprint to suppress republishing on values that tick
+        every cycle (e.g. mark-to-market prices).
+        """
+        return self.mqtt_performance_data
+
+    def publish_mqtt_data(self):
+        """
+        Publish the controller's generic data categories to MQTT. Market and account data are
+        published every tick; performance data is published only when it changes.
+        """
+        if not self.mqtt_enabled or self._mqtt_publisher is None:
+            return
+        try:
+            base = f"controllers/{self.config.id}"
+            ts = self.market_data_provider.time()
+            market = self.mqtt_market_data
+            if market is not None:
+                self._mqtt_publisher.send(f"{base}/market_data", {"timestamp": ts, **market})
+            account = self.mqtt_account_data
+            if account is not None:
+                self._mqtt_publisher.send(f"{base}/account_data", {"timestamp": ts, **account})
+            performance = self.mqtt_performance_data
+            if performance is not None:
+                signature = self.mqtt_performance_signature
+                if signature != self._last_published_performance:
+                    self._mqtt_publisher.send(f"{base}/performance_data", {"timestamp": ts, **performance})
+                    self._last_published_performance = signature
+        except Exception as e:
+            self.logger().error(f"Error publishing MQTT data: {e}", exc_info=True)

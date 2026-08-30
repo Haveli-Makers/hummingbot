@@ -69,6 +69,7 @@ class AccountEvent(Enum):
 
 class ExecutorEvent(Enum):
     EXECUTOR_INFO_UPDATE = 500
+    EXECUTOR_TERMINATED = 501
 
 
 class MarketTransactionFailureEvent(NamedTuple):

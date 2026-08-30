@@ -241,6 +241,23 @@ class CoinexExchange(ExchangePyBase):
         requested = {tp.replace("-", "").upper() for tp in trading_pairs}
         return [t for t in tickers if str(t.get("market", "")).upper() in requested]
 
+    async def get_order_book_snapshot(self, trading_pair: str) -> Dict[str, Any]:
+        """
+        Fetch a REST order-book snapshot (``/spot/depth``) for a single pair and return the
+        ``depth`` payload (``{"bids": [...], "asks": [...], ...}``). Used as a bid/ask fallback
+        when the ticker does not expose a usable price.
+        """
+        symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+        response = await self._api_get(
+            path_url=CONSTANTS.DEPTH_PATH_URL,
+            params={"market": symbol, "limit": CONSTANTS.WS_DEPTH_LIMIT, "interval": CONSTANTS.WS_DEPTH_INTERVAL},
+            is_auth_required=False,
+        )
+        data = _result(response)
+        if isinstance(data, dict):
+            return data.get("depth") or {}
+        return {}
+
     async def _get_last_traded_price(self, trading_pair: str) -> float:
         try:
             symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)

@@ -36,7 +36,7 @@ VOLUME_ORACLE_SOURCES = {
     "coindcx": CoindcxVolumeSource,
     "coindcx_perpetual": CoinDCXPerpetualVolumeSource,
     "coinex": CoinexVolumeSource,
-    "coinswitch": CoinswitchVolumeSource,
+    "coin_switch": CoinswitchVolumeSource,
     "csx": CsxVolumeSource,
     "cube": CubeVolumeSource,
     "derive": DeriveVolumeSource,

@@ -47,6 +47,9 @@ SERVER_TIME_PATH_URL = "/v1/time"
 EXCHANGE_INFO_PATH_URL = "/v1/exchange-info"
 KLINES_PATH_URL = "/v1/klines"
 DEPTH_PATH_URL = "/v1/depth"
+# Levels requested when seeding a book from REST. Matches WS_DEPTH_STREAM_SUFFIX
+# so the seed and the stream that replaces it describe the same depth.
+DEPTH_SNAPSHOT_LIMIT = 20
 # Note the hyphen and the PLURAL ``symbols`` parameter (max 50 per call);
 # "/v1/ticker/bookTicker" does not exist and 404s at the gateway.
 BOOK_TICKER_PATH_URL = "/v1/ticker/book-ticker"
@@ -80,8 +83,26 @@ WS_CONNECTIONS_LIMIT_ID = "WSConnections"
 WS_SUBSCRIPTIONS_LIMIT_ID = "WSSubscriptions"
 
 # WebSocket event types (the ``e`` field on each raw payload).
+# The SUBSCRIBE suffix and the payload's ``e`` value are NOT the same string.
+# Verified live 2026-08-31 on mainnet with a fresh listenKey per stream:
+#
+#   <SYMBOL>@depth5/10/20/50 -> {"lastUpdateId":.., "e":"depth", "s":.., bids, asks}
+#   <SYMBOL>@depth           -> {"u","s","b","B","a","A"}  i.e. TOP OF BOOK, not a
+#                               book -- subscribing to it yields frames the depth
+#                               parser cannot use, which is what the connector did.
+#   <SYMBOL>@bookTicker      -> same top-of-book shape
+#
+# So the stream we ask for is "depth20" while every frame it delivers is tagged
+# e="depth". Ajaib calls this "Partial Depth Book WS".
+WS_DEPTH_STREAM_SUFFIX = "depth20"
 WS_DEPTH_EVENT_TYPE = "depth"
 WS_TRADE_EVENT_TYPE = "trade"
+
+# Observed frame counts over a 15s window on a moving pair (ELIZAOS_IDR):
+# depth5=11, depth10=10, depth20=7, depth50=16. Deeper books update more often
+# because Ajaib suppresses any event whose UpdateId repeats, and a deeper book
+# changes more. Raise WS_DEPTH_STREAM_SUFFIX to "depth50" for fresher snapshots
+# at the cost of bandwidth.
 WS_EXECUTION_REPORT_EVENT_TYPE = "executionReport"
 
 SIDE_BUY = "BUY"

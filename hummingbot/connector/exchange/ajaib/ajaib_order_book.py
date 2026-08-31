@@ -9,9 +9,10 @@ class AjaibOrderBook(OrderBook):
     """
     Ajaib order book message parsing.
 
-    The Ajaib partial-book-depth stream (``<symbol>@depth``) pushes a full
-    snapshot of the top 20 levels every 500ms, so every depth message is treated
-    as a SNAPSHOT rather than an incremental diff.
+    The Ajaib partial-book-depth stream (``<SYMBOL>@depth20``) pushes a full
+    snapshot of the top levels, so every depth message is treated as a SNAPSHOT
+    rather than an incremental diff. Frames carry ``lastUpdateId``, ``e`` set to
+    "depth", ``s``, and ``bids``/``asks`` as [price, quantity] pairs.
     """
 
     @classmethod

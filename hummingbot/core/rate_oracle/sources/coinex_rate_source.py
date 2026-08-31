@@ -24,17 +24,7 @@ class CoinexRateSource(RateSourceBase):
 
     @async_ttl_cache(ttl=30, maxsize=1)
     async def get_prices(self, quote_token: Optional[str] = None) -> Dict[str, Decimal]:
-        """Fetch last prices for all spot trading pairs (optionally filtered by quote)."""
-        bid_ask = await self.get_bid_ask_prices(quote_token=quote_token)
-        return {trading_pair: data["mid"] for trading_pair, data in bid_ask.items()}
-
-    @async_ttl_cache(ttl=30, maxsize=1)
-    async def get_bid_ask_prices(self, quote_token: Optional[str] = None) -> Dict[str, Dict[str, Decimal]]:
-        """
-        Fetch a price snapshot for all spot pairs as {bid, ask, mid, spread}.
-
-        CoinEx's ticker has no best-bid/ask, so bid == ask == last (spread 0).
-        """
+        """Fetch last prices (ticker-based) for all spot trading pairs (optionally filtered by quote)."""
         self._ensure_exchanges()
         results: Dict[str, Dict[str, Decimal]] = {}
 
@@ -50,6 +40,59 @@ class CoinexRateSource(RateSourceBase):
                 )
                 break
             results.update(task_result)
+
+        return {trading_pair: data["mid"] for trading_pair, data in results.items()}
+
+    @async_ttl_cache(ttl=30, maxsize=1)
+    async def get_bid_ask_prices(self, quote_token: Optional[str] = None) -> Dict[str, Dict[str, Decimal]]:
+        """
+        Fetch a best bid/ask snapshot for all spot pairs as {bid, ask, mid, spread}.
+
+        CoinEx's ticker has no best-bid/ask, so bid/ask are taken from an order book
+        snapshot (``/spot/depth``) for every pair listed by MARKETS_PATH_URL.
+        """
+        self._ensure_exchanges()
+        return await self._get_coinex_order_book_prices(exchange=self._exchange, quote_token=quote_token)
+
+    @staticmethod
+    async def _get_coinex_order_book_prices(exchange: "CoinexExchange", quote_token: Optional[str] = None
+                                            ) -> Dict[str, Dict[str, Decimal]]:
+        results: Dict[str, Dict[str, Decimal]] = {}
+        if exchange is None:
+            return results
+
+        # The tradable universe comes from MARKETS_PATH_URL (drives the symbol map).
+        try:
+            symbol_map = await exchange.trading_pair_symbol_map()
+        except Exception:
+            return results
+
+        for trading_pair in symbol_map.values():
+            if quote_token is not None:
+                base, quote = trading_pair.split("-")
+                if quote != quote_token:
+                    continue
+
+            try:
+                depth = await exchange.get_order_book_snapshot(trading_pair)
+            except Exception:
+                continue
+
+            bids = depth.get("bids") or []
+            asks = depth.get("asks") or []
+            if not bids or not asks:
+                continue
+            try:
+                bid = Decimal(str(bids[0][0]))
+                ask = Decimal(str(asks[0][0]))
+            except Exception:
+                continue
+            if bid <= 0 or ask <= 0 or bid > ask:
+                continue
+
+            mid = (bid + ask) / Decimal("2")
+            spread = ((ask - bid) / mid) * Decimal("100")
+            results[trading_pair] = {"bid": bid, "ask": ask, "mid": mid, "spread": spread}
 
         return results
 

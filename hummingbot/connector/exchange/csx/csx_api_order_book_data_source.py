@@ -3,9 +3,11 @@ import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from hummingbot.connector.exchange.csx import csx_constants as CONSTANTS
+from hummingbot.connector.exchange.csx.csx_utils import unwrap_data
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.order_book_message import OrderBookMessage, OrderBookMessageType
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
+from hummingbot.core.utils.async_utils import safe_gather
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
 if TYPE_CHECKING:
@@ -20,9 +22,6 @@ class CsxAPIOrderBookDataSource(OrderBookTrackerDataSource):
     polls the public REST depth and trades endpoints on a fixed interval and
     injects synthetic SNAPSHOT / TRADE messages into the tracker queues.
     """
-
-    SNAPSHOT_POLL_INTERVAL = 30.0
-    TRADE_POLL_INTERVAL = 10.0
 
     def __init__(
         self,
@@ -121,70 +120,83 @@ class CsxAPIOrderBookDataSource(OrderBookTrackerDataSource):
     # ── Main subscription loop (REST polling) ─────────────────────────────────
 
     async def listen_for_subscriptions(self):
-        """
-        Repeatedly fetches order-book snapshots and recent trades via REST and
-        pushes them into the appropriate message queues.
-        """
+        # No WebSocket: poll the order book and public trades on independent cadences
+        # (the order book is the realtime hot path; trades can be a touch slower) so
+        # one never blocks the other.
+        await safe_gather(
+            self._poll_loop(self._fetch_order_book_snapshots, CONSTANTS.ORDER_BOOK_POLL_INTERVAL, "order book"),
+            self._poll_loop(self._fetch_public_trades, CONSTANTS.PUBLIC_TRADES_POLL_INTERVAL, "trades"),
+        )
+
+    async def _poll_loop(self, fetch_coro, interval: float, label: str):
         while True:
             try:
-                snapshot_queue = self._message_queue[self._snapshot_messages_queue_key]
-                trade_queue = self._message_queue[self._trade_messages_queue_key]
-
-                # Snapshot pass
-                for trading_pair in self._trading_pairs:
-                    try:
-                        raw = await self._request_order_book_snapshot(trading_pair)
-                        data = self._extract_depth_data(raw)
-                        ts = self._time()
-                        msg = {
-                            "trading_pair": trading_pair,
-                            "bids": data["buy"],
-                            "asks": data["sell"],
-                            "timestamp": ts * 1000,
-                        }
-                        snapshot_queue.put_nowait(msg)
-                    except Exception as exc:
-                        self.logger().warning(
-                            f"Error fetching order-book snapshot for {trading_pair}: {exc}"
-                        )
-
-                # Trade pass
-                for trading_pair in self._trading_pairs:
-                    try:
-                        try:
-                            instrument = await self._connector.exchange_symbol_associated_to_pair(
-                                trading_pair=trading_pair
-                            )
-                        except KeyError:
-                            instrument = trading_pair.replace("-", "/")
-
-                        trades_resp = await self._connector._api_get(
-                            path_url=CONSTANTS.TRADES_PATH_URL,
-                            params={"instrument": instrument},
-                            is_auth_required=False,
-                        )
-                        trades = (
-                            trades_resp
-                            if isinstance(trades_resp, list)
-                            else trades_resp.get("data", [])
-                        )
-                        for trade in trades:
-                            trade["_trading_pair"] = trading_pair
-                            trade_queue.put_nowait(trade)
-                    except Exception as exc:
-                        self.logger().warning(
-                            f"Error fetching trades for {trading_pair}: {exc}"
-                        )
-
-                await asyncio.sleep(self.SNAPSHOT_POLL_INTERVAL)
-
+                await fetch_coro()
+                await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 raise
             except Exception:
-                self.logger().exception(
-                    "Unexpected error in CSX order-book polling loop. Retrying in 5 s …"
-                )
+                self.logger().exception(f"Unexpected error in CSX {label} polling loop. Retrying in 5 s …")
                 await asyncio.sleep(5.0)
+
+    async def _fetch_order_book_snapshots(self):
+        # One depth request per pair, fired TOGETHER. At the 2s cadence a serial loop
+        # costs pairs x latency (worse through the proxy) and self-throttles further
+        # behind its own interval as pairs are added. Per-pair failures are isolated.
+        snapshot_queue = self._message_queue[self._snapshot_messages_queue_key]
+        raws = await safe_gather(
+            *(self._request_order_book_snapshot(tp) for tp in self._trading_pairs),
+            return_exceptions=True,
+        )
+        for trading_pair, raw in zip(self._trading_pairs, raws):
+            try:
+                if isinstance(raw, Exception):
+                    raise raw
+                data = self._extract_depth_data(raw)
+                ts = self._time()
+                snapshot_queue.put_nowait({
+                    "trading_pair": trading_pair,
+                    "bids": data["buy"],
+                    "asks": data["sell"],
+                    "timestamp": ts * 1000,
+                })
+            except Exception as exc:
+                self.logger().warning(f"Error fetching order-book snapshot for {trading_pair}: {exc}")
+
+    async def _fetch_public_trades(self):
+        # Concurrent for the same reason as the depth poll above.
+        trade_queue = self._message_queue[self._trade_messages_queue_key]
+        responses = await safe_gather(
+            *(self._request_public_trades(tp) for tp in self._trading_pairs),
+            return_exceptions=True,
+        )
+        for trading_pair, trades_resp in zip(self._trading_pairs, responses):
+            try:
+                if isinstance(trades_resp, Exception):
+                    raise trades_resp
+                trades = (
+                    trades_resp if isinstance(trades_resp, list) else unwrap_data(trades_resp)
+                )
+                if not isinstance(trades, list):
+                    continue
+                for trade in trades:
+                    if isinstance(trade, dict):
+                        trade["_trading_pair"] = trading_pair
+                        trade_queue.put_nowait(trade)
+            except Exception as exc:
+                self.logger().warning(f"Error fetching trades for {trading_pair}: {exc}")
+
+    async def _request_public_trades(self, trading_pair: str):
+        """GET the recent public trades for one pair. Raises on failure (caller isolates)."""
+        try:
+            instrument = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+        except KeyError:
+            instrument = trading_pair.replace("-", "/")
+        return await self._connector._api_get(
+            path_url=CONSTANTS.TRADES_PATH_URL,
+            params={"instrument": instrument},
+            is_auth_required=False,
+        )
 
     # ── Message parsers ────────────────────────────────────────────────────────
 

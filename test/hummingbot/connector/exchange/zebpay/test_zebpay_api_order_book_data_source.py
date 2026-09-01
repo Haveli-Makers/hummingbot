@@ -77,5 +77,63 @@ class ZebpayOrderBookDataSourceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({"BTC-INR": 3_000_000.0}, prices)
 
 
+class ZebpayOrderBookPollConcurrencyTests(unittest.IsolatedAsyncioTestCase):
+    """
+    The depth poll runs at a 2s cadence. Fetching pairs one after another costs
+    pairs x latency per cycle, so a serial loop self-throttles further behind its
+    own interval as pairs are added.
+    """
+
+    PAIRS = ["BTC-INR", "ETH-INR", "XRP-INR"]
+
+    def setUp(self):
+        self.connector = _make_connector()
+        self.connector._set_trading_pair_symbol_map(bidict({p: p for p in self.PAIRS}))
+        self.source = ZebpayAPIOrderBookDataSource(
+            trading_pairs=list(self.PAIRS), connector=self.connector, api_factory=MagicMock(),
+        )
+
+    @staticmethod
+    def _concurrency_tracker(result):
+        state = {"in_flight": 0, "peak": 0}
+
+        async def tracked(*args, **kwargs):
+            state["in_flight"] += 1
+            state["peak"] = max(state["peak"], state["in_flight"])
+            await asyncio.sleep(0.05)
+            state["in_flight"] -= 1
+            return result
+
+        return tracked, state
+
+    async def test_order_book_snapshots_fetched_concurrently(self):
+        tracked, state = self._concurrency_tracker(
+            {"bids": [["3000000", "0.5"]], "asks": [["3001000", "0.2"]]})
+        self.source._request_order_book_snapshot = tracked
+        await self.source._fetch_order_book_snapshots()
+        self.assertEqual(len(self.PAIRS), state["peak"], "depth snapshots were fetched sequentially")
+        self.assertEqual(len(self.PAIRS),
+                         self.source._message_queue[self.source._snapshot_messages_queue_key].qsize())
+
+    async def test_order_book_snapshot_failure_is_isolated(self):
+        async def flaky(trading_pair):
+            if trading_pair == "ETH-INR":
+                raise IOError("boom")
+            return {"bids": [["1", "1"]], "asks": [["2", "1"]]}
+
+        self.source._request_order_book_snapshot = flaky
+        await self.source._fetch_order_book_snapshots()
+        self.assertEqual(len(self.PAIRS) - 1,
+                         self.source._message_queue[self.source._snapshot_messages_queue_key].qsize())
+
+    async def test_public_trades_fetched_concurrently(self):
+        tracked, state = self._concurrency_tracker({"data": [{"id": "t1", "price": "1", "amount": "1"}]})
+        self.connector._api_get = tracked
+        await self.source._fetch_public_trades()
+        self.assertEqual(len(self.PAIRS), state["peak"], "public trades were fetched sequentially")
+        self.assertEqual(len(self.PAIRS),
+                         self.source._message_queue[self.source._trade_messages_queue_key].qsize())
+
+
 if __name__ == "__main__":
     unittest.main()

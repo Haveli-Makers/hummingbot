@@ -324,10 +324,15 @@ class AjaibExchange(ExchangePyBase):
     @staticmethod
     def _is_server_side_error(exception: Exception) -> bool:
         """
-        True for HTTP 5XX, which Ajaib documents as "the issue is on our server
+        True when the outcome of the request is UNKNOWN and the order may in fact
+        have been accepted, so the caller must reconcile rather than fail.
+
+        Covers HTTP 5XX, which Ajaib documents as "the issue is on our server
         side ... the execution status is UNKNOWN and could have been a success".
         """
         text = str(exception)
+        if "-1007" in text or "HTTP status is 408" in text:
+            return True
         return any(f"HTTP status is {code}" in text for code in range(500, 512))
 
     async def _find_order_by_client_id(self, client_order_id: str) -> Optional[Dict[str, Any]]:

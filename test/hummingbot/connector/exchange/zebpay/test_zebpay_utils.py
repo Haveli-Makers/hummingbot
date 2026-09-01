@@ -3,6 +3,7 @@ from decimal import Decimal
 
 from hummingbot.connector.exchange.zebpay.zebpay_utils import (
     ZebpayConfigMap,
+    is_empty_balance_payload,
     parse_balance_response,
     raise_for_status,
     str_to_decimal,
@@ -42,6 +43,11 @@ class ZebpayUtilsTests(unittest.TestCase):
     def test_parse_balance_response_empty(self):
         self.assertEqual({}, parse_balance_response({"data": []}))
 
+    def test_parse_balance_response_null_data(self):
+        # {"data": null} must not raise AttributeError — return an empty mapping.
+        self.assertEqual({}, parse_balance_response({"data": None}))
+        self.assertEqual({}, parse_balance_response({"data": "unexpected-string"}))
+
     def test_raise_for_status_ok(self):
         ok = {"data": {"orderId": "1"}, "statusCode": 200}
         self.assertIs(ok, raise_for_status(ok))  # no raise, returns input
@@ -52,6 +58,39 @@ class ZebpayUtilsTests(unittest.TestCase):
                     "statusDescription": "Rate should be in the range of 5694116 - 7703804"}
         with self.assertRaises(IOError):
             raise_for_status(rejected)
+
+
+class ZebpayIsEmptyBalancePayloadTests(unittest.TestCase):
+    """
+    Only a payload that POSITIVELY says "no balances" may wipe tracked balances.
+    Everything else is degenerate and must keep the last known state.
+    """
+
+    def test_empty_list_is_empty(self):
+        self.assertTrue(is_empty_balance_payload({"data": []}))
+
+    def test_empty_nested_list_is_empty(self):
+        self.assertTrue(is_empty_balance_payload({"data": {"balances": []}}))
+        self.assertTrue(is_empty_balance_payload({"data": {"assets": []}}))
+
+    def test_bare_empty_list_is_empty(self):
+        self.assertTrue(is_empty_balance_payload([]))
+
+    def test_null_data_is_not_empty(self):
+        self.assertFalse(is_empty_balance_payload({"data": None}))
+
+    def test_empty_dict_is_not_empty(self):
+        self.assertFalse(is_empty_balance_payload({"data": {}}))
+
+    def test_unparseable_non_empty_list_is_not_empty(self):
+        # The regression case: items present but with unrecognised keys. This is a
+        # list, so a "not a list" test would wrongly call it a real empty account.
+        payload = {"data": [{"symbol": "BTC", "amount": "1.0"}]}
+        self.assertEqual({}, parse_balance_response(payload))
+        self.assertFalse(is_empty_balance_payload(payload))
+
+    def test_populated_list_is_not_empty(self):
+        self.assertFalse(is_empty_balance_payload({"data": [{"currency": "BTC", "total": "1"}]}))
 
 
 class ZebpayConfigMapTests(unittest.TestCase):

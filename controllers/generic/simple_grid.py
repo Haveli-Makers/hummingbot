@@ -22,7 +22,11 @@ from hummingbot.strategy_v2.executors.simple_grid_executor.data_types import (
     SimpleGridEntryMode,
     SimpleGridExecutorConfig,
 )
-from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction
+from hummingbot.strategy_v2.models.executor_actions import (
+    CreateExecutorAction,
+    ExecutorAction,
+    StopExecutorAction,
+)
 from hummingbot.strategy_v2.models.executors import CloseType
 from hummingbot.strategy_v2.models.executors_info import ExecutorInfo
 
@@ -45,10 +49,10 @@ class SimpleGridConfig(ControllerConfigBase):
     # order_amount_quote.
     order_amount_quote: Decimal = Field(default=Decimal("100"), json_schema_extra={"is_updatable": True})
 
-    # The one distance the whole chain is built from. Both exits are measured from the leg's
-    # anchor — the price the previous leg closed at — never from the price we actually
-    # filled at. The entry rests passively inside that bracket, so a fill better than the
-    # anchor widens the take profit and narrows the stop instead of dragging both along.
+    # The one distance the whole chain is built from, and it does every job: it sets where the
+    # next entry rests, where its trigger sits, and how far the exits are from the fill. Both
+    # exits are measured from the price the leg actually FILLED at, so a long filled at F is
+    # bracketed symmetrically at F * (1 ± step).
     take_profit: Decimal = Field(default=Decimal("0.005"), json_schema_extra={"is_updatable": True})
     stop_loss: Decimal = Field(default=Decimal("0.005"), json_schema_extra={"is_updatable": True})
     time_limit: Optional[int] = Field(default=None, json_schema_extra={"is_updatable": True})
@@ -56,32 +60,17 @@ class SimpleGridConfig(ControllerConfigBase):
     # silently fall back to mid anyway. Saying it outright makes the trigger explicit.
     trigger_price_type: PriceType = PriceType.MidPrice
 
-    # Entry behaviour. Every entry is a maker order resting at the touch — a buy at the best
-    # bid, a sell at the best ask — so it earns the maker fee rather than paying the taker
-    # one. It follows the touch as the book moves, but only inside a band around the anchor:
-    # a fill outside the band would land past its own take profit or stop loss and close
-    # immediately for nothing.
-    # None derives it from the step. It has to stay well INSIDE the step: a band as wide as
-    # the step lets an entry fill at the edge with its take profit already on top of it and
-    # its stop loss two steps away, which is a losing bracket before the leg even starts.
-    entry_band_pct: Optional[Decimal] = Field(default=None, json_schema_extra={"is_updatable": True})
-    entry_band_fraction_of_step: Decimal = Field(default=Decimal("0.2"),
-                                                 json_schema_extra={"is_updatable": True})
-    entry_requote_pct: Decimal = Field(default=Decimal("0.0005"), json_schema_extra={"is_updatable": True})
-    entry_price_improvement_pct: Decimal = Field(default=Decimal("0"), json_schema_extra={"is_updatable": True})
-    # A maker entry can rest unfilled indefinitely. Without a timeout the leg never ends, the
-    # controller never opens another, and the anchor can never be refreshed.
+    # Entry behaviour. The opening order rests one step in our favour of where the previous
+    # leg ended; one step against it is a trigger. If the market reaches the trigger first we
+    # open there instead, crossing to do it. An order a full step from the market cannot
+    # cross by accident, so the resting side is reliably a maker fill and only the trigger
+    # ever pays taker.
+    #
+    # The very first leg has no previous exit to measure from, so it rests at the touch.
+    #
+    # An entry can still sit unfilled if the price stays between the two prices, so the
+    # timeout is what ends a leg that is going nowhere.
     entry_timeout: Optional[int] = Field(default=300, json_schema_extra={"is_updatable": True})
-    # When that timeout fires having traded nothing, start the next leg from wherever the
-    # market is now instead of from the stale anchor. Without this the band and the anchor
-    # deadlock each other: the anchor only moves on a trade, and no trade can happen while
-    # the price sits outside the band around that anchor. Sitting out a trend is intended;
-    # never coming back once it ends is not.
-    reanchor_on_entry_timeout: bool = Field(default=True, json_schema_extra={"is_updatable": True})
-    # Re-anchoring deliberately allows an entry right after a big move, which is the shape of
-    # market this strategy loses in. The pause is what stops it re-entering straight into the
-    # middle of a run.
-    cooldown_after_reanchor: int = Field(default=60, json_schema_extra={"is_updatable": True})
 
     # Stop loss behaviour. The stop level is watched, then left through a maker limit resting
     # at the touch on the exit side and followed down the book. Bounded by the drift cap,
@@ -98,6 +87,13 @@ class SimpleGridConfig(ControllerConfigBase):
     cancel_settle_delay: float = Field(default=0.25, json_schema_extra={"is_updatable": True})
     exit_retry_max_delay: float = Field(default=2.0, json_schema_extra={"is_updatable": True})
 
+    # "Insufficient funds" on a reduce-only close is not a transient: the margin is held by an
+    # exit we already asked the venue to cancel and were told was gone. Replacing it faster
+    # cannot help, so after this many refusals in a row the executor waits for that order to
+    # resolve instead of sending another.
+    collateral_refusal_wait: float = Field(default=3.0, json_schema_extra={"is_updatable": True})
+    collateral_refusals_before_waiting: int = Field(default=2, json_schema_extra={"is_updatable": True})
+
     stop_loss_chase: bool = Field(default=True, json_schema_extra={"is_updatable": True})
     # Ticks inside the OPPOSITE touch: a sell one tick above the best bid, a buy one tick
     # below the best ask. The most aggressive a maker order can be — best offer in the book,
@@ -107,14 +103,14 @@ class SimpleGridConfig(ControllerConfigBase):
     stop_loss_requote_pct: Decimal = Field(default=Decimal("0.0005"), json_schema_extra={"is_updatable": True})
     stop_loss_max_drift_pct: Decimal = Field(default=Decimal("0.001"), json_schema_extra={"is_updatable": True})
 
-    # Direction. The opening leg of a perpetual run rests a maker order on each side of the
-    # book and lets the market pick; whichever fills first is the side for the rest of the
-    # run. Spot can only ever buy, so it is long from the start and stays there.
+    # Direction. Between legs the account is flat, so a run that opens with a buy is long or
+    # flat for its whole life, and one that opens with a sell is short or flat. The first
+    # order fixes the bias and there is nothing to re-decide afterwards.
     initial_entry_mode: SimpleGridEntryMode = SimpleGridEntryMode.BOTH_OCO
-    lock_side_after_first_fill: bool = Field(default=True, json_schema_extra={"is_updatable": True})
 
+    # A pause means standing flat while the grid wants to be working, so both default to none.
     cooldown_after_take_profit: int = Field(default=0, json_schema_extra={"is_updatable": True})
-    cooldown_after_stop_loss: int = Field(default=60, json_schema_extra={"is_updatable": True})
+    cooldown_after_stop_loss: int = Field(default=0, json_schema_extra={"is_updatable": True})
 
     # Risk. Two independent halts, either one stops new legs being opened. Nothing is
     # force-closed; an open leg is left to finish on its own barriers.
@@ -131,7 +127,31 @@ class SimpleGridConfig(ControllerConfigBase):
     #    every tick against a venue that is refusing them, logging one error a second
     #    forever — which is what a stranded position looks like from the inside, because the
     #    position holds the margin the next leg needs.
+    #
+    #    Counts only legs the VENUE refused. A leg stopped by our own budget check never
+    #    reached the exchange and is counted by time instead — see below.
     max_consecutive_failed_legs: int = Field(default=5, json_schema_extra={"is_updatable": True})
+
+    # 3b. Our own budget check keeps refusing to open a leg.
+    #
+    #     Counted in seconds rather than in legs, because the two causes look identical per
+    #     leg and differ only in how long they last. The check reads the connector's CACHED
+    #     balance, and that cache is refreshed by REST every LONG_POLL_INTERVAL — 120s —
+    #     whenever the private websocket is alive. So margin released just now can stay
+    #     invisible for a long time, and a controller retrying every second racks up refusals
+    #     at a rate that says nothing about whether the money is really there.
+    #
+    #     On 2026-09-02 that halted a run holding 904 INR against a 713 INR leg. Five refusals
+    #     in five seconds, every one of them a stale read of a wallet that was already full.
+    #
+    #     A genuine shortage does not clear; a stale read does, at the next poll. Anything past
+    #     one full poll interval is therefore real, and worth halting for.
+    insufficient_balance_grace_seconds: float = Field(default=180.0,
+                                                      json_schema_extra={"is_updatable": True})
+    #     How long to wait before trying again after one. The check reads a cached wallet, so
+    #     the answer cannot change until that cache is re-read and retrying every tick only
+    #     produces an error line every tick.
+    retry_after_insufficient_balance: int = Field(default=5, json_schema_extra={"is_updatable": True})
 
     # 4. The venue holds a position no leg claims. The stop loss lives in this process, so an
     #    unowned position has nothing watching it — the single most dangerous state this
@@ -158,13 +178,6 @@ class SimpleGridConfig(ControllerConfigBase):
             raise ValueError("take_profit, stop_loss and order_amount_quote must be greater than zero")
         return value
 
-    @property
-    def effective_entry_band(self) -> Optional[Decimal]:
-        """How far from the anchor an entry may rest, defaulting to a fraction of the step."""
-        if self.entry_band_pct is not None:
-            return self.entry_band_pct
-        return self.take_profit * self.entry_band_fraction_of_step
-
     def update_markets(self, markets: MarketDict) -> MarketDict:
         return markets.add_or_update(self.connector_name, self.trading_pair)
 
@@ -182,8 +195,12 @@ class SimpleGrid(ControllerBase):
         super().__init__(config, *args, **kwargs)
         self.config = config
 
-        self._anchor_price: Optional[Decimal] = None
-        self._locked_side: Optional[TradeType] = None
+        # Where the previous leg ended. The next leg's two entry prices hang off it.
+        self._reference_price: Optional[Decimal] = None
+        # The side every leg opens on. Undecided until the first one trades: an opening leg
+        # may offer both, but once one has filled the account is long-or-flat (or
+        # short-or-flat) for the rest of the run, so there is nothing left to choose.
+        self._bias_side: Optional[TradeType] = None
         self._processed_executor_ids: Set[str] = set()
 
         self._realized_pnl_quote: Decimal = Decimal("0")
@@ -192,12 +209,13 @@ class SimpleGrid(ControllerBase):
         self._cooldown_seconds: int = 0
 
         self._consecutive_failed_legs: int = 0
+        # When our own budget check first refused a leg, cleared the moment one reaches the
+        # venue. A timestamp rather than a count: see insufficient_balance_grace_seconds.
+        self._insufficient_balance_since: Optional[float] = None
         # Reconciliation against what the venue actually holds.
         self._seen_flat_since_start: bool = False
         self._orphan_since: Optional[float] = None
         self._orphan_flatten_sent: bool = False
-        self._reanchor_pending: bool = False
-        self._reanchors: int = 0
 
         self._legs_closed: int = 0
         self._wins: int = 0
@@ -245,12 +263,30 @@ class SimpleGrid(ControllerBase):
     def active_executors(self) -> List[ExecutorInfo]:
         return self.filter_executors(self.executors_info, lambda e: e.is_active)
 
+    def unfinished_executors(self) -> List[ExecutorInfo]:
+        """
+        Every leg that has not reached TERMINATED — including the ones still closing.
+
+        ``is_active`` covers RUNNING and NOT_STARTED only, so a leg that has hit its stop and
+        is working its way out does not appear there. For most controllers that distinction
+        does not matter. Here it decides whether the strategy works at all: this one is flat
+        BETWEEN legs, and a closing leg still owns both the position and the margin behind it.
+
+        Starting the next leg off ``is_active`` opens it while the old one still holds the
+        collateral. The venue refuses it for want of funds, the executor reports a leg that
+        failed before trading, and five of those in a row trip the halt — which is exactly
+        what ended the 16:53 run on 2026-09-02: leg 2 spent eight seconds failing to place its
+        exit, and the controller spawned five doomed legs inside that window, each one asking
+        for the same price leg 2 had already taken.
+        """
+        return self.filter_executors(self.executors_info, lambda e: not e.is_done)
+
     # ------------------------------------------------------------------ main loop
 
     async def update_processed_data(self):
         self.processed_data = {
-            "anchor_price": self._anchor_price,
-            "locked_side": self._locked_side,
+            "anchor_price": self._reference_price,
+            "reference_price": self._reference_price,
             "realized_pnl_quote": self._realized_pnl_quote,
             "drawdown_quote": self.current_drawdown_quote,
             "halted": self.is_halted,
@@ -265,8 +301,15 @@ class SimpleGrid(ControllerBase):
             return reconciliation
 
         if self.is_halted or self.config.manual_kill_switch:
-            return []
-        if len(self.active_executors()) > 0:
+            # The account is only flat between legs, so a halt that leaves an open leg
+            # running leaves a position with nothing watching it — and under this design its
+            # exit would simply open the next one. Close it instead.
+            return [StopExecutorAction(controller_id=self.config.id, executor_id=executor.id,
+                                       keep_position=False)
+                    for executor in self.active_executors()]
+        # Not active_executors: a leg that is still closing has not given the margin back yet,
+        # and the next leg cannot be funded until it has.
+        if len(self.unfinished_executors()) > 0:
             return []
         if not self._cooldown_elapsed():
             return []
@@ -299,12 +342,11 @@ class SimpleGrid(ControllerBase):
                                                       CloseType.INSUFFICIENT_BALANCE,
                                                       CloseType.FAILED))
             if opened and close_price:
-                self._anchor_price = Decimal(str(close_price))
-            if opened and side is not None and self.config.lock_side_after_first_fill \
-                    and self._locked_side is None:
-                self._locked_side = side
-                self.logger().info(f"SimpleGrid locked to {side.name} for the rest of the run")
-
+                self._reference_price = Decimal(str(close_price))
+            if opened and side is not None and self._bias_side is None:
+                self._bias_side = side
+                self.logger().info(
+                    f"SimpleGrid is {side.name}-or-flat for the rest of the run")
             if opened:
                 self._realized_pnl_quote += executor.net_pnl_quote
                 self._peak_pnl_quote = max(self._peak_pnl_quote, self._realized_pnl_quote)
@@ -315,18 +357,32 @@ class SimpleGrid(ControllerBase):
                 elif executor.close_type == CloseType.STOP_LOSS:
                     self._losses += 1
 
-            # An entry that timed out having filled nothing is the one case where the chain
-            # is allowed to start somewhere the market chose rather than somewhere a trade
-            # ended. It is a fresh start, not a continuation, so it goes through here rather
-            # than through close_price above — that price is just the current mid and means
-            # nothing as a link in the chain.
+            # A timed-out entry does NOT move the reference either — it is covered by the
+            # rule above, and deliberately so. The two prices bracket the market by a step
+            # either side, so a price that reaches neither is simply a price still inside the
+            # grid; re-placing the same pair is the right answer, and re-anchoring on the mid
+            # would walk the grid along with a market that has not actually gone anywhere.
             # A leg that failed before trading tells us the venue is refusing us, not that
             # the market moved. A leg that failed AFTER trading is worse: its position may
             # still be open, and every later leg would be stacked on top of it.
             if opened:
                 self._consecutive_failed_legs = 0
-            elif executor.close_type in (CloseType.INSUFFICIENT_BALANCE, CloseType.FAILED):
+            elif executor.close_type == CloseType.FAILED:
                 self._consecutive_failed_legs += 1
+
+            # INSUFFICIENT_BALANCE is our own budget check, not the venue's answer — no order
+            # was ever sent. It reads a balance cache that only refreshes every LONG_POLL_
+            # INTERVAL while the websocket is up, so a leg refused a second after margin was
+            # released says nothing about whether the money is there. Counting those alongside
+            # real venue rejections is what halted the 17:46 run on 2026-09-02 with a full
+            # wallet. Time tells the two apart where a count cannot: a stale read clears at the
+            # next poll, a real shortage does not.
+            if executor.close_type == CloseType.INSUFFICIENT_BALANCE:
+                if self._insufficient_balance_since is None:
+                    self._insufficient_balance_since = self.market_data_provider.time()
+            else:
+                # Any other outcome means an order did reach the venue, so funding was fine.
+                self._insufficient_balance_since = None
             if executor.close_type == CloseType.FAILED and executor.filled_amount_quote > Decimal("0"):
                 self._halt_reason = (
                     f"leg {executor.id} failed after trading {executor.filled_amount_quote:.4f} "
@@ -334,12 +390,8 @@ class SimpleGrid(ControllerBase):
                     f"hand before restarting")
                 self.logger().error(f"SimpleGrid halted: {self._halt_reason}")
 
-            timed_out_unfilled = (not opened and executor.close_type == CloseType.EXPIRED)
-            if timed_out_unfilled and self.config.reanchor_on_entry_timeout:
-                self._reanchor_pending = True
-
             self._last_close_timestamp = executor.close_timestamp or self.market_data_provider.time()
-            self._cooldown_seconds = self._cooldown_for(executor.close_type, timed_out_unfilled)
+            self._cooldown_seconds = self._cooldown_for(executor.close_type)
             self._evaluate_halt_conditions()
 
     # ------------------------------------------------------------------ reconciliation
@@ -458,11 +510,16 @@ class SimpleGrid(ControllerBase):
         except Exception:
             return Decimal("0")
 
-    def _cooldown_for(self, close_type: Optional[CloseType], timed_out_unfilled: bool) -> int:
-        if timed_out_unfilled and self.config.reanchor_on_entry_timeout:
-            return self.config.cooldown_after_reanchor
+    def _cooldown_for(self, close_type: Optional[CloseType]) -> int:
         if close_type == CloseType.STOP_LOSS:
             return self.config.cooldown_after_stop_loss
+        if close_type == CloseType.INSUFFICIENT_BALANCE:
+            # Retrying this one at tick speed cannot help. The budget check reads a cached
+            # wallet, so the answer is identical every tick until the cache is re-read, and
+            # the only thing a new leg per second produces is one error line per second —
+            # 56 of them on 2026-09-03 before the run was stopped by hand. Waiting gives the
+            # refresh time to land and turns the storm into a handful of lines.
+            return self.config.retry_after_insufficient_balance
         return self.config.cooldown_after_take_profit
 
     def _evaluate_halt_conditions(self):
@@ -480,6 +537,15 @@ class SimpleGrid(ControllerBase):
                                  f"position still holding the margin the next leg needs")
             self.logger().error(f"SimpleGrid halted: {self._halt_reason}")
             return
+        if self._insufficient_balance_since is not None:
+            starved = self.market_data_provider.time() - self._insufficient_balance_since
+            if starved >= self.config.insufficient_balance_grace_seconds:
+                self._halt_reason = (
+                    f"no leg has been affordable for {starved:.0f}s. That is longer than a "
+                    f"balance refresh, so it is a real shortage rather than a stale cache — "
+                    f"check the wallet and whether something is still holding margin")
+                self.logger().error(f"SimpleGrid halted: {self._halt_reason}")
+                return
         limit = self.loss_limit_quote
         if limit is not None and self._realized_pnl_quote <= -limit:
             self._halt_reason = (f"loss {self._realized_pnl_quote:.4f} reached the threshold "
@@ -503,20 +569,10 @@ class SimpleGrid(ControllerBase):
         if not mid_price or mid_price <= Decimal("0"):
             return None
 
-        # The chain hangs off the anchor: where the previous leg closed, or the current mid
-        # on the very first leg. Both exits are measured from it, and the entry may only rest
-        # within a band around it.
-        if self._reanchor_pending:
-            previous = self._anchor_price
-            self._anchor_price = mid_price
-            self._reanchor_pending = False
-            self._reanchors += 1
-            self.logger().info(
-                f"SimpleGrid re-anchored from {previous} to {mid_price} after an entry timed "
-                f"out unfilled; the price had left the band around the old anchor")
-
-        anchor = self._anchor_price if self._anchor_price is not None else mid_price
-        amount = self.config.order_amount_quote / anchor
+        # The chain hangs off where the previous leg ended. The very first leg has nothing
+        # to measure from and rests at the touch instead, so it is sized off the mid.
+        reference = self._reference_price
+        amount = self.config.order_amount_quote / (reference if reference is not None else mid_price)
         return SimpleGridExecutorConfig(
             timestamp=self.market_data_provider.time(),
             controller_id=self.config.id,
@@ -524,13 +580,12 @@ class SimpleGrid(ControllerBase):
             trading_pair=self.config.trading_pair,
             entry_mode=self._next_entry_mode(),
             amount=amount,
-            entry_price=anchor,
-            entry_band_pct=self.config.effective_entry_band,
-            entry_requote_pct=self.config.entry_requote_pct,
-            entry_price_improvement_pct=self.config.entry_price_improvement_pct,
+            entry_reference_price=reference,
             entry_timeout=self.config.entry_timeout,
             cancel_settle_delay=self.config.cancel_settle_delay,
             exit_retry_max_delay=self.config.exit_retry_max_delay,
+            collateral_refusal_wait=self.config.collateral_refusal_wait,
+            collateral_refusals_before_waiting=self.config.collateral_refusals_before_waiting,
             trigger_price_type=self.config.trigger_price_type,
             barriers=SimpleGridBarriers(
                 take_profit=self.config.take_profit,
@@ -553,14 +608,15 @@ class SimpleGrid(ControllerBase):
         """
         Which side(s) to offer.
 
-        Spot can only ever go long. A perpetual opens with a maker order on each side of the
-        book and lets the market decide which one gets hit; from then on the run stays on
-        that side, so every later leg rests a single order.
+        Every leg opens on the same side, because between legs the account is flat: a run
+        that opens with a buy is long or flat for its whole life. An opening leg may offer
+        both sides and let the market pick, but only until something fills. Spot can only
+        ever go long.
         """
         if not self.is_perpetual:
             return SimpleGridEntryMode.LONG_ONLY
-        if self._locked_side is not None and self.config.lock_side_after_first_fill:
-            return (SimpleGridEntryMode.LONG_ONLY if self._locked_side == TradeType.BUY
+        if self._bias_side is not None:
+            return (SimpleGridEntryMode.LONG_ONLY if self._bias_side == TradeType.BUY
                     else SimpleGridEntryMode.SHORT_ONLY)
         return self.config.initial_entry_mode
 
@@ -575,71 +631,54 @@ class SimpleGrid(ControllerBase):
         active = [info for info in self.executors_info if info.is_active]
         info = active[0].custom_info if active else {}
 
-        base = self._anchor_price if self._anchor_price is not None else mid_price
-        anchor = f"{base:.6f}"
-        if self._anchor_price is None:
-            anchor += " (mid, no leg closed yet)"
+        base = self._reference_price if self._reference_price is not None else mid_price
+        reference = f"{base:.6f}"
+        if self._reference_price is None:
+            reference += " (mid, no leg closed yet)"
 
-        # Read the bracket off the live executor, which freezes it when the leg opens.
-        # Recomputing it here from the current mid would show the exits chasing the market.
-        tp_price = info.get("take_profit_price") or base * (1 + self.config.take_profit)
-        sl_price = info.get("stop_loss_price") or base * (1 - self.config.stop_loss)
+        step_tp, step_sl = self.config.take_profit, self.config.stop_loss
+        buying = self._next_entry_mode() != SimpleGridEntryMode.SHORT_ONLY
 
-        # Nothing sits at a level any more — the entries rest at the touch — so the useful
-        # thing to show is where our orders actually are, and whether the band is holding
-        # them back. Without this there is no way to tell working from stuck.
+        # What is actually in the book, and what would make it move. Nothing about this is
+        # visible from the outside otherwise: one order rests at a price a step away, and the
+        # other price is only watched.
         resting = info.get("resting_entries") or {}
-        band = self.config.effective_entry_band
-        # How far the market has wandered from the anchor. Nothing rests in the book while
-        # the price is outside the band, so without this number a strategy that has been
-        # left behind by a trend looks identical to one that is simply waiting.
-        drift = abs(mid_price - base) / base if base else None
         if info.get("stop_loss_triggered"):
             working = ["stop loss triggered — leaving passively at the touch"]
+        elif info.get("take_profit_price"):
+            working = [f"holding | take profit resting at {Decimal(str(info['take_profit_price'])):.6f}",
+                       f"stop watched at {Decimal(str(info['stop_loss_price'])):.6f}"]
         elif resting:
-            working = [f"{side.lower()} resting at {Decimal(str(price)):.6f}"
-                       for side, price in resting.items()]
+            entry_rest = ", ".join(f"{s.lower()} {Decimal(str(p)):.6f}" for s, p in resting.items())
+            trigger = base * (1 + step_sl) if buying else base * (1 - step_sl)
+            working = [f"flat | entry resting at {entry_rest}",
+                       f"trigger watched at {trigger:.6f}"]
         elif active:
-            working = ["nothing resting — price is outside the entry band, waiting"]
+            working = ["flat | entry not placed yet"]
         else:
             working = ["no leg open"]
-        if band is not None:
-            working.append(f"band ±{band:.2%}")
-        if drift is not None:
-            working.append(f"price is {drift:.2%} from the anchor")
 
-        side = self._locked_side.name if self._locked_side else (
-            "both (opening leg)" if self.is_perpetual else "BUY")
+        side = "BUY" if buying else "SELL"
+        if self._bias_side is None and self.is_perpetual \
+                and self.config.initial_entry_mode == SimpleGridEntryMode.BOTH_OCO:
+            side = "both (opening leg)"
         actual_str = f"{actual:.2%}" if actual is not None else "n/a"
         loss_str = f"{self._realized_pnl_quote:.4f}"
         loss_str += f" / threshold -{limit:.4f}" if limit is not None else " (no threshold set)"
 
         lines = [
             f"Simple Grid | {self.config.connector_name} | {self.config.trading_pair}",
-            f"  Mid: {mid_price:.6f} | Anchor: {anchor} | Side: {side}",
+            f"  Mid: {mid_price:.6f} | Last exit: {reference} | Side: {side}",
             f"  Working: {' | '.join(working)}",
-            f"  TP: {tp_price:.6f} ({self.config.take_profit:.4%}) | "
-            f"SL: {sl_price:.6f} ({self.config.stop_loss:.4%}) | "
+            f"  Step: {step_tp:.4%} up / {step_sl:.4%} down | "
             f"Amount/leg: {self.config.order_amount_quote}",
             f"  Legs closed: {self._legs_closed} | TP: {self._wins} | SL: {self._losses} | "
-            f"Re-anchors: {self._reanchors} | Realised PnL: {self._realized_pnl_quote:.4f}",
+            f"Realised PnL: {self._realized_pnl_quote:.4f}",
             # Printed side by side deliberately: the configuration only makes money if the
             # actual rate stays above the break-even one.
             f"  Win rate needed: {self.break_even_win_rate:.2%} (before fees) | actual: {actual_str}",
             f"  Realised: {loss_str}",
         ]
-        # A mean-reverting entry only works near the anchor, and the anchor only moves when
-        # something trades. Once a trend carries the price out of the band the strategy can
-        # sit there indefinitely with nothing resting and nothing to report — so say so.
-        if band is not None and drift is not None and drift > band * Decimal("3") \
-                and not self.is_halted:
-            if self.config.reanchor_on_entry_timeout and self.config.entry_timeout:
-                lines.append(f"  Adrift — the price is {drift:.2%} from the anchor "
-                             f"({band:.2%} band); re-anchoring in up to "
-                             f"{self.config.entry_timeout}s")
-            else:
-                lines.append(f"  STALE — the price has been {drift:.2%} from the anchor "
-                             f"({band:.2%} band); no leg can open until it comes back")
         if self.is_halted:
             lines.append(f"  HALTED — {self._halt_reason}")
         elif len(self.active_executors()) == 0 and not self._cooldown_elapsed():

@@ -29,9 +29,10 @@ class SimpleGridBarriers(BaseModel):
     Deliberately independent of the shared TripleBarrierConfig: this executor must be able
     to grow its own fields without editing a model that position/grid/DCA executors rely on.
 
-    Both distances are measured from the leg's anchor, not from the price we actually filled
-    at. A maker entry fills inside the bracket, so a better fill widens the take profit and
-    narrows the stop rather than dragging both along with it.
+    Both distances are measured from the price the leg actually FILLED at, so the bracket is
+    symmetric around the fill: a long filled at F takes profit at F * (1 + take_profit) and
+    stops at F * (1 - stop_loss). What the entry was aiming at before it filled does not
+    enter into it — the risk and the reward are the ones the position really has.
     """
     take_profit: Decimal
     stop_loss: Decimal
@@ -121,8 +122,20 @@ class SimpleGridBarriers(BaseModel):
 
 class SimpleGridExecutorConfig(ExecutorConfigBase):
     """
-    One leg of the simple grid: a maker entry resting at the touch, then a take profit and a
-    stop loss measured from the anchor.
+    One leg of the simple grid: open a position, then close it one step either way.
+
+    A leg is a round trip. Between legs the account is flat, so the order sequence across
+    legs alternates buy, sell, buy, sell — one order per state change, all the same size.
+
+    Both the entry and the exit are a fixed step from a reference price, and both work the
+    same way: a resting limit at the favourable price, and a watched trigger at the
+    unfavourable one.
+
+        FLAT, reference P   rest BUY at P - step   |  trigger: price reaches P + step
+        LONG at F           rest SELL at F + step  |  trigger: price reaches F - step
+
+    The resting order is always a full step away from the market, so it cannot cross by
+    accident and is reliably a maker fill. Only a triggered order ever pays taker.
 
     The controller owns where the grid sits and when the next leg starts; this config
     describes a single leg in isolation.
@@ -133,29 +146,12 @@ class SimpleGridExecutorConfig(ExecutorConfigBase):
     entry_mode: SimpleGridEntryMode = SimpleGridEntryMode.LONG_ONLY
     amount: Decimal
 
-    # The anchor: the price the whole leg is measured from. The take profit and stop loss
-    # hang off it, and the entry may only rest within a band around it. None means use the
-    # live touch price when the leg starts.
-    entry_price: Optional[Decimal] = None
-
-    # The entry rests passively at the touch — a buy at the best bid, a sell at the best ask
-    # — so it earns the maker fee instead of paying the taker one. It sits INSIDE the
-    # bracket, which is what makes an anchor-measured take profit and stop loss reachable.
+    # Where the previous leg ended. The entry's two prices are one step either side of it:
+    # a resting order at the favourable price, a trigger at the unfavourable one.
     #
-    # How far from the touch to rest. Zero means join the touch exactly; a positive value
-    # improves on it by that fraction of the price to gain queue priority.
-    entry_price_improvement_pct: Decimal = Decimal("0")
-
-    # Follow the touch as the book moves, but only re-place once it has drifted this far
-    # from our resting price. Without a threshold every tick of the book is a cancel and a
-    # re-post.
-    entry_requote_pct: Decimal = Decimal("0.0005")
-
-    # The entry may never rest further than this from the anchor. Beyond it the order is
-    # pulled and we wait for the price to come back, because a fill out there would land
-    # already past its own take profit or stop loss and close instantly for nothing. None
-    # disables the band, which is only sensible in tests.
-    entry_band_pct: Optional[Decimal] = Decimal("0.001")
+    # None means there is no previous leg — the very first one has nothing to measure from,
+    # so it rests at the live touch instead and has no trigger.
+    entry_reference_price: Optional[Decimal] = None
 
     # Give up if the entry is never filled within this many seconds.
     entry_timeout: Optional[int] = None
@@ -182,6 +178,26 @@ class SimpleGridExecutorConfig(ExecutorConfigBase):
     # worst thing this executor does, so the ceiling stays low enough to keep trying often.
     exit_retry_max_delay: float = 2.0
 
+    # How long to stand down once the venue has refused a close for want of collateral twice
+    # in a row.
+    #
+    # That refusal is not a transient and it is not about our order: a reduce-only close is
+    # refused for funds when a PREVIOUS exit is still holding the margin — an order we asked
+    # to cancel and were told was gone. Replacing it faster cannot help, because the thing in
+    # the way is the replacement's own predecessor. It resolves when that order does, one way
+    # or the other, and the only useful thing to do meanwhile is wait for it.
+    #
+    # On 2026-09-02 the executor read the refusal as a transient and sent eleven replacements
+    # in eight seconds, exhausting its retries; the cancelled order then filled by itself, as
+    # a maker, at a better price than any of them asked for.
+    collateral_refusal_wait: float = 3.0
+
+    # How many of those refusals in a row before that longer wait kicks in. The first one is
+    # genuinely ambiguous — cancel_settle_delay exists because the venue frees collateral a
+    # moment after it confirms the cancel — so one refusal is treated as the ordinary race it
+    # usually is, and only a second says the order never went away.
+    collateral_refusals_before_waiting: int = 2
+
     # On a partial fill the barriers arm against whatever filled; the unfilled remainder
     # is cancelled by default so take profit and stop loss stay pinned to one entry price.
     cancel_remainder_on_partial_fill: bool = True
@@ -203,25 +219,19 @@ class SimpleGridExecutorConfig(ExecutorConfigBase):
             raise ValueError("amount must be greater than zero")
         return value
 
-    @field_validator("cancel_settle_delay", "exit_retry_max_delay")
+    @field_validator("cancel_settle_delay", "exit_retry_max_delay", "collateral_refusal_wait")
     @classmethod
     def validate_delays(cls, value: float) -> float:
         if value < 0:
             raise ValueError("retry delays cannot be negative")
         return value
 
-    @field_validator("entry_price_improvement_pct", "entry_requote_pct")
+    @field_validator("collateral_refusals_before_waiting")
     @classmethod
-    def validate_non_negative(cls, value: Decimal) -> Decimal:
-        if value < Decimal("0"):
-            raise ValueError("entry price improvement and requote distances cannot be negative")
-        return value
-
-    @field_validator("entry_band_pct")
-    @classmethod
-    def validate_band(cls, value: Optional[Decimal]) -> Optional[Decimal]:
-        if value is not None and value <= Decimal("0"):
-            raise ValueError("entry_band_pct must be greater than zero, or None to disable the band")
+    def validate_refusal_threshold(cls, value: int) -> int:
+        # Zero would stand down on the ordinary settle race the backoff already handles.
+        if value < 1:
+            raise ValueError("collateral_refusals_before_waiting must be at least 1")
         return value
 
     def sides(self):

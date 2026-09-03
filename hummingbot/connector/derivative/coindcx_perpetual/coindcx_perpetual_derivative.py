@@ -576,6 +576,22 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
         if isinstance(response, dict):
             code = response.get("code", response.get("status"))
             if str(response.get("message", "")).lower() == "success" or code in (200, "200"):
+                # The ONLY place a cancel we initiated can ask for the released margin to be
+                # re-read.
+                #
+                # On success the framework builds the CANCELED OrderUpdate itself, in
+                # _execute_order_cancel_and_process_update, and hands it straight to the order
+                # tracker — never passing through _push_order_update, which is where settling
+                # orders normally trigger a balance refresh. And a later venue frame repeating
+                # CANCELED does reach that method, but its state already matches the tracker's,
+                # so it returns on the dedupe check one line before the refresh.
+                #
+                # The result is that cancelling frees collateral the connector does not learn
+                # about until its next scheduled poll — LONG_POLL_INTERVAL, 120s, whenever the
+                # websocket is alive. On 2026-09-03 that made the budget checker refuse a
+                # 6.99 USDT leg against a 9.11 USDT wallet, once a second for 56 seconds, until
+                # the run was stopped by hand.
+                self._refresh_balances_soon(delay=CONSTANTS.BALANCE_REFRESH_AFTER_CANCEL_DELAY)
                 return True
         raise IOError(f"Unexpected response cancelling order {exchange_order_id}: {response}")
 
@@ -1162,27 +1178,36 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
         if update.new_state in (OrderState.FILLED, OrderState.CANCELED, OrderState.FAILED):
             self._refresh_balances_soon()
 
-    def _refresh_balances_soon(self):
+    def _refresh_balances_soon(self, delay: float = 0.0):
         """
         Re-read balances as soon as an order settles.
 
         Closing a position releases margin, but the connector only learns that on its next
         scheduled poll — until then a budget check sees the pre-close figure and refuses
         an order the wallet can afford. Orders settle rarely enough for this to be cheap.
+
+        ``delay`` waits before reading, for the callers where the venue frees the collateral
+        slightly after it reports the order gone.
         """
         if not self._trading_required:
             return
         if self._balance_refresh_task is not None and not self._balance_refresh_task.done():
             return
-        self._balance_refresh_task = safe_ensure_future(self._refresh_balances())
+        self._balance_refresh_task = safe_ensure_future(self._refresh_balances(delay))
 
-    async def _refresh_balances(self):
+    async def _refresh_balances(self, delay: float = 0.0):
         try:
+            if delay > 0:
+                await self._sleep(delay)
             await self._update_balances()
         except asyncio.CancelledError:
             raise
         except Exception as exception:
             self.logger().debug(f"Post-settlement balance refresh failed: {exception}")
+
+    async def _sleep(self, delay: float):
+        """Seam for tests, which must not wait out a real delay."""
+        await asyncio.sleep(delay)
 
     def _apply_fills(self, fills: Optional[List[Any]], tracked_order: InFlightOrder):
         """Apply any fills on a payload. Safe to repeat: trade updates dedupe on trade id."""

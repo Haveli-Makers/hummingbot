@@ -262,6 +262,46 @@ class CoindcxPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
         self.exchange._api_post = AsyncMock(side_effect=AssertionError("should not call the API"))
         self.assertFalse(await self.exchange._place_cancel("haveli-1", self._order(exchange_order_id=None)))
 
+    async def test_a_confirmed_cancel_re_reads_the_wallet(self):
+        """
+        Cancelling frees collateral, and this is the only place we can ask to see it.
+
+        On success the framework builds the CANCELED OrderUpdate itself and hands it to the
+        order tracker, so it never passes through _push_order_update where settling orders
+        normally trigger a refresh; and a later venue frame repeating CANCELED returns on that
+        method's dedupe check one line before the refresh. Without this call the connector
+        keeps the pre-cancel wallet until its next scheduled poll — up to 120s with the
+        websocket alive.
+
+        Live on 2026-09-03: a 6.99 USDT leg refused against a 9.11 USDT wallet, once a second
+        for 56 seconds, until the run was stopped by hand.
+        """
+        self.exchange._trading_required = True
+        self.exchange._api_post = AsyncMock(return_value={"message": "success", "status": 200, "code": 200})
+        self.exchange._update_balances = AsyncMock()
+        self.exchange._sleep = AsyncMock()
+
+        self.assertTrue(await self.exchange._place_cancel("haveli-1", self._order()))
+        await self.exchange._balance_refresh_task
+
+        self.exchange._update_balances.assert_awaited_once()
+        # Read AFTER a wait, not on the acknowledgement: CoinDCX frees the collateral a beat
+        # after it confirms, so reading immediately just caches the pre-release figure.
+        self.exchange._sleep.assert_awaited_once_with(
+            CONSTANTS.BALANCE_REFRESH_AFTER_CANCEL_DELAY)
+
+    async def test_a_refused_cancel_does_not_re_read_the_wallet(self):
+        """Nothing was released, so there is nothing new to read."""
+        self.exchange._trading_required = True
+        self.exchange._api_post = AsyncMock(return_value={"message": "something else", "code": 422})
+        self.exchange._update_balances = AsyncMock()
+
+        with self.assertRaises(IOError):
+            await self.exchange._place_cancel("haveli-1", self._order())
+
+        self.assertIsNone(self.exchange._balance_refresh_task)
+        self.exchange._update_balances.assert_not_awaited()
+
     async def test_request_order_status_finds_order_in_list(self):
         self.exchange._api_post = AsyncMock(return_value=[
             {"id": "other", "status": "open"},

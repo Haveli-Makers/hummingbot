@@ -31,20 +31,25 @@ class SimpleGridExecutor(ExecutorBase):
     """
     Runs a single leg of the simple grid strategy.
 
-    A leg is one complete round trip: a passive entry resting at the touch price, then
-    whichever exit comes first out of the take profit, the stop loss and the time limit. The
-    controller reads ``close_price`` back off this executor to decide where the next leg is
-    anchored.
+    A leg is one complete round trip: an entry, then whichever exit comes first out of the
+    take profit, the stop loss and the time limit. The controller reads ``close_price`` back
+    off this executor to place the next leg.
+
+    Both ends work the same way — a resting limit at the price that favours us, and a watched
+    trigger at the one that does not:
+
+        FLAT, reference P   rest BUY at P - step   |  trigger: price reaches P + step
+        LONG at F           rest SELL at F + step  |  trigger: price reaches F - step
 
     Three behaviours distinguish it from the other executors in this package:
 
-    * **Maker on both ends.** The entry rests at the touch — a buy at the best bid, a sell
-      at the best ask — and follows the book, so it earns the maker fee rather than paying
-      the taker one. The take profit is a resting limit for the same reason.
-    * **The bracket hangs off the anchor, not the fill.** A passive entry fills inside the
-      bracket, so a better fill is kept as extra edge instead of dragging the exits with it.
-      The entry is confined to a band around the anchor, because a fill outside it would sit
-      past its own exits and close instantly for nothing.
+    * **Maker by construction.** The resting order sits a full step away from the market, so
+      it cannot cross by accident and reliably earns the maker fee. Only a trigger — an order
+      placed because the price came to meet it — ever pays taker, and even that one rests
+      passively and chases before it gives up and crosses.
+    * **The bracket hangs off the fill.** Take profit and stop loss are measured from the
+      price the entry actually filled at, not from what it was aiming at, so a long filled at
+      F is bracketed symmetrically at F * (1 ± step).
     * **First fill wins.** In ``both_oco`` mode a maker order rests on each side of the book
       and the first one to fill cancels the other, so only one position is ever open. The
       controller then locks the run to that side.
@@ -64,9 +69,21 @@ class SimpleGridExecutor(ExecutorBase):
         self.config: SimpleGridExecutorConfig = config
         self.trading_rules = self.get_trading_rules(config.connector_name, config.trading_pair)
 
-        # The price the whole leg is measured from. Frozen once, so the exits cannot drift
-        # with the market while the leg is live.
-        self._anchor: Optional[Decimal] = config.entry_price
+        # Where the previous leg ended. The opening order rests one step in our favour of
+        # it, and one step against it is the trigger. None on the very first leg, which has
+        # nothing to measure from and rests at the touch instead.
+        self._reference: Optional[Decimal] = config.entry_reference_price
+        # Set once a trigger order has actually been sent, so the leg stops re-triggering.
+        # NOT set merely because the trigger was reached: an order the venue refuses leaves us
+        # with no position and no resting order, and the market is still past the trigger, so
+        # the leg has to be able to try again. See process_order_failed_event.
+        self._entry_triggered = False
+        # The side whose trigger order is waiting on a cancelled resting order to release its
+        # collateral, and the moment it may be sent. The venue frees margin a beat AFTER it
+        # confirms the cancel, so cancelling and placing in one breath is refused for funds —
+        # which is what cost the 17:44 trigger on 2026-09-02.
+        self._entry_trigger_pending: Optional[TradeType] = None
+        self._entry_blocked_until: float = 0.0
 
         # Entry state, tracked per side so both_oco can rest two maker orders at once.
         self._entry_orders: Dict[TradeType, Optional[TrackedOrder]] = {side: None for side in config.sides()}
@@ -110,6 +127,16 @@ class SimpleGridExecutor(ExecutorBase):
         self._exit_blocked_until: float = 0.0
         self._exit_retry_task: Optional[asyncio.Task] = None
 
+        # Closes the venue refused for want of collateral, in a row. That refusal means an
+        # exit we were told had been cancelled is still holding the margin, so replacing it
+        # faster cannot work — see collateral_refusal_wait.
+        self._consecutive_collateral_refusals = 0
+        # Whether any exit has been refused yet. Until one has, the venue's position feed is
+        # not consulted before placing a close: a position that has just filled takes a moment
+        # to appear there, and skipping the exit because of that lag would be far worse than
+        # the storm this guards against.
+        self._exit_has_been_refused = False
+
         # Orders already warned about in _order_filled_base, so the warning is logged once
         # each rather than on every tick.
         self._assumed_full_fills: List[str] = []
@@ -151,8 +178,8 @@ class SimpleGridExecutor(ExecutorBase):
         return TradeType.SELL if self.side == TradeType.BUY else TradeType.BUY
 
     @property
-    def anchor_price(self) -> Optional[Decimal]:
-        return self._anchor
+    def reference_price(self) -> Optional[Decimal]:
+        return self._reference
 
     def _order_filled_base(self, order: Optional[TrackedOrder]) -> Decimal:
         """
@@ -264,12 +291,12 @@ class SimpleGridExecutor(ExecutorBase):
 
     @property
     def entry_price(self) -> Decimal:
-        """Average price actually paid, falling back to the anchor before anything fills."""
+        """Average price actually paid, falling back to the reference before anything fills."""
         if self._filled_side is not None:
             price = self._weighted_avg_price(self._entry_orders_for_side(self._filled_side))
             if price is not None:
                 return price
-        return self._anchor if self._anchor is not None else self._reference_or_entry()
+        return self._reference_or_entry()
 
     @property
     def close_price(self) -> Decimal:
@@ -384,7 +411,8 @@ class SimpleGridExecutor(ExecutorBase):
         bound = self._no_cross_bound(side)
         if bound is None:
             # No tick size or no book: fall back to our own touch, which cannot cross.
-            return self._maker_entry_price(side)
+            touch = self._touch_price(side)
+            return self._quantize(touch) if touch is not None else None
         tick = self._tick_size()
         extra = tick * (max(1, self.config.barriers.stop_loss_maker_offset_ticks) - 1)
         price = bound - extra if side == TradeType.BUY else bound + extra
@@ -410,33 +438,37 @@ class SimpleGridExecutor(ExecutorBase):
             return self._quantize(bound)
         return price
 
-    def _maker_entry_price(self, side: TradeType) -> Optional[Decimal]:
-        """Where this side's entry should be resting right now, quantized to the tick."""
-        touch = self._touch_price(side)
-        if touch is None:
+    def _entry_rest_price(self, side: TradeType) -> Optional[Decimal]:
+        """
+        Where this side's opening order rests: one step from the reference, in our favour.
+
+        Buying cheaper than the last exit, or selling dearer than it, is the whole point of
+        the grid. A price a full step from the market also cannot cross by accident, so
+        unlike an order sitting at the touch this one is reliably a maker fill.
+
+        The very first leg has no reference to measure from, so it rests at the touch.
+        """
+        if self._reference is None:
+            touch = self._touch_price(side)
+            return self._quantize(touch) if touch is not None else None
+        step = self.config.barriers.take_profit
+        price = self._reference * (1 - step) if side == TradeType.BUY \
+            else self._reference * (1 + step)
+        return self._quantize(price)
+
+    def _entry_trigger_price(self, side: TradeType) -> Optional[Decimal]:
+        """
+        The price at which we stop waiting and open on the wrong side of the reference.
+
+        A buy that pays a step more than the last exit, or a sell that takes a step less.
+        Without it, a grid the market walks away from never trades again.
+        """
+        if self._reference is None:
             return None
-        improvement = self.config.entry_price_improvement_pct
-        if improvement > Decimal("0"):
-            # Improving means moving towards the spread: a buy bids higher, a sell offers
-            # lower. It buys queue priority at the cost of a slightly worse price — but far
-            # enough and it crosses, which turns a maker entry into a taker one.
-            touch = touch * (1 + improvement) if side == TradeType.BUY else touch * (1 - improvement)
-            return self._clamp_to_maker(self._quantize(touch), side)
-        return self._quantize(touch)
-
-    def _within_entry_band(self, price: Decimal) -> bool:
-        """
-        Whether an entry resting at this price could still produce a workable leg.
-
-        The take profit and stop loss are measured from the anchor, so an entry that fills
-        far from it lands already past one of them and closes instantly for nothing — or
-        worse, for a loss. Outside the band we would rather hold the order back and wait for
-        the price to come to us.
-        """
-        band = self.config.entry_band_pct
-        if band is None or self._anchor is None or self._anchor <= Decimal("0"):
-            return True
-        return abs(price - self._anchor) / self._anchor <= band
+        step = self.config.barriers.stop_loss
+        price = self._reference * (1 + step) if side == TradeType.BUY \
+            else self._reference * (1 - step)
+        return self._quantize(price)
 
     def _exit_reference_price(self) -> Decimal:
         """
@@ -452,8 +484,9 @@ class SimpleGridExecutor(ExecutorBase):
         return price if price is not None else self._reference_or_entry()
 
     def _reference_or_entry(self) -> Decimal:
-        if self._anchor is not None:
-            return self._anchor
+        """A usable price when nothing better is available: the last exit, else the mid."""
+        if self._reference is not None:
+            return self._reference
         price = self._usable_price(PriceType.MidPrice)
         return price if price is not None else Decimal("0")
 
@@ -489,31 +522,34 @@ class SimpleGridExecutor(ExecutorBase):
 
     @property
     def take_profit_price(self) -> Optional[Decimal]:
-        """One step from the anchor in our favour. Independent of where the entry filled."""
-        if self._anchor is None or self.side is None:
+        """One step from the price we filled at, in our favour."""
+        if self._filled_side is None or self.side is None:
             return None
         if self.side == TradeType.BUY:
-            return self._anchor * (1 + self.config.barriers.take_profit)
-        return self._anchor * (1 - self.config.barriers.take_profit)
+            return self.entry_price * (1 + self.config.barriers.take_profit)
+        return self.entry_price * (1 - self.config.barriers.take_profit)
 
     @property
     def stop_loss_price(self) -> Optional[Decimal]:
-        """One step from the anchor against us. Independent of where the entry filled."""
-        if self._anchor is None or self.side is None:
+        """One step from the price we filled at, against us."""
+        if self._filled_side is None or self.side is None:
             return None
         if self.side == TradeType.BUY:
-            return self._anchor * (1 - self.config.barriers.stop_loss)
-        return self._anchor * (1 + self.config.barriers.stop_loss)
+            return self.entry_price * (1 - self.config.barriers.stop_loss)
+        return self.entry_price * (1 + self.config.barriers.stop_loss)
 
-    def _urgent_close_price(self, side: TradeType) -> Decimal:
+    def _crossing_price(self, side: TradeType) -> Optional[Decimal]:
         """
         A limit priced far enough through the book that it fills like a market order.
 
-        CoinDCX rejects reduce_only on a market order — "Reduce Only Order is only applicable
-        for Limit Order" — and the connector must send reduce_only on a close or the venue
-        demands margin for a fresh opposite position, which fails exactly when the position
-        is large against the wallet. A crossing limit satisfies both: it executes immediately
-        against the resting side of the book, and its price is a hard bound on the fill.
+        Used by both orders that have to happen now: an exit whose chase has given up, and an
+        entry whose trigger has fired.
+
+        It is a limit rather than a market order because CoinDCX rejects reduce_only on a
+        market order — "Reduce Only Order is only applicable for Limit Order" — and the
+        connector must send reduce_only on a close, or the venue demands margin for a fresh
+        opposite position and refuses exactly when the position is what holds the collateral.
+        A crossing limit satisfies both, and its price bounds the fill.
         """
         # Sell into the bid, buy into the ask, then push past it by the slippage budget.
         touch_type = PriceType.BestBid if side == TradeType.SELL else PriceType.BestAsk
@@ -553,7 +589,6 @@ class SimpleGridExecutor(ExecutorBase):
         # the case that strands a position.
         self._reap_cancelled_entries()
         if self.status == RunnableStatus.RUNNING:
-            self._ensure_anchor()
             self._detect_entry_fill()
             if self._filled_side is None:
                 self.control_entry_orders()
@@ -562,21 +597,6 @@ class SimpleGridExecutor(ExecutorBase):
         elif self.status == RunnableStatus.SHUTTING_DOWN:
             await self.control_shutdown_process()
         self.evaluate_max_retries()
-
-    def _ensure_anchor(self):
-        """
-        Freeze the anchor on the first tick that has a price.
-
-        The controller normally supplies it. When it does not — the very first leg of a run —
-        the live mid becomes the anchor once and never moves again, because every exit price
-        for this leg is measured from it.
-        """
-        if self._anchor is not None:
-            return
-        price = self._usable_price(PriceType.MidPrice)
-        if price is not None:
-            self._anchor = price
-            self.logger().info(f"Executor ID: {self.config.id} - anchored at {price}")
 
     async def on_start(self):
         await super().on_start()
@@ -592,9 +612,36 @@ class SimpleGridExecutor(ExecutorBase):
             self.stop()
 
     def evaluate_max_retries(self):
-        if self._current_retries > self._max_retries:
+        if self._current_retries <= self._max_retries:
+            return
+        # Out of retries. Before calling this a failure, ask the venue what it actually holds:
+        # a run of rejected exits is equally consistent with the exit having ALREADY happened,
+        # on an order the venue told us it had cancelled.
+        #
+        # That is what the 16:56 stop on 2026-09-02 was. The chase was cancelled, the cancel
+        # was confirmed, and the order filled as a maker five seconds later regardless; every
+        # "Insufficient funds" in between was the venue refusing to let us double-close a
+        # position that was already on its way out.
+        #
+        # Overwriting the close type with FAILED there does three wrong things at once. It
+        # halts the run. It tells the operator to go and close a position by hand that is not
+        # there — spending the credibility of the one message that has to be believed. And it
+        # drops the leg out of the tally entirely, because the controller reads FAILED as
+        # never having traded, so a real stop loss goes uncounted in both the win rate and the
+        # drawdown. Whatever exit we were already working towards is the truthful answer.
+        if (self.open_filled_amount > Decimal("0")
+                and self.close_type is not None
+                and self.close_type != CloseType.FAILED
+                and self._venue_holds_a_position() is False):
+            self.logger().warning(
+                f"Executor ID: {self.config.id} - every exit order was rejected, but the venue "
+                f"reports no position: it closed on an order we were told had been cancelled. "
+                f"Recording this as {self.close_type} rather than FAILED. Its realised PnL is "
+                f"understated — that fill was never reported to us, so the close price is not "
+                f"known here; read it off the account, not off this leg.")
+        else:
             self.close_type = CloseType.FAILED
-            self.stop()
+        self.stop()
 
     # ------------------------------------------------------------------ entry
 
@@ -662,28 +709,39 @@ class SimpleGridExecutor(ExecutorBase):
 
     def control_entry_orders(self):
         """
-        Keep a maker order resting at the touch on every side still on offer.
+        Rest the opening order a step in our favour, and take the other side if it comes.
 
-        The order rests inside the bracket rather than at a level beyond it, so it earns the
-        maker fee and leaves both exits reachable. It follows the touch as the book moves,
-        but only within a band around the anchor: outside it a fill would land past its own
-        take profit or stop loss, so we pull the order and wait for the price to come back.
+        Both prices come from where the previous leg ended: a resting limit one step in our
+        favour, and a trigger one step against us. The resting order never moves — it is a
+        grid level, not a quote that follows the market — so it cannot cross by accident and
+        it fills as a maker. Only the trigger ever pays taker.
+
+        The first leg of a run has no previous exit to measure from, so it rests at the touch
+        and has no trigger.
         """
         if self.config.entry_timeout is not None and \
                 self._strategy.current_timestamp - self.config.timestamp >= self.config.entry_timeout:
             self.logger().info(f"Executor ID: {self.config.id} - entry timed out unfilled")
             self._give_up_on_entry()
             return
-        if self._anchor is None:
+
+        # A trigger whose resting order has been cancelled is waiting for the venue to let go
+        # of the collateral behind it. Nothing else may be placed while that is outstanding.
+        if self._entry_trigger_pending is not None:
+            self._place_pending_entry_trigger()
             return
 
         for side in self.config.sides():
-            desired = self._maker_entry_price(side)
-            order = self._entry_orders[side]
-            if desired is None:
-                # Every entry is priced off the touch, so no order book means no entry at
-                # all. Silence here looks exactly like a strategy patiently waiting for the
-                # market, which is the one thing it is not doing.
+            if self._entry_trigger_reached(side):
+                self._take_the_trigger(side)
+                return
+            if self._entry_orders[side] is not None:
+                continue          # already resting; a grid level does not move
+            price = self._entry_rest_price(side)
+            if price is None:
+                # With no reference the entry is priced off the touch, so no order book
+                # means no entry at all. Silence here looks exactly like a strategy
+                # patiently waiting for the market, which is the one thing it is not doing.
                 if not self._warned_no_touch:
                     self._warned_no_touch = True
                     self.logger().warning(
@@ -692,39 +750,75 @@ class SimpleGridExecutor(ExecutorBase):
                         f"{side.name} entry can be priced. Nothing will be placed until it does.")
                 continue
             self._warned_no_touch = False
-            if not self._within_entry_band(desired):
-                # Out of band: hold back rather than fill into a dead bracket.
-                if order and order.order and order.order.is_open:
-                    self.logger().info(
-                        f"Executor ID: {self.config.id} - {side.name} touch {desired} left the "
-                        f"band around {self._anchor}; pulling the entry")
-                    self._cancel_order(order)
-                continue
-            if order is None:
-                self.place_entry_order(side, desired)
-            elif self._should_requote(order, desired):
-                self.logger().debug(
-                    f"Executor ID: {self.config.id} - re-quoting {side.name} entry to {desired}")
-                self._cancel_order(order)
+            self.place_entry_order(side, price)
 
-    def _should_requote(self, order: TrackedOrder, desired: Decimal) -> bool:
-        """
-        Whether a resting order has drifted far enough from the touch to be worth replacing.
+    def _entry_trigger_reached(self, side: TradeType) -> bool:
+        """Has the market gone the wrong way by a full step since the last leg ended?"""
+        if self._entry_triggered:
+            return False
+        trigger = self._entry_trigger_price(side)
+        if trigger is None:
+            return False
+        reference = self._trigger_reference_price()
+        if reference is None:
+            return False
+        return reference >= trigger if side == TradeType.BUY else reference <= trigger
 
-        Re-posting on every book change would be a cancel and a create every tick — rate
-        limit for nothing, and each round trip is a window where we hold no order at all.
+    def _take_the_trigger(self, side: TradeType):
         """
-        if order.order is None or not order.order.is_open:
-            return False
-        if order.order_id in self._cancel_requested:
-            return False
-        if self._order_filled_base(order) > Decimal("0"):
-            return False  # already going in; let the fill path finish it
-        resting = order.order.price
-        if resting is None or resting.is_nan() or resting <= Decimal("0"):
-            return False
-        reference = self._anchor if self._anchor and self._anchor > Decimal("0") else resting
-        return abs(resting - desired) >= self.config.entry_requote_pct * reference
+        Open on the wrong side of the reference, crossing to get in.
+
+        Waiting is over: the price we hoped to open at is now a step behind the market, and a
+        resting order there would never fill. This is the only entry that pays taker, and the
+        crossing price bounds how much worse than the trigger we accept.
+
+        The resting order has to go first, and its collateral with it. CoinDCX releases that
+        margin a moment AFTER it confirms the cancel, so the trigger cannot be sent in the same
+        breath — on 2026-09-02 it was, and the venue refused it for funds while holding 660 INR
+        against an order it had just agreed to cancel. The leg then had no entry at all.
+        """
+        resting = self._entry_orders.get(side)
+        if resting and resting.order and resting.order.is_open:
+            self._cancel_order(resting)
+            self._entry_orders[side] = None
+            self._entry_quoted_price[side] = None
+            self._entry_trigger_pending = side
+            # A floor, in case the confirmation never arrives; the cancel event pushes it out
+            # again so the real wait is measured from the confirmation.
+            self._entry_blocked_until = \
+                self._strategy.current_timestamp + self.config.cancel_settle_delay
+            self.logger().info(
+                f"Executor ID: {self.config.id} - {side.name} entry trigger "
+                f"{self._entry_trigger_price(side)} reached; cancelling the resting order "
+                f"first and opening once its margin is released")
+            return
+        self._place_entry_trigger(side)
+
+    def _place_pending_entry_trigger(self):
+        """Send the deferred trigger once the cancelled resting order has let go of its margin."""
+        if self._strategy.current_timestamp < self._entry_blocked_until:
+            return
+        if any(order and order.order and order.order.is_open
+               for order in self._entry_orders.values()):
+            return          # the cancel has not landed yet
+        side = self._entry_trigger_pending
+        self._entry_trigger_pending = None
+        self._place_entry_trigger(side)
+
+    def _place_entry_trigger(self, side: TradeType):
+        """The crossing order itself, priced off the book as it stands now."""
+        price = self._crossing_price(side)
+        if price is None:
+            return
+        # Only now, with the order actually going out. Setting it when the trigger was merely
+        # reached leaves a refused order looking like a taken one, and _entry_trigger_reached
+        # never fires again — so the leg drops back to resting a full step below a market that
+        # has just moved up, and sits there until it times out.
+        self._entry_triggered = True
+        self.logger().info(
+            f"Executor ID: {self.config.id} - {side.name} entry trigger "
+            f"{self._entry_trigger_price(side)} reached; opening at {price}")
+        self.place_entry_order(side, price)
 
     def place_entry_order(self, side: TradeType, price: Decimal):
         order_id = self.place_order(
@@ -992,7 +1086,7 @@ class SimpleGridExecutor(ExecutorBase):
         elif price is not None and not price.is_nan():
             close_price = price
         else:
-            close_price = self._urgent_close_price(self.close_order_side)
+            close_price = self._crossing_price(self.close_order_side)
         order_id = self.place_order(
             connector_name=self.config.connector_name,
             trading_pair=self.config.trading_pair,
@@ -1045,6 +1139,11 @@ class SimpleGridExecutor(ExecutorBase):
     def _place_scheduled_exit(self):
         """Whichever exit is owed — the deferred close first, then the chase."""
         self._exit_blocked_until = 0.0
+        # This runs off a timer rather than the shutdown pass, so it needs the same check:
+        # by the time the wait is over the order that was holding the margin may have filled,
+        # which is precisely the outcome the wait was for.
+        if self._settle_as_closed_if_venue_is_flat():
+            return
         self._place_pending_close_if_clear()
         self._resume_stop_loss_chase_if_clear()
 
@@ -1054,6 +1153,47 @@ class SimpleGridExecutor(ExecutorBase):
     def _reset_exit_backoff(self):
         self._exit_retry_delay = self.config.cancel_settle_delay
         self._exit_blocked_until = 0.0
+        self._consecutive_collateral_refusals = 0
+
+    @staticmethod
+    def _is_collateral_refusal(message: Optional[str]) -> bool:
+        """
+        Whether the venue refused this order for want of collateral rather than on its merits.
+
+        On a reduce-only close that is a specific, diagnosable state and not a transient: the
+        margin is committed to an exit we already asked the venue to cancel. CoinDCX phrases
+        it "Insufficient funds"; the substring is matched rather than the code, because the
+        same 400 covers several unrelated refusals.
+        """
+        if not message:
+            return False
+        lowered = str(message).lower()
+        return "insufficient funds" in lowered or "insufficient balance" in lowered
+
+    def _stand_down_after_collateral_refusal(self) -> bool:
+        """
+        Wait for the order that is holding the margin instead of replacing it again.
+
+        Returns True once we have decided to wait, so the caller skips the ordinary backoff.
+        The wait is long by the standards of this executor on purpose: the thing in the way
+        is our own cancelled exit, and it clears when that order fills or the venue really
+        does drop it — neither of which we can hurry.
+        """
+        self._consecutive_collateral_refusals += 1
+        if self._consecutive_collateral_refusals < self.config.collateral_refusals_before_waiting:
+            return False
+        wait = self.config.collateral_refusal_wait
+        self._exit_blocked_until = self._strategy.current_timestamp + wait
+        if self._consecutive_collateral_refusals == self.config.collateral_refusals_before_waiting:
+            # Once, at the point the diagnosis is made. Repeating it every refusal would bury
+            # the one line that explains the whole episode.
+            self.logger().warning(
+                f"Executor ID: {self.config.id} - the venue has refused this close for want of "
+                f"collateral {self._consecutive_collateral_refusals} times running. That margin "
+                f"is held by an exit we were told had been cancelled, so a replacement cannot "
+                f"be funded until that order resolves. Waiting {wait:.2f}s for it rather than "
+                f"sending another.")
+        return True
 
     def _resume_stop_loss_chase_if_clear(self):
         """
@@ -1139,6 +1279,10 @@ class SimpleGridExecutor(ExecutorBase):
 
     async def control_shutdown_process(self):
         self.close_timestamp = self._strategy.current_timestamp
+        # Nothing to close means nothing to send. Checked before the placement below, or we
+        # spend a whole pass and a retry on an order the venue has no reason to accept.
+        if self._settle_as_closed_if_venue_is_flat():
+            return
         # Belt and braces: normally the cancel event places this, but a cancel confirmation
         # that never arrives must not leave the position uncovered.
         self._place_pending_close_if_clear()
@@ -1190,6 +1334,48 @@ class SimpleGridExecutor(ExecutorBase):
             return False
         except Exception:
             return None
+
+    def _venue_confirms_the_position_is_gone(self) -> bool:
+        """
+        The venue reports flat while our own books still show something to close.
+
+        Deliberately not consulted until an exit has actually been refused. Before that the
+        position feed cannot carry this weight: a position that has just filled takes a moment
+        to appear in it, and skipping an exit on that lag would strand the very position the
+        exit exists to close — a far worse failure than the one this prevents.
+
+        After a refusal the reasoning runs the other way. The venue has told us something is
+        wrong, and of the explanations available, "the position is already gone" is the one
+        that also explains why it will not let us reduce it.
+        """
+        if not self._exit_has_been_refused:
+            return False
+        if self.open_filled_amount <= Decimal("0"):
+            return False
+        return self._venue_holds_a_position() is False
+
+    def _settle_as_closed_if_venue_is_flat(self) -> bool:
+        """
+        Stop trying to close a position the venue says we no longer have.
+
+        Without this the executor keeps sending reduce-only orders that cannot be accepted,
+        one per pass, until it runs out of retries — twenty seconds of noise to reach a
+        conclusion already visible in the position feed. True means the leg has been settled
+        and the caller should do nothing further.
+        """
+        if not self._venue_confirms_the_position_is_gone():
+            return False
+        if self.close_type is None or self.close_type == CloseType.FAILED:
+            return False
+        self.logger().warning(
+            f"Executor ID: {self.config.id} - the venue reports no position while our books "
+            f"still show {self.amount_to_close} to close, and our exits are being refused: it "
+            f"closed on an order we were told had been cancelled. Settling this leg as "
+            f"{self.close_type} instead of sending exits the venue cannot accept. Its realised "
+            f"PnL is understated — that fill was never reported to us, so the close price is "
+            f"not known here; read it off the account, not off this leg.")
+        self.stop()
+        return True
 
     def early_stop(self, keep_position: bool = False):
         """
@@ -1271,7 +1457,7 @@ class SimpleGridExecutor(ExecutorBase):
         first fill, so this is the opening leg only.
         """
         for side in self.config.sides():
-            price = self._maker_entry_price(side) or self._anchor
+            price = self._entry_rest_price(side) or self._reference
             if price is None:
                 continue
             if self.is_perpetual:
@@ -1370,6 +1556,11 @@ class SimpleGridExecutor(ExecutorBase):
                     (side, self._entry_orders[side], self._strategy.current_timestamp))
                 self._entry_orders[side] = None
                 self._entry_quoted_price[side] = None
+            if self._entry_trigger_pending is not None:
+                # The collateral is released a beat after this confirmation, not on it, so the
+                # wait that matters starts here rather than when the cancel was requested.
+                self._entry_blocked_until = \
+                    self._strategy.current_timestamp + self.config.cancel_settle_delay
             return
         if self._take_profit_order and self._take_profit_order.order_id == event.order_id:
             self._retire_exit_order(self._take_profit_order)
@@ -1385,6 +1576,20 @@ class SimpleGridExecutor(ExecutorBase):
         # moment to release its collateral before it will accept the replacement.
         if (self._close_pending or self._stop_loss_triggered) and not self._has_resting_orders():
             self._arm_exit_placement()
+
+    def _reschedule_after_exit_refusal(self, event: MarketOrderFailureEvent) -> bool:
+        """
+        Decide how long to wait before trying this exit again.
+
+        A collateral refusal is diagnosable and gets its own, longer wait; everything else
+        goes through the ordinary doubling backoff. True means the collateral path handled it
+        and logged its own line.
+        """
+        if self._is_collateral_refusal(event.error_message) \
+                and self._stand_down_after_collateral_refusal():
+            return True
+        self._arm_exit_placement(after_refusal=True)
+        return False
 
     def _retire_exit_order(self, order: TrackedOrder):
         """
@@ -1410,6 +1615,12 @@ class SimpleGridExecutor(ExecutorBase):
             self._entry_orders[side] = None
             self._entry_quoted_price[side] = None
             self._current_retries += 1
+            if self._entry_triggered:
+                # Once the trigger has been taken it is the only entry order in flight, so a
+                # failure here is the trigger's. Release the latch: the market is still on the
+                # far side of it, and a leg that cannot re-trigger falls back to resting a full
+                # step the wrong way and simply waits out its timeout.
+                self._entry_triggered = False
             self.logger().error(f"Entry order failed {event.order_id}. "
                                 f"Retrying {self._current_retries}/{self._max_retries}")
             return
@@ -1421,19 +1632,21 @@ class SimpleGridExecutor(ExecutorBase):
             self._failed_orders.append(self._sl_chase_order)
             self._sl_chase_order = None
             self._current_retries += 1
-            self._arm_exit_placement(after_refusal=True)
-            self.logger().error(
-                f"Stop loss exit failed {event.order_id}. Retrying in "
-                f"{self._exit_retry_delay:.2f}s ({self._current_retries}/{self._max_retries})")
+            self._exit_has_been_refused = True
+            if not self._reschedule_after_exit_refusal(event):
+                self.logger().error(
+                    f"Stop loss exit failed {event.order_id}. Retrying in "
+                    f"{self._exit_retry_delay:.2f}s ({self._current_retries}/{self._max_retries})")
         elif self._close_order and self._close_order.order_id == event.order_id:
             self._failed_orders.append(self._close_order)
             self._close_order = None
             self._close_pending = True
             self._current_retries += 1
-            self._arm_exit_placement(after_refusal=True)
-            self.logger().error(
-                f"Close order failed {event.order_id}. Retrying in "
-                f"{self._exit_retry_delay:.2f}s ({self._current_retries}/{self._max_retries})")
+            self._exit_has_been_refused = True
+            if not self._reschedule_after_exit_refusal(event):
+                self.logger().error(
+                    f"Close order failed {event.order_id}. Retrying in "
+                    f"{self._exit_retry_delay:.2f}s ({self._current_retries}/{self._max_retries})")
 
     # ------------------------------------------------------------------ reporting
 
@@ -1442,7 +1655,7 @@ class SimpleGridExecutor(ExecutorBase):
             "level_id": self.config.level_id,
             "side": self.side,
             "entry_mode": self.config.entry_mode,
-            "anchor_price": self._anchor,
+            "reference_price": self._reference,
             "entry_price": self.entry_price,
             # The controller re-anchors the grid on this pair of fields.
             "close_price": self.close_price,

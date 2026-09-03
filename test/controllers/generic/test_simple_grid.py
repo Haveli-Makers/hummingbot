@@ -89,60 +89,6 @@ class TestSimpleGrid(IsolatedAsyncioWrapperTestCase):
         config = controller.determine_executor_actions()[0].executor_config
         self.assertEqual(config.entry_mode, SimpleGridEntryMode.LONG_ONLY)
 
-    def test_the_side_locks_to_whichever_filled_first(self):
-        controller = self.controller()
-        controller.executors_info = [
-            self.closed_leg("leg-1", CloseType.TAKE_PROFIT, side=TradeType.SELL, net_pnl_quote="1")]
-        config = controller.determine_executor_actions()[0].executor_config
-        self.assertEqual(controller._locked_side, TradeType.SELL)
-        self.assertEqual(config.entry_mode, SimpleGridEntryMode.SHORT_ONLY)
-
-    def test_a_locked_long_run_stays_long_after_a_stop_loss(self):
-        """The first fill decides the direction, not the outcome of each leg."""
-        controller = self.controller(stop_when_losses_outnumber_wins=False)
-        controller.executors_info = [
-            self.closed_leg("leg-1", CloseType.STOP_LOSS, side=TradeType.BUY, net_pnl_quote="-1")]
-        config = controller.determine_executor_actions()[0].executor_config
-        self.assertEqual(config.entry_mode, SimpleGridEntryMode.LONG_ONLY)
-
-    def test_a_locked_short_run_stays_short_after_a_take_profit(self):
-        controller = self.controller()
-        controller.executors_info = [
-            self.closed_leg("leg-1", CloseType.TAKE_PROFIT, side=TradeType.SELL, net_pnl_quote="1")]
-        controller.determine_executor_actions()
-        controller.executors_info.append(
-            self.closed_leg("leg-2", CloseType.TAKE_PROFIT, side=TradeType.SELL, net_pnl_quote="1"))
-        config = controller.determine_executor_actions()[0].executor_config
-        self.assertEqual(config.entry_mode, SimpleGridEntryMode.SHORT_ONLY)
-
-    def test_the_lock_is_only_set_once(self):
-        """A stray later leg on the other side must not be able to turn the run around."""
-        controller = self.controller()
-        controller.executors_info = [
-            self.closed_leg("leg-1", CloseType.TAKE_PROFIT, side=TradeType.SELL, net_pnl_quote="1")]
-        controller.determine_executor_actions()
-        controller.executors_info.append(
-            self.closed_leg("leg-2", CloseType.TAKE_PROFIT, side=TradeType.BUY, net_pnl_quote="1"))
-        controller.determine_executor_actions()
-        self.assertEqual(controller._locked_side, TradeType.SELL)
-
-    def test_a_leg_that_never_traded_does_not_lock_the_side(self):
-        controller = self.controller(cooldown_after_reanchor=0)
-        leg = self.closed_leg("leg-1", CloseType.EXPIRED, side=TradeType.SELL, net_pnl_quote="0")
-        leg.filled_amount_quote = Decimal("0")
-        controller.executors_info = [leg]
-        config = controller.determine_executor_actions()[0].executor_config
-        self.assertIsNone(controller._locked_side)
-        self.assertEqual(config.entry_mode, SimpleGridEntryMode.BOTH_OCO)
-
-    def test_locking_can_be_switched_off(self):
-        controller = self.controller(lock_side_after_first_fill=False)
-        controller.executors_info = [
-            self.closed_leg("leg-1", CloseType.TAKE_PROFIT, side=TradeType.SELL, net_pnl_quote="1")]
-        config = controller.determine_executor_actions()[0].executor_config
-        self.assertIsNone(controller._locked_side)
-        self.assertEqual(config.entry_mode, SimpleGridEntryMode.BOTH_OCO)
-
     def test_spot_never_offers_both_sides_even_once_locked(self):
         controller = self.controller(connector_name="binance")
         controller.executors_info = [
@@ -152,20 +98,23 @@ class TestSimpleGrid(IsolatedAsyncioWrapperTestCase):
 
     # ------------------------------------------------------------------ the anchor
 
-    def test_first_leg_anchors_on_the_current_price(self):
+    def test_the_first_leg_has_no_reference(self):
+        """Nothing has traded yet, so there is no exit to measure a step from."""
         self.market_data_provider.get_price_by_type.return_value = Decimal("100")
         controller = self.controller()
         config = controller.determine_executor_actions()[0].executor_config
-        self.assertEqual(config.entry_price, Decimal("100"))
+        self.assertIsNone(config.entry_reference_price)
+        # sized off the mid instead
+        self.assertEqual(config.amount, Decimal("1"))
 
-    def test_next_leg_anchors_on_the_previous_exit(self):
+    def test_the_next_leg_references_the_previous_exit(self):
         controller = self.controller()
         controller.executors_info = [
             self.closed_leg("leg-1", CloseType.TAKE_PROFIT, close_price="98")]
         config = controller.determine_executor_actions()[0].executor_config
-        self.assertEqual(config.entry_price, Decimal("98"))
+        self.assertEqual(config.entry_reference_price, Decimal("98"))
 
-    def test_a_leg_that_never_traded_does_not_move_the_anchor(self):
+    def test_a_leg_that_never_traded_does_not_move_the_reference(self):
         """
         A maker entry that is never filled closes having done nothing. Letting it move the
         anchor would walk the grid across the market with no fills behind it.
@@ -175,15 +124,15 @@ class TestSimpleGrid(IsolatedAsyncioWrapperTestCase):
         leg.filled_amount_quote = Decimal("0")
         controller.executors_info = [leg]
         controller.determine_executor_actions()
-        self.assertIsNone(controller._anchor_price)
+        self.assertIsNone(controller._reference_price)
         self.assertEqual(controller._wins + controller._losses, 0)
 
-    def test_a_leg_that_never_opened_does_not_move_the_anchor(self):
+    def test_a_leg_that_never_opened_does_not_move_the_reference(self):
         controller = self.controller()
         controller.executors_info = [
             self.closed_leg("leg-1", CloseType.EXPIRED, close_price="98", net_pnl_quote="0")]
         controller.determine_executor_actions()
-        self.assertIsNone(controller._anchor_price)
+        self.assertIsNone(controller._reference_price)
         self.assertEqual(controller._wins + controller._losses, 0)
 
     # ------------------------------------------------------------------ settings passed through
@@ -193,15 +142,6 @@ class TestSimpleGrid(IsolatedAsyncioWrapperTestCase):
         config = controller.determine_executor_actions()[0].executor_config
         self.assertEqual(config.barriers.take_profit, Decimal("0.02"))
         self.assertEqual(config.barriers.stop_loss, Decimal("0.03"))
-
-    def test_the_maker_entry_settings_reach_the_executor(self):
-        controller = self.controller(entry_band_pct=Decimal("0.004"),
-                                     entry_requote_pct=Decimal("0.0002"),
-                                     entry_price_improvement_pct=Decimal("0.0001"))
-        config = controller.determine_executor_actions()[0].executor_config
-        self.assertEqual(config.entry_band_pct, Decimal("0.004"))
-        self.assertEqual(config.entry_requote_pct, Decimal("0.0002"))
-        self.assertEqual(config.entry_price_improvement_pct, Decimal("0.0001"))
 
     def test_the_stop_loss_chase_settings_reach_the_executor(self):
         controller = self.controller(stop_loss_chase=True,
@@ -236,6 +176,36 @@ class TestSimpleGrid(IsolatedAsyncioWrapperTestCase):
         controller = self.controller()
         controller.executors_info = [self.active_leg()]
         self.assertEqual(controller.determine_executor_actions(), [])
+
+    def test_a_leg_that_is_still_closing_blocks_the_next_one(self):
+        """
+        A leg working its way out still owns the position and the margin behind it.
+
+        is_active is False the moment a leg starts shutting down, so gating on it opens the
+        next leg on top of collateral the venue has not released. Every such leg is refused
+        for want of funds and counts as a leg that failed before trading, so five of them in
+        a row halt the run. That is what ended the 16:53 run on 2026-09-02, inside the eight
+        seconds leg 2 spent failing to place its exit.
+        """
+        controller = self.controller()
+        closing = self.active_leg("closing-1")
+        closing.status = RunnableStatus.SHUTTING_DOWN
+        closing.is_active = False
+        controller.executors_info = [closing]
+        self.assertEqual(controller.determine_executor_actions(), [])
+
+    def test_the_next_leg_starts_once_the_closing_one_terminates(self):
+        """The block above lifts on TERMINATED, not before — otherwise nothing ever starts."""
+        controller = self.controller()
+        closing = self.active_leg("closing-1")
+        closing.status = RunnableStatus.SHUTTING_DOWN
+        closing.is_active = False
+        controller.executors_info = [closing]
+        self.assertEqual(controller.determine_executor_actions(), [])
+
+        controller.executors_info = [
+            self.closed_leg("closing-1", CloseType.STOP_LOSS, net_pnl_quote="-1")]
+        self.assertEqual(len(controller.determine_executor_actions()), 1)
 
     def test_cooldown_after_stop_loss_blocks_then_releases(self):
         controller = self.controller(cooldown_after_stop_loss=60,
@@ -386,42 +356,6 @@ class TestSimpleGrid(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(controller.processed_data["anchor_price"], Decimal("98"))
         self.assertFalse(controller.processed_data["halted"])
 
-    def test_the_entry_band_defaults_to_a_fraction_of_the_step(self):
-        """
-        A band as wide as the step is a losing bracket before the leg starts: the entry can
-        fill at the edge with its take profit already on top of it and its stop loss two
-        steps away.
-        """
-        controller = self.controller(take_profit=Decimal("0.005"))
-        config = controller.determine_executor_actions()[0].executor_config
-        self.assertEqual(config.entry_band_pct, Decimal("0.001"))
-
-    def test_the_entry_band_can_be_set_outright(self):
-        controller = self.controller(take_profit=Decimal("0.005"), entry_band_pct=Decimal("0.0004"))
-        config = controller.determine_executor_actions()[0].executor_config
-        self.assertEqual(config.entry_band_pct, Decimal("0.0004"))
-
-    def test_the_band_fraction_is_configurable(self):
-        controller = self.controller(take_profit=Decimal("0.01"),
-                                     entry_band_fraction_of_step=Decimal("0.5"))
-        config = controller.determine_executor_actions()[0].executor_config
-        self.assertEqual(config.entry_band_pct, Decimal("0.005"))
-
-    def test_status_reports_how_far_the_price_has_left_the_anchor_behind(self):
-        """
-        Nothing rests in the book while the price is outside the band, so without this number
-        a strategy that a trend has left behind looks identical to one that is just waiting.
-        """
-        controller = self.controller(take_profit=Decimal("0.005"))
-        controller.executors_info = [
-            self.closed_leg("leg-1", CloseType.STOP_LOSS, close_price="100", net_pnl_quote="-1")]
-        controller.determine_executor_actions()
-        self.market_data_provider.get_price_by_type.return_value = Decimal("130")
-
-        status = "\n".join(controller.to_format_status())
-
-        self.assertIn("30.00% from the anchor", status)
-
     def test_status_does_not_cry_stale_while_the_price_is_near_the_anchor(self):
         controller = self.controller(take_profit=Decimal("0.005"))
         controller.executors_info = [
@@ -431,76 +365,8 @@ class TestSimpleGrid(IsolatedAsyncioWrapperTestCase):
 
         self.assertNotIn("STALE", "\n".join(controller.to_format_status()))
 
-    # ------------------------------------------------------------------ re-anchoring
-
-    def test_an_entry_that_timed_out_re_anchors_the_next_leg_to_the_market(self):
-        """
-        Breaks the deadlock. The anchor only moves on a trade and no trade can happen while
-        the price is outside the band around that anchor, so a trend would otherwise leave
-        the strategy waiting for a price it will never see again.
-        """
-        controller = self.controller(cooldown_after_reanchor=0)
-        controller.executors_info = [
-            self.closed_leg("leg-1", CloseType.STOP_LOSS, close_price="130", net_pnl_quote="-1")]
-        controller.determine_executor_actions()
-        self.assertEqual(controller._anchor_price, Decimal("130"))
-
-        # The price runs away and the maker entry never fills.
-        expired = self.closed_leg("leg-2", CloseType.EXPIRED, close_price="173", net_pnl_quote="0")
-        expired.filled_amount_quote = Decimal("0")
-        controller.executors_info.append(expired)
-        self.market_data_provider.get_price_by_type.return_value = Decimal("173")
-
-        config = controller.determine_executor_actions()[0].executor_config
-
-        self.assertEqual(controller._anchor_price, Decimal("173"))
-        self.assertEqual(config.entry_price, Decimal("173"))
-        self.assertEqual(controller._reanchors, 1)
-
-    def test_the_re_anchor_uses_the_live_price_not_the_expired_legs_close(self):
-        """An unfilled leg's close price is just the mid at the time; it is not a chain link."""
-        controller = self.controller(cooldown_after_reanchor=0)
-        expired = self.closed_leg("leg-1", CloseType.EXPIRED, close_price="150", net_pnl_quote="0")
-        expired.filled_amount_quote = Decimal("0")
-        controller.executors_info = [expired]
-        self.market_data_provider.get_price_by_type.return_value = Decimal("173")
-
-        config = controller.determine_executor_actions()[0].executor_config
-
-        self.assertEqual(config.entry_price, Decimal("173"))
-
-    def test_re_anchoring_waits_out_its_own_cooldown(self):
-        """It deliberately allows an entry right after a big move, so it must not be instant."""
-        controller = self.controller(cooldown_after_reanchor=90)
-        expired = self.closed_leg("leg-1", CloseType.EXPIRED, net_pnl_quote="0")
-        expired.filled_amount_quote = Decimal("0")
-        controller.executors_info = [expired]
-
-        self.assertEqual(controller.determine_executor_actions(), [])
-        self.now = START_TS + 30
-        self.assertEqual(controller.determine_executor_actions(), [])
-        self.now = START_TS + 95
-        self.assertEqual(len(controller.determine_executor_actions()), 1)
-
-    def test_re_anchoring_can_be_switched_off(self):
-        controller = self.controller(reanchor_on_entry_timeout=False, cooldown_after_reanchor=0)
-        controller.executors_info = [
-            self.closed_leg("leg-1", CloseType.STOP_LOSS, close_price="130", net_pnl_quote="-1")]
-        controller.determine_executor_actions()
-
-        expired = self.closed_leg("leg-2", CloseType.EXPIRED, net_pnl_quote="0")
-        expired.filled_amount_quote = Decimal("0")
-        controller.executors_info.append(expired)
-        self.market_data_provider.get_price_by_type.return_value = Decimal("173")
-
-        config = controller.determine_executor_actions()[0].executor_config
-
-        self.assertEqual(controller._anchor_price, Decimal("130"))
-        self.assertEqual(config.entry_price, Decimal("130"))
-        self.assertEqual(controller._reanchors, 0)
-
-    def test_a_leg_that_traded_still_anchors_on_where_it_closed(self):
-        """Re-anchoring must not loosen the ordinary rule; the chain still follows the exits."""
+    def test_a_leg_that_traded_sets_the_next_reference(self):
+        """The chain follows the exits, whatever the market has done since."""
         controller = self.controller()
         controller.executors_info = [
             self.closed_leg("leg-1", CloseType.TAKE_PROFIT, close_price="102", net_pnl_quote="1")]
@@ -508,54 +374,13 @@ class TestSimpleGrid(IsolatedAsyncioWrapperTestCase):
 
         config = controller.determine_executor_actions()[0].executor_config
 
-        self.assertEqual(config.entry_price, Decimal("102"))
-        self.assertEqual(controller._reanchors, 0)
-
-    def test_an_early_stop_does_not_re_anchor(self):
-        """Only the entry timeout re-anchors; being stopped by hand is not a fresh start."""
-        controller = self.controller(cooldown_after_reanchor=0)
-        controller.executors_info = [
-            self.closed_leg("leg-1", CloseType.STOP_LOSS, close_price="130", net_pnl_quote="-1")]
-        controller.determine_executor_actions()
-
-        stopped = self.closed_leg("leg-2", CloseType.EARLY_STOP, net_pnl_quote="0")
-        stopped.filled_amount_quote = Decimal("0")
-        controller.executors_info.append(stopped)
-        self.market_data_provider.get_price_by_type.return_value = Decimal("173")
-
-        config = controller.determine_executor_actions()[0].executor_config
-
-        self.assertEqual(config.entry_price, Decimal("130"))
-        self.assertEqual(controller._reanchors, 0)
+        self.assertEqual(config.entry_reference_price, Decimal("102"))
 
     def test_the_entry_timeout_has_a_default_and_reaches_the_executor(self):
         """Without one the maker entry rests forever and no leg ever ends."""
         controller = self.controller()
         config = controller.determine_executor_actions()[0].executor_config
         self.assertEqual(config.entry_timeout, 300)
-
-    def test_status_says_re_anchoring_rather_than_stale_when_it_is_armed(self):
-        controller = self.controller(take_profit=Decimal("0.005"))
-        controller.executors_info = [
-            self.closed_leg("leg-1", CloseType.STOP_LOSS, close_price="100", net_pnl_quote="-1")]
-        controller.determine_executor_actions()
-        self.market_data_provider.get_price_by_type.return_value = Decimal("130")
-
-        status = "\n".join(controller.to_format_status())
-
-        self.assertIn("Adrift", status)
-        self.assertIn("re-anchoring in up to 300s", status)
-        self.assertNotIn("STALE", status)
-
-    def test_status_still_says_stale_when_re_anchoring_is_off(self):
-        controller = self.controller(take_profit=Decimal("0.005"),
-                                     reanchor_on_entry_timeout=False)
-        controller.executors_info = [
-            self.closed_leg("leg-1", CloseType.STOP_LOSS, close_price="100", net_pnl_quote="-1")]
-        controller.determine_executor_actions()
-        self.market_data_provider.get_price_by_type.return_value = Decimal("130")
-
-        self.assertIn("STALE", "\n".join(controller.to_format_status()))
 
     # ------------------------------------------------------------------ failing legs
 
@@ -564,14 +389,14 @@ class TestSimpleGrid(IsolatedAsyncioWrapperTestCase):
         leg.filled_amount_quote = Decimal(filled)
         return leg
 
-    def test_repeated_legs_that_never_trade_halt_instead_of_retrying_forever(self):
+    def test_repeated_legs_the_venue_refuses_halt_instead_of_retrying_forever(self):
         """
-        A live run logged 'Not enough budget' once a second for two minutes: a stranded
-        position held the margin, so every new leg was refused the moment it was created.
+        A live run logged an error once a second for two minutes: a stranded position held the
+        margin, so every new leg was refused the moment it was created.
         """
-        controller = self.controller(max_consecutive_failed_legs=3, cooldown_after_reanchor=0)
+        controller = self.controller(max_consecutive_failed_legs=3)
         controller.executors_info = [
-            self.failed_leg(f"leg-{i}", CloseType.INSUFFICIENT_BALANCE) for i in range(1, 4)]
+            self.failed_leg(f"leg-{i}", CloseType.FAILED) for i in range(1, 4)]
 
         actions = controller.determine_executor_actions()
 
@@ -579,11 +404,77 @@ class TestSimpleGrid(IsolatedAsyncioWrapperTestCase):
         self.assertTrue(controller.is_halted)
         self.assertIn("failed before trading", controller._halt_reason)
 
-    def test_a_leg_that_trades_clears_the_failure_streak(self):
-        controller = self.controller(max_consecutive_failed_legs=3, cooldown_after_reanchor=0)
+    def test_a_short_run_of_unaffordable_legs_does_not_halt(self):
+        """
+        INSUFFICIENT_BALANCE is our own budget check, and it reads a balance cache refreshed
+        only every 120s while the websocket is up. Margin released a second ago is still
+        invisible to it, so a burst of refusals says nothing about the wallet.
+
+        On 2026-09-02 five of these in five seconds halted a run holding 904 INR against a
+        713 INR leg. Counting them like venue rejections is what made that possible.
+        """
+        controller = self.controller(max_consecutive_failed_legs=3)
         controller.executors_info = [
-            self.failed_leg("leg-1", CloseType.INSUFFICIENT_BALANCE),
-            self.failed_leg("leg-2", CloseType.INSUFFICIENT_BALANCE),
+            self.failed_leg(f"leg-{i}", CloseType.INSUFFICIENT_BALANCE) for i in range(1, 6)]
+
+        controller.determine_executor_actions()
+
+        self.assertEqual(controller._consecutive_failed_legs, 0)
+        self.assertFalse(controller.is_halted)
+
+    def test_an_unaffordable_leg_is_not_retried_at_tick_speed(self):
+        """
+        The budget check reads a cached wallet, so the answer is identical every tick until
+        that cache is re-read. Retrying immediately just prints one error per second — 56 of
+        them on 2026-09-03 before the run was stopped by hand.
+        """
+        controller = self.controller(retry_after_insufficient_balance=5)
+        controller.executors_info = [self.failed_leg("leg-1", CloseType.INSUFFICIENT_BALANCE)]
+        controller.determine_executor_actions()
+
+        controller.executors_info = []
+        self.now = START_TS + 1
+        self.assertEqual(controller.determine_executor_actions(), [])
+
+        self.now = START_TS + 6
+        self.assertEqual(len(controller.determine_executor_actions()), 1)
+
+    def test_a_sustained_shortage_halts_on_time_instead(self):
+        """A stale read clears at the next poll. Anything past a full refresh interval is real."""
+        controller = self.controller(insufficient_balance_grace_seconds=180)
+        controller.executors_info = [self.failed_leg("leg-1", CloseType.INSUFFICIENT_BALANCE)]
+        controller.determine_executor_actions()
+        self.assertFalse(controller.is_halted)
+
+        self.now = START_TS + 181
+        controller.executors_info = [self.failed_leg("leg-2", CloseType.INSUFFICIENT_BALANCE)]
+        controller.determine_executor_actions()
+
+        self.assertTrue(controller.is_halted)
+        self.assertIn("no leg has been affordable", controller._halt_reason)
+
+    def test_one_affordable_leg_clears_the_shortage_clock(self):
+        """An order that reached the venue is proof the money was there."""
+        controller = self.controller(insufficient_balance_grace_seconds=180)
+        controller.executors_info = [self.failed_leg("leg-1", CloseType.INSUFFICIENT_BALANCE)]
+        controller.determine_executor_actions()
+        self.assertIsNotNone(controller._insufficient_balance_since)
+
+        controller.executors_info = [self.failed_leg("leg-2", CloseType.EXPIRED)]
+        controller.determine_executor_actions()
+        self.assertIsNone(controller._insufficient_balance_since)
+
+        self.now = START_TS + 181
+        controller.executors_info = [self.failed_leg("leg-3", CloseType.INSUFFICIENT_BALANCE)]
+        controller.determine_executor_actions()
+
+        self.assertFalse(controller.is_halted)
+
+    def test_a_leg_that_trades_clears_the_failure_streak(self):
+        controller = self.controller(max_consecutive_failed_legs=3)
+        controller.executors_info = [
+            self.failed_leg("leg-1", CloseType.FAILED),
+            self.failed_leg("leg-2", CloseType.FAILED),
             self.closed_leg("leg-3", CloseType.TAKE_PROFIT, net_pnl_quote="1"),
         ]
 
@@ -607,7 +498,7 @@ class TestSimpleGrid(IsolatedAsyncioWrapperTestCase):
         self.assertIn("position may still be open", controller._halt_reason)
 
     def test_a_leg_that_failed_without_trading_does_not_halt_on_its_own(self):
-        controller = self.controller(max_consecutive_failed_legs=5, cooldown_after_reanchor=0)
+        controller = self.controller(max_consecutive_failed_legs=5)
         controller.executors_info = [self.failed_leg("leg-1", CloseType.FAILED)]
 
         controller.determine_executor_actions()
@@ -780,3 +671,85 @@ class TestSimpleGrid(IsolatedAsyncioWrapperTestCase):
 
         self.assertFalse(controller.is_halted)
         self.assertEqual(len(actions), 1, "it carries on opening legs")
+
+    # ------------------------------------------------------------------ the flat-between rule
+
+    def test_every_leg_opens_on_the_same_side(self):
+        """
+        Between legs the account is flat, so a run that opens with a buy is long or flat for
+        its whole life. There is no side to re-decide.
+        """
+        controller = self.controller(initial_entry_mode=SimpleGridEntryMode.LONG_ONLY)
+        controller.executors_info = [
+            self.closed_leg("leg-1", CloseType.STOP_LOSS, side=TradeType.BUY, net_pnl_quote="-1")]
+
+        config = controller.determine_executor_actions()[0].executor_config
+
+        self.assertEqual(config.entry_mode, SimpleGridEntryMode.LONG_ONLY)
+
+    def test_there_are_no_pauses_between_legs(self):
+        """A pause means standing flat while the grid wants to be working."""
+        controller = self.controller()
+        self.assertEqual(controller.config.cooldown_after_take_profit, 0)
+        self.assertEqual(controller.config.cooldown_after_stop_loss, 0)
+
+        controller.executors_info = [
+            self.closed_leg("leg-1", CloseType.STOP_LOSS, net_pnl_quote="-1")]
+
+        self.assertEqual(len(controller.determine_executor_actions()), 1)
+
+    def test_a_halt_closes_the_open_position(self):
+        """
+        There is no longer a moment where we happen to be flat, so a halt that leaves the leg
+        running leaves a position with nothing watching it.
+        """
+        controller = self.controller(max_loss_quote=Decimal("1"))
+        controller.executors_info = [
+            self.closed_leg("leg-1", CloseType.STOP_LOSS, net_pnl_quote="-2"),
+            self.active_leg("live-1"),
+        ]
+
+        actions = controller.determine_executor_actions()
+
+        self.assertTrue(controller.is_halted)
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].executor_id, "live-1")
+        self.assertFalse(actions[0].keep_position, "the position must not be handed on")
+
+    def test_a_halt_with_nothing_open_asks_for_nothing(self):
+        controller = self.controller(max_loss_quote=Decimal("1"))
+        controller.executors_info = [
+            self.closed_leg("leg-1", CloseType.STOP_LOSS, net_pnl_quote="-2")]
+
+        self.assertEqual(controller.determine_executor_actions(), [])
+        self.assertTrue(controller.is_halted)
+
+    def test_the_first_fill_fixes_the_side_for_the_rest_of_the_run(self):
+        """
+        An opening leg may offer both sides, but once one has filled the account is
+        long-or-flat (or short-or-flat) — there is nothing left to choose.
+        """
+        controller = self.controller(initial_entry_mode=SimpleGridEntryMode.BOTH_OCO)
+        controller.executors_info = [
+            self.closed_leg("leg-1", CloseType.STOP_LOSS, side=TradeType.SELL, net_pnl_quote="-1")]
+
+        config = controller.determine_executor_actions()[0].executor_config
+
+        self.assertEqual(controller._bias_side, TradeType.SELL)
+        self.assertEqual(config.entry_mode, SimpleGridEntryMode.SHORT_ONLY)
+
+    def test_the_opening_leg_may_still_offer_both_sides(self):
+        controller = self.controller(initial_entry_mode=SimpleGridEntryMode.BOTH_OCO)
+        config = controller.determine_executor_actions()[0].executor_config
+        self.assertEqual(config.entry_mode, SimpleGridEntryMode.BOTH_OCO)
+
+    def test_a_leg_that_never_traded_does_not_fix_the_side(self):
+        controller = self.controller(initial_entry_mode=SimpleGridEntryMode.BOTH_OCO)
+        leg = self.closed_leg("leg-1", CloseType.EXPIRED, side=TradeType.SELL, net_pnl_quote="0")
+        leg.filled_amount_quote = Decimal("0")
+        controller.executors_info = [leg]
+
+        config = controller.determine_executor_actions()[0].executor_config
+
+        self.assertIsNone(controller._bias_side)
+        self.assertEqual(config.entry_mode, SimpleGridEntryMode.BOTH_OCO)

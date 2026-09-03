@@ -163,6 +163,14 @@ MAX_PENDING_ORDER_EVENTS = 256
 # to outlive the window in which the venue repeats a frame, which is seconds.
 MAX_APPLIED_ORDER_EVENTS = 512
 
+# How long to wait after the venue confirms a cancel before re-reading the wallet.
+#
+# CoinDCX frees the collateral behind a cancelled order a beat AFTER it acknowledges the
+# cancel, so a wallet read taken on the acknowledgement returns the pre-release figure and
+# caches staleness rather than curing it. Measured at roughly 100ms-1s across several live
+# runs; 1.5s clears it with room while still being far inside the next scheduled poll.
+BALANCE_REFRESH_AFTER_CANCEL_DELAY = 1.5
+
 RATE_LIMITS = [
     RateLimit(limit_id=ACTIVE_INSTRUMENTS_PATH_URL, limit=2000, time_interval=ONE_MINUTE),
     RateLimit(limit_id=INSTRUMENT_PATH_URL, limit=2000, time_interval=ONE_MINUTE),

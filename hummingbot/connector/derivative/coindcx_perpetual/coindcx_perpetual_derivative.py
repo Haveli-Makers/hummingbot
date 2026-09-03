@@ -576,21 +576,12 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
         if isinstance(response, dict):
             code = response.get("code", response.get("status"))
             if str(response.get("message", "")).lower() == "success" or code in (200, "200"):
-                # The ONLY place a cancel we initiated can ask for the released margin to be
-                # re-read.
-                #
-                # On success the framework builds the CANCELED OrderUpdate itself, in
-                # _execute_order_cancel_and_process_update, and hands it straight to the order
-                # tracker — never passing through _push_order_update, which is where settling
-                # orders normally trigger a balance refresh. And a later venue frame repeating
-                # CANCELED does reach that method, but its state already matches the tracker's,
-                # so it returns on the dedupe check one line before the refresh.
-                #
-                # The result is that cancelling frees collateral the connector does not learn
-                # about until its next scheduled poll — LONG_POLL_INTERVAL, 120s, whenever the
-                # websocket is alive. On 2026-09-03 that made the budget checker refuse a
-                # 6.99 USDT leg against a 9.11 USDT wallet, once a second for 56 seconds, until
-                # the run was stopped by hand.
+                # The only place a cancel WE initiated can ask for the released margin to be
+                # re-read. On success the framework marks the order CANCELED itself, bypassing
+                # _push_order_update where settling orders normally trigger a refresh, and a
+                # repeat frame from the venue returns on that method's dedupe check. So without
+                # this the freed collateral stays invisible until the next scheduled poll —
+                # LONG_POLL_INTERVAL, 120s, whenever the websocket is alive.
                 self._refresh_balances_soon(delay=CONSTANTS.BALANCE_REFRESH_AFTER_CANCEL_DELAY)
                 return True
         raise IOError(f"Unexpected response cancelling order {exchange_order_id}: {response}")

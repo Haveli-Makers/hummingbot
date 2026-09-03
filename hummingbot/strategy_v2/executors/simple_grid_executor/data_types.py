@@ -39,41 +39,31 @@ class SimpleGridBarriers(BaseModel):
     time_limit: Optional[int] = None
     take_profit_order_type: OrderType = OrderType.LIMIT
 
-    # Order type for the urgent exit — the one used when the stop loss gives up on being
-    # passive, on a time limit, and when the strategy is shut down.
-    #
-    # NOT market. CoinDCX rejects reduce_only on a market order outright:
-    #     400 "Reduce Only Order is only applicable for Limit Order"
-    # and the connector has to send reduce_only on a close, or the venue treats it as a
-    # fresh opposite position and demands margin for it — which fails exactly when the
-    # position is large against the wallet, i.e. the moment you most need out. A limit
-    # priced through the book crosses and fills like a market order, is a limit order as far
-    # as the venue is concerned, and bounds how much slippage we accept.
+    # The urgent exit: stop loss giving up, time limit, shutdown. NOT market — CoinDCX rejects
+    # reduce_only on a market order ("Reduce Only Order is only applicable for Limit Order"),
+    # and a close without reduce_only is treated as a fresh opposite position needing margin,
+    # which fails exactly when you most need out. A limit priced through the book crosses like
+    # a market order and bounds the slippage.
     close_order_type: OrderType = OrderType.LIMIT
 
-    # How far through the book to price that crossing limit. Wide enough to clear several
-    # levels so it actually fills; the price is still a hard floor under the fill.
+    # How far through the book to price it: enough levels to actually fill, and still a hard
+    # floor under the price.
     close_slippage_ticks: int = 20
 
-    # Once the stop level is breached, exit with a maker limit resting at the touch price on
-    # the exit side (a long sells at the best ask) and follow the book down rather than
-    # crossing the spread immediately. Set False to go straight to market as before.
+    # Leave passively and follow the book down instead of crossing the moment the stop breaks.
     stop_loss_chase: bool = True
 
-    # Where the chasing exit rests, in ticks INSIDE the opposite touch: a sell one tick above
-    # the best bid, a buy one tick below the best ask. That is the most aggressive price an
-    # order can hold without crossing, so it is the best offer in the book and first to fill,
-    # while still earning the maker fee. Raising it backs off towards our own touch — a better
-    # price, but further back in the queue, which for an exit is the wrong way round.
+    # Where that exit rests, in ticks INSIDE the opposite touch. One tick is the most
+    # aggressive price that still earns the maker fee — best in the book, first to fill.
+    # Raising it is a better price further back in the queue, which for an exit is backwards.
     stop_loss_maker_offset_ticks: int = 1
 
-    # Re-place the chasing exit once the touch price has moved this far from where our order
-    # is resting. Re-posting on every book change would burn rate limit and risk racing our
-    # own cancels.
+    # Re-place once the touch has moved this far from our resting price. Re-posting on every
+    # book change would burn rate limit and race our own cancels.
     stop_loss_requote_pct: Decimal = Decimal("0.0005")
 
-    # How far the price may drift past the ORIGINAL stop level before the chase is abandoned
-    # and we take the market price. This is the bound on what patience can cost us.
+    # How far past the stop level the chase may follow before crossing. The bound on what
+    # patience can cost.
     stop_loss_max_drift_pct: Decimal = Decimal("0.001")
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -146,56 +136,33 @@ class SimpleGridExecutorConfig(ExecutorConfigBase):
     entry_mode: SimpleGridEntryMode = SimpleGridEntryMode.LONG_ONLY
     amount: Decimal
 
-    # Where the previous leg ended. The entry's two prices are one step either side of it:
-    # a resting order at the favourable price, a trigger at the unfavourable one.
-    #
-    # None means there is no previous leg — the very first one has nothing to measure from,
-    # so it rests at the live touch instead and has no trigger.
+    # Where the previous leg ended; the entry's two prices sit one step either side of it.
+    # None on the very first leg, which rests at the live touch and has no trigger.
     entry_reference_price: Optional[Decimal] = None
 
     # Give up if the entry is never filled within this many seconds.
     entry_timeout: Optional[int] = None
 
-    # How long to keep watching an entry the venue said it cancelled.
-    #
-    # A cancel is a claim, not a fact. CoinDCX has acknowledged a cancel and then filled the
-    # same order thirty seconds later — leaving a real position that nothing was tracking,
-    # with no take profit, no stop loss, and invisible to the shutdown flatten. While an
-    # order is watched, a fill on it is still ours and its exits still get armed.
+    # How long to keep watching an entry the venue said it cancelled. A cancel is a claim, not
+    # a fact: CoinDCX has acknowledged one and filled the same order thirty seconds later. A
+    # fill on a watched order is still ours, and its exits still get armed.
     cancelled_entry_watch_seconds: float = 60.0
 
     # How long to let the venue release the collateral behind a cancelled reduce-only order
-    # before sending its replacement.
-    #
-    # CoinDCX acknowledges a cancel BEFORE it frees the margin. An exit sent on the
-    # acknowledgement is still seen as a second reduce-only order against the same position
-    # and refused with "Insufficient funds" — measured live, ~100ms after the ack was not
-    # enough. Waiting a moment on purpose is cheaper than a rejection, because a rejection
-    # costs a whole control tick and the price moves inside it.
+    # before sending its replacement. CoinDCX acknowledges a cancel BEFORE it frees the margin,
+    # so an exit sent on the acknowledgement is refused as a second reduce-only order.
     cancel_settle_delay: float = 0.25
 
     # Every refusal doubles that wait, capped here. A stop that cannot place its exit is the
     # worst thing this executor does, so the ceiling stays low enough to keep trying often.
     exit_retry_max_delay: float = 2.0
 
-    # How long to stand down once the venue has refused a close for want of collateral twice
-    # in a row.
-    #
-    # That refusal is not a transient and it is not about our order: a reduce-only close is
-    # refused for funds when a PREVIOUS exit is still holding the margin — an order we asked
-    # to cancel and were told was gone. Replacing it faster cannot help, because the thing in
-    # the way is the replacement's own predecessor. It resolves when that order does, one way
-    # or the other, and the only useful thing to do meanwhile is wait for it.
-    #
-    # On 2026-09-02 the executor read the refusal as a transient and sent eleven replacements
-    # in eight seconds, exhausting its retries; the cancelled order then filled by itself, as
-    # a maker, at a better price than any of them asked for.
+    # Stand-down once a close has been refused for collateral this many times in a row. That
+    # refusal is not a transient: the margin is held by a PREVIOUS exit we asked to cancel and
+    # were told was gone, so replacing it faster cannot help — the obstacle is the
+    # replacement's own predecessor, and it clears only when that order resolves. The first
+    # refusal is still treated as the ordinary settle race cancel_settle_delay exists for.
     collateral_refusal_wait: float = 3.0
-
-    # How many of those refusals in a row before that longer wait kicks in. The first one is
-    # genuinely ambiguous — cancel_settle_delay exists because the venue frees collateral a
-    # moment after it confirms the cancel — so one refusal is treated as the ordinary race it
-    # usually is, and only a second says the order never went away.
     collateral_refusals_before_waiting: int = 2
 
     # On a partial fill the barriers arm against whatever filled; the unfilled remainder

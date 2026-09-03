@@ -60,25 +60,12 @@ class SimpleGridConfig(ControllerConfigBase):
     # silently fall back to mid anyway. Saying it outright makes the trigger explicit.
     trigger_price_type: PriceType = PriceType.MidPrice
 
-    # Entry behaviour. The opening order rests one step in our favour of where the previous
-    # leg ended; one step against it is a trigger. If the market reaches the trigger first we
-    # open there instead, crossing to do it. An order a full step from the market cannot
-    # cross by accident, so the resting side is reliably a maker fill and only the trigger
-    # ever pays taker.
-    #
-    # The very first leg has no previous exit to measure from, so it rests at the touch.
-    #
-    # An entry can still sit unfilled if the price stays between the two prices, so the
-    # timeout is what ends a leg that is going nowhere.
+    # An entry can sit unfilled while the price stays between the resting order and the
+    # trigger, so this is what ends a leg that is going nowhere.
     entry_timeout: Optional[int] = Field(default=300, json_schema_extra={"is_updatable": True})
 
-    # Stop loss behaviour. The stop level is watched, then left through a maker limit resting
-    # at the touch on the exit side and followed down the book. Bounded by the drift cap,
-    # past which we accept the market price.
-    # The urgent exit — stop loss fallback, time limit, shutdown. A crossing LIMIT, not a
-    # MARKET order: CoinDCX rejects reduce_only on market orders, and a close without
-    # reduce_only has the venue demand margin for a fresh opposite position.
-    # 1 = LIMIT (PriceType-style int parsing does not apply here; OrderType parses by value).
+    # How far through the book the urgent exit is priced. See SimpleGridBarriers for why it is
+    # a crossing limit rather than a market order.
     close_slippage_ticks: int = Field(default=20, json_schema_extra={"is_updatable": True})
 
     # CoinDCX acknowledges a cancel before it releases the collateral behind it, so an exit
@@ -112,63 +99,43 @@ class SimpleGridConfig(ControllerConfigBase):
     cooldown_after_take_profit: int = Field(default=0, json_schema_extra={"is_updatable": True})
     cooldown_after_stop_loss: int = Field(default=0, json_schema_extra={"is_updatable": True})
 
-    # Risk. Two independent halts, either one stops new legs being opened. Nothing is
-    # force-closed; an open leg is left to finish on its own barriers.
-    #
-    # 1. Losses reach the threshold. Set as an absolute quote amount, a fraction of
-    #    total_amount_quote, or both — the tighter one wins.
+    # Risk. Any one of these stops new legs being opened. Nothing is force-closed; an open leg
+    # is left to finish on its own barriers.
+
+    # 1. Losses reach the threshold — absolute, a fraction of total_amount_quote, or both,
+    #    whichever is tighter.
     max_loss_quote: Optional[Decimal] = Field(default=None, json_schema_extra={"is_updatable": True})
     max_loss_pct: Optional[Decimal] = Field(default=None, json_schema_extra={"is_updatable": True})
-    # 2. Stop losses have caught up with take profits AND we are down overall. Being behind
-    #    on count while still in profit is not enough on its own.
-    #    OFF by default: the loss threshold above is the agreed stop condition for now, and
-    #    this one is kept ready to switch on later rather than removed.
-    # 3. Legs keep failing before they trade. Without this the controller opens a new leg
-    #    every tick against a venue that is refusing them, logging one error a second
-    #    forever — which is what a stranded position looks like from the inside, because the
-    #    position holds the margin the next leg needs.
-    #
-    #    Counts only legs the VENUE refused. A leg stopped by our own budget check never
-    #    reached the exchange and is counted by time instead — see below.
+
+    # 2. Legs the VENUE refused, in a row. Without it the controller opens a new leg every tick
+    #    against a venue refusing them, which is what a stranded position looks like from the
+    #    inside: the position holds the margin the next leg needs.
     max_consecutive_failed_legs: int = Field(default=5, json_schema_extra={"is_updatable": True})
 
-    # 3b. Our own budget check keeps refusing to open a leg.
-    #
-    #     Counted in seconds rather than in legs, because the two causes look identical per
-    #     leg and differ only in how long they last. The check reads the connector's CACHED
-    #     balance, and that cache is refreshed by REST every LONG_POLL_INTERVAL — 120s —
-    #     whenever the private websocket is alive. So margin released just now can stay
-    #     invisible for a long time, and a controller retrying every second racks up refusals
-    #     at a rate that says nothing about whether the money is really there.
-    #
-    #     On 2026-09-02 that halted a run holding 904 INR against a 713 INR leg. Five refusals
-    #     in five seconds, every one of them a stale read of a wallet that was already full.
-    #
-    #     A genuine shortage does not clear; a stale read does, at the next poll. Anything past
-    #     one full poll interval is therefore real, and worth halting for.
+    # 3. Our own budget check keeps refusing, measured in seconds rather than legs. It reads the
+    #    connector's CACHED balance, refreshed by REST only every LONG_POLL_INTERVAL (120s) when
+    #    the websocket is alive, so a burst of refusals says nothing about the real wallet. A
+    #    stale read clears at the next poll; a genuine shortage does not.
     insufficient_balance_grace_seconds: float = Field(default=180.0,
                                                       json_schema_extra={"is_updatable": True})
-    #     How long to wait before trying again after one. The check reads a cached wallet, so
-    #     the answer cannot change until that cache is re-read and retrying every tick only
-    #     produces an error line every tick.
+    #    Retrying at tick speed cannot help for the same reason, and prints an error per tick.
     retry_after_insufficient_balance: int = Field(default=5, json_schema_extra={"is_updatable": True})
 
     # 4. The venue holds a position no leg claims. The stop loss lives in this process, so an
-    #    unowned position has nothing watching it — the single most dangerous state this
-    #    strategy can be in, and the one that survives every other guard.
+    #    unowned position has nothing watching it — the most dangerous state here, and the one
+    #    that survives every other guard.
     reconcile_positions: bool = Field(default=True, json_schema_extra={"is_updatable": True})
-    #    How long the venue and our own books must disagree before we act. An executor that
-    #    has just filled takes a moment to report it, and flattening a leg that was about to
-    #    announce itself would be worse than the problem.
+    #    How long the two views must disagree first: a leg that has just filled takes a moment
+    #    to report it, and flattening that would be worse than the problem.
     orphan_grace_seconds: float = Field(default=10.0, json_schema_extra={"is_updatable": True})
-    #    Close it as well as halting. Only ever applies to a position that appeared while this
-    #    controller was running and watching a flat account — a position that was already
-    #    there when we started is somebody else's and is never touched.
+    #    Close it as well as halting — but only a position that appeared while this controller
+    #    was running and watching a flat account. One already there is somebody else's.
     flatten_orphan_positions: bool = Field(default=True, json_schema_extra={"is_updatable": True})
+
+    # 5. Stop losses have caught up with take profits AND we are down overall. Off by default;
+    #    max_loss_quote is the agreed stop condition.
     stop_when_losses_outnumber_wins: bool = Field(default=False, json_schema_extra={"is_updatable": True})
-    #    Grace period, in closed legs, before that count check applies. Without it a single
-    #    losing first leg already satisfies "losses >= wins and down", and the strategy
-    #    would stop before it had a fair sample.
+    #    Without a minimum sample one losing first leg already satisfies "losses >= wins".
     min_legs_before_count_check: int = Field(default=10, json_schema_extra={"is_updatable": True})
 
     @field_validator("take_profit", "stop_loss", "order_amount_quote")
@@ -267,17 +234,10 @@ class SimpleGrid(ControllerBase):
         """
         Every leg that has not reached TERMINATED — including the ones still closing.
 
-        ``is_active`` covers RUNNING and NOT_STARTED only, so a leg that has hit its stop and
-        is working its way out does not appear there. For most controllers that distinction
-        does not matter. Here it decides whether the strategy works at all: this one is flat
-        BETWEEN legs, and a closing leg still owns both the position and the margin behind it.
-
-        Starting the next leg off ``is_active`` opens it while the old one still holds the
-        collateral. The venue refuses it for want of funds, the executor reports a leg that
-        failed before trading, and five of those in a row trip the halt — which is exactly
-        what ended the 16:53 run on 2026-09-02: leg 2 spent eight seconds failing to place its
-        exit, and the controller spawned five doomed legs inside that window, each one asking
-        for the same price leg 2 had already taken.
+        ``is_active`` covers RUNNING and NOT_STARTED only, so a leg working its way out does
+        not appear there. That matters here because the strategy is flat BETWEEN legs: a
+        closing leg still owns the position and the margin behind it, so starting the next one
+        off ``is_active`` opens it against collateral the venue has not released.
         """
         return self.filter_executors(self.executors_info, lambda e: not e.is_done)
 
@@ -332,11 +292,9 @@ class SimpleGrid(ControllerBase):
             close_price = executor.custom_info.get("close_price")
             side = executor.custom_info.get("side")
 
-            # A leg that never opened tells us nothing about where the grid should sit.
-            # Whether a leg counts is decided by whether it actually traded, not by how it
-            # closed. A leg whose entry was never filled has nothing to say about where the
-            # chain should sit next, and letting it move the anchor would walk the grid
-            # across the market without a single fill behind it.
+            # Whether a leg counts is decided by whether it actually TRADED, not by how it
+            # closed. Letting a leg that never filled move the reference would walk the grid
+            # across the market with no fill behind it.
             opened = (executor.filled_amount_quote > Decimal("0")
                       and executor.close_type not in (CloseType.EXPIRED,
                                                       CloseType.INSUFFICIENT_BALANCE,
@@ -357,26 +315,19 @@ class SimpleGrid(ControllerBase):
                 elif executor.close_type == CloseType.STOP_LOSS:
                     self._losses += 1
 
-            # A timed-out entry does NOT move the reference either — it is covered by the
-            # rule above, and deliberately so. The two prices bracket the market by a step
-            # either side, so a price that reaches neither is simply a price still inside the
-            # grid; re-placing the same pair is the right answer, and re-anchoring on the mid
-            # would walk the grid along with a market that has not actually gone anywhere.
-            # A leg that failed before trading tells us the venue is refusing us, not that
-            # the market moved. A leg that failed AFTER trading is worse: its position may
-            # still be open, and every later leg would be stacked on top of it.
+            # That covers a timed-out entry too, deliberately: the two prices bracket the
+            # market, so a price reaching neither has not gone anywhere and the same pair
+            # should be re-placed. A leg that failed AFTER trading is the dangerous one — its
+            # position may still be open, and every later leg would stack on top of it.
             if opened:
                 self._consecutive_failed_legs = 0
             elif executor.close_type == CloseType.FAILED:
                 self._consecutive_failed_legs += 1
 
             # INSUFFICIENT_BALANCE is our own budget check, not the venue's answer — no order
-            # was ever sent. It reads a balance cache that only refreshes every LONG_POLL_
-            # INTERVAL while the websocket is up, so a leg refused a second after margin was
-            # released says nothing about whether the money is there. Counting those alongside
-            # real venue rejections is what halted the 17:46 run on 2026-09-02 with a full
-            # wallet. Time tells the two apart where a count cannot: a stale read clears at the
-            # next poll, a real shortage does not.
+            # was ever sent, and it reads a cache that refreshes only every LONG_POLL_INTERVAL.
+            # Counting those as venue rejections halts runs with a full wallet. Time tells them
+            # apart where a count cannot: a stale read clears at the next poll.
             if executor.close_type == CloseType.INSUFFICIENT_BALANCE:
                 if self._insufficient_balance_since is None:
                     self._insufficient_balance_since = self.market_data_provider.time()
@@ -514,11 +465,9 @@ class SimpleGrid(ControllerBase):
         if close_type == CloseType.STOP_LOSS:
             return self.config.cooldown_after_stop_loss
         if close_type == CloseType.INSUFFICIENT_BALANCE:
-            # Retrying this one at tick speed cannot help. The budget check reads a cached
-            # wallet, so the answer is identical every tick until the cache is re-read, and
-            # the only thing a new leg per second produces is one error line per second —
-            # 56 of them on 2026-09-03 before the run was stopped by hand. Waiting gives the
-            # refresh time to land and turns the storm into a handful of lines.
+            # The budget check reads a cached wallet, so the answer is identical every tick
+            # until that cache is re-read — retrying at tick speed only prints an error per
+            # tick. Waiting gives the refresh time to land.
             return self.config.retry_after_insufficient_balance
         return self.config.cooldown_after_take_profit
 

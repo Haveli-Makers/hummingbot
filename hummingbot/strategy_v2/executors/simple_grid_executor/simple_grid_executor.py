@@ -614,21 +614,11 @@ class SimpleGridExecutor(ExecutorBase):
     def evaluate_max_retries(self):
         if self._current_retries <= self._max_retries:
             return
-        # Out of retries. Before calling this a failure, ask the venue what it actually holds:
-        # a run of rejected exits is equally consistent with the exit having ALREADY happened,
-        # on an order the venue told us it had cancelled.
-        #
-        # That is what the 16:56 stop on 2026-09-02 was. The chase was cancelled, the cancel
-        # was confirmed, and the order filled as a maker five seconds later regardless; every
-        # "Insufficient funds" in between was the venue refusing to let us double-close a
-        # position that was already on its way out.
-        #
-        # Overwriting the close type with FAILED there does three wrong things at once. It
-        # halts the run. It tells the operator to go and close a position by hand that is not
-        # there — spending the credibility of the one message that has to be believed. And it
-        # drops the leg out of the tally entirely, because the controller reads FAILED as
-        # never having traded, so a real stop loss goes uncounted in both the win rate and the
-        # drawdown. Whatever exit we were already working towards is the truthful answer.
+        # A run of rejected exits is equally consistent with the exit having ALREADY happened,
+        # on an order the venue told us it had cancelled — so ask the venue before calling it a
+        # failure. FAILED would halt the run, send the operator after a position that is not
+        # there, and drop a real stop loss out of the tally, because the controller reads it as
+        # a leg that never traded.
         if (self.open_filled_amount > Decimal("0")
                 and self.close_type is not None
                 and self.close_type != CloseType.FAILED
@@ -768,14 +758,13 @@ class SimpleGridExecutor(ExecutorBase):
         """
         Open on the wrong side of the reference, crossing to get in.
 
-        Waiting is over: the price we hoped to open at is now a step behind the market, and a
-        resting order there would never fill. This is the only entry that pays taker, and the
-        crossing price bounds how much worse than the trigger we accept.
+        The price we hoped to open at is now a step behind the market, where a resting order
+        would never fill. This is the only entry that pays taker, and the crossing price
+        bounds how much worse than the trigger we accept.
 
-        The resting order has to go first, and its collateral with it. CoinDCX releases that
-        margin a moment AFTER it confirms the cancel, so the trigger cannot be sent in the same
-        breath — on 2026-09-02 it was, and the venue refused it for funds while holding 660 INR
-        against an order it had just agreed to cancel. The leg then had no entry at all.
+        The resting order goes first, and its collateral with it: CoinDCX frees that margin
+        a beat AFTER confirming the cancel, so sending the trigger in the same breath gets it
+        refused for funds and the leg opens nothing at all.
         """
         resting = self._entry_orders.get(side)
         if resting and resting.order and resting.order.is_open:
@@ -931,11 +920,10 @@ class SimpleGridExecutor(ExecutorBase):
         so the total cost of being patient is known in advance.
         """
         reference = self._trigger_reference_price()
-        # Measured from where the market WAS when the stop fired, not from the level itself.
-        # A tick only notices once the price is already through the level, and on a fast move
-        # that gap alone can exceed the cap — which silently skipped the chase entirely and
-        # went straight to a market order every time. That gap is slippage we have already
-        # suffered; the cap is meant to bound what being patient costs on top of it.
+        # Measured from where the market WAS when the stop fired, not from the level. A tick
+        # only notices once the price is already through, and on a fast move that gap alone
+        # can exceed the cap and skip the chase entirely. The gap is slippage already
+        # suffered; the cap bounds what patience costs on top of it.
         anchor_for_drift = self._stop_loss_trigger_reference or self._stop_loss_trigger_price
         if reference is not None and anchor_for_drift:
             # Only movement AWAY from the stop counts. A price recovering back through the
@@ -955,11 +943,10 @@ class SimpleGridExecutor(ExecutorBase):
         exit_side = self.close_order_side
         if exit_side is None or self.amount_to_close < self.trading_rules.min_order_size:
             return
-        # The take profit we just asked to cancel is a reduce-only order for the whole
-        # position. Until the venue lets go of it, a chasing exit is a second reduce-only
-        # order for the same position and CoinDCX refuses the pair with "Insufficient funds".
-        # Waiting costs a moment; not waiting cost a failed order and a second of delay, and
-        # a second is long enough for the book to move the exit from maker to taker.
+        # Until the venue lets go of the take profit we just cancelled, a chasing exit is a
+        # second reduce-only order for the same position and is refused. Waiting costs a
+        # moment; a failed order costs a control tick, which is long enough for the book to
+        # turn the exit from maker into taker.
         if any(order is not self._sl_chase_order for order in self._resting_orders()):
             return
         if self._exit_placement_blocked():
@@ -1068,12 +1055,9 @@ class SimpleGridExecutor(ExecutorBase):
         if self.amount_to_close < self.trading_rules.min_order_size:
             return
         if still_resting:
-            # A cancel is a request, not an instant. For the moment between asking and the
-            # venue agreeing, the take profit is still live — and it is a reduce-only order
-            # for the whole position. Sending the close now makes that two reduce-only orders
-            # for twice what we hold, which CoinDCX refuses with "Insufficient funds": an
-            # attempt guaranteed to fail, burning one of the retries we may need. Send it the
-            # instant the cancel is acknowledged instead.
+            # Same reason as the chase above: while the take profit is still live the close
+            # would be a second reduce-only order for the same position, refused on arrival
+            # and costing one of the retries we may need. Send it on the acknowledgement.
             self._close_pending = True
             self._close_pending_price = price
             return
@@ -1339,14 +1323,11 @@ class SimpleGridExecutor(ExecutorBase):
         """
         The venue reports flat while our own books still show something to close.
 
-        Deliberately not consulted until an exit has actually been refused. Before that the
-        position feed cannot carry this weight: a position that has just filled takes a moment
-        to appear in it, and skipping an exit on that lag would strand the very position the
-        exit exists to close — a far worse failure than the one this prevents.
-
-        After a refusal the reasoning runs the other way. The venue has told us something is
-        wrong, and of the explanations available, "the position is already gone" is the one
-        that also explains why it will not let us reduce it.
+        Deliberately not consulted until an exit has been refused. Before that the position
+        feed cannot carry the weight: a position that has just filled takes a moment to appear
+        in it, and skipping an exit on that lag would strand the very position the exit exists
+        to close. After a refusal, "already gone" is the explanation that also accounts for
+        the venue refusing to reduce it.
         """
         if not self._exit_has_been_refused:
             return False
@@ -1399,11 +1380,10 @@ class SimpleGridExecutor(ExecutorBase):
             return
 
         if self._status != RunnableStatus.RUNNING:
-            # Already winding down under its own close type. The orchestrator calls this on
-            # anything not yet TERMINATED, so a leg whose take profit has just filled lands
-            # here too — overwriting close_type would report a win as an early stop and cost
-            # the controller its tally and its anchor, and a second close order would sell a
-            # position we no longer hold. Only step in if nothing is covering the position.
+            # The orchestrator calls this on anything not yet TERMINATED, so a leg whose take
+            # profit has just filled lands here too. Overwriting close_type would report a win
+            # as an early stop, and a second close would sell a position we no longer hold.
+            # Only step in if nothing is covering the position.
             if self.close_type == CloseType.POSITION_HOLD:
                 return
             if self._close_order is None and self.amount_to_close >= self.trading_rules.min_order_size:

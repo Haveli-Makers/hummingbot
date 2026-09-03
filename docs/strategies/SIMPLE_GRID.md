@@ -1,273 +1,260 @@
 # Simple Grid
 
-A trend-following strategy that trades one position at a time and re-centres itself on
-wherever the last trade closed.
+A mean-reversion strategy that holds one position or none, alternates buy and sell, and
+measures every price from where the previous leg ended.
 
 ---
 
 ## What it does
 
-Pick a starting price — the **anchor**. Simple Grid then watches two levels, one step above
-and one step below it, and does nothing until the market reaches one of them.
+The strategy is always in one of two states, and both work the same way.
 
-When a level is reached, it enters **in that direction**: a step up means buy, a step down
-means sell. It is joining the move, not betting against it. Once in, it sets a take profit
-one step further along and a stop loss one step back. Whichever is hit closes the position,
-and the closing price becomes the new anchor. Then it starts watching again.
+When it is **flat**, it rests a limit order one step *below* the price the last leg ended at,
+waiting to buy cheaper. When it is **holding**, it rests a limit order one step *above* what it
+paid, waiting to sell dearer.
 
-That is the whole cycle:
+In each state there is also a price one step the *other* way that it watches but does not
+place. Reach that first and it acts there anyway, crossing the spread to do it.
 
 ```
-watch  ->  a level is reached  ->  enter at market  ->  take profit or stop loss
-   ^                                                              |
-   +---------------- re-anchor at the closing price --------------+
+FLAT, last exit at P              HOLDING, filled at F
+
+  rest    BUY  at P − step          rest    SELL at F + step
+  trigger      P + step             trigger      F − step
 ```
 
-Only one position is open at a time. This is not a classic grid that ladders many orders
-into the book — it is a single leg that keeps moving with the market.
+Whichever of the two happens first ends the state and begins the next. Every order is the same
+size, and they alternate buy, sell, buy, sell for the life of the run. Between legs the account
+is flat, so the position is never doubled.
 
-### Why nothing rests in the book
+The very first order of a run has nothing to measure from, so it rests at the touch and has no
+trigger.
 
-The entry levels sit on the far side of the market by design. A limit order left at a level
-the market has already reached would fill instantly at the wrong price, so the strategy
-watches instead and sends a **market order** once the price is genuinely there.
+It makes money when the price keeps coming back. It loses when the price walks away in the
+direction it is not facing.
 
-This means `status` will often show no open orders. That is the strategy waiting, not a
-hang — the `Waiting for:` line tells you which prices it wants.
+### Why the resting order never moves
+
+It is a grid level, not a quote. It is never re-priced to follow the market.
+
+That is the point rather than an omission. An order sitting *at* the touch can be crossed by a
+book that moves between reading it and the order landing, and CoinDCX has no post-only flag to
+prevent that — in one live run it turned 9 of 13 fills into taker fills. An order a full step
+away cannot be crossed by accident, so **only a trigger ever pays taker**.
+
+### The bracket comes off the fill
+
+Take profit and stop loss are measured from the price the entry actually filled at, not from
+what it was aiming at. A long filled at `F` is bracketed symmetrically at `F × (1 ± step)`, so
+the risk and the reward are the ones the position really has.
 
 ---
 
 ## A worked example
 
-Anchor at **100**, step **0.5%**, on futures.
+Step **0.15%**, first order rests at the touch of **100.00**.
 
-| | |
-|---|---|
-| Long level | 100.50 |
-| Short level | 99.50 |
+| # | state | action | result |
+|---|---|---|---|
+| 1 | flat | rest BUY 100.00 | fills — long at 100.00 |
+| 2 | long | rest SELL 100.15, watch 99.85 | 100.15 fills — **+0.15%**, flat |
+| 3 | flat | rest BUY 100.00, watch 100.30 | fills — long at 100.00 |
+| 4 | long | rest SELL 100.15, watch 99.85 | 99.85 reached — stop, cross out |
 
-**The market rises to 100.50.** It buys at market. Take profit goes at 101.00, stop loss at
-100.00.
+Legs 1–2 are the winning shape: price came back. Legs 3–4 are the losing shape: it did not.
 
-- Price reaches **101.00** — take profit fills, +0.5%. New anchor: **101.00**, now watching
-  101.505 and 100.495.
-- Or price falls to **100.00** — stop loss fires, −0.5%. New anchor: **100.00**, watching
-  100.50 and 99.50 again.
+### The first fill fixes the direction
 
-**The market falls to 99.50 instead.** On futures it sells short, take profit at 99.00, stop
-loss at 100.00. On spot it cannot short — see below.
-
-### Spot vs futures
-
-| | Futures | Spot |
-|---|---|---|
-| Rise to the upper level | buy | buy |
-| Fall to the lower level | sell short | **buy the dip** |
-| Sides watched | both | both, but both mean buy |
-
-Spot can only ever hold the base asset, so a fall is treated as a cheaper entry rather than
-a chance to go short. Set `initial_entry_mode: long_only` on spot; `both_oco` is rejected.
+On futures the opening leg may offer both sides at once (`both_oco`); the first to fill cancels
+the other. From then on the account is **long-or-flat** (or short-or-flat) for the whole run —
+there is nothing left to choose, because the alternation is forced by the position itself. Spot
+can only ever be long-or-flat.
 
 ### The three market shapes
 
-- **Trending** — the best case. Each move triggers an entry in the direction of the trend
-  and the take profit is reached.
-- **Sideways** — the worst case. Price nudges past a level, triggers an entry, then reverses
-  into the stop loss. Repeatedly. This is what `max_loss_quote` exists to stop.
-- **Sharp reversal** — one stop loss, then it re-anchors lower and follows the new direction.
+- **Chop** — the intended case. Price crosses the grid repeatedly, each crossing a completed leg.
+- **Trend with the bias** — take profits fill, but the entry keeps having to reach further.
+- **Trend against the bias** — the losing case, and it is structural. Every leg buys on the way
+  past and stops out. `max_loss_quote` is what ends it.
 
 ---
 
 ## Fees decide whether this works
 
-A win and a loss are **not** symmetric, because the two sides pay different fees.
+Measured on CoinDCX futures: **maker 0.0236%**, **taker 0.0590%**. A maker round trip costs
+**0.0472%**.
 
-Entries and stop losses are market orders and pay the **taker** fee. Only take profits rest
-in the book and pay **maker**. So every round costs one taker fee plus either a maker fee (on
-a win) or a second taker fee (on a loss):
+At a step of `s` with both ends maker, a win returns `s − 0.0472%` and a loss costs
+`s + 0.0472%`. Break-even win rate is therefore:
 
-```
-win  = +step − taker − maker
-loss = −step − taker − taker
-```
+| step | win | loss | break-even |
+|---|---|---|---|
+| 0.05% | +0.003% | −0.097% | 97% — unusable |
+| 0.15% | +0.103% | −0.197% | **66%** |
+| 0.50% | +0.453% | −0.547% | 55% |
 
-Work it out for your venue's schedule before choosing a step. As an illustration, at 0.02%
-maker and 0.06% taker with a 0.5% step, a win is +0.42% and a loss is −0.62% — so you need
-roughly **60%** of legs to win, not 50%.
+A step under about 3× the round-trip fee cannot win no matter how good the entries are. If a
+stop crosses instead of chasing passively, its break-even is higher still — about 74% at 0.15%.
 
-> The `Win rate needed` line in `status` shows the **pre-fee** figure of 50%. The real number
-> is always higher. Treat the panel as a floor, not an answer.
-
-There is also a step below which no win rate is profitable, because `step` no longer covers
-the round-trip fee. Compute that floor first; it sets the minimum step your venue allows you
-to trade at all.
+**Nothing in this strategy predicts direction.** The edge, if it exists, is that a step is
+recovered more often than not. That has not yet been demonstrated over a meaningful sample.
 
 ---
 
 ## Choosing a pair and a step
 
-The step has to clear fees *and* be reachable. Those pull in opposite directions.
+The step must be large in **ticks** and small in **time**.
 
-- Too tight and fees eat every round.
-- Too wide and nothing ever triggers. A 0.5% step on a pair that moves 0.15% a day will sit
-  and watch for hours — correctly, but pointlessly.
+- Large in ticks, because all four prices are quantized. Under ~15 ticks per step they start to
+  collide and the drift cap stops being expressible.
+- Small in time, because leg rate is what produces a sample.
 
-Check the pair's typical daily range before committing to a step. Also check the pair's
-**minimum notional** — it varies widely between pairs on the same exchange, and a
-high-priced pair can require ten times the order size of a cheap one.
+`temp/tools/coindcx_pair_scout.py` ranks pairs on both. On CoinDCX at a 0.15% step, ZEC-USDT
+gives ~125 ticks and a ~2 minute median leg; XRP-USDT gives ~20 ticks and ~4 minutes.
 
-Two floors apply at once — a minimum notional *and* a minimum size increment. Quantisation
-rounds **down**, so an order sized exactly at the limit can land just under it. Leave
-headroom.
+Beware the **minimum notional**. If one leg is only just above it, any partial fill leaves a
+position too small for the venue to close (see *Partial fills* below).
 
 ---
 
 ## Configuration
 
-Two files are needed, with the **same base name** in different directories. `--conf` names
-the script one.
+Two files: a script config and a controller config.
 
-| File | Holds |
-|---|---|
-| `conf/scripts/<name>.yml` | the `controllers_config:` list and global drawdown guards |
-| `conf/controllers/<name>.yml` | the strategy settings |
-
-If only the controller file exists you get a short run that does nothing, with this in the
-log and no connector created:
-
-```
-Failed to load config file ...: No such file or directory: '.../conf/scripts/<name>.yml'
-```
-
-### Script file
+### Script file — `conf/scripts/conf_simple_grid_<name>.yml`
 
 ```yaml
 script_file_name: v2_with_controllers.py
 markets: {}
 candles_config: []
 controllers_config:
-  - my_simple_grid.yml
-
-max_global_drawdown_quote: 15
-max_controller_drawdown_quote: 10
+  - conf_simple_grid_<name>.yml
+max_global_drawdown_quote: 0.4
+max_controller_drawdown_quote: 0.4
 ```
 
-### Controller file
+### Controller file — `conf/controllers/conf_simple_grid_<name>.yml`
 
-```yaml
-id: my_simple_grid
-controller_name: simple_grid
-controller_type: generic
+| setting | default | what it does |
+|---|---|---|
+| `connector_name` | `coindcx_perpetual` | |
+| `trading_pair` | `BTC-USDT` | |
+| `leverage` / `position_mode` | `1` / `ONEWAY` | |
+| `total_amount_quote` | `100` | caps the strategy |
+| `order_amount_quote` | `100` | size of one leg, in quote |
+| `take_profit` / `stop_loss` | `0.005` | **the step.** Both ends of every bracket |
+| `time_limit` | `None` | optional per-leg deadline |
+| `trigger_price_type` | `MidPrice` | CoinDCX perps publish no last trade |
+| `entry_timeout` | `300` | give up if neither entry price is reached |
+| `initial_entry_mode` | `both_oco` | `long_only`, `short_only`, or both sides at once |
 
-connector_name: binance_perpetual   # your connector
-trading_pair: ETH-USDT              # your pair
-leverage: 1
-position_mode: ONEWAY
+**Exits**
 
-total_amount_quote: '9'      # ceiling on capital in use
-order_amount_quote: '7'      # per leg
+| setting | default | what it does |
+|---|---|---|
+| `close_slippage_ticks` | `20` | how far through the book an urgent exit is priced |
+| `stop_loss_chase` | `True` | leave passively at the touch instead of crossing at once |
+| `stop_loss_maker_offset_ticks` | `1` | ticks *inside* the opposite touch |
+| `stop_loss_requote_pct` | `0.0005` | re-post the chase after this much movement |
+| `stop_loss_max_drift_pct` | `0.001` | how far past the stop before it gives up and crosses |
 
-take_profit: '0.005'         # 0.5%
-stop_loss: '0.005'
-entry_step: null             # null = same as take_profit
+**Venue timing** — these exist because CoinDCX releases collateral *after* it confirms a cancel.
 
-trigger_price_type: 1        # 1 = MidPrice
-entry_order_type: 1          # 1 = MARKET
+| setting | default | what it does |
+|---|---|---|
+| `cancel_settle_delay` | `0.25` | wait before replacing a cancelled reduce-only order |
+| `exit_retry_max_delay` | `2.0` | ceiling on the doubling backoff |
+| `collateral_refusal_wait` | `3.0` | stand-down after repeated "Insufficient funds" |
+| `collateral_refusals_before_waiting` | `2` | how many in a row before that longer wait |
+| `retry_after_insufficient_balance` | `5` | pause before retrying a leg our budget check refused |
 
-initial_entry_mode: both_oco
-lock_side_after_first_fill: false
+**Risk** — any one of these stops new legs being opened.
 
-cooldown_after_take_profit: 0
-cooldown_after_stop_loss: 60
-
-max_loss_quote: '2'          # the stop condition — always set it
-max_loss_pct: null
-stop_when_losses_outnumber_wins: false
-min_legs_before_count_check: 10
-
-manual_kill_switch: false
-candles_config: []
-initial_positions: []
-```
-
-### What to decide
-
-| Setting | Guidance |
-|---|---|
-| `trading_pair` | Check its minimum notional and daily range |
-| `order_amount_quote` | Per leg. Must clear the minimum notional with headroom |
-| `total_amount_quote` | Caps capital in use. Less than 2× the leg size means one leg at a time |
-| `take_profit` / `stop_loss` | The step. Must clear fees — see above |
-| `max_loss_quote` | **The stop condition.** Always set it |
-| `leverage` | Leave at 1 unless you have a specific reason |
+| setting | default | what it does |
+|---|---|---|
+| `max_loss_quote` / `max_loss_pct` | `None` | loss threshold; the tighter one wins |
+| `max_consecutive_failed_legs` | `5` | legs the **venue** refused, in a row |
+| `insufficient_balance_grace_seconds` | `180.0` | how long our own budget check may keep refusing |
+| `reconcile_positions` | `True` | halt on a position no leg claims |
+| `orphan_grace_seconds` | `10.0` | how long the venue and our books must disagree first |
+| `flatten_orphan_positions` | `True` | close an unclaimed position the run itself opened |
+| `stop_when_losses_outnumber_wins` | `False` | off by default; `max_loss_quote` is the agreed stop |
+| `min_legs_before_count_check` | `10` | minimum sample before that check can fire |
+| `cooldown_after_take_profit`, `cooldown_after_stop_loss` | `0` | a pause is time spent flat, so both default to none |
 
 ### Settings that are easy to get wrong
 
-| Setting | Note |
-|---|---|
-| `entry_order_type` | Must be **MARKET**. A limit at a level the market has already reached never fills, and every leg times out with no position |
-| `trigger_price_type` | `LastTrade` needs the venue to publish trades. Where it does not, the value silently falls back to mid — prefer **MidPrice** so the config says what it does |
-| `initial_entry_mode` | `both_oco` needs a non-zero step, and is futures-only |
-| `entry_step: '0'` | Enters immediately at the anchor. Useful for testing, not for trading |
+- **`take_profit` below ~3× the round-trip fee** guarantees a loss. See the fee table.
+- **`stop_loss_max_drift_pct` too small for the pair's tick** skips the chase entirely — on a
+  coarse tick 0.03% can be under 4 ticks, so the exit crosses every time.
+- **`close_slippage_ticks` scaled from another pair.** 20 ticks is 0.024% on ZEC but 0.148% on
+  XRP — a whole step of slippage allowance.
+- **`both_oco` on a small wallet.** It rests an order on each side, so margin is locked twice.
 
 ---
 
 ## Running it
 
-```
-connect <your connector>
-start --script v2_with_controllers.py --conf my_simple_grid.yml
-status
+```bash
+cd /home/vinayak/hm/hummingbot && ./start
 ```
 
-Reading `status`:
-
 ```
-Mid: 1.001050 | Anchor: 1.001000 | Side: both (unlocked)
-Waiting for: long above 1.006005 | short below 0.995995 | distance to nearer level: 0.4988%
-Legs closed: 3 | TP: 2 | SL: 1 | Realised PnL: -0.0109
-Realised: -0.0109 / threshold -0.3000
+start --script v2_with_controllers.py --conf conf_simple_grid_<name>.yml
 ```
 
-- **`Waiting for`** — the levels it wants, and how far away the nearer one is. If that
-  distance moves with price, the strategy is working. Nothing rests in the book while it
-  waits.
-- **`Anchor`** — `(mid, no leg open yet)` until the first leg closes, then the last closing
-  price. It should move after every close.
-- **`Legs closed` / `TP` / `SL`** — the running tally.
-- **`Realised / threshold`** — how close you are to the halt.
+Check the config loads before starting the bot:
 
-To stop: `stop`, then **check your positions**. Orders and positions are different things;
-"no open orders" does not mean you are flat.
+```bash
+cd /home/vinayak/hm/hummingbot && python -c "import sys; sys.path.insert(0,'.'); \
+from controllers.generic.simple_grid import SimpleGridConfig; import yaml; \
+print(SimpleGridConfig(**yaml.safe_load(open('conf/controllers/conf_simple_grid_<name>.yml'))).trading_pair)"
+```
+
+`temp/tools/simple_grid_preflight.py` checks the arithmetic offline — size against the venue
+minimums, margin against the wallet, the four grid prices in ticks, and the break-even rate.
+
+---
+
+## Partial fills
+
+The side latches on the **first** fill, however small, and the unfilled remainder of the entry
+is cancelled — leaving it open would keep moving the average entry price, and the bracket hangs
+off that price. The take profit is re-sized if the position changes underneath it, and a stop
+that fills across several chased orders is accounted at their weighted average.
+
+**The one gap:** a partial fill below the venue's minimum notional leaves a position that
+cannot be closed. No take profit or stop loss is armed for it, the leg exhausts its retries,
+and the run halts telling you to close it by hand. Size legs comfortably above the minimum
+notional so a partial fill still clears it.
 
 ---
 
 ## When it stops
 
-The strategy halts when peak-to-trough realised losses reach `max_loss_quote` (or
-`max_loss_pct`). It stops opening new legs; it does not abandon an open one.
+New legs stop on any halt condition above; an open leg is left to finish on its own barriers.
+`stop` cancels resting orders and flattens any open position in the same call.
 
-A second condition — halting when losses outnumber wins — exists behind
-`stop_when_losses_outnumber_wins`, with `min_legs_before_count_check` as a grace period so a
-bad opening run does not end it early. It is **off by default**.
+The stop loss exists **only inside the running process**. A position that outlives the bot has
+nothing watching it — always confirm the account is flat after stopping.
 
 ---
 
 ## Troubleshooting
 
-| Symptom | Cause |
+| symptom | cause |
 |---|---|
-| No orders, ever | Usually correct. Check `distance to nearer level` — if it moves, the strategy is watching. The step may just be wider than the pair's range |
-| `Not enough budget to open the position` | The leg does not fit. Lower `order_amount_quote`, but not below the minimum notional. A single occurrence right after a close is a position still settling and clears itself |
-| `is not ready. Please wait...` repeating | The connector has not finished starting. The log names the check it is waiting on |
-| Every leg times out with no position | `entry_order_type` is not MARKET |
-| Nothing runs, log mentions a missing file | The `conf/scripts/` half of the config is missing |
+| `Insufficient funds` on a close | a cancelled exit still holds the margin; the executor waits it out |
+| `Cannot place reduce only order` | there is no position left — it already closed |
+| `Not enough budget` repeatedly | our budget check is reading a stale wallet; it re-reads after a cancel |
+| entry never fills | price sat between the two grid prices; `entry_timeout` ends the leg |
+| every leg stops out | trend against the bias — structural, not a bug |
+| `STILL OPEN` at shutdown | a position we could not close. Check the account by hand |
 
 ---
 
 ## Related
 
-- Executor: `hummingbot/strategy_v2/executors/simple_grid_executor/`
-- Controller: `controllers/generic/simple_grid.py`
-- Tests: `test/hummingbot/strategy_v2/executors/simple_grid_executor/`,
-  `test/controllers/generic/test_simple_grid.py`
+- `hummingbot/strategy_v2/executors/simple_grid_executor/` — one leg
+- `controllers/generic/simple_grid.py` — the chain of legs
+- `temp/docs/Simple_Grid_Strategy/` — internals, CoinDCX venue notes, and the test ladder

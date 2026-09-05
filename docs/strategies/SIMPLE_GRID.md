@@ -138,7 +138,8 @@ max_controller_drawdown_quote: 0.4
 | `stop_loss_requote_pct` | `0.0005` | re-post the chase after this much movement |
 | `stop_loss_max_drift_pct` | `0.001` | how far past the stop before it gives up and crosses |
 
-**Venue timing** — these exist because CoinDCX releases collateral *after* it confirms a cancel.
+**Venue timing** — for exchanges that release collateral *after* they confirm a cancel, rather
+than with it. Set them all to `0` on a venue that settles a cancel synchronously.
 
 | setting | default | what it does |
 |---|---|---|
@@ -170,6 +171,38 @@ max_controller_drawdown_quote: 0.4
 - **`close_slippage_ticks` scaled from another pair.** 20 ticks is 0.024% on ZEC but 0.148% on
   XRP — a whole step of slippage allowance.
 - **`both_oco` on a small wallet.** It rests an order on each side, so margin is locked twice.
+
+---
+
+## Using it on another exchange
+
+Nothing in the strategy is venue-specific. It reads tick size, minimum order size and minimum
+notional from the connector's trading rules, sizes in quote currency, and asks the connector
+which order types it supports. Spot and perpetual are both supported; on spot the account can
+only ever be long-or-flat, which the controller enforces for you.
+
+Four things to check when pointing it somewhere new:
+
+**1. Post-only.** The resting entry is placed as `LIMIT_MAKER` where the venue offers it and a
+plain `LIMIT` where it does not. The crossing trigger is always a plain `LIMIT` — a post-only
+order priced to cross is rejected outright. Both are automatic.
+
+**2. Venue timing.** `cancel_settle_delay`, `collateral_refusal_wait` and
+`collateral_refusals_before_waiting` all exist for one behaviour: an exchange that acknowledges
+a cancel before it frees the margin behind it. On a venue that settles a cancel synchronously,
+set them to `0` and the executor replaces its exits immediately.
+
+**3. The urgent exit.** `close_order_type` defaults to a crossing `LIMIT` because some venues
+refuse `reduce_only` on a market order. If yours accepts a market close, `MARKET` is simpler
+and `close_slippage_ticks` stops mattering.
+
+**4. Spot vs perpetual.** On spot, set `initial_entry_mode: long_only` — `both_oco` needs the
+ability to open a short. `leverage`, `position_mode` and `reconcile_positions` apply to
+perpetuals only; on spot the reconciliation quietly does nothing, because there are no
+positions to reconcile.
+
+Then re-do *Choosing a pair and a step* for the new market — the step that works on one venue's
+tick size and volatility rarely transfers.
 
 ---
 

@@ -69,9 +69,10 @@ class SimpleGridConfig(ControllerConfigBase):
     # a crossing limit rather than a market order.
     close_slippage_ticks: int = Field(default=20, json_schema_extra={"is_updatable": True})
 
-    # CoinDCX acknowledges a cancel before it releases the collateral behind it, so an exit
-    # sent on the acknowledgement is still refused as a second reduce-only order. Wait this
-    # long on purpose; every refusal doubles it, capped at exit_retry_max_delay.
+    # Some venues acknowledge a cancel before releasing the collateral behind it (CoinDCX
+    # does), so an exit sent on the acknowledgement is refused as a second reduce-only order.
+    # Wait this long on purpose; every refusal doubles it, capped at exit_retry_max_delay.
+    # Set to 0 on a venue that settles a cancel synchronously.
     cancel_settle_delay: float = Field(default=0.25, json_schema_extra={"is_updatable": True})
     exit_retry_max_delay: float = Field(default=2.0, json_schema_extra={"is_updatable": True})
 

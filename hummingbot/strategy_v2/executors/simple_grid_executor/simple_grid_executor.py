@@ -807,13 +807,17 @@ class SimpleGridExecutor(ExecutorBase):
         self.logger().info(
             f"Executor ID: {self.config.id} - {side.name} entry trigger "
             f"{self._entry_trigger_price(side)} reached; opening at {price}")
-        self.place_entry_order(side, price)
+        self.place_entry_order(side, price, crossing=True)
 
-    def place_entry_order(self, side: TradeType, price: Decimal):
+    def place_entry_order(self, side: TradeType, price: Decimal, crossing: bool = False):
+        # The trigger crosses on purpose, and a post-only order priced to cross is rejected
+        # outright by every venue that offers post-only. Only the resting order — a full step
+        # from the market — may ask for the maker type.
+        order_type = OrderType.LIMIT if crossing else self._maker_order_type()
         order_id = self.place_order(
             connector_name=self.config.connector_name,
             trading_pair=self.config.trading_pair,
-            order_type=self._maker_order_type(),
+            order_type=order_type,
             amount=self.config.amount,
             price=price,
             side=side,
@@ -821,7 +825,10 @@ class SimpleGridExecutor(ExecutorBase):
         )
         self._entry_orders[side] = TrackedOrder(order_id=order_id)
         self._entry_quoted_price[side] = price
-        self.logger().debug(f"Executor ID: {self.config.id} - resting {side.name} entry {order_id} at {price}")
+        placed = "crossing" if crossing else "resting"
+        self.logger().debug(
+            f"Executor ID: {self.config.id} - {placed} {side.name} entry {order_id} at {price} "
+            f"({order_type.name})")
 
     def _give_up_on_entry(self):
         """No entry filled, so no position was ever opened and nothing needs unwinding."""

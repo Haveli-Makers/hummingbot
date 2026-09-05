@@ -279,6 +279,27 @@ class TestSimpleGridExecutor(IsolatedAsyncioWrapperTestCase):
 
         self.assertEqual(self.order_args(self.strategy.buy.call_args)["order_type"], OrderType.LIMIT)
 
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_the_trigger_is_a_plain_limit_even_where_post_only_exists(self, mock_price, rules_mock):
+        """
+        The trigger crosses on purpose, and a post-only order priced to cross is rejected
+        outright by every venue that offers post-only. Invisible on CoinDCX, which has no
+        post-only at all — on any venue that does, the trigger would never fill.
+        """
+        rules_mock.return_value = self.trading_rules()
+        self.strategy.connectors["coindcx_perpetual"].supported_order_types.return_value = [
+            OrderType.LIMIT, OrderType.LIMIT_MAKER, OrderType.MARKET]
+        executor = self.running_executor(self.config())
+
+        # reference 100, stop loss step 2% -> the trigger sits at 102.00
+        mock_price.side_effect = self.price_feed(best_bid="101.9", best_ask="102.1", mid="102")
+        executor.control_entry_orders()
+
+        args = self.order_args(self.strategy.buy.call_args)
+        self.assertEqual(args["order_type"], OrderType.LIMIT)
+        self.assertEqual(args["price"], Decimal("102.30"))
+
     # ------------------------------------------------------------------ first fill wins
 
     @patch.object(SimpleGridExecutor, "get_trading_rules")

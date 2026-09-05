@@ -79,28 +79,6 @@ can only ever be long-or-flat.
 
 ---
 
-## Fees decide whether this works
-
-Measured on CoinDCX futures: **maker 0.0236%**, **taker 0.0590%**. A maker round trip costs
-**0.0472%**.
-
-At a step of `s` with both ends maker, a win returns `s − 0.0472%` and a loss costs
-`s + 0.0472%`. Break-even win rate is therefore:
-
-| step | win | loss | break-even |
-|---|---|---|---|
-| 0.05% | +0.003% | −0.097% | 97% — unusable |
-| 0.15% | +0.103% | −0.197% | **66%** |
-| 0.50% | +0.453% | −0.547% | 55% |
-
-A step under about 3× the round-trip fee cannot win no matter how good the entries are. If a
-stop crosses instead of chasing passively, its break-even is higher still — about 74% at 0.15%.
-
-**Nothing in this strategy predicts direction.** The edge, if it exists, is that a step is
-recovered more often than not. That has not yet been demonstrated over a meaningful sample.
-
----
-
 ## Choosing a pair and a step
 
 The step must be large in **ticks** and small in **time**.
@@ -109,8 +87,10 @@ The step must be large in **ticks** and small in **time**.
   collide and the drift cap stops being expressible.
 - Small in time, because leg rate is what produces a sample.
 
-`temp/tools/coindcx_pair_scout.py` ranks pairs on both. On CoinDCX at a 0.15% step, ZEC-USDT
-gives ~125 ticks and a ~2 minute median leg; XRP-USDT gives ~20 ticks and ~4 minutes.
+Measure both from public 1-minute candles before committing to a pair: ticks per step is
+`price x step / price_increment`, and leg time is how long the price takes to travel one step
+from a standing start. On CoinDCX at a 0.15% step, ZEC-USDT gives ~125 ticks and a ~2 minute
+median leg; XRP-USDT gives ~20 ticks and ~4 minutes.
 
 Beware the **minimum notional**. If one leg is only just above it, any partial fill leaves a
 position too small for the venue to close (see *Partial fills* below).
@@ -144,7 +124,7 @@ max_controller_drawdown_quote: 0.4
 | `order_amount_quote` | `100` | size of one leg, in quote |
 | `take_profit` / `stop_loss` | `0.005` | **the step.** Both ends of every bracket |
 | `time_limit` | `None` | optional per-leg deadline |
-| `trigger_price_type` | `MidPrice` | CoinDCX perps publish no last trade |
+| `trigger_price_type` | `MidPrice` | which price arms the stop and the entry trigger |
 | `entry_timeout` | `300` | give up if neither entry price is reached |
 | `initial_entry_mode` | `both_oco` | `long_only`, `short_only`, or both sides at once |
 
@@ -196,7 +176,7 @@ max_controller_drawdown_quote: 0.4
 ## Running it
 
 ```bash
-cd /home/vinayak/hm/hummingbot && ./start
+./start
 ```
 
 ```
@@ -206,17 +186,18 @@ start --script v2_with_controllers.py --conf conf_simple_grid_<name>.yml
 Check the config loads before starting the bot:
 
 ```bash
-cd /home/vinayak/hm/hummingbot && python -c "import sys; sys.path.insert(0,'.'); \
+python -c "import sys; sys.path.insert(0,'.'); \
 from controllers.generic.simple_grid import SimpleGridConfig; import yaml; \
 print(SimpleGridConfig(**yaml.safe_load(open('conf/controllers/conf_simple_grid_<name>.yml'))).trading_pair)"
 ```
 
-`temp/tools/simple_grid_preflight.py` checks the arithmetic offline — size against the venue
-minimums, margin against the wallet, the four grid prices in ticks, and the break-even rate.
+Before a first live run, check by hand that one leg clears the venue's minimum size and
+minimum notional, that its margin fits the wallet, and that the step is worth more than the
+round-trip fee. Those four are what a misconfigured run gets wrong.
 
 ---
 
-## Partial fills
+## Partial fills (Need Confirmation)
 
 The side latches on the **first** fill, however small, and the unfilled remainder of the entry
 is cancelled — leaving it open would keep moving the average entry price, and the bracket hangs
@@ -257,4 +238,6 @@ nothing watching it — always confirm the account is flat after stopping.
 
 - `hummingbot/strategy_v2/executors/simple_grid_executor/` — one leg
 - `controllers/generic/simple_grid.py` — the chain of legs
-- `temp/docs/Simple_Grid_Strategy/` — internals, CoinDCX venue notes, and the test ladder
+- `test/controllers/generic/test_simple_grid.py` and
+  `test/hummingbot/strategy_v2/executors/simple_grid_executor/` — the test names are the
+  specification for the behaviour above

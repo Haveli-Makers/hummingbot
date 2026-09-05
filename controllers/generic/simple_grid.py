@@ -56,8 +56,9 @@ class SimpleGridConfig(ControllerConfigBase):
     take_profit: Decimal = Field(default=Decimal("0.005"), json_schema_extra={"is_updatable": True})
     stop_loss: Decimal = Field(default=Decimal("0.005"), json_schema_extra={"is_updatable": True})
     time_limit: Optional[int] = Field(default=None, json_schema_extra={"is_updatable": True})
-    # Mid, not LastTrade: CoinDCX perpetuals never publish a last trade, so LastTrade would
-    # silently fall back to mid anyway. Saying it outright makes the trigger explicit.
+    # Which price arms the stop loss and the entry trigger. Mid by choice: LastTrade is live on
+    # this connector but jumps with each print, and BestBid/BestAsk read differently depending
+    # on which way the leg is facing.
     trigger_price_type: PriceType = PriceType.MidPrice
 
     # An entry can sit unfilled while the price stays between the resting order and the

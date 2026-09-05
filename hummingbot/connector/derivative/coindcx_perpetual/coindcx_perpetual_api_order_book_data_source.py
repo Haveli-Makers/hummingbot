@@ -68,7 +68,6 @@ class CoinDCXPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         self._api_factory = api_factory
         self._domain = domain
         self._client: Optional[socketio.AsyncClient] = None
-        self._logged_first_trade = False
         # depth-snapshot frames identify the instrument by market symbol
         # ("BTCUSDT"), unlike every other endpoint which uses "B-BTC_USDT".
         self._market_symbol_to_trading_pair: Dict[str, str] = {
@@ -224,17 +223,6 @@ class CoinDCXPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
             self.logger().warning(
                 f"Dropping trade for unknown CoinDCX symbol {coindcx_pair}: {exception}")
             return
-        # PriceType.LastTrade reads the order book's last traded price, which is only ever
-        # written by these messages. It has been observed sitting at NaN, and a NaN Decimal
-        # raises on comparison rather than returning False, so a strategy triggering off
-        # LastTrade fails outright. Log the first one to distinguish "no trades on this
-        # feed" from "trades arrive but do not reach the book".
-        if not self._logged_first_trade:
-            self._logged_first_trade = True
-            self.logger().info(
-                f"First public trade received for {trading_pair}: "
-                f"price={raw_message.get('p')} amount={raw_message.get('q')}. "
-                f"LastTrade prices are live.")
         message_queue.put_nowait(CoinDCXPerpetualOrderBook.trade_message_from_exchange(
             raw_message, metadata={"trading_pair": trading_pair}))
 

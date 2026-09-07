@@ -1,6 +1,7 @@
 import asyncio
 import importlib
 import inspect
+import math
 import os
 from decimal import Decimal
 from typing import Callable, Dict, List, Optional, Set
@@ -19,7 +20,7 @@ from hummingbot.core.data_type.common import MarketDict, PositionMode
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.data_feed.market_data_provider import MarketDataProvider
 from hummingbot.exceptions import InvalidController
-from hummingbot.remote_iface.mqtt import ETopicPublisher
+from hummingbot.remote_iface.mqtt import ETopicPublisher, to_mqtt_payload
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase, ControllerConfigBase
 from hummingbot.strategy_v2.controllers.directional_trading_controller_base import (
@@ -170,6 +171,10 @@ class StrategyV2Base(ScriptStrategyBase):
     closed_executors_buffer: int = 100
     max_executors_close_attempts: int = 10
     config_update_interval: int = 10
+    # Minimum seconds between two performance reports on MQTT. Ticks can be sub-second and the
+    # reports are not small, so publishing on every one of them is a lot of broker traffic for
+    # numbers nobody can read that fast. Set to 0 to publish on every update.
+    performance_report_interval: float = 1.0
 
     @classmethod
     def init_markets(cls, config: StrategyV2ConfigBase):
@@ -208,6 +213,7 @@ class StrategyV2Base(ScriptStrategyBase):
         )
         self.mqtt_enabled = False
         self._pub: Optional[ETopicPublisher] = None
+        self._last_performance_report_ts: float = 0.0
 
     def start(self, clock: Clock, timestamp: float) -> None:
         """
@@ -313,8 +319,46 @@ class StrategyV2Base(ScriptStrategyBase):
                 controller.executors_info = controller_report.get("executors", [])
                 controller.positions_held = controller_report.get("positions", [])
                 controller.executors_update_event.set()
+
+            self.publish_performance_reports()
         except Exception as e:
             self.logger().error(f"Error updating controller reports: {e}", exc_info=True)
+
+    def publish_performance_reports(self):
+        """
+        Publish the latest performance report of every controller to this bot's `performance`
+        topic, `{namespace}/{instance_id}/performance`, so that remote consumers can follow
+        the strategy while it runs.
+
+        The payload is keyed by controller id:
+
+            {"<controller_id>": {"performance": {...}, "custom_info": {...}}}
+
+        Called on every update of the controller reports and rate limited to one report every
+        `performance_report_interval` seconds. Errors are logged and swallowed - a broker that
+        goes away must never interrupt trading.
+        """
+        if not self.mqtt_enabled or self._pub is None:
+            return
+        now = self.current_timestamp
+        if math.isnan(now):
+            # The clock has not started ticking yet, so there is nothing worth reporting. Left
+            # unhandled this also poisons the rate limit: NaN compares False against everything,
+            # so once stored it would let every later report through.
+            return
+        if now - self._last_performance_report_ts < self.performance_report_interval:
+            return
+        self._last_performance_report_ts = now
+        try:
+            self._pub({
+                controller_id: {
+                    "performance": to_mqtt_payload(report.get("performance", {})),
+                    "custom_info": to_mqtt_payload(report.get("custom_info", {})),
+                }
+                for controller_id, report in self.controller_reports.items()
+            })
+        except Exception as e:
+            self.logger().error(f"Error publishing performance reports: {e}", exc_info=True)
 
     @staticmethod
     def is_perpetual(connector: str) -> bool:
@@ -328,8 +372,16 @@ class StrategyV2Base(ScriptStrategyBase):
             controller.stop()
         self.market_data_provider.stop()
         self.executor_orchestrator.store_all_executors()
-        if self.mqtt_enabled:
-            self._pub({controller_id: {} for controller_id in self.controllers.keys()})
+        if self.mqtt_enabled and self._pub is not None:
+            # Final message on the way out, in the same shape as the live ones, so consumers
+            # clear the last report they saw rather than showing stale numbers forever. The
+            # reports can carry ids the controllers dict does not - "main" holds the executors
+            # that belong to no controller - so clear everything that was ever published.
+            published_ids = set(self.controllers.keys()) | set(self.controller_reports.keys())
+            self._pub({
+                controller_id: {"performance": {}, "custom_info": {}}
+                for controller_id in published_ids
+            })
             self._pub = None
 
     def on_tick(self):

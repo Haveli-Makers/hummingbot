@@ -9,7 +9,10 @@ from collections import deque
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from decimal import Decimal
+from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+
+from pydantic import BaseModel
 
 from hummingbot import get_logging_conf
 from hummingbot.client.config.config_helpers import ClientConfigAdapter
@@ -1124,6 +1127,33 @@ class ExternalTopicFactory:
     @classmethod
     def remove_listener(cls, listener):
         return ETopicListenerFactory.remove(listener)
+
+
+def to_mqtt_payload(obj: Any) -> Any:
+    """
+    Convert an arbitrary object graph into a JSON-serializable one, ready to publish.
+
+    Strategy data is full of types `json.dumps` refuses: pydantic models, `Decimal`
+    amounts and `Enum` members. Pydantic's own `model_dump(mode="json")` clears that
+    bar, but renders every `Decimal` as a string and every `Enum` as its raw value -
+    so a P&L arrives as `"5.67"` instead of a number, and a close type as `3` instead
+    of `TAKE_PROFIT`. Consumers do arithmetic on those numbers, so instead:
+
+    - `Decimal` becomes `float`
+    - `Enum` becomes its name
+    - pydantic models and containers are walked recursively
+    """
+    if isinstance(obj, BaseModel):
+        return to_mqtt_payload(obj.model_dump())
+    elif isinstance(obj, Decimal):
+        return float(obj)
+    elif isinstance(obj, Enum):
+        return obj.name
+    elif isinstance(obj, dict):
+        return {to_mqtt_payload(key): to_mqtt_payload(val) for key, val in obj.items()}
+    elif isinstance(obj, (list, tuple, set)):
+        return [to_mqtt_payload(val) for val in obj]
+    return obj
 
 
 class ETopicPublisher:

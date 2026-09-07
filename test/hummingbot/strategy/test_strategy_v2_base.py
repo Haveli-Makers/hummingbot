@@ -1,4 +1,6 @@
 import asyncio
+import json
+import math
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
@@ -180,6 +182,122 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         # Check if stop is called on each controller
         for controller in self.strategy.controllers.values():
             controller.stop.assert_called_once()
+
+    async def test_on_stop_publishes_empty_reports(self):
+        self.strategy.executor_orchestrator.stop = AsyncMock()
+        self.strategy.mqtt_enabled = True
+        publisher = MagicMock()
+        self.strategy._pub = publisher
+        # "main" holds executors that belong to no controller - it is published while the
+        # strategy runs, so it has to be cleared on the way out too
+        self.strategy.controller_reports = {"controller_1": {}, "main": {}}
+
+        await self.strategy.on_stop()
+
+        publisher.assert_called_once_with({
+            "controller_1": {"performance": {}, "custom_info": {}},
+            "controller_2": {"performance": {}, "custom_info": {}},
+            "main": {"performance": {}, "custom_info": {}},
+        })
+        # The publisher is released, and must not be used again afterwards
+        self.assertIsNone(self.strategy._pub)
+
+    def _set_clock(self, timestamp: float):
+        """`current_timestamp` is NaN until the clock starts, which the rate limit treats as
+        'not running yet'. Tests that expect a report have to look like a running strategy."""
+        type(self.strategy).current_timestamp = PropertyMock(return_value=timestamp)
+        self.addCleanup(delattr, type(self.strategy), "current_timestamp")
+
+    def test_publish_performance_reports(self):
+        report = PerformanceReport(realized_pnl_quote=Decimal("5.67"),
+                                   volume_traded=Decimal("1000.5"),
+                                   close_type_counts={CloseType.TAKE_PROFIT: 3})
+        self.strategy.controller_reports = {
+            "controller_1": {"executors": [], "positions": [], "performance": report},
+        }
+        self.strategy.mqtt_enabled = True
+        self.strategy._pub = MagicMock()
+        self._set_clock(self.start_timestamp)
+
+        self.strategy.publish_performance_reports()
+
+        payload = self.strategy._pub.call_args[0][0]
+        self.assertEqual({"controller_1"}, set(payload.keys()))
+        self.assertEqual({"performance", "custom_info"}, set(payload["controller_1"].keys()))
+
+        performance = payload["controller_1"]["performance"]
+        self.assertEqual(5.67, performance["realized_pnl_quote"])
+        self.assertEqual(1000.5, performance["volume_traded"])
+        self.assertEqual({"TAKE_PROFIT": 3}, performance["close_type_counts"])
+        # Consumers add up and round these, so they have to be real numbers
+        self.assertIsInstance(performance["realized_pnl_quote"], float)
+        # And the whole payload has to reach the broker as JSON
+        self.assertEqual(payload, json.loads(json.dumps(payload)))
+
+    def test_publish_performance_reports_does_nothing_without_mqtt(self):
+        self.strategy.controller_reports = {"controller_1": {"performance": PerformanceReport()}}
+        self._set_clock(self.start_timestamp)
+
+        # MQTT was never enabled for this run
+        self.strategy.mqtt_enabled = False
+        self.strategy._pub = MagicMock()
+        self.strategy.publish_performance_reports()
+        self.strategy._pub.assert_not_called()
+
+        # ...or the publisher was released on stop while ticks were still in flight
+        self.strategy.mqtt_enabled = True
+        self.strategy._pub = None
+        self.strategy.publish_performance_reports()  # must not raise
+
+    def test_publish_performance_reports_waits_for_the_clock(self):
+        # current_timestamp is NaN until the strategy is actually running
+        self.strategy.controller_reports = {"controller_1": {"performance": PerformanceReport()}}
+        self.strategy.mqtt_enabled = True
+        self.strategy._pub = MagicMock()
+
+        self.strategy.publish_performance_reports()
+
+        self.strategy._pub.assert_not_called()
+        # ...and the rate limit must not have been poisoned with NaN
+        self.assertFalse(math.isnan(self.strategy._last_performance_report_ts))
+
+    def test_publish_performance_reports_is_rate_limited(self):
+        self.strategy.controller_reports = {"controller_1": {"performance": PerformanceReport()}}
+        self.strategy.mqtt_enabled = True
+        self.strategy._pub = MagicMock()
+        self.strategy.performance_report_interval = 1.0
+
+        self._set_clock(self.start_timestamp)
+        self.strategy.publish_performance_reports()
+        self.assertEqual(1, self.strategy._pub.call_count)
+
+        # A second tick inside the interval is dropped
+        self.strategy.publish_performance_reports()
+        self.assertEqual(1, self.strategy._pub.call_count)
+
+        # ...and once the interval has passed, reporting resumes
+        type(self.strategy).current_timestamp = PropertyMock(return_value=self.start_timestamp + 1)
+        self.strategy.publish_performance_reports()
+        self.assertEqual(2, self.strategy._pub.call_count)
+
+    def test_publish_performance_reports_swallows_publisher_errors(self):
+        self.strategy.controller_reports = {"controller_1": {"performance": PerformanceReport()}}
+        self.strategy.mqtt_enabled = True
+        self.strategy._pub = MagicMock(side_effect=Exception("broker is gone"))
+        self._set_clock(self.start_timestamp)
+
+        # A broker that goes away must never interrupt trading
+        self.strategy.publish_performance_reports()
+
+        self.strategy._pub.assert_called_once()
+
+    @patch.object(StrategyV2Base, "publish_performance_reports")
+    def test_update_executors_info_publishes_reports(self, mock_publish):
+        self.strategy.executor_orchestrator.get_all_reports = MagicMock(return_value={})
+
+        self.strategy.update_executors_info()
+
+        mock_publish.assert_called_once()
 
     def test_parse_markets_str_valid(self):
         test_input = "binance.JASMY-USDT,RLC-USDT:kucoin.BTC-USDT"

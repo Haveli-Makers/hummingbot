@@ -936,3 +936,47 @@ class RemoteIfaceMQTTTests(TestCase):
         pub2.send("test/a/b", test_msg)
         pub2.send("test/c/d", test_msg)
         self.assertTrue(1)
+
+
+class ToMQTTPayloadTests(TestCase):
+    """`to_mqtt_payload` is a pure function - it needs no gateway and no broker."""
+
+    def test_to_mqtt_payload_scalars(self):
+        from hummingbot.remote_iface.mqtt import to_mqtt_payload
+        # Decimals become floats, so that consumers can do arithmetic on them
+        self.assertEqual(1.5, to_mqtt_payload(Decimal("1.5")))
+        self.assertIsInstance(to_mqtt_payload(Decimal("1.5")), float)
+        # Enums become their name, not their raw value
+        self.assertEqual("BUY", to_mqtt_payload(TradeType.BUY))
+        # Everything else is left alone
+        for value in ("a", 1, 1.5, True, None):
+            self.assertEqual(value, to_mqtt_payload(value))
+
+    def test_to_mqtt_payload_containers(self):
+        from hummingbot.remote_iface.mqtt import to_mqtt_payload
+        self.assertEqual([1.5, 2.5], to_mqtt_payload([Decimal("1.5"), Decimal("2.5")]))
+        self.assertEqual([1.5], to_mqtt_payload((Decimal("1.5"),)))
+        self.assertEqual({"a": {"b": [1.5]}},
+                         to_mqtt_payload({"a": {"b": [Decimal("1.5")]}}))
+        # Enum keys are converted too, otherwise the dict is not JSON serializable
+        self.assertEqual({"BUY": 1}, to_mqtt_payload({TradeType.BUY: 1}))
+
+    def test_to_mqtt_payload_pydantic_model_is_json_serializable(self):
+        import json
+
+        from hummingbot.remote_iface.mqtt import to_mqtt_payload
+        from hummingbot.strategy_v2.models.executors import CloseType
+        from hummingbot.strategy_v2.models.executors_info import PerformanceReport
+
+        report = PerformanceReport(
+            realized_pnl_quote=Decimal("5.67"),
+            volume_traded=Decimal("1000.5"),
+            close_type_counts={CloseType.TAKE_PROFIT: 3},
+        )
+        payload = to_mqtt_payload(report)
+
+        self.assertEqual(5.67, payload["realized_pnl_quote"])
+        self.assertIsInstance(payload["realized_pnl_quote"], float)
+        self.assertEqual({"TAKE_PROFIT": 3}, payload["close_type_counts"])
+        # The whole point: this has to survive the trip through the broker
+        self.assertEqual(payload, json.loads(json.dumps(payload)))

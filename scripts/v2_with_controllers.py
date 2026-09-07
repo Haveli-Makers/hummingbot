@@ -30,8 +30,6 @@ class V2WithControllers(StrategyV2Base):
     specific controller and wait until the active executors finalize their execution. The rest of the executors will
     wait until the main strategy stops them.
     """
-    performance_report_interval: int = 1
-
     def __init__(self, connectors: Dict[str, ConnectorBase], config: V2WithControllersConfig):
         super().__init__(connectors, config)
         self.config = config
@@ -39,14 +37,12 @@ class V2WithControllers(StrategyV2Base):
         self.max_global_pnl = Decimal("0")
         self.drawdown_exited_controllers = []
         self.closed_executors_buffer: int = 30
-        self._last_performance_report_timestamp = 0
 
     def on_tick(self):
         super().on_tick()
         if not self._is_stop_triggered:
             self.check_manual_kill_switch()
             self.control_max_drawdown()
-            self.send_performance_report()
 
     def control_max_drawdown(self):
         if self.config.max_controller_drawdown_quote:
@@ -87,12 +83,6 @@ class V2WithControllers(StrategyV2Base):
                 self.logger().info("Global drawdown reached. Stopping the strategy.")
                 self._is_stop_triggered = True
                 HummingbotApplication.main_application().stop()
-
-    def send_performance_report(self):
-        if self.current_timestamp - self._last_performance_report_timestamp >= self.performance_report_interval and self._pub:
-            performance_reports = {controller_id: self.get_performance_report(controller_id).dict() for controller_id in self.controllers.keys()}
-            self._pub(performance_reports)
-            self._last_performance_report_timestamp = self.current_timestamp
 
     def check_manual_kill_switch(self):
         for controller_id, controller in self.controllers.items():

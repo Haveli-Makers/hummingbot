@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Tuple, Union
 
 from pydantic import Field
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
 from hummingbot.client.config.config_data_types import BaseClientModel
 from hummingbot.core.web_assistant.connections.connections_factory import ConnectionsFactory
@@ -20,6 +20,7 @@ from hummingbot.data_feed.candles_feed.data_types import CandlesConfig, Historic
 SUPPORTED_CONNECTORS: List[str] = sorted(CandlesFactory._candles_map.keys())
 
 INTERVAL = "1d"
+INTERVAL_SECONDS = 86400
 CONCURRENCY = 5
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -97,43 +98,84 @@ def _last_n_months(n: int) -> List[Tuple[int, int, str]]:
     return months
 
 
-async def fetch_connector_volume(connector_name: str, trading_pair: str,
-                                 start_time: int, end_time: int) -> VolumeResult:
-    config = CandlesConfig(connector=connector_name, trading_pair=trading_pair, interval=INTERVAL, max_records=1)
+def _warn_on_gaps(connector_name: str, trading_pair: str, timestamps: List[float]):
+    if len(timestamps) <= 1:
+        return
+    diffs = [b - a for a, b in zip(timestamps, timestamps[1:])]
+    if any(d <= 0 for d in diffs):
+        logger.warning(f"{connector_name} ({trading_pair}): candles are not sorted ascending by timestamp")
+    elif any(d != INTERVAL_SECONDS for d in diffs):
+        logger.warning(
+            f"{connector_name} ({trading_pair}): candles are not equidistant "
+            f"({sorted(set(diffs))} second steps, expected {INTERVAL_SECONDS}) — there may be missing days"
+        )
+
+
+async def fetch_connector_volumes(connector_name: str, trading_pair: str,
+                                  months: List[Tuple[int, int, str]]) -> List[VolumeResult]:
+    overall_start = min(start for start, _, _ in months)
+    overall_end = max(end for _, end, _ in months)
+    max_records = max(150, len(months) * 31 + 5)
+
+    config = CandlesConfig(connector=connector_name, trading_pair=trading_pair,
+                           interval=INTERVAL, max_records=max_records)
     candle = CandlesFactory.get_candle(config)
     historical_config = HistoricalCandlesConfig(
         connector_name=connector_name,
         trading_pair=trading_pair,
         interval=INTERVAL,
-        start_time=start_time,
-        end_time=end_time,
+        start_time=overall_start,
+        end_time=overall_end,
     )
     candles_df = await candle.get_historical_candles(historical_config)
     if candles_df is None or candles_df.empty:
         raise ValueError("no candle data returned")
 
-    quote_volume_sum = float(candles_df["quote_asset_volume"].sum())
+    candles_df = candles_df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp")
+    _warn_on_gaps(connector_name, trading_pair, candles_df["timestamp"].astype(float).tolist())
 
-    return VolumeResult(
-        connector=connector_name,
-        trading_pair=trading_pair,
-        base_volume=float(candles_df["volume"].sum()),
-        quote_volume=quote_volume_sum if quote_volume_sum else "-",
-    )
+    results: List[VolumeResult] = []
+    for start_time, end_time, label in months:
+        month_df = candles_df[(candles_df["timestamp"] >= start_time) & (candles_df["timestamp"] <= end_time)]
+        if month_df.empty:
+            results.append(VolumeResult(connector=connector_name, trading_pair=trading_pair,
+                                        month=label, error="no candle data for month"))
+            continue
+
+        base_volume_sum = float(month_df["volume"].sum())
+        quote_col = month_df["quote_asset_volume"]
+        if (quote_col == 0).all() and base_volume_sum > 0:
+            quote_volume: Union[float, str] = "-"
+        else:
+            quote_volume = float(quote_col.sum())
+
+        results.append(VolumeResult(
+            connector=connector_name,
+            trading_pair=trading_pair,
+            month=label,
+            base_volume=base_volume_sum,
+            quote_volume=quote_volume,
+        ))
+    return results
 
 
-async def fetch_all(targets: List[Tuple[str, str]], start_time: int, end_time: int) -> List[VolumeResult]:
+async def fetch_all(targets: List[Tuple[str, str]],
+                    months: List[Tuple[int, int, str]]) -> List[VolumeResult]:
     semaphore = asyncio.Semaphore(CONCURRENCY)
 
-    async def _bounded(connector_name: str, trading_pair: str) -> VolumeResult:
+    async def _bounded(connector_name: str, trading_pair: str) -> List[VolumeResult]:
         async with semaphore:
             try:
-                return await fetch_connector_volume(connector_name, trading_pair, start_time, end_time)
+                return await fetch_connector_volumes(connector_name, trading_pair, months)
             except Exception as e:
                 logger.warning(f"Skipping {connector_name} ({trading_pair}): {e}")
-                return VolumeResult(connector=connector_name, trading_pair=trading_pair, error=str(e))
+                return [
+                    VolumeResult(connector=connector_name, trading_pair=trading_pair, month=label, error=str(e))
+                    for _, _, label in months
+                ]
 
-    return await asyncio.gather(*(_bounded(connector_name, trading_pair) for connector_name, trading_pair in targets))
+    nested = await asyncio.gather(*(_bounded(connector_name, trading_pair) for connector_name, trading_pair in targets))
+    return [result for sublist in nested for result in sublist]
 
 
 def _print_results(all_results: List[VolumeResult]):
@@ -148,7 +190,7 @@ def _print_results(all_results: List[VolumeResult]):
         print(f"{r.connector:<22}{r.trading_pair:<14}{r.base_volume:>20,.4f}{quote_volume:>20}{r.month:>10}")
 
     if failed:
-        print(f"\n{len(failed)} connector(s) skipped:")
+        print(f"\n{len(failed)} results(s) skipped:")
         for r in failed:
             print(f"  {r.connector} ({r.trading_pair}, {r.month}): {r.error}")
 
@@ -168,7 +210,14 @@ def _print_summary(all_results: List[VolumeResult]):
 
     rows = sorted(sums.items(), key=lambda item: item[1]["quote_volume"], reverse=True)
 
-    print(f"\nSum across {max((v['months'] for _, v in rows), default=0)} month(s)\n")
+    month_counts = {int(v["months"]) for _, v in rows}
+    if not month_counts:
+        span = "0"
+    elif len(month_counts) == 1:
+        span = str(next(iter(month_counts)))
+    else:
+        span = f"{min(month_counts)}-{max(month_counts)}"
+    print(f"\nSum per connector (see 'months' column; {span} month(s) summed)\n")
     print(f"{'connector':<22}{'pair':<14}{'months':>8}{'base_volume':>20}{'quote_volume':>20}")
     for (connector, trading_pair), totals in rows:
         quote_volume = f"{totals['quote_volume']:,.2f}" if totals["quote_volume_count"] else "-"
@@ -199,26 +248,26 @@ class MonthlyVolume:
         self.trading_pairs: List[str] = [p.strip() for p in config.trading_pairs.split(",") if p.strip()]
         self.months: int = config.months
 
-    async def run_once(self) -> List[VolumeResult]:
+    async def run_once(self, close_shared_session: bool = False) -> List[VolumeResult]:
         """
         Fetch monthly volume for the configured connectors/trading pairs, print the
         results and summary, and return the raw results.
         """
         targets = _build_targets(self.connectors, self.trading_pairs)
+        months = _last_n_months(self.months)
 
         all_results: List[VolumeResult] = []
         try:
-            for start_time, end_time, label in _last_n_months(self.months):
-                self.logger().info(f"Fetching {label} volume for {len(targets)} connector/pair combination(s)...")
-                results = await fetch_all(targets, start_time, end_time)
-                for result in results:
-                    result.month = label
-                all_results.extend(results)
+            self.logger().info(
+                f"Fetching {len(months)} month(s) of volume for {len(targets)} connector/pair combination(s)..."
+            )
+            all_results = await fetch_all(targets, months)
 
             _print_results(all_results)
             _print_summary(all_results)
         finally:
-            await ConnectionsFactory().close()
+            if close_shared_session:
+                await ConnectionsFactory().close()
 
         return [r for r in all_results if r.ok]
 
@@ -256,6 +305,9 @@ def main():
 
     args = parser.parse_args()
 
+    if args.months < 1:
+        parser.error("--months must be >= 1")
+
     config = _create_config_from_args(
         connectors=args.connectors,
         trading_pairs=args.trading_pairs,
@@ -264,7 +316,7 @@ def main():
     mv = MonthlyVolume(config=config)
 
     try:
-        asyncio.run(mv.run_once())
+        asyncio.run(mv.run_once(close_shared_session=True))
     except KeyboardInterrupt:
         print("Interrupted, exiting")
 

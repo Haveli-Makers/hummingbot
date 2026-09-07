@@ -320,6 +320,17 @@ class MarketsRecorder:
                 session.add(market_data)
             session.commit()
 
+    def delete_old_market_data(self, cutoff_timestamp: float) -> int:
+        """
+        Delete MarketData records whose timestamp is older than cutoff_timestamp.
+
+        Returns the number of deleted rows.
+        """
+        with self._sql_manager.get_new_session() as session:
+            deleted_count = session.query(MarketData).filter(MarketData.timestamp < cutoff_timestamp).delete()
+            session.commit()
+            return deleted_count
+
     def get_executors_by_ids(self, executor_ids: List[str]):
         with self._sql_manager.get_new_session() as session:
             executors = session.query(Executors).filter(Executors.id.in_(executor_ids)).all()

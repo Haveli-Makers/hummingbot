@@ -203,6 +203,17 @@ class CoindcxExchange(ExchangePyBase):
         pairs_prices = await self._api_get(path_url=CONSTANTS.TICKER_PATH_URL)
         return pairs_prices
 
+    async def get_all_24h_volume_tickers(self, trading_pairs: Optional[List[str]] = None) -> List[Dict[str, str]]:
+        all_tickers = await self.get_all_pairs_prices()
+        if not trading_pairs:
+            return all_tickers
+        filter_symbols = {tp.replace("-", "").upper() for tp in trading_pairs}
+        found = {item.get("market", "").upper() for item in all_tickers if isinstance(item, dict)}
+        for sym in filter_symbols:
+            if sym not in found:
+                self.logger().warning(f"Skipping {sym}: symbol not found on {self.name}")
+        return [item for item in all_tickers if isinstance(item, dict) and item.get("market", "").upper() in filter_symbols]
+
     async def get_markets_details(self) -> List[Dict[str, Any]]:
         """
         Returns markets details (metadata) for all trading pairs.
@@ -370,6 +381,47 @@ class CoindcxExchange(ExchangePyBase):
         if cancel_result is not None:
             return True
         return False
+
+    @property
+    def is_edit_order_supported_by_exchange(self) -> bool:
+        """CoinDCX supports native order price editing via POST /exchange/v1/orders/edit."""
+        return True
+
+    async def _place_edit(
+        self,
+        client_order_id: str,
+        exchange_order_id: str,
+        trading_pair: str,
+        new_price: Decimal,
+        new_amount: Decimal,
+        **kwargs
+    ) -> Tuple[str, str, float]:
+        """
+        Calls the CoinDCX native order-edit endpoint.
+
+        Returns (new_client_order_id, new_exchange_order_id, update_timestamp).
+        The client_order_id stays the same on CoinDCX native edits.
+        """
+        api_params = {
+            "id": exchange_order_id,
+            "price_per_unit": float(new_price),
+        }
+        edit_result = await self._api_post(
+            path_url=CONSTANTS.ORDER_EDIT_PATH_URL,
+            data=api_params,
+            is_auth_required=True,
+        )
+        if isinstance(edit_result, list):
+            order_data = edit_result[0]
+        else:
+            order_data = edit_result
+        new_exchange_id = str(order_data.get("id", exchange_order_id))
+        updated_at = order_data.get("updated_at", "")
+        if isinstance(updated_at, (int, float)):
+            timestamp = updated_at / 1e3
+        else:
+            timestamp = self._time_synchronizer.time()
+        return client_order_id, new_exchange_id, timestamp
 
     async def _update_trading_rules(self):
         """Override to add logging for trading rules update."""

@@ -1,0 +1,834 @@
+import asyncio
+import logging
+import time
+from decimal import Decimal
+from typing import Any, Dict, List, Optional, Tuple
+
+from bidict import bidict
+
+from hummingbot.connector.constants import s_decimal_NaN
+from hummingbot.connector.exchange.csx import csx_constants as CONSTANTS, csx_web_utils as web_utils
+from hummingbot.connector.exchange.csx.csx_api_order_book_data_source import CsxAPIOrderBookDataSource
+from hummingbot.connector.exchange.csx.csx_api_user_stream_data_source import CsxAPIUserStreamDataSource
+from hummingbot.connector.exchange.csx.csx_auth import CsxAuth
+from hummingbot.connector.exchange.csx.csx_utils import unwrap_data
+from hummingbot.connector.exchange_py_base import ExchangePyBase
+from hummingbot.connector.trading_rule import TradingRule
+from hummingbot.connector.utils import combine_to_hb_trading_pair
+from hummingbot.core.data_type.common import OrderType, TradeType
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
+from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
+from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TradeFeeBase
+from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
+from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
+
+_logger = logging.getLogger(__name__)
+
+
+def _resolve_proxy_url(explicit: str = "") -> str:
+    """
+    Resolve the proxy URL for a CSX connector instance.
+
+    CSX enforces IP whitelisting on EVERY endpoint — including public ones like
+    the ticker — so every CsxExchange instance needs the proxy or it gets HTTP
+    403. Some hummingbot components (rate oracle, volume oracle, trading-pair
+    fetcher) build throwaway connectors WITHOUT passing the proxy, so we resolve
+    it centrally here.
+
+    Precedence:
+      1. explicit value (the CLI `connect csx` config, passed to __init__)
+      2. CSX_PROXY_URL environment variable (handy for scripts / tests)
+      3. the saved CSX connector config via Security (so the oracle sources and
+         trading-pair fetcher pick up the same proxy you configured in the CLI)
+    """
+    if explicit:
+        return explicit
+
+    import os
+    env_proxy = os.environ.get("CSX_PROXY_URL", "")
+    if env_proxy:
+        return env_proxy
+
+    # Lazy, defensive lookup of the saved connector config. Returns "" if the
+    # config does not exist or the keystore has not been decrypted yet.
+    try:
+        from hummingbot.client.config.security import Security
+        keys = Security.api_keys("csx") or {}
+        return keys.get("csx_proxy_url", "") or ""
+    except Exception:
+        return ""
+
+
+def _extract_instruments_list(response: Any) -> list:
+    """
+    Navigate the CSX instruments response to a flat list of instrument objects.
+
+    Actual API shape:
+        {"data": {"instruments": [{"instrument": "BTC/INR", "basePrecision": "0.001", ...}, ...]}}
+
+    Also handles simpler shapes returned by tests / other callers:
+        ["BTC/INR", ...]          plain list of strings
+        [{"symbol": "BTC/INR"}]   plain list of dicts
+        {"instruments": [...]}    dict with top-level key
+    """
+    if isinstance(response, list):
+        return response
+    if not isinstance(response, dict):
+        return []
+
+    # Unwrap the outer "data" key if present
+    data = response.get("data", response)
+
+    if isinstance(data, dict):
+        # {"instruments": [...]} — typical CSX shape inside "data"
+        if "instruments" in data:
+            return data["instruments"]
+        # Unexpected: dict of symbol → object  {"BTC/INR": {...}}
+        return list(data.keys())
+
+    if isinstance(data, list):
+        return data
+
+    return []
+
+
+class CsxExchange(ExchangePyBase):
+    UPDATE_ORDER_STATUS_MIN_INTERVAL = 10.0
+    web_utils = web_utils
+
+    def __init__(
+        self,
+        csx_api_key: str,
+        csx_api_secret: str,
+        balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
+        rate_limits_share_pct: Decimal = Decimal("100"),
+        trading_pairs: Optional[List[str]] = None,
+        trading_required: bool = True,
+        domain: str = CONSTANTS.DEFAULT_DOMAIN,
+        csx_proxy_url: str = "",
+    ):
+        self.api_key = csx_api_key
+        self.secret_key = csx_api_secret
+        self._domain = domain
+        self._trading_required = trading_required
+        self._trading_pairs = trading_pairs
+        # Resolve the proxy from the explicit arg, env var, or saved config so
+        # oracle/trading-pair-fetcher instances (which don't pass one) still
+        # route through the whitelisted IP. CSX 403s without it on all endpoints.
+        self._proxy_url = _resolve_proxy_url(csx_proxy_url or "")
+        self._last_trades_poll_timestamp = 1.0
+        self._username: Optional[str] = None  # cached from GET /api/v1/me/ for order placement
+        # Built once and cached: rebuilding hex-decodes the secret and reconstructs
+        # the Ed25519 signing key on every access otherwise.
+        self._authenticator: Optional[CsxAuth] = None
+        # Short-lived cache of the raw GET /orders/{id} payload, keyed by exchange
+        # order id, so the fills pass and the state pass of one status cycle can
+        # share a single request instead of issuing 2N per cycle.
+        self._order_status_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        super().__init__(balance_asset_limit, rate_limits_share_pct)
+
+    # ── Static helpers ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    def csx_order_type(order_type: OrderType) -> str:
+        return CONSTANTS.ORDER_TYPE_LIMIT
+
+    @staticmethod
+    def to_hb_order_type(csx_type: str) -> OrderType:
+        return OrderType.LIMIT
+
+    # ── Properties ─────────────────────────────────────────────────────────────
+
+    @property
+    def authenticator(self) -> CsxAuth:
+        # Built once and cached. ExchangePyBase reads this during __init__ and it
+        # may be accessed repeatedly afterwards; rebuilding each time re-decodes
+        # the secret and reconstructs the Ed25519 signing key needlessly.
+        if self._authenticator is None:
+            self._authenticator = CsxAuth(
+                api_key=self.api_key,
+                secret_key=self.secret_key,
+                time_provider=self._time_synchronizer,
+            )
+        return self._authenticator
+
+    @property
+    def name(self) -> str:
+        return "csx"
+
+    @property
+    def rate_limits_rules(self):
+        return CONSTANTS.RATE_LIMITS
+
+    @property
+    def domain(self):
+        return self._domain
+
+    @property
+    def client_order_id_max_length(self):
+        return CONSTANTS.MAX_ORDER_ID_LEN
+
+    @property
+    def client_order_id_prefix(self):
+        return CONSTANTS.HBOT_ORDER_ID_PREFIX
+
+    @property
+    def trading_rules_request_path(self):
+        return CONSTANTS.INSTRUMENTS_PATH_URL
+
+    @property
+    def trading_pairs_request_path(self):
+        return CONSTANTS.INSTRUMENTS_PATH_URL
+
+    @property
+    def check_network_request_path(self):
+        return CONSTANTS.HEALTH_PATH_URL
+
+    @property
+    def trading_pairs(self) -> List[str]:
+        return self._trading_pairs
+
+    @property
+    def is_cancel_request_in_exchange_synchronous(self) -> bool:
+        return True
+
+    @property
+    def is_trading_required(self) -> bool:
+        return self._trading_required
+
+    def supported_order_types(self) -> List[OrderType]:
+        return [OrderType.LIMIT, OrderType.LIMIT_MAKER]
+
+    # ── Factory methods ────────────────────────────────────────────────────────
+
+    def _create_web_assistants_factory(self) -> WebAssistantsFactory:
+        return web_utils.build_api_factory(
+            throttler=self._throttler,
+            time_synchronizer=self._time_synchronizer,
+            domain=self._domain,
+            auth=self._auth,
+            proxy_url=self._proxy_url or None,
+        )
+
+    def _create_order_book_data_source(self) -> OrderBookTrackerDataSource:
+        return CsxAPIOrderBookDataSource(
+            trading_pairs=self._trading_pairs,
+            connector=self,
+            domain=self._domain,
+            api_factory=self._web_assistants_factory,
+        )
+
+    def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
+        return CsxAPIUserStreamDataSource(
+            auth=self._auth,
+            trading_pairs=self._trading_pairs,
+            connector=self,
+            api_factory=self._web_assistants_factory,
+            domain=self._domain,
+        )
+
+    async def stop_network(self):
+        await super().stop_network()
+        # With a proxy configured, the web-assistants factory owns a dedicated,
+        # per-connector aiohttp session (aiohttp-socks). Close it on shutdown so it
+        # doesn't leak ("Unclosed client session"). The default ConnectionsFactory
+        # is a shared singleton, so it is deliberately left alone.
+        if self._proxy_url:
+            try:
+                await self._web_assistants_factory.close()
+            except Exception:
+                self.logger().debug("Error closing CSX proxy connections factory on stop_network.", exc_info=True)
+
+    # ── Exception classification ───────────────────────────────────────────────
+
+    def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception) -> bool:
+        msg = str(request_exception).lower()
+        return "timestamp" in msg or "future time" in msg or "stale request" in msg
+
+    def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
+        msg = str(status_update_exception).lower()
+        return "not found" in msg or "does not exist" in msg or "404" in msg
+
+    def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
+        msg = str(cancelation_exception).lower()
+        return "not found" in msg or "does not exist" in msg or "404" in msg
+
+    # ── Trading pair initialisation ────────────────────────────────────────────
+
+    def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Any):
+        """
+        Build the bidict from instrument strings returned by GET /api/v1/public/instrument.
+
+        The endpoint may return:
+          - a list of strings: ["BTC/INR", "ETH/INR", ...]
+          - a list of dicts:   [{"symbol": "BTC/INR", ...}, ...]
+          - a dict with a data key containing either of the above
+        """
+        mapping = bidict()
+        try:
+            instruments = _extract_instruments_list(exchange_info)
+
+            for item in instruments:
+                try:
+                    if isinstance(item, str):
+                        symbol = item
+                    elif isinstance(item, dict):
+                        symbol = item.get("symbol") or item.get("instrument") or item.get("name") or ""
+                    else:
+                        continue
+
+                    symbol = symbol.strip()
+                    if not symbol:
+                        continue
+
+                    if "/" in symbol:
+                        base, quote = symbol.split("/", 1)
+                    elif "-" in symbol:
+                        base, quote = symbol.split("-", 1)
+                    else:
+                        continue
+
+                    hb_pair = combine_to_hb_trading_pair(base=base.upper(), quote=quote.upper())
+                    mapping[symbol] = hb_pair
+                except Exception as exc:
+                    self.logger().debug(f"Error parsing instrument '{item}': {exc}")
+
+        except Exception as exc:
+            self.logger().error(f"Error initialising trading pair symbols: {exc}")
+
+        self._set_trading_pair_symbol_map(mapping)
+
+    async def _make_trading_pairs_request(self) -> Any:
+        return await self._api_get(
+            path_url=CONSTANTS.INSTRUMENTS_PATH_URL,
+            is_auth_required=False,
+        )
+
+    async def _make_trading_rules_request(self) -> Any:
+        return await self._api_get(
+            path_url=CONSTANTS.INSTRUMENTS_PATH_URL,
+            is_auth_required=False,
+        )
+
+    async def _format_trading_rules(self, exchange_info: Any) -> List[TradingRule]:
+        """
+        Parse instrument info into TradingRule objects.
+
+        If the endpoint only returns symbol strings (no precision data) sensible
+        defaults are applied so the connector still starts up correctly.
+        """
+        trading_rules: List[TradingRule] = []
+        try:
+            instruments = _extract_instruments_list(exchange_info)
+
+            for item in instruments:
+                try:
+                    if isinstance(item, str):
+                        symbol = item
+                        info: Dict[str, Any] = {}
+                    elif isinstance(item, dict):
+                        symbol = item.get("symbol") or item.get("instrument") or item.get("name") or ""
+                        info = item
+                    else:
+                        continue
+
+                    symbol = symbol.strip()
+                    if not symbol:
+                        continue
+
+                    if "/" in symbol:
+                        base, quote = symbol.split("/", 1)
+                    elif "-" in symbol:
+                        base, quote = symbol.split("-", 1)
+                    else:
+                        continue
+
+                    trading_pair = f"{base.upper()}-{quote.upper()}"
+
+                    # CSX instrument precision fields (confirmed live):
+                    #   basePrecision  → base-asset quantity step  (e.g. "0.000001" BTC)
+                    #   limitPrecision → LIMIT PRICE tick           (e.g. "1" → integer INR price)
+                    #   quotePrecision → quote-amount precision     (e.g. "0.01" INR)
+                    # Using quotePrecision as the price tick is WRONG and triggers
+                    # "Limit Price Precision is not correct" — the tick is limitPrecision.
+                    step = Decimal(str(
+                        info.get("basePrecision") or info.get("stepSize")
+                        or info.get("step_size") or "0.0001"))
+                    tick = Decimal(str(
+                        info.get("limitPrecision") or info.get("tickSize")
+                        or info.get("tick_size") or "0.01"))
+                    min_qty = step   # min order size == one base step
+                    max_qty = Decimal(str(info.get("maxQuantity") or info.get("max_quantity") or "1000000"))
+                    min_notional = Decimal(str(
+                        info.get("minNotional") or info.get("min_notional") or "1"))
+
+                    trading_rules.append(
+                        TradingRule(
+                            trading_pair=trading_pair,
+                            min_order_size=min_qty,
+                            max_order_size=max_qty,
+                            min_price_increment=tick,
+                            min_base_amount_increment=step,
+                            min_notional_size=min_notional,
+                        )
+                    )
+                except Exception as exc:
+                    self.logger().debug(f"Error parsing trading rule for '{item}': {exc}")
+
+        except Exception as exc:
+            self.logger().error(f"Error formatting trading rules: {exc}")
+
+        return trading_rules
+
+    # ── Pricing ────────────────────────────────────────────────────────────────
+
+    async def _get_last_traded_prices(self, trading_pairs: List[str]) -> Dict[str, float]:
+        prices: Dict[str, float] = {}
+        try:
+            response = await self._api_get(
+                path_url=CONSTANTS.TICKER_V2_PATH_URL,
+                is_auth_required=False,
+            )
+            tickers = response if isinstance(response, list) else response.get("data", [])
+            for ticker in tickers:
+                # CSX returns PascalCase field names (Instrument, LastTradedPrice)
+                instrument = (ticker.get("Instrument") or ticker.get("instrument")
+                              or ticker.get("symbol") or "")
+                hb_pair = instrument.replace("/", "-").upper()
+                if hb_pair in trading_pairs:
+                    raw = (ticker.get("LastTradedPrice") or ticker.get("lastTradedPrice")
+                           or ticker.get("last") or 0)
+                    prices[hb_pair] = float(raw)
+        except Exception as exc:
+            self.logger().error(f"Error fetching last traded prices: {exc}")
+        return prices
+
+    async def get_all_pairs_prices(self) -> List[Dict[str, Any]]:
+        """Used by rate-oracle source."""
+        response = await self._api_get(
+            path_url=CONSTANTS.TICKER_V2_PATH_URL,
+            is_auth_required=False,
+        )
+        return response if isinstance(response, list) else response.get("data", [])
+
+    async def get_all_24h_volume_tickers(
+        self, trading_pairs: Optional[List[str]] = None
+    ) -> List[Dict[str, Any]]:
+        """Used by volume-oracle source."""
+        tickers = await self.get_all_pairs_prices()
+        if not trading_pairs:
+            return tickers
+        requested = {tp.replace("-", "/").upper() for tp in trading_pairs}
+        return [t for t in tickers
+                if (t.get("Instrument") or t.get("instrument") or "").upper() in requested]
+
+    async def get_order_book_snapshot(self, trading_pair: str) -> Dict[str, list]:
+        """
+        REST order-book snapshot for one pair as ``{"bids": [[price, qty], ...],
+        "asks": [...]}``.
+
+        Used by the rate-oracle source for *real* best bid/ask: the CSX ticker
+        carries no top-of-book, so bid/ask must come from the depth endpoint.
+        Reuses the order-book data source's depth parser so the response-shape
+        handling lives in one place.
+        """
+        try:
+            instrument = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+        except KeyError:
+            instrument = trading_pair.replace("-", "/")
+
+        response = await self._api_get(
+            path_url=CONSTANTS.DEPTH_V2_PATH_URL,
+            params={"instrument": instrument},
+            is_auth_required=False,
+        )
+        data = CsxAPIOrderBookDataSource._extract_depth_data(response)
+        return {"bids": data["buy"], "asks": data["sell"]}
+
+    # ── Account profile ────────────────────────────────────────────────────────
+
+    async def _get_username(self) -> str:
+        """
+        Fetch and cache the account username from GET /api/v1/me/.
+
+        CSX requires a `username` field in the create-order body; its value is
+        the `userName` returned by the profile endpoint. Cached after the first
+        successful lookup since it does not change for the lifetime of the keys.
+        """
+        if self._username:
+            return self._username
+        response = await self._api_get(
+            path_url=CONSTANTS.PROFILE_PATH_URL,
+            is_auth_required=True,
+        )
+        data = response.get("data", response) if isinstance(response, dict) else {}
+        self._username = data.get("userName") or data.get("username") or ""
+        if not self._username:
+            self.logger().warning(
+                f"Could not determine CSX username from profile response: {response}"
+            )
+        return self._username
+
+    # ── Order placement & cancellation ────────────────────────────────────────
+
+    async def _place_order(
+        self,
+        order_id: str,
+        trading_pair: str,
+        amount: Decimal,
+        trade_type: TradeType,
+        order_type: OrderType,
+        price: Decimal,
+        **kwargs,
+    ) -> Tuple[str, float]:
+        try:
+            instrument = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+        except KeyError:
+            instrument = trading_pair.replace("-", "/")
+
+        username = await self._get_username()
+
+        # NOTE: CSX requires clientOrderId to be a UUID (32-hex or 36-char canonical)
+        # and rejects any other format with "Invalid ClientOrderId". hummingbot's
+        # client order IDs are not UUIDs, so we OMIT clientOrderId entirely (which
+        # CSX accepts) and correlate via the server-assigned orderId returned below.
+        payload: Dict[str, Any] = {
+            "instrument": instrument,
+            "limitPrice": str(price),
+            "quantity": str(amount),
+            "quantityType": CONSTANTS.QUANTITY_TYPE_BASE,
+            "side": CONSTANTS.SIDE_BUY if trade_type == TradeType.BUY else CONSTANTS.SIDE_SELL,
+            "type": CONSTANTS.ORDER_TYPE_LIMIT,
+            "username": username,
+        }
+
+        result = await self._api_post(
+            path_url=CONSTANTS.CREATE_ORDER_PATH_URL,
+            data=payload,
+            is_auth_required=True,
+        )
+
+        # CSX wraps the payload under "data": {"data": {"orderId": "...", "createdAt": ...}}
+        data = result.get("data", result) if isinstance(result, dict) else {}
+        exchange_order_id = str(
+            data.get("orderId") or data.get("order_id")
+            or (result.get("orderId") if isinstance(result, dict) else "") or ""
+        )
+        if not exchange_order_id:
+            # Without an exchange order id the order can never be polled or
+            # cancelled (DELETE /orders/ with no id), so fail loudly here instead
+            # of tracking a phantom order with an empty id.
+            raise ValueError(f"CSX create-order response missing orderId: {result}")
+        created_at = float(
+            data.get("createdAt") or data.get("created_at")
+            or (result.get("createdAt") if isinstance(result, dict) else 0) or 0
+        )
+        if created_at == 0:
+            created_at = self._time_synchronizer.time()
+        return exchange_order_id, created_at
+
+    async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder) -> bool:
+        result = await self._api_delete(
+            path_url=f"{CONSTANTS.ORDER_BY_ID_PATH_URL}/{tracked_order.exchange_order_id}",
+            limit_id=CONSTANTS.ORDER_BY_ID_PATH_URL,
+            is_auth_required=True,
+        )
+        # CSX cancel response: {"data": {"cancelled": true, "info": {...}}, "message": "..."}
+        data = unwrap_data(result) if isinstance(result, dict) else {}
+        if data.get("cancelled") is True or data.get("canceled") is True:
+            return True
+        status = (data.get("status") or result.get("status") or "").upper()
+        return result.get("success") is True or status in ("CANCELLED", "CANCELED")
+
+    # ── Order & trade status ───────────────────────────────────────────────────
+
+    # GET /orders/{id} is deduped within one status cycle: the base class runs the
+    # fills pass (_all_trade_updates_for_order) and then the state pass
+    # (_request_order_status) back-to-back, and both need the same payload.
+    _ORDER_STATUS_CACHE_TTL = 5.0  # seconds; bridges the two passes of one cycle
+
+    async def _fetch_order_data(self, exchange_order_id: str) -> Dict[str, Any]:
+        """GET /orders/{id} and unwrap to the order dict (CSX wraps it in 'data')."""
+        result = await self._api_get(
+            path_url=f"{CONSTANTS.ORDER_BY_ID_PATH_URL}/{exchange_order_id}",
+            limit_id=CONSTANTS.ORDER_BY_ID_PATH_URL,
+            is_auth_required=True,
+        )
+        if not isinstance(result, dict):
+            return {}
+        return unwrap_data(result, identity_key="orderId")
+
+    def _cache_order_data(self, exchange_order_id: str, order_data: Dict[str, Any]) -> None:
+        now = time.monotonic()
+        # Prune stale entries so the cache cannot grow unbounded over the bot's life.
+        self._order_status_cache = {
+            k: v for k, v in self._order_status_cache.items()
+            if now - v[0] <= self._ORDER_STATUS_CACHE_TTL
+        }
+        self._order_status_cache[exchange_order_id] = (now, order_data)
+
+    def _pop_cached_order_data(self, exchange_order_id: str) -> Optional[Dict[str, Any]]:
+        cached = self._order_status_cache.pop(exchange_order_id, None)
+        if cached is not None and time.monotonic() - cached[0] <= self._ORDER_STATUS_CACHE_TTL:
+            return cached[1]
+        return None
+
+    async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
+        exchange_order_id = str(tracked_order.exchange_order_id)
+        # Reuse the payload the fills pass just fetched this cycle, if present.
+        order_data = self._pop_cached_order_data(exchange_order_id)
+        if order_data is None:
+            order_data = await self._fetch_order_data(exchange_order_id)
+
+        status_str = (order_data.get("status") or "").upper()
+        new_state = CONSTANTS.ORDER_STATE.get(status_str)
+        if new_state is None:
+            raise ValueError(
+                f"Unknown CSX order status '{status_str}' for {tracked_order.exchange_order_id}"
+            )
+
+        update_ts = float(order_data.get("updatedAt", order_data.get("updated_at", 0)))
+        return OrderUpdate(
+            client_order_id=tracked_order.client_order_id,
+            exchange_order_id=exchange_order_id,
+            trading_pair=tracked_order.trading_pair,
+            update_timestamp=update_ts,
+            new_state=new_state,
+        )
+
+    async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
+        if order.exchange_order_id is None:
+            return []
+        try:
+            exchange_order_id = str(order.exchange_order_id)
+            order_data = await self._fetch_order_data(exchange_order_id)
+            # Cache for the state pass that immediately follows this fills pass.
+            self._cache_order_data(exchange_order_id, order_data)
+            trade_update = self._build_trade_update_from_order_data(order, order_data)
+            return [trade_update] if trade_update is not None else []
+        except Exception as exc:
+            self.logger().error(
+                f"Error fetching trade updates for {order.exchange_order_id}: {exc}"
+            )
+            return []
+
+    def _build_trade_update_from_order_data(
+        self, order: InFlightOrder, order_data: Dict[str, Any]
+    ) -> Optional[TradeUpdate]:
+        """
+        Build the incremental TradeUpdate for ``order`` from a GET /orders/{id}
+        payload, or None when there is no new fill.
+
+        CSX reports CUMULATIVE fills with no per-fill trade id, so we emit only the
+        increment since the last applied fill, keyed by a trade id unique to the
+        cumulative value (InFlightOrder dedupes repeated ids). Shared by the
+        status-poll path and the user-stream terminal path, so the final fill can be
+        recorded BEFORE the order reaches a terminal state and stops being tracked.
+        """
+        if order.exchange_order_id is None:
+            return None
+        exchange_order_id = str(order.exchange_order_id)
+
+        filled_qty = Decimal(str(order_data.get("filledQuantity", "0")))
+        if filled_qty <= 0:
+            return None
+        incremental_base = filled_qty - order.executed_amount_base
+        if incremental_base <= 0:
+            return None
+
+        filled_quote_qty = Decimal(str(order_data.get("filledQuoteQuantity", "0")))
+        if filled_quote_qty > 0:
+            avg_price = filled_quote_qty / filled_qty
+        else:
+            avg_price = Decimal(str(order_data.get("averagePrice", "0")))
+
+        incremental_quote = filled_quote_qty - order.executed_amount_quote
+        if incremental_quote <= 0:
+            incremental_quote = incremental_base * avg_price
+        fill_price = (incremental_quote / incremental_base) if incremental_quote > 0 else avg_price
+
+        is_maker = order.order_type is OrderType.LIMIT_MAKER
+        # makerFee/takerFee are whole-number percents per the CSX docs (maker != taker
+        # on the live exchange); TradeFeeBase.percent is a fraction, hence the /100.
+        fee_pct = Decimal(str(
+            order_data.get("makerFee", 0) if is_maker else order_data.get("takerFee", 0)
+        ))
+        fee = DeductedFromReturnsTradeFee(percent=fee_pct / Decimal("100"))
+
+        return TradeUpdate(
+            trade_id=f"{exchange_order_id}-{filled_qty}",
+            client_order_id=order.client_order_id,
+            exchange_order_id=exchange_order_id,
+            trading_pair=order.trading_pair,
+            fee=fee,
+            fill_base_amount=incremental_base,
+            fill_quote_amount=incremental_quote,
+            fill_price=fill_price,
+            fill_timestamp=float(order_data.get("updatedAt", 0)),
+        )
+
+    # ── Balance ────────────────────────────────────────────────────────────────
+
+    async def _update_balances(self) -> None:
+        local_assets = set(self._account_balances.keys())
+        remote_assets: set = set()
+
+        try:
+            response = await self._api_get(
+                path_url=CONSTANTS.BALANCE_V2_PATH_URL,
+                is_auth_required=True,
+            )
+
+            # CSX wraps the payload in a "data" key:
+            #   {"data": {"Available": {...}, "Locked": {...}}, "message": "..."}
+            balance_data = unwrap_data(response) if isinstance(response, dict) else {}
+            if not isinstance(balance_data, dict):
+                balance_data = {}
+            available = balance_data.get("Available") or {}
+            locked = balance_data.get("Locked") or {}
+            all_assets = set(available.keys()) | set(locked.keys())
+
+            # Distinguish a genuinely-empty account from a degenerate response before
+            # the stale-removal loop below wipes every tracked balance. A real empty
+            # account still CARRIES the Available/Locked keys (they are just empty
+            # objects); a payload missing both — {"data": null}, {"data": {}}, a
+            # partial-outage body — parses to the same "no assets" and must instead
+            # keep the last known balances, or the strategy sees zero funds and stops
+            # sizing orders. Mirrors the Zebpay guard in zebpay_exchange._update_balances.
+            if not all_assets and not ("Available" in balance_data or "Locked" in balance_data):
+                self.logger().warning(
+                    "CSX balance payload was degenerate (no Available/Locked section): "
+                    f"{response!r}. Keeping last known balances."
+                )
+                return
+
+            for asset in all_assets:
+                free = Decimal(str(available.get(asset, "0")))
+                held = Decimal(str(locked.get(asset, "0")))
+                key = asset.upper()
+                self._account_balances[key] = free + held
+                self._account_available_balances[key] = free
+                remote_assets.add(key)
+
+            for stale in local_assets - remote_assets:
+                del self._account_balances[stale]
+                del self._account_available_balances[stale]
+
+        except Exception as exc:
+            self.logger().error(f"Error updating CSX balances: {exc}", exc_info=True)
+
+    # ── Fees ───────────────────────────────────────────────────────────────────
+
+    def _get_fee(
+        self,
+        base_currency: str,
+        quote_currency: str,
+        order_type: OrderType,
+        order_side: TradeType,
+        amount: Decimal,
+        price: Decimal = s_decimal_NaN,
+        is_maker: Optional[bool] = None,
+    ) -> TradeFeeBase:
+        # Respect an explicit is_maker=False (e.g. a LIMIT_MAKER that crossed and
+        # filled as taker); only infer from the order type when it is unspecified.
+        is_maker = is_maker if is_maker is not None else (order_type is OrderType.LIMIT_MAKER)
+        return DeductedFromReturnsTradeFee(percent=self.estimate_fee_pct(is_maker))
+
+    async def _update_trading_fees(self):
+        """
+        CSX does not expose a dedicated trading-fees endpoint.
+        Fees are embedded in order responses (makerFee / takerFee).
+        This is a no-op; fee estimation falls back to DEFAULT_FEES.
+        """
+        pass
+
+    # ── User-stream event listener ─────────────────────────────────────────────
+
+    async def _user_stream_event_listener(self):
+        async for event in self._iter_user_event_queue():
+            try:
+                event_type = event.get("event")
+
+                if event_type == "balance_update":
+                    # Unwrap CSX's "data" envelope if the raw response was forwarded
+                    balance_data = unwrap_data(event.get("data") or {})
+                    if not isinstance(balance_data, dict):
+                        balance_data = {}
+                    available = balance_data.get("Available") or {}
+                    locked = balance_data.get("Locked") or {}
+                    all_assets = set(available.keys()) | set(locked.keys())
+                    for asset in all_assets:
+                        free = Decimal(str(available.get(asset, "0")))
+                        held = Decimal(str(locked.get(asset, "0")))
+                        key = asset.upper()
+                        self._account_balances[key] = free + held
+                        self._account_available_balances[key] = free
+
+                elif event_type == "trade_update":
+                    # Realtime account fills from the user-stream account-trades poll.
+                    # Each entry is a GET /orders/{id} payload with the cumulative
+                    # filledQuantity; the helper turns it into the incremental fill,
+                    # deduped by trade id so re-emitting the same cumulative is a no-op.
+                    # Index once per event batch: ClientOrderTracker rebuilds this map
+                    # on every property access, so resolving it inside the loop would
+                    # be an O(entries x tracked-orders) scan every poll cycle.
+                    fillable_by_exchange_id = self._order_tracker.all_fillable_orders_by_exchange_order_id
+                    for order_data in event.get("data") or []:
+                        if not isinstance(order_data, dict):
+                            continue
+                        exchange_order_id = str(order_data.get("orderId", order_data.get("order_id", "")))
+                        tracked = fillable_by_exchange_id.get(exchange_order_id)
+                        if tracked is None:
+                            continue
+                        trade_update = self._build_trade_update_from_order_data(tracked, order_data)
+                        if trade_update is not None:
+                            self._order_tracker.process_trade_update(trade_update)
+
+                elif event_type == "order_update":
+                    updatable_by_exchange_id = self._order_tracker.all_updatable_orders_by_exchange_order_id
+                    for order_data in event.get("data") or []:
+                        client_order_id = order_data.get("clientOrderId") or order_data.get("client_order_id")
+                        exchange_order_id = str(order_data.get("orderId", order_data.get("order_id", "")))
+                        status_str = (order_data.get("status") or "").upper()
+
+                        # We omit clientOrderId on placement (CSX requires UUIDs),
+                        # so match primarily by the exchange orderId; fall back to
+                        # clientOrderId if the exchange happens to echo one.
+                        tracked = None
+                        if client_order_id:
+                            tracked = self._order_tracker.all_updatable_orders.get(client_order_id)
+                        if tracked is None and exchange_order_id:
+                            tracked = updatable_by_exchange_id.get(exchange_order_id)
+                        if tracked is None:
+                            continue
+
+                        new_state = CONSTANTS.ORDER_STATE.get(status_str)
+                        if new_state is None:
+                            continue
+
+                        # Record any outstanding fill from this same payload BEFORE a
+                        # terminal transition stops tracking the order. The settled-order
+                        # fast-path emits the terminal OrderUpdate (FULFILLED→FILLED),
+                        # which removes the order from tracking; without this the final
+                        # fill increment would be lost and executed_amount_base would be
+                        # permanently under-reported. The trade-id dedup makes this a
+                        # no-op if the status poll already recorded that fill.
+                        if new_state in (OrderState.FILLED, OrderState.CANCELED, OrderState.FAILED):
+                            trade_update = self._build_trade_update_from_order_data(tracked, order_data)
+                            if trade_update is not None:
+                                self._order_tracker.process_trade_update(trade_update)
+
+                        order_update = OrderUpdate(
+                            trading_pair=tracked.trading_pair,
+                            update_timestamp=float(order_data.get("updatedAt", 0)),
+                            new_state=new_state,
+                            client_order_id=tracked.client_order_id,
+                            exchange_order_id=exchange_order_id,
+                        )
+                        self._order_tracker.process_order_update(order_update=order_update)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger().error("Unexpected error in CSX user-stream listener.", exc_info=True)
+                await self._sleep(5.0)

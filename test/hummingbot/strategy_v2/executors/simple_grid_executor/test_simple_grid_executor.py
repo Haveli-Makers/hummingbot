@@ -1439,6 +1439,27 @@ class TestSimpleGridExecutor(IsolatedAsyncioWrapperTestCase):
 
     @patch.object(SimpleGridExecutor, "get_trading_rules")
     @patch.object(SimpleGridExecutor, "get_price")
+    def test_the_backoff_grows_even_from_a_zero_settle_delay(self, mock_price, rules_mock):
+        """
+        cancel_settle_delay is correctly 0 on a venue that settles cancels synchronously, and
+        0 doubles to 0 for ever — so every refusal retried in the same instant and ten of them
+        burned the whole retry budget inside a second. Seen on CoinEx, where a post-only exit
+        is refused whenever the book moves underneath it ("Retrying in 0.00s").
+        """
+        rules_mock.return_value = self.trading_rules()
+        executor = self.chasing_executor(mock_price, cancel_settle_delay=0.0)
+        self.assertEqual(executor._exit_retry_delay, 0.0)
+
+        self.refuse_exit(executor, "This order can't be Maker only and has been canceled.")
+        first = executor._exit_retry_delay
+        executor._place_scheduled_exit()
+        self.refuse_exit(executor, "This order can't be Maker only and has been canceled.")
+
+        self.assertGreater(first, 0.0)
+        self.assertGreater(executor._exit_retry_delay, first)
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
     def test_the_backoff_is_capped(self, mock_price, rules_mock):
         """A stop that cannot place its exit is the worst state, so keep trying often."""
         rules_mock.return_value = self.trading_rules()

@@ -27,6 +27,11 @@ from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
 
 
+# Floor the exit backoff doubles from, so a cancel_settle_delay of 0 — correct on a venue
+# that settles cancels synchronously — still produces a growing wait after a refusal.
+MIN_EXIT_RETRY_DELAY = 0.1
+
+
 class SimpleGridExecutor(ExecutorBase):
     """
     Runs a single leg of the simple grid strategy.
@@ -1102,7 +1107,12 @@ class SimpleGridExecutor(ExecutorBase):
         order in as soon as it can actually be accepted.
         """
         if after_refusal:
-            self._exit_retry_delay = min(self._exit_retry_delay * 2,
+            # Double, but from a floor rather than from whatever cancel_settle_delay happens
+            # to be. A venue that settles cancels synchronously wants that set to 0, and 0
+            # doubles to 0 for ever — so every refusal would be retried in the same instant
+            # and ten of them would burn the whole retry budget inside a second. Seen on
+            # CoinEx, where a post-only exit is refused whenever the book moves underneath it.
+            self._exit_retry_delay = min(max(self._exit_retry_delay, MIN_EXIT_RETRY_DELAY) * 2,
                                          self.config.exit_retry_max_delay)
         delay = self._exit_retry_delay
         self._exit_blocked_until = self._strategy.current_timestamp + delay

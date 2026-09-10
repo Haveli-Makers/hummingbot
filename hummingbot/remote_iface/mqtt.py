@@ -506,13 +506,25 @@ class MQTTNotifier(NotifierBase):
             msg_type=NotifyMessage
         )
 
-    def add_msg_to_queue(self, msg: str):
+    def add_message_to_queue(self, msg: str):
+        """
+        Publish immediately - the name must match NotifierBase, which is what
+        HummingbotApplication.notify() and TradingCore.notify() actually call.
+
+        This was `add_msg_to_queue` until NotifierBase renamed the method and gave it a real
+        queue-and-task implementation. The old name stopped overriding anything, so every
+        notification fell through to the base class and sat in a queue that nothing drained -
+        `start()` below is a no-op, so the draining task was never created. Nothing was ever
+        published to the /notify topic, and the queue grew for the life of the process.
+        """
         if threading.current_thread() != threading.main_thread():  # pragma: no cover
-            self._ev_loop.call_soon_threadsafe(self.add_msg_to_queue, msg)
+            self._ev_loop.call_soon_threadsafe(self.add_message_to_queue, msg)
             return
         self.notify_pub.publish(NotifyMessage(msg=msg))
 
     def start(self) -> None:
+        # Correct as a no-op: publishing above is non-blocking, so there is no background
+        # queue to drain and no task to own.
         return None
 
     def stop(self) -> None:
@@ -1140,15 +1152,21 @@ def to_mqtt_payload(obj: Any) -> Any:
     of `TAKE_PROFIT`. Consumers do arithmetic on those numbers, so instead:
 
     - `Decimal` becomes `float`
-    - `Enum` becomes its name
+    - `Enum` becomes `str(member)`, i.e. "CloseType.TAKE_PROFIT"
     - pydantic models and containers are walked recursively
+
+    The enum rendering is `str()` and not `.name` on purpose. "TAKE_PROFIT" reads better, but
+    `close_type_counts` is already consumed in the "CloseType.TAKE_PROFIT" form - the dashboard
+    looks up exactly those keys to build its TP/SL/TS counts, and would silently render zeros
+    for all of them if this changed. `_make_event_payload` above uses `str()` for the same
+    reason. Changing it is a breaking change for consumers, not a cosmetic one.
     """
     if isinstance(obj, BaseModel):
         return to_mqtt_payload(obj.model_dump())
     elif isinstance(obj, Decimal):
         return float(obj)
     elif isinstance(obj, Enum):
-        return obj.name
+        return str(obj)
     elif isinstance(obj, dict):
         return {to_mqtt_payload(key): to_mqtt_payload(val) for key, val in obj.items()}
     elif isinstance(obj, (list, tuple, set)):

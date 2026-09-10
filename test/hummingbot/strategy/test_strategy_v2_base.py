@@ -208,6 +208,17 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         type(self.strategy).current_timestamp = PropertyMock(return_value=timestamp)
         self.addCleanup(delattr, type(self.strategy), "current_timestamp")
 
+    def _enable_mqtt(self, publisher=None):
+        """The publisher is resolved on every report now rather than latched at start(), so a
+        test that expects a report has to stand in for a live bridge."""
+        publisher = publisher if publisher is not None else MagicMock()
+        self.strategy._pub = publisher
+        self.strategy.mqtt_enabled = True
+        patcher = patch.object(StrategyV2Base, "_resolve_publisher", return_value=publisher)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return publisher
+
     def test_publish_performance_reports(self):
         report = PerformanceReport(realized_pnl_quote=Decimal("5.67"),
                                    volume_traded=Decimal("1000.5"),
@@ -215,20 +226,19 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         self.strategy.controller_reports = {
             "controller_1": {"executors": [], "positions": [], "performance": report},
         }
-        self.strategy.mqtt_enabled = True
-        self.strategy._pub = MagicMock()
+        publisher = self._enable_mqtt()
         self._set_clock(self.start_timestamp)
 
         self.strategy.publish_performance_reports()
 
-        payload = self.strategy._pub.call_args[0][0]
+        payload = publisher.call_args[0][0]
         self.assertEqual({"controller_1"}, set(payload.keys()))
         self.assertEqual({"performance", "custom_info"}, set(payload["controller_1"].keys()))
 
         performance = payload["controller_1"]["performance"]
         self.assertEqual(5.67, performance["realized_pnl_quote"])
         self.assertEqual(1000.5, performance["volume_traded"])
-        self.assertEqual({"TAKE_PROFIT": 3}, performance["close_type_counts"])
+        self.assertEqual({"CloseType.TAKE_PROFIT": 3}, performance["close_type_counts"])
         # Consumers add up and round these, so they have to be real numbers
         self.assertIsInstance(performance["realized_pnl_quote"], float)
         # And the whole payload has to reach the broker as JSON
@@ -238,58 +248,57 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         self.strategy.controller_reports = {"controller_1": {"performance": PerformanceReport()}}
         self._set_clock(self.start_timestamp)
 
-        # MQTT was never enabled for this run
-        self.strategy.mqtt_enabled = False
-        self.strategy._pub = MagicMock()
-        self.strategy.publish_performance_reports()
-        self.strategy._pub.assert_not_called()
+        # The bridge is not up, so the resolver hands back nothing
+        publisher = MagicMock()
+        self.strategy._pub = publisher
+        with patch.object(StrategyV2Base, "_resolve_publisher", return_value=None):
+            self.strategy.publish_performance_reports()
+        publisher.assert_not_called()
 
-        # ...or the publisher was released on stop while ticks were still in flight
-        self.strategy.mqtt_enabled = True
-        self.strategy._pub = None
-        self.strategy.publish_performance_reports()  # must not raise
+        # ...and a strategy on its way out never publishes either
+        self.strategy._is_stop_triggered = True
+        with patch.object(StrategyV2Base, "_resolve_publisher", return_value=publisher):
+            self.strategy.publish_performance_reports()
+        publisher.assert_not_called()
 
     def test_publish_performance_reports_waits_for_the_clock(self):
         # current_timestamp is NaN until the strategy is actually running
         self.strategy.controller_reports = {"controller_1": {"performance": PerformanceReport()}}
-        self.strategy.mqtt_enabled = True
-        self.strategy._pub = MagicMock()
+        publisher = self._enable_mqtt()
 
         self.strategy.publish_performance_reports()
 
-        self.strategy._pub.assert_not_called()
+        publisher.assert_not_called()
         # ...and the rate limit must not have been poisoned with NaN
         self.assertFalse(math.isnan(self.strategy._last_performance_report_ts))
 
     def test_publish_performance_reports_is_rate_limited(self):
         self.strategy.controller_reports = {"controller_1": {"performance": PerformanceReport()}}
-        self.strategy.mqtt_enabled = True
-        self.strategy._pub = MagicMock()
+        publisher = self._enable_mqtt()
         self.strategy.performance_report_interval = 1.0
 
         self._set_clock(self.start_timestamp)
         self.strategy.publish_performance_reports()
-        self.assertEqual(1, self.strategy._pub.call_count)
+        self.assertEqual(1, publisher.call_count)
 
         # A second tick inside the interval is dropped
         self.strategy.publish_performance_reports()
-        self.assertEqual(1, self.strategy._pub.call_count)
+        self.assertEqual(1, publisher.call_count)
 
         # ...and once the interval has passed, reporting resumes
         type(self.strategy).current_timestamp = PropertyMock(return_value=self.start_timestamp + 1)
         self.strategy.publish_performance_reports()
-        self.assertEqual(2, self.strategy._pub.call_count)
+        self.assertEqual(2, publisher.call_count)
 
     def test_publish_performance_reports_swallows_publisher_errors(self):
         self.strategy.controller_reports = {"controller_1": {"performance": PerformanceReport()}}
-        self.strategy.mqtt_enabled = True
-        self.strategy._pub = MagicMock(side_effect=Exception("broker is gone"))
+        publisher = self._enable_mqtt(MagicMock(side_effect=Exception("broker is gone")))
         self._set_clock(self.start_timestamp)
 
         # A broker that goes away must never interrupt trading
         self.strategy.publish_performance_reports()
 
-        self.strategy._pub.assert_called_once()
+        publisher.assert_called_once()
 
     @patch.object(StrategyV2Base, "publish_performance_reports")
     def test_update_executors_info_publishes_reports(self, mock_publish):
@@ -298,6 +307,98 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         self.strategy.update_executors_info()
 
         mock_publish.assert_called_once()
+
+    # ---------------------------------------------------------------- custom_info
+
+    def test_custom_info_comes_from_the_controller(self):
+        self.strategy.controllers["controller_1"].get_custom_info.return_value = {
+            "signal": 1, "spread": Decimal("0.0015"),
+        }
+        self.strategy.controller_reports = {
+            "controller_1": {"performance": PerformanceReport()},
+        }
+        publisher = self._enable_mqtt()
+        self._set_clock(self.start_timestamp)
+
+        self.strategy.publish_performance_reports()
+
+        custom_info = publisher.call_args[0][0]["controller_1"]["custom_info"]
+        # Decimals coming out of a controller are converted like everything else
+        self.assertEqual({"signal": 1, "spread": 0.0015}, custom_info)
+
+    def test_custom_info_is_empty_for_ids_with_no_controller(self):
+        # "main" holds executors that belong to no controller, so there is nobody to ask
+        self.strategy.controller_reports = {"main": {"performance": PerformanceReport()}}
+        publisher = self._enable_mqtt()
+        self._set_clock(self.start_timestamp)
+
+        self.strategy.publish_performance_reports()
+
+        self.assertEqual({}, publisher.call_args[0][0]["main"]["custom_info"])
+
+    def test_one_bad_controller_does_not_silence_the_report(self):
+        self.strategy.controllers["controller_1"].get_custom_info.side_effect = Exception("boom")
+        self.strategy.controller_reports = {
+            "controller_1": {"performance": PerformanceReport(realized_pnl_quote=Decimal("2.5"))},
+        }
+        publisher = self._enable_mqtt()
+        self._set_clock(self.start_timestamp)
+
+        self.strategy.publish_performance_reports()
+
+        payload = publisher.call_args[0][0]["controller_1"]
+        self.assertEqual({}, payload["custom_info"])
+        # ...and the performance half still went out
+        self.assertEqual(2.5, payload["performance"]["realized_pnl_quote"])
+
+    def test_controller_base_custom_info_defaults_to_empty(self):
+        from hummingbot.strategy_v2.controllers.controller_base import ControllerBase
+        self.assertEqual({}, ControllerBase.get_custom_info(MagicMock()))
+
+    def test_custom_info_of_the_wrong_type_is_ignored(self):
+        # An overridden hook returning a non-dict would otherwise reach the JSON encoder
+        # and take the whole report down with it
+        self.strategy.controllers["controller_1"].get_custom_info.return_value = ["not", "a dict"]
+        self.strategy.controller_reports = {
+            "controller_1": {"performance": PerformanceReport(volume_traded=Decimal("9"))},
+        }
+        publisher = self._enable_mqtt()
+        self._set_clock(self.start_timestamp)
+
+        self.strategy.publish_performance_reports()
+
+        payload = publisher.call_args[0][0]["controller_1"]
+        self.assertEqual({}, payload["custom_info"])
+        self.assertEqual(9.0, payload["performance"]["volume_traded"])
+        self.assertEqual(payload, json.loads(json.dumps(payload)))
+
+    # ---------------------------------------------------------------- publisher lifecycle
+
+    def test_publisher_is_resolved_when_mqtt_starts_after_the_strategy(self):
+        # A strategy started before `mqtt start` used to stay silent for its whole run
+        self.strategy._pub = None
+        self.strategy.mqtt_enabled = False
+
+        with patch("hummingbot.client.hummingbot_application.HummingbotApplication") as mock_app:
+            mock_app.main_application.return_value._mqtt = MagicMock()
+            with patch("hummingbot.strategy.strategy_v2_base.ETopicPublisher") as mock_pub_cls:
+                resolved = self.strategy._resolve_publisher()
+
+        self.assertIsNotNone(resolved)
+        self.assertTrue(self.strategy.mqtt_enabled)
+        mock_pub_cls.assert_called_once_with("performance", use_bot_prefix=True)
+
+    def test_publisher_is_dropped_when_mqtt_stops_mid_run(self):
+        self.strategy._pub = MagicMock()
+        self.strategy.mqtt_enabled = True
+
+        with patch("hummingbot.client.hummingbot_application.HummingbotApplication") as mock_app:
+            mock_app.main_application.return_value._mqtt = None
+            resolved = self.strategy._resolve_publisher()
+
+        self.assertIsNone(resolved)
+        self.assertIsNone(self.strategy._pub)
+        self.assertFalse(self.strategy.mqtt_enabled)
 
     def test_parse_markets_str_valid(self):
         test_input = "binance.JASMY-USDT,RLC-USDT:kucoin.BTC-USDT"

@@ -2,7 +2,7 @@ import asyncio
 import importlib
 import inspect
 from decimal import Decimal
-from typing import TYPE_CHECKING, Callable, List
+from typing import TYPE_CHECKING, Callable, Dict, List
 
 from pydantic import ConfigDict, Field, field_validator
 
@@ -206,3 +206,18 @@ class ControllerBase(RunnableBase):
         controller to be displayed in the UI.
         """
         return []
+
+    def get_custom_info(self) -> Dict:
+        """
+        Controller-specific data to publish alongside the performance report, on this bot's
+        `performance` MQTT topic. This is the machine-readable counterpart of
+        `to_format_status()`: same intent, but consumed by dashboards rather than printed.
+
+        Override in a derived class to expose whatever that controller wants remote consumers
+        to see - a signal, a grid state, a level breakdown. Keep it small and JSON-friendly;
+        it is published on every report, roughly once per second. `Decimal` and `Enum` values
+        are converted for you, so returning them directly is fine.
+
+        Defaults to empty, so a controller that does not opt in costs nothing.
+        """
+        return {}

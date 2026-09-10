@@ -223,11 +223,9 @@ class StrategyV2Base(ScriptStrategyBase):
         """
         self._last_timestamp = timestamp
         self.apply_initial_setting()
-        # Check if MQTT is enabled at runtime
-        from hummingbot.client.hummingbot_application import HummingbotApplication
-        if HummingbotApplication.main_application()._mqtt is not None:
-            self.mqtt_enabled = True
-            self._pub = ETopicPublisher("performance", use_bot_prefix=True)
+        # The publisher is resolved lazily on every report instead of latched here, so that
+        # `mqtt start` / `mqtt stop` during a run are picked up. See _resolve_publisher.
+        self._resolve_publisher()
 
         # Start controllers
         for controller in self.controllers.values():
@@ -324,6 +322,59 @@ class StrategyV2Base(ScriptStrategyBase):
         except Exception as e:
             self.logger().error(f"Error updating controller reports: {e}", exc_info=True)
 
+    def _resolve_publisher(self) -> Optional[ETopicPublisher]:
+        """
+        Return a publisher for this bot's `performance` topic, or None when MQTT is off.
+
+        Checked on every report rather than once at start(), because the bridge can come and
+        go while a strategy runs - `mqtt start` and `mqtt stop` are ordinary CLI commands.
+        Latching the answer at start() meant a bot started before the bridge stayed silent
+        for its entire run.
+
+        `HummingbotApplication._mqtt` is the authority on whether the bridge is live;
+        `MQTTGateway.main()` is not, because stopping the gateway leaves that singleton set.
+        """
+        from hummingbot.client.hummingbot_application import HummingbotApplication
+        try:
+            gateway = HummingbotApplication.main_application()._mqtt
+        except Exception:
+            gateway = None
+        if gateway is None:
+            self.mqtt_enabled = False
+            self._pub = None
+        elif self._pub is None:
+            self._pub = ETopicPublisher("performance", use_bot_prefix=True)
+            self.mqtt_enabled = True
+        return self._pub
+
+    def _collect_custom_info(self, controller_id: str) -> Dict:
+        """
+        Ask a controller for the extra data it wants published. A controller that does not
+        override `get_custom_info`, or raises, contributes nothing rather than breaking the
+        whole report - one bad controller must not silence the others.
+        """
+        controller = self.controllers.get(controller_id)
+        if controller is None:
+            # Reports can carry ids with no controller behind them - "main" holds the
+            # executors that belong to no controller.
+            return {}
+        try:
+            custom_info = controller.get_custom_info()
+        except Exception as e:
+            self.logger().error(
+                f"Error collecting custom_info from controller {controller_id}: {e}", exc_info=True)
+            return {}
+        if not custom_info:
+            return {}
+        if not isinstance(custom_info, dict):
+            # An overridden hook that returns the wrong type would otherwise reach the JSON
+            # encoder and take the whole report down with it.
+            self.logger().warning(
+                f"Controller {controller_id} returned {type(custom_info).__name__} from "
+                f"get_custom_info(), expected dict - ignoring it.")
+            return {}
+        return custom_info
+
     def publish_performance_reports(self):
         """
         Publish the latest performance report of every controller to this bot's `performance`
@@ -334,11 +385,12 @@ class StrategyV2Base(ScriptStrategyBase):
 
             {"<controller_id>": {"performance": {...}, "custom_info": {...}}}
 
-        Called on every update of the controller reports and rate limited to one report every
-        `performance_report_interval` seconds. Errors are logged and swallowed - a broker that
-        goes away must never interrupt trading.
+        `custom_info` comes from each controller's `get_custom_info()`, which defaults to
+        empty. Called on every update of the controller reports and rate limited to one report
+        every `performance_report_interval` seconds. Errors are logged and swallowed - a broker
+        that goes away must never interrupt trading.
         """
-        if not self.mqtt_enabled or self._pub is None:
+        if self._is_stop_triggered or self._resolve_publisher() is None:
             return
         now = self.current_timestamp
         if math.isnan(now):
@@ -353,7 +405,7 @@ class StrategyV2Base(ScriptStrategyBase):
             self._pub({
                 controller_id: {
                     "performance": to_mqtt_payload(report.get("performance", {})),
-                    "custom_info": to_mqtt_payload(report.get("custom_info", {})),
+                    "custom_info": to_mqtt_payload(self._collect_custom_info(controller_id)),
                 }
                 for controller_id, report in self.controller_reports.items()
             })

@@ -938,16 +938,53 @@ class RemoteIfaceMQTTTests(TestCase):
         self.assertTrue(1)
 
 
+class MQTTNotifierContractTests(TestCase):
+    """The notifier only works if its method name matches what NotifierBase's callers use.
+
+    A rename in NotifierBase once left MQTTNotifier overriding nothing, so every notification
+    fell through to the base class and sat in a queue that nothing drained - MQTTNotifier
+    overrides start() to a no-op, so the draining task was never created. Nothing reached the
+    /notify topic. These tests pin the contract so that cannot happen silently again.
+    """
+
+    def test_notifier_overrides_the_method_its_callers_actually_call(self):
+        from hummingbot.notifier.notifier_base import NotifierBase
+        from hummingbot.remote_iface.mqtt import MQTTNotifier
+
+        self.assertIn("add_message_to_queue", vars(MQTTNotifier))
+        self.assertIsNot(
+            MQTTNotifier.add_message_to_queue,
+            NotifierBase.add_message_to_queue,
+            "MQTTNotifier must override add_message_to_queue, not shadow some other name",
+        )
+
+    def test_notify_publishes_instead_of_queueing(self):
+        from hummingbot.remote_iface.mqtt import MQTTNotifier
+
+        notifier = MQTTNotifier.__new__(MQTTNotifier)
+        notifier._message_queue = asyncio.Queue()
+        notifier.notify_pub = MagicMock()
+
+        MQTTNotifier.add_message_to_queue(notifier, "an order was placed")
+
+        notifier.notify_pub.publish.assert_called_once()
+        published = notifier.notify_pub.publish.call_args[0][0]
+        self.assertEqual("an order was placed", published.msg)
+        # ...and nothing was left sitting in the base class queue
+        self.assertTrue(notifier._message_queue.empty())
+
+
 class ToMQTTPayloadTests(TestCase):
     """`to_mqtt_payload` is a pure function - it needs no gateway and no broker."""
 
     def test_to_mqtt_payload_scalars(self):
         from hummingbot.remote_iface.mqtt import to_mqtt_payload
+
         # Decimals become floats, so that consumers can do arithmetic on them
         self.assertEqual(1.5, to_mqtt_payload(Decimal("1.5")))
         self.assertIsInstance(to_mqtt_payload(Decimal("1.5")), float)
         # Enums become their name, not their raw value
-        self.assertEqual("BUY", to_mqtt_payload(TradeType.BUY))
+        self.assertEqual("TradeType.BUY", to_mqtt_payload(TradeType.BUY))
         # Everything else is left alone
         for value in ("a", 1, 1.5, True, None):
             self.assertEqual(value, to_mqtt_payload(value))
@@ -959,7 +996,7 @@ class ToMQTTPayloadTests(TestCase):
         self.assertEqual({"a": {"b": [1.5]}},
                          to_mqtt_payload({"a": {"b": [Decimal("1.5")]}}))
         # Enum keys are converted too, otherwise the dict is not JSON serializable
-        self.assertEqual({"BUY": 1}, to_mqtt_payload({TradeType.BUY: 1}))
+        self.assertEqual({"TradeType.BUY": 1}, to_mqtt_payload({TradeType.BUY: 1}))
 
     def test_to_mqtt_payload_pydantic_model_is_json_serializable(self):
         import json
@@ -977,6 +1014,6 @@ class ToMQTTPayloadTests(TestCase):
 
         self.assertEqual(5.67, payload["realized_pnl_quote"])
         self.assertIsInstance(payload["realized_pnl_quote"], float)
-        self.assertEqual({"TAKE_PROFIT": 3}, payload["close_type_counts"])
+        self.assertEqual({"CloseType.TAKE_PROFIT": 3}, payload["close_type_counts"])
         # The whole point: this has to survive the trip through the broker
         self.assertEqual(payload, json.loads(json.dumps(payload)))

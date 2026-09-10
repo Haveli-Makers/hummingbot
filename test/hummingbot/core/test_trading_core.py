@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import time
 from decimal import Decimal
 from pathlib import Path
@@ -15,6 +16,7 @@ from hummingbot.core.clock import Clock
 from hummingbot.core.trading_core import StrategyType, TradingCore
 from hummingbot.exceptions import InvalidScriptModule
 from hummingbot.model.trade_fill import TradeFill
+from hummingbot.monitoring.config import PMMSLAMonitorConfig
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 from hummingbot.strategy.strategy_base import StrategyBase
 
@@ -387,6 +389,72 @@ class TradingCoreTest(IsolatedAsyncioWrapperTestCase):
         self.trading_core.notify("Test message", "INFO")
 
         mock_notifier.add_message_to_queue.assert_called_once_with("Test message")
+
+    async def test_gchat_alerts_start_and_stop(self):
+        """Test that Google Chat alerting attaches/detaches with the webhook env var set"""
+        with patch.dict("os.environ", {"GCHAT_WEBHOOK_URL": "https://chat.googleapis.com/v1/spaces/T/messages"}):
+            self.trading_core._start_gchat_alerts()
+
+        handler = self.trading_core._gchat_log_handler
+        self.assertIsNotNone(handler)
+        self.assertIn(handler, logging.getLogger().handlers)
+        # propagate=false subtrees must be patched directly or their errors never surface
+        self.assertIn(handler, logging.getLogger("hummingbot.connector").handlers)
+        # the alerting pipeline's own subtree must never feed back into itself
+        self.assertNotIn(handler, logging.getLogger("hummingbot.monitoring").handlers)
+        self.assertIsNotNone(self.trading_core.alert_dispatcher)
+        self.assertIn(self.trading_core._gchat_notifier, self.trading_core.notifiers)
+
+        self.trading_core._stop_gchat_alerts()
+
+        self.assertNotIn(handler, logging.getLogger().handlers)
+        self.assertNotIn(handler, logging.getLogger("hummingbot.connector").handlers)
+        self.assertIsNone(self.trading_core._gchat_log_handler)
+        self.assertEqual([], self.trading_core.notifiers)
+        self.assertIsNone(self.trading_core.alert_dispatcher)
+
+    async def test_gchat_alerts_disabled_without_webhook(self):
+        """Test that Google Chat alerting stays off when no webhook is configured"""
+        with patch.dict("os.environ", {"GCHAT_WEBHOOK_URL": ""}):
+            self.trading_core._start_gchat_alerts()
+
+        self.assertIsNone(self.trading_core._gchat_log_handler)
+        self.assertIsNone(self.trading_core.alert_dispatcher)
+        self.assertEqual([], self.trading_core.notifiers)
+
+    async def test_sla_monitor_started_when_config_present(self):
+        """Test that the SLA monitor starts when monitoring.yml enables it"""
+        config = PMMSLAMonitorConfig(connector_name="binance", trading_pair="BTC-USDT")
+        monitor = Mock()
+        with patch("hummingbot.core.trading_core.load_monitoring_config", return_value=config), \
+                patch("hummingbot.core.trading_core.create_sla_monitor", return_value=monitor) as factory_mock, \
+                patch.object(TradingCore, "_wait_till_ready", new_callable=AsyncMock) as wait_mock:
+            await self.trading_core._start_sla_monitor()
+
+        factory_mock.assert_called_once_with(self.trading_core, config,
+                                             dispatcher=self.trading_core.alert_dispatcher)
+        self.assertIs(monitor, self.trading_core.sla_monitor)
+        wait_mock.assert_awaited_once()
+
+        self.trading_core._stop_sla_monitor()
+        monitor.stop.assert_called_once()
+        self.assertIsNone(self.trading_core.sla_monitor)
+
+    async def test_sla_monitor_not_started_without_config(self):
+        """Test that the SLA monitor stays off without monitoring.yml"""
+        with patch("hummingbot.core.trading_core.load_monitoring_config", return_value=None):
+            await self.trading_core._start_sla_monitor()
+
+        self.assertIsNone(self.trading_core.sla_monitor)
+
+    async def test_sla_monitor_not_started_when_factory_declines(self):
+        """Test that the SLA monitor stays off when the factory returns None"""
+        config = PMMSLAMonitorConfig(connector_name="wazirx", trading_pair="USDT-INR")
+        with patch("hummingbot.core.trading_core.load_monitoring_config", return_value=config), \
+                patch("hummingbot.core.trading_core.create_sla_monitor", return_value=None):
+            await self.trading_core._start_sla_monitor()
+
+        self.assertIsNone(self.trading_core.sla_monitor)
 
     @patch.object(TradingCore, "initialize_markets_recorder")
     async def test_initialize_markets(self, mock_init_recorder):

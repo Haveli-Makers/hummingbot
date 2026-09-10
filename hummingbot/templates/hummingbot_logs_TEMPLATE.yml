@@ -1,6 +1,6 @@
 ---
 version: 1
-template_version: 12
+template_version: 13
 
 formatters:
     simple:
@@ -62,6 +62,24 @@ loggers:
         handlers: [console, file_handler]
         mqtt: true
     hummingbot.client:
+        level: NETWORK
+        propagate: false
+        handlers: [console, file_handler]
+        mqtt: true
+    # The three entries below keep these loggers alive across strategy restarts:
+    # init_logging re-runs dictConfig on every `start`, which disables existing
+    # loggers that are not named here (or via an ancestor).
+    hummingbot.core:
+        level: NETWORK
+        propagate: false
+        handlers: [console, file_handler]
+        mqtt: true
+    hummingbot.monitoring:
+        level: NETWORK
+        propagate: false
+        handlers: [console, file_handler]
+        mqtt: true
+    hummingbot.notifier:
         level: NETWORK
         propagate: false
         handlers: [console, file_handler]

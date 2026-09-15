@@ -108,6 +108,12 @@ class KucoinPerpetualCandles(CandlesBase):
     def _resolve_native_interval(self) -> str:
         if self.interval in CONSTANTS.GRANULARITIES:
             return self.interval
+        if self.interval_in_seconds < 60:
+            raise ValueError(
+                f"KuCoin Futures cannot provide '{self.interval}' candles via REST/WS: its "
+                f"smallest native granularity is 1 minute, so sub-minute intervals can't be "
+                f"resampled from it."
+            )
         target_minutes = self.interval_in_seconds // 60
         for native, minutes in sorted(CONSTANTS.GRANULARITIES.items(), key=lambda kv: -kv[1]):
             if minutes <= target_minutes and target_minutes % minutes == 0:
@@ -200,6 +206,12 @@ class KucoinPerpetualCandles(CandlesBase):
         return candles
 
     def ws_subscription_payload(self):
+        if self.interval not in CONSTANTS.GRANULARITIES:
+            raise ValueError(
+                f"KuCoin Futures has no live websocket feed for '{self.interval}' candles: only "
+                f"its native granularities {sorted(CONSTANTS.GRANULARITIES.keys(), key=lambda i: CONSTANTS.GRANULARITIES[i])} "
+                f"are streamed live; '{self.interval}' is only available via historical REST resampling."
+            )
         topic_candle = f"{self.symbols_dict[self._ex_trading_pair]}_{CONSTANTS.INTERVALS[self.interval]}"
         payload = {
             "id": str(get_tracking_nonce()),

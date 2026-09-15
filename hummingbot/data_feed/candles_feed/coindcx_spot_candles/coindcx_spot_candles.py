@@ -24,6 +24,7 @@ class CoinDCXSpotCandles(CandlesBase):
     def __init__(self, trading_pair: str, interval: str = "1m", max_records: int = 150):
         super().__init__(trading_pair, interval, max_records)
         self._polling_task: Optional[asyncio.Task] = None
+        self._historical_fill_task: Optional[asyncio.Task] = None
         self._is_running = False
         self._shutdown_event = asyncio.Event()
         self._historical_fill_in_progress = False
@@ -232,6 +233,14 @@ class CoinDCXSpotCandles(CandlesBase):
                     pass
         self._polling_task = None
         self._is_running = False
+        if self._historical_fill_task and not self._historical_fill_task.done():
+            self._historical_fill_task.cancel()
+            try:
+                await self._historical_fill_task
+            except asyncio.CancelledError:
+                pass
+        self._historical_fill_task = None
+        self._historical_fill_in_progress = False
 
     def _get_rest_candles_params(
         self,
@@ -365,7 +374,7 @@ class CoinDCXSpotCandles(CandlesBase):
             if candles.size > 0:
                 self._candles.extend(candles)
                 self._ws_candle_available.set()
-                safe_ensure_future(self.fill_historical_candles())
+                self._historical_fill_task = safe_ensure_future(self.fill_historical_candles())
                 self.logger().info(
                     f"CoinDCX candles seeded with {len(self._candles)} recent candles "
                     f"for {self._trading_pair} [{self.interval}]; backfill scheduled."
@@ -430,7 +439,7 @@ class CoinDCXSpotCandles(CandlesBase):
                 if candles:
                     self._candles.append(candles[-1])
                     self._ws_candle_available.set()
-                    safe_ensure_future(self.fill_historical_candles())
+                    self._historical_fill_task = safe_ensure_future(self.fill_historical_candles())
                 return
 
             for candle in candles:

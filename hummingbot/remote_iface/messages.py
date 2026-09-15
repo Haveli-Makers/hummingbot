@@ -41,6 +41,35 @@ class ExternalEventMessage(PubSubMessage):
     data: Optional[Dict[str, Any]] = {}
 
 
+class MarketDataMessage(PubSubMessage):
+    """One trading pair's market state. `trigger` says what caused it: a book change, a trade,
+    a funding update, or the periodic snapshot."""
+    timestamp: float = 0.0
+    trigger: str = ''
+    connector: str = ''
+    trading_pair: str = ''
+    update_id: int = 0
+    best_bid: Optional[float] = None
+    best_ask: Optional[float] = None
+    mid_price: Optional[float] = None
+    spread_pct: Optional[float] = None
+    last_trade_price: Optional[float] = None
+    last_trade: Optional[Dict[str, Any]] = None
+    order_book: Dict[str, List[List[float]]] = {}
+    funding: Optional[Dict[str, Any]] = None
+
+
+class AccountDataMessage(PubSubMessage):
+    """One connector's full account state. `trigger` says what caused it: an order event, a
+    position change, a funding payment, or the periodic snapshot."""
+    timestamp: float = 0.0
+    trigger: str = ''
+    connector: str = ''
+    balances: Dict[str, Dict[str, Optional[float]]] = {}
+    positions: List[Dict[str, Any]] = []
+    open_orders: List[Dict[str, Any]] = []
+
+
 class StartCommandMessage(RPCMessage):
     class Request(RPCMessage.Request):
         log_level: Optional[str] = None

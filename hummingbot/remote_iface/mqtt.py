@@ -2,7 +2,9 @@
 
 import asyncio
 import functools
+import itertools
 import logging
+import math
 import threading
 import time
 from collections import deque
@@ -35,6 +37,7 @@ from hummingbot.core.utils.async_utils import call_sync, safe_ensure_future
 from hummingbot.notifier.notifier_base import NotifierBase
 from hummingbot.remote_iface.messages import (
     MQTT_STATUS_CODE,
+    AccountDataMessage,
     BalanceLimitCommandMessage,
     BalancePaperCommandMessage,
     ConfigCommandMessage,
@@ -43,6 +46,7 @@ from hummingbot.remote_iface.messages import (
     ImportCommandMessage,
     InternalEventMessage,
     LogMessage,
+    MarketDataMessage,
     NotifyMessage,
     StartCommandMessage,
     StatusCommandMessage,
@@ -73,6 +77,8 @@ class TopicSpecs:
     STATUS_UPDATES: str = '/status_updates'
     HEARTBEATS: str = '/hb'
     EXTERNAL_EVENTS: str = '/external/event/*'
+    MARKET_DATA: str = '/market_data'
+    ACCOUNT_DATA: str = '/account_data'
 
 
 class MQTTCommands:
@@ -487,6 +493,285 @@ class MQTTMarketEventForwarder:
                 market.remove_listener(event_pair[0], event_pair[1])
 
 
+class _MQTTDataPublisher:
+    """
+    Shared plumbing for publishers that push connector state the moment it changes.
+
+    Subclasses attach change listeners to the markets and call `request_publish(key, trigger)`. Requests
+    go through a per-key throttle: the first change publishes at once, and a burst collapses to at most
+    one message per MIN_PUBLISH_INTERVAL carrying the latest state. A full snapshot of every key also goes
+    out every `mqtt_data_snapshot_interval` seconds, so a consumer that joins late or misses a message is
+    never more than one interval behind.
+    """
+    MIN_PUBLISH_INTERVAL: float = 0.1
+    TOPIC: str = ''
+    MSG_TYPE: Any = None
+
+    @classmethod
+    def logger(cls) -> HummingbotLogger:
+        global mqtts_logger
+        if mqtts_logger is None:  # pragma: no cover
+            mqtts_logger = HummingbotLogger(__name__)
+        return mqtts_logger
+
+    def __init__(self,
+                 hb_app: "HummingbotApplication",
+                 node: Node):
+        if threading.current_thread() != threading.main_thread():  # pragma: no cover
+            raise EnvironmentError(
+                f"{type(self).__name__} can only be initialized from the main thread."
+            )
+        self._hb_app = hb_app
+        self._node = node
+        self._ev_loop: asyncio.AbstractEventLoop = self._hb_app.ev_loop
+
+        topic_prefix = TopicSpecs.PREFIX.format(
+            namespace=self._node.namespace,
+            instance_id=self._hb_app.instance_id
+        )
+        self._topic = f'{topic_prefix}{self.TOPIC}'
+        self.publisher = self._node.create_publisher(topic=self._topic, msg_type=self.MSG_TYPE)
+
+        # Paper-trade connectors are left out for now: only live exchange state is published.
+        self._connectors: Dict[str, ConnectorBase] = {
+            name: connector for name, connector in self._hb_app.markets.items() if is_live_connector(connector)
+        }
+        self._throttle = PublishThrottle(self._ev_loop, self.MIN_PUBLISH_INTERVAL, self._publish_key)
+        self._publish_error_logged = False
+        self._start_listeners()
+        self._snapshot_task: Optional[asyncio.Task] = safe_ensure_future(self._snapshot_loop(), loop=self._ev_loop)
+
+    @property
+    def _bridge_config(self):
+        return self._hb_app.client_config_map.mqtt_bridge
+
+    def _attached_connector(self, name: str) -> Optional[ConnectorBase]:
+        # `stop` removes the strategy's connectors from the app, but this publisher still holds them until the
+        # next `start` replaces it. Their state is frozen from then on and would pass for live data, so a
+        # connector the app no longer has publishes nothing.
+        connector = self._connectors.get(name)
+        if connector is None or self._hb_app.markets.get(name) is not connector:
+            return None
+        return connector
+
+    def request_publish(self, key: Any, trigger: str):
+        if threading.current_thread() != threading.main_thread():  # pragma: no cover
+            self._ev_loop.call_soon_threadsafe(self.request_publish, key, trigger)
+            return
+        self._throttle.request(key, trigger)
+
+    def publish_snapshot(self):
+        for key in self._snapshot_keys():
+            self._throttle.mark_published(key)
+            self._publish_key(key, "snapshot")
+
+    def stop(self):
+        self._stop_listeners()
+        self._throttle.cancel()
+        if self._snapshot_task is not None:
+            self._snapshot_task.cancel()
+            self._snapshot_task = None
+
+    async def _snapshot_loop(self):
+        while True:
+            await asyncio.sleep(self._bridge_config.mqtt_data_snapshot_interval)
+            try:
+                self.publish_snapshot()
+            except Exception:
+                self.logger().error(f"Error publishing a snapshot on {self._topic}.", exc_info=True)
+
+    def _publish_key(self, key: Any, trigger: str):
+        try:
+            payload = self._build_payload(key, trigger)
+            if payload is None:
+                return
+            self.publisher.publish(self.MSG_TYPE(**payload))
+            self._publish_error_logged = False
+        except Exception as e:
+            # Log once per outage. At up to ten messages a second per key, logging every failure
+            # would bury everything else while the broker is unreachable.
+            if not self._publish_error_logged:
+                self._publish_error_logged = True
+                self.logger().error(f"Could not publish on {self._topic}: {e}", exc_info=True)
+
+    def _start_listeners(self):
+        raise NotImplementedError
+
+    def _stop_listeners(self):
+        raise NotImplementedError
+
+    def _snapshot_keys(self) -> List[Any]:
+        raise NotImplementedError
+
+    def _build_payload(self, key: Any, trigger: str) -> Optional[Dict[str, Any]]:
+        raise NotImplementedError
+
+
+class MQTTMarketDataPublisher(_MQTTDataPublisher):
+    """
+    Publishes each live trading pair's order book, prices and funding on
+    {namespace}/{instance_id}/market_data the moment they change. Book changes come from the order book
+    tracker, trades from the order book's trade events, and funding from the perpetual trading state.
+    """
+    TOPIC = TopicSpecs.MARKET_DATA
+    MSG_TYPE = MarketDataMessage
+
+    def _start_listeners(self):
+        self._book_listeners: Dict[str, Callable[[str], None]] = {}
+        self._funding_listeners: Dict[str, Callable[[str], None]] = {}
+        # PubSub holds only weak references to its listeners, so the forwarders must be kept here.
+        self._trade_forwarders: Dict[Tuple[str, str], Tuple[Any, SourceInfoEventForwarder]] = {}
+        self._last_trades: Dict[Tuple[str, str], Any] = {}
+
+        for name, connector in self._connectors.items():
+            tracker = getattr(connector, "order_book_tracker", None)
+            if tracker is not None and hasattr(tracker, "add_order_book_update_listener"):
+                listener = functools.partial(self._on_order_book_updated, name)
+                tracker.add_order_book_update_listener(listener)
+                self._book_listeners[name] = listener
+                for trading_pair in list(tracker.order_books.keys()):
+                    self._watch_trades(name, trading_pair)
+
+            perpetual_trading = getattr(connector, "_perpetual_trading", None)
+            if perpetual_trading is not None and hasattr(perpetual_trading, "add_funding_info_update_listener"):
+                listener = functools.partial(self._on_funding_updated, name)
+                perpetual_trading.add_funding_info_update_listener(listener)
+                self._funding_listeners[name] = listener
+
+    def _stop_listeners(self):
+        for name, listener in self._book_listeners.items():
+            tracker = getattr(self._connectors.get(name), "order_book_tracker", None)
+            if tracker is not None:
+                tracker.remove_order_book_update_listener(listener)
+        for name, listener in self._funding_listeners.items():
+            perpetual_trading = getattr(self._connectors.get(name), "_perpetual_trading", None)
+            if perpetual_trading is not None:
+                perpetual_trading.remove_funding_info_update_listener(listener)
+        for order_book, forwarder in self._trade_forwarders.values():
+            order_book.remove_listener(events.OrderBookEvent.TradeEvent, forwarder)
+        self._book_listeners.clear()
+        self._funding_listeners.clear()
+        self._trade_forwarders.clear()
+
+    def _watch_trades(self, connector_name: str, trading_pair: str):
+        key = (connector_name, trading_pair)
+        if key in self._trade_forwarders:
+            return
+        try:
+            order_book = self._connectors[connector_name].get_order_book(trading_pair)
+        except Exception:
+            return
+        forwarder = SourceInfoEventForwarder(functools.partial(self._on_trade, connector_name))
+        order_book.add_listener(events.OrderBookEvent.TradeEvent, forwarder)
+        self._trade_forwarders[key] = (order_book, forwarder)
+
+    def _on_order_book_updated(self, connector_name: str, trading_pair: str):
+        # Books are created while the tracker initialises, so hook a pair's trades the first time its book updates.
+        self._watch_trades(connector_name, trading_pair)
+        self.request_publish((connector_name, trading_pair), "order_book")
+
+    def _on_trade(self, connector_name: str, event_tag: int, caller: Any, trade: Any):
+        key = (connector_name, trade.trading_pair)
+        self._last_trades[key] = trade
+        self.request_publish(key, "trade")
+
+    def _on_funding_updated(self, connector_name: str, trading_pair: str):
+        self.request_publish((connector_name, trading_pair), "funding")
+
+    def _snapshot_keys(self) -> List[Tuple[str, str]]:
+        keys = []
+        for name in self._connectors:
+            order_books = getattr(self._attached_connector(name), "order_books", None) or {}
+            keys.extend((name, trading_pair) for trading_pair in list(order_books.keys()))
+        return keys
+
+    def _build_payload(self, key: Tuple[str, str], trigger: str) -> Optional[Dict[str, Any]]:
+        connector_name, trading_pair = key
+        connector = self._attached_connector(connector_name)
+        if connector is None:
+            return None
+        return build_market_data_payload(
+            connector,
+            trading_pair,
+            depth=self._bridge_config.mqtt_market_data_depth,
+            trigger=trigger,
+            last_trade=self._last_trades.get(key),
+        )
+
+
+class MQTTAccountDataPublisher(_MQTTDataPublisher):
+    """
+    Publishes each live connector's balances, positions and open orders on
+    {namespace}/{instance_id}/account_data the moment they change. Order lifecycle and funding payments
+    come from the connector's market events, and positions from the perpetual trading state. Balances
+    have no change signal of their own, so they ride along with every one of those messages and with
+    each snapshot.
+    """
+    TOPIC = TopicSpecs.ACCOUNT_DATA
+    MSG_TYPE = AccountDataMessage
+    ACCOUNT_EVENTS = (
+        events.MarketEvent.BuyOrderCreated,
+        events.MarketEvent.SellOrderCreated,
+        events.MarketEvent.OrderFilled,
+        events.MarketEvent.OrderCancelled,
+        events.MarketEvent.OrderFailure,
+        events.MarketEvent.OrderExpired,
+        events.MarketEvent.BuyOrderCompleted,
+        events.MarketEvent.SellOrderCompleted,
+        events.MarketEvent.FundingPaymentCompleted,
+    )
+
+    def _start_listeners(self):
+        # PubSub holds only weak references to its listeners, so the forwarders must be kept here.
+        self._event_forwarders: Dict[str, SourceInfoEventForwarder] = {}
+        self._position_listeners: Dict[str, Callable[[str], None]] = {}
+
+        for name, connector in self._connectors.items():
+            forwarder = SourceInfoEventForwarder(functools.partial(self._on_account_event, name))
+            for event in self.ACCOUNT_EVENTS:
+                connector.add_listener(event, forwarder)
+            self._event_forwarders[name] = forwarder
+
+            perpetual_trading = getattr(connector, "_perpetual_trading", None)
+            if perpetual_trading is not None and hasattr(perpetual_trading, "add_position_update_listener"):
+                listener = functools.partial(self._on_position_updated, name)
+                perpetual_trading.add_position_update_listener(listener)
+                self._position_listeners[name] = listener
+
+    def _stop_listeners(self):
+        for name, forwarder in self._event_forwarders.items():
+            connector = self._connectors.get(name)
+            if connector is not None:
+                for event in self.ACCOUNT_EVENTS:
+                    connector.remove_listener(event, forwarder)
+        for name, listener in self._position_listeners.items():
+            perpetual_trading = getattr(self._connectors.get(name), "_perpetual_trading", None)
+            if perpetual_trading is not None:
+                perpetual_trading.remove_position_update_listener(listener)
+        self._event_forwarders.clear()
+        self._position_listeners.clear()
+
+    def _on_account_event(self, connector_name: str, event_tag: int, caller: Any, event: Any):
+        try:
+            trigger = events.MarketEvent(event_tag).name
+        except ValueError:
+            trigger = "event"
+        self.request_publish(connector_name, trigger)
+
+    def _on_position_updated(self, connector_name: str, trading_pair: str):
+        self.request_publish(connector_name, "position")
+
+    def _snapshot_keys(self) -> List[str]:
+        # A connector that is not ready yet has no balances worth reporting.
+        return [name for name in self._connectors if getattr(self._attached_connector(name), "ready", False)]
+
+    def _build_payload(self, key: str, trigger: str) -> Optional[Dict[str, Any]]:
+        connector = self._attached_connector(key)
+        if connector is None:
+            return None
+        return build_account_data_payload(connector, trigger)
+
+
 class MQTTNotifier(NotifierBase):
     def __init__(self,
                  hb_app: "HummingbotApplication",
@@ -598,6 +883,8 @@ class MQTTGateway(Node):
         self._notifier: MQTTNotifier = None
         self._status_updates: MQTTStatusUpdates = None
         self._market_events: MQTTMarketEventForwarder = None
+        self._market_data: Optional[MQTTMarketDataPublisher] = None
+        self._account_data: Optional[MQTTAccountDataPublisher] = None
         self._commands: MQTTCommands = None
         self._logh: MQTTLogHandler = None
         self._external_events: MQTTExternalEvents = None
@@ -722,6 +1009,27 @@ class MQTTGateway(Node):
             self._market_events = MQTTMarketEventForwarder(self._hb_app, self)
             if self.state == NodeState.RUNNING:
                 self._market_events.event_fw_pub.run()
+        self._start_data_publishers()
+
+    def _start_data_publishers(self):
+        # Like the event forwarder, these attach to the markets, so they start once the strategy has loaded.
+        self._stop_data_publishers()
+        bridge_config = self._hb_app.client_config_map.mqtt_bridge
+        if bridge_config.mqtt_market_data:
+            self._market_data = MQTTMarketDataPublisher(self._hb_app, self)
+        if bridge_config.mqtt_account_data:
+            self._account_data = MQTTAccountDataPublisher(self._hb_app, self)
+        if self.state == NodeState.RUNNING:
+            for data_publisher in (self._market_data, self._account_data):
+                if data_publisher is not None:
+                    data_publisher.publisher.run()
+
+    def _stop_data_publishers(self):
+        for data_publisher in (self._market_data, self._account_data):
+            if data_publisher is not None:
+                data_publisher.stop()
+        self._market_data = None
+        self._account_data = None
 
     def _remove_market_event_listeners(self):
         if self._market_events is not None:
@@ -860,6 +1168,7 @@ class MQTTGateway(Node):
         self._remove_notifier()
         self._remove_log_handlers()
         self._remove_market_event_listeners()
+        self._stop_data_publishers()
 
         if with_health:
             self._stop_health_monitoring_loop()
@@ -1172,6 +1481,201 @@ def to_mqtt_payload(obj: Any) -> Any:
     elif isinstance(obj, (list, tuple, set)):
         return [to_mqtt_payload(val) for val in obj]
     return obj
+
+
+_paper_trade_exchange_type = None
+
+
+def _paper_trade_exchange_class():
+    # Imported lazily to keep this module's import light.
+    global _paper_trade_exchange_type
+    if _paper_trade_exchange_type is None:
+        from hummingbot.connector.exchange.paper_trade.paper_trade_exchange import PaperTradeExchange
+        _paper_trade_exchange_type = PaperTradeExchange
+    return _paper_trade_exchange_type
+
+
+def is_live_connector(connector: Any) -> bool:
+    """False for paper-trade connectors: their state is simulated, and publishing it is deferred for now."""
+    return not isinstance(connector, _paper_trade_exchange_class())
+
+
+def _finite(value: Any) -> Optional[float]:
+    """
+    `value` as a float, or None when it is missing or not a finite number. JSON has no NaN, and an order
+    book with no trades yet reports NaN as its last trade price.
+    """
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def build_market_data_payload(connector: Any,
+                              trading_pair: str,
+                              depth: int,
+                              trigger: str,
+                              last_trade: Optional[Any] = None) -> Optional[Dict[str, Any]]:
+    """
+    One trading pair's market state from a connector, as MarketDataMessage fields: the top `depth`
+    levels per side (best price first), best bid and ask, mid, spread, the last trade, and funding for
+    perpetuals. Returns None while the connector has no order book for the pair yet.
+    """
+    try:
+        order_book = connector.get_order_book(trading_pair)
+    except Exception:
+        return None
+
+    bids = [[float(row.price), float(row.amount)] for row in itertools.islice(order_book.bid_entries(), depth)]
+    asks = [[float(row.price), float(row.amount)] for row in itertools.islice(order_book.ask_entries(), depth)]
+    best_bid = bids[0][0] if bids else None
+    best_ask = asks[0][0] if asks else None
+    mid_price = spread_pct = None
+    if best_bid is not None and best_ask is not None:
+        mid_price = (best_bid + best_ask) / 2
+        spread_pct = (best_ask - best_bid) / mid_price if mid_price else None
+
+    payload = {
+        "timestamp": time.time(),
+        "trigger": trigger,
+        "connector": connector.name,
+        "trading_pair": trading_pair,
+        "update_id": int(max(order_book.snapshot_uid, order_book.last_diff_uid)),
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+        "mid_price": mid_price,
+        "spread_pct": spread_pct,
+        "last_trade_price": _finite(order_book.last_trade_price),
+        "last_trade": None,
+        "order_book": {"bids": bids, "asks": asks},
+        "funding": None,
+    }
+    if last_trade is not None:
+        payload["last_trade"] = to_mqtt_payload({
+            "timestamp": last_trade.timestamp,
+            "type": last_trade.type,
+            "price": last_trade.price,
+            "amount": last_trade.amount,
+            "trade_id": last_trade.trade_id,
+        })
+
+    get_funding_info = getattr(connector, "get_funding_info", None)
+    if callable(get_funding_info):
+        try:
+            funding_info = get_funding_info(trading_pair)
+        except Exception:
+            funding_info = None
+        if funding_info is not None:
+            payload["funding"] = {
+                "rate": _finite(funding_info.rate),
+                "mark_price": _finite(funding_info.mark_price),
+                "index_price": _finite(funding_info.index_price),
+                "next_funding_utc_timestamp": funding_info.next_funding_utc_timestamp,
+            }
+    return payload
+
+
+def build_account_data_payload(connector: Any, trigger: str) -> Dict[str, Any]:
+    """
+    One connector's account state, as AccountDataMessage fields: total and available balance per asset,
+    open positions (perpetuals only), and every order still in flight.
+    """
+    balances = {}
+    for asset, total in dict(connector.get_all_balances()).items():
+        try:
+            available = connector.get_available_balance(asset)
+        except Exception:
+            available = None
+        balances[asset] = {"total": _finite(total), "available": _finite(available)}
+
+    positions = [
+        {
+            "trading_pair": position.trading_pair,
+            "side": position.position_side,
+            "amount": position.amount,
+            "entry_price": position.entry_price,
+            "unrealized_pnl": position.unrealized_pnl,
+            "leverage": position.leverage,
+        }
+        for position in list((getattr(connector, "account_positions", None) or {}).values())
+    ]
+
+    open_orders = [
+        {
+            "client_order_id": order.client_order_id,
+            "exchange_order_id": order.exchange_order_id,
+            "trading_pair": order.trading_pair,
+            "trade_type": order.trade_type,
+            "order_type": order.order_type,
+            "price": order.price,
+            "amount": order.amount,
+            "executed_amount_base": order.executed_amount_base,
+            "state": order.current_state,
+            "position": order.position,
+            "leverage": order.leverage,
+            "creation_timestamp": order.creation_timestamp,
+        }
+        for order in list(connector.in_flight_orders.values())
+    ]
+
+    return to_mqtt_payload({
+        "timestamp": time.time(),
+        "trigger": trigger,
+        "connector": connector.name,
+        "balances": balances,
+        "positions": positions,
+        "open_orders": open_orders,
+    })
+
+
+class PublishThrottle:
+    """
+    Per-key leading-edge throttle with a trailing flush.
+
+    The first request for a key publishes immediately. Requests arriving within `min_interval` of the last
+    publish collapse into a single publish at the end of that interval, carrying the latest trigger. A burst
+    costs at most one message per interval, and its final state is never dropped.
+    """
+
+    def __init__(self, loop: Any, min_interval: float, publish: Callable[[Any, str], None]):
+        self._loop = loop
+        self._min_interval = min_interval
+        self._publish = publish
+        self._last_published: Dict[Any, float] = {}
+        self._pending: Dict[Any, Any] = {}
+        self._pending_triggers: Dict[Any, str] = {}
+
+    def request(self, key: Any, trigger: str):
+        if key in self._pending:
+            self._pending_triggers[key] = trigger
+            return
+        wait = self._min_interval - (self._loop.time() - self._last_published.get(key, float("-inf")))
+        if wait <= 0:
+            self._fire(key, trigger)
+        else:
+            self._pending_triggers[key] = trigger
+            self._pending[key] = self._loop.call_later(wait, self._flush, key)
+
+    def mark_published(self, key: Any):
+        """Record a publish made outside the throttle, such as a snapshot."""
+        self._last_published[key] = self._loop.time()
+
+    def cancel(self):
+        for handle in self._pending.values():
+            handle.cancel()
+        self._pending.clear()
+        self._pending_triggers.clear()
+
+    def _flush(self, key: Any):
+        self._pending.pop(key, None)
+        self._fire(key, self._pending_triggers.pop(key, "update"))
+
+    def _fire(self, key: Any, trigger: str):
+        self._last_published[key] = self._loop.time()
+        self._publish(key, trigger)
 
 
 class ETopicPublisher:

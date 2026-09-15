@@ -1017,3 +1017,573 @@ class ToMQTTPayloadTests(TestCase):
         self.assertEqual({"CloseType.TAKE_PROFIT": 3}, payload["close_type_counts"])
         # The whole point: this has to survive the trip through the broker
         self.assertEqual(payload, json.loads(json.dumps(payload)))
+
+
+class _FakeLoop:
+    """Deterministic stand-in for the event loop's clock and call_later."""
+
+    def __init__(self):
+        self.now = 1000.0
+        self._scheduled = []
+
+    def time(self):
+        return self.now
+
+    def call_later(self, delay, callback, *args):
+        handle = MagicMock()
+        self._scheduled.append((self.now + delay, callback, args, handle))
+        return handle
+
+    def advance(self, seconds):
+        self.now += seconds
+        due = [item for item in self._scheduled if item[0] <= self.now]
+        self._scheduled = [item for item in self._scheduled if item[0] > self.now]
+        for _, callback, args, handle in due:
+            if not handle.cancel.called:
+                callback(*args)
+
+
+class PublishThrottleTests(TestCase):
+
+    def setUp(self):
+        from hummingbot.remote_iface.mqtt import PublishThrottle
+        self.loop = _FakeLoop()
+        self.published = []
+        self.throttle = PublishThrottle(self.loop, 0.1, lambda key, trigger: self.published.append((key, trigger)))
+
+    def test_first_change_publishes_immediately(self):
+        self.throttle.request("a", "order_book")
+        self.assertEqual([("a", "order_book")], self.published)
+
+    def test_burst_collapses_to_one_trailing_publish_with_the_latest_trigger(self):
+        self.throttle.request("a", "order_book")
+        for trigger in ("order_book", "trade", "funding"):
+            self.throttle.request("a", trigger)
+        self.assertEqual([("a", "order_book")], self.published)
+
+        self.loop.advance(0.1)
+
+        self.assertEqual([("a", "order_book"), ("a", "funding")], self.published)
+
+    def test_keys_are_throttled_independently(self):
+        self.throttle.request("a", "x")
+        self.throttle.request("b", "y")
+        self.assertEqual([("a", "x"), ("b", "y")], self.published)
+
+    def test_publishes_immediately_again_once_the_interval_has_passed(self):
+        self.throttle.request("a", "x")
+        self.loop.advance(0.2)
+        self.throttle.request("a", "y")
+        self.assertEqual([("a", "x"), ("a", "y")], self.published)
+
+    def test_cancel_drops_pending_publishes(self):
+        self.throttle.request("a", "x")
+        self.throttle.request("a", "y")
+        self.throttle.cancel()
+        self.loop.advance(1)
+        self.assertEqual([("a", "x")], self.published)
+
+    def test_mark_published_defers_the_next_change(self):
+        self.throttle.mark_published("a")
+        self.throttle.request("a", "x")
+        self.assertEqual([], self.published)
+
+        self.loop.advance(0.1)
+
+        self.assertEqual([("a", "x")], self.published)
+
+
+class MarketDataPayloadTests(TestCase):
+    trading_pair = "ZEC-USDT"
+
+    def setUp(self):
+        from hummingbot.core.data_type.order_book import OrderBook
+        from hummingbot.core.data_type.order_book_row import OrderBookRow
+        self.order_book = OrderBook()
+        self.order_book.apply_snapshot(
+            [OrderBookRow(100.0 - i, 1.0 + i, 7) for i in range(15)],
+            [OrderBookRow(101.0 + i, 2.0 + i, 7) for i in range(15)],
+            7,
+        )
+        self.connector = MagicMock()
+        self.connector.name = "coindcx_perpetual"
+        self.connector.get_order_book.return_value = self.order_book
+        self.connector.get_funding_info.side_effect = KeyError(self.trading_pair)
+
+    def _build(self, last_trade=None, depth=10):
+        from hummingbot.remote_iface.mqtt import build_market_data_payload
+        return build_market_data_payload(self.connector, self.trading_pair, depth=depth, trigger="order_book",
+                                         last_trade=last_trade)
+
+    def test_book_is_cut_to_depth_with_the_best_price_first(self):
+        book = self._build()["order_book"]
+
+        self.assertEqual(10, len(book["bids"]))
+        self.assertEqual(10, len(book["asks"]))
+        self.assertEqual([100.0, 1.0], book["bids"][0])
+        self.assertEqual([91.0, 10.0], book["bids"][-1])
+        self.assertEqual([101.0, 2.0], book["asks"][0])
+        self.assertEqual([110.0, 11.0], book["asks"][-1])
+
+    def test_top_of_book_mid_and_spread(self):
+        payload = self._build()
+
+        self.assertEqual(("coindcx_perpetual", self.trading_pair, "order_book", 7),
+                         (payload["connector"], payload["trading_pair"], payload["trigger"], payload["update_id"]))
+        self.assertEqual((100.0, 101.0, 100.5), (payload["best_bid"], payload["best_ask"], payload["mid_price"]))
+        self.assertAlmostEqual(1.0 / 100.5, payload["spread_pct"])
+
+    def test_no_trade_yet_is_null_rather_than_nan(self):
+        self.assertIsNone(self._build()["last_trade_price"])
+
+    def test_last_trade_is_included(self):
+        from hummingbot.core.data_type.common import TradeType
+        from hummingbot.core.event.events import OrderBookTradeEvent
+        trade = OrderBookTradeEvent(self.trading_pair, 1789.0, TradeType.SELL, 100.5, 0.3, "t-1")
+        self.order_book.apply_trade(trade)
+
+        payload = self._build(last_trade=trade)
+
+        self.assertEqual(100.5, payload["last_trade_price"])
+        self.assertEqual(
+            {"timestamp": 1789.0, "type": "TradeType.SELL", "price": 100.5, "amount": 0.3, "trade_id": "t-1"},
+            payload["last_trade"])
+
+    def test_funding_is_included_for_perpetuals(self):
+        from hummingbot.core.data_type.funding_info import FundingInfo
+        self.connector.get_funding_info.side_effect = None
+        self.connector.get_funding_info.return_value = FundingInfo(
+            self.trading_pair, Decimal("100.1"), Decimal("100.2"), 1789142400, Decimal("0.0001"))
+
+        self.assertEqual(
+            {"rate": 0.0001, "mark_price": 100.2, "index_price": 100.1, "next_funding_utc_timestamp": 1789142400},
+            self._build()["funding"])
+
+    def test_no_funding_when_the_connector_has_none(self):
+        self.assertIsNone(self._build()["funding"])
+
+    def test_nothing_is_built_until_the_pair_has_an_order_book(self):
+        self.connector.get_order_book.side_effect = ValueError("No order book exists")
+        self.assertIsNone(self._build())
+
+    def test_empty_book_has_null_prices(self):
+        from hummingbot.core.data_type.order_book import OrderBook
+        self.connector.get_order_book.return_value = OrderBook()
+
+        payload = self._build()
+
+        self.assertEqual({"bids": [], "asks": []}, payload["order_book"])
+        self.assertEqual((None, None, None, None),
+                         (payload["best_bid"], payload["best_ask"], payload["mid_price"], payload["spread_pct"]))
+
+    def test_payload_fits_the_message_and_survives_json(self):
+        import json
+
+        from hummingbot.remote_iface.messages import MarketDataMessage
+        dumped = MarketDataMessage(**self._build()).model_dump()
+        self.assertEqual(dumped, json.loads(json.dumps(dumped)))
+
+
+class AccountDataPayloadTests(TestCase):
+
+    def setUp(self):
+        from hummingbot.connector.derivative.position import Position
+        from hummingbot.core.data_type.common import OrderType, PositionAction, PositionSide, TradeType
+        from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
+        available = {"USDT": Decimal("900.1"), "ZEC": Decimal("0")}
+        self.connector = MagicMock()
+        self.connector.name = "coindcx_perpetual"
+        self.connector.get_all_balances.return_value = {"USDT": Decimal("923.4"), "ZEC": Decimal("0.008")}
+        self.connector.get_available_balance.side_effect = lambda asset: available[asset]
+        self.connector.account_positions = {
+            "ZEC-USDT": Position("ZEC-USDT", PositionSide.LONG, Decimal("0.03"), Decimal("797.2"),
+                                 Decimal("0.008"), Decimal("1")),
+        }
+        self.connector.in_flight_orders = {
+            "haveli-1": InFlightOrder(
+                client_order_id="haveli-1",
+                trading_pair="ZEC-USDT",
+                order_type=OrderType.LIMIT,
+                trade_type=TradeType.BUY,
+                amount=Decimal("0.008"),
+                creation_timestamp=1789.0,
+                price=Decimal("796"),
+                exchange_order_id="ex-1",
+                initial_state=OrderState.OPEN,
+                leverage=1,
+                position=PositionAction.OPEN,
+            ),
+        }
+
+    def _build(self, connector=None):
+        from hummingbot.remote_iface.mqtt import build_account_data_payload
+        return build_account_data_payload(connector or self.connector, "OrderFilled")
+
+    def test_balances_carry_total_and_available(self):
+        payload = self._build()
+
+        self.assertEqual(("coindcx_perpetual", "OrderFilled"), (payload["connector"], payload["trigger"]))
+        self.assertEqual({"USDT": {"total": 923.4, "available": 900.1}, "ZEC": {"total": 0.008, "available": 0.0}},
+                         payload["balances"])
+
+    def test_positions(self):
+        self.assertEqual(
+            [{"trading_pair": "ZEC-USDT", "side": "PositionSide.LONG", "amount": 0.008, "entry_price": 797.2,
+              "unrealized_pnl": 0.03, "leverage": 1.0}],
+            self._build()["positions"])
+
+    def test_open_orders(self):
+        self.assertEqual(
+            [{"client_order_id": "haveli-1", "exchange_order_id": "ex-1", "trading_pair": "ZEC-USDT",
+              "trade_type": "TradeType.BUY", "order_type": "OrderType.LIMIT", "price": 796.0, "amount": 0.008,
+              "executed_amount_base": 0.0, "state": "OrderState.OPEN", "position": "PositionAction.OPEN",
+              "leverage": 1, "creation_timestamp": 1789.0}],
+            self._build()["open_orders"])
+
+    def test_spot_connector_has_no_positions(self):
+        from types import SimpleNamespace
+        spot = SimpleNamespace(
+            name="binance",
+            get_all_balances=lambda: {"BTC": Decimal("1")},
+            get_available_balance=lambda asset: Decimal("0.5"),
+            in_flight_orders={},
+        )
+
+        payload = self._build(spot)
+
+        self.assertEqual([], payload["positions"])
+        self.assertEqual({"BTC": {"total": 1.0, "available": 0.5}}, payload["balances"])
+
+    def test_payload_fits_the_message_and_survives_json(self):
+        import json
+
+        from hummingbot.remote_iface.messages import AccountDataMessage
+        dumped = AccountDataMessage(**self._build()).model_dump()
+        self.assertEqual(dumped, json.loads(json.dumps(dumped)))
+
+
+def _fake_connector_class():
+    from hummingbot.connector.perpetual_trading import PerpetualTrading
+    from hummingbot.core.data_type.order_book import OrderBook
+    from hummingbot.core.data_type.order_book_row import OrderBookRow
+    from hummingbot.core.data_type.order_book_tracker import OrderBookTracker
+    from hummingbot.core.pubsub import PubSub
+
+    class FakeLivePerpetualConnector(PubSub):
+        """A live perpetual connector made of the real tracker, order book, perpetual state and PubSub."""
+
+        def __init__(self, name, trading_pair):
+            super().__init__()
+            self.name = name
+            self.ready = True
+            self.order_book_tracker = OrderBookTracker(data_source=MagicMock(), trading_pairs=[trading_pair])
+            order_book = OrderBook()
+            order_book.apply_snapshot([OrderBookRow(100.0, 1.0, 1)], [OrderBookRow(101.0, 1.0, 1)], 1)
+            self.order_book_tracker._order_books[trading_pair] = order_book
+            self._perpetual_trading = PerpetualTrading([trading_pair])
+            self.balances = {"USDT": Decimal("923.4")}
+            self.in_flight_orders = {}
+
+        @property
+        def order_books(self):
+            return self.order_book_tracker.order_books
+
+        @property
+        def account_positions(self):
+            return self._perpetual_trading.account_positions
+
+        def get_order_book(self, trading_pair):
+            if trading_pair not in self.order_books:
+                raise ValueError(f"No order book exists for '{trading_pair}'.")
+            return self.order_books[trading_pair]
+
+        def get_funding_info(self, trading_pair):
+            return self._perpetual_trading.get_funding_info(trading_pair)
+
+        def get_all_balances(self):
+            return dict(self.balances)
+
+        def get_available_balance(self, asset):
+            return self.balances[asset]
+
+    return FakeLivePerpetualConnector
+
+
+class MQTTDataPublisherTests(TestCase):
+    trading_pair = "ZEC-USDT"
+
+    def setUp(self):
+        self.loop = _FakeLoop()
+        self.connector = _fake_connector_class()("coindcx_perpetual", self.trading_pair)
+        self.hb_app = MagicMock()
+        self.hb_app.ev_loop = self.loop
+        self.hb_app.instance_id = "bot-1"
+        self.hb_app.markets = {"coindcx_perpetual": self.connector}
+        self.hb_app.client_config_map.mqtt_bridge.mqtt_market_data_depth = 10
+        self.hb_app.client_config_map.mqtt_bridge.mqtt_data_snapshot_interval = 5.0
+        self.node = MagicMock()
+        self.node.namespace = "hbot"
+        self.snapshot_task = MagicMock()
+        patcher = patch("hummingbot.remote_iface.mqtt.safe_ensure_future", side_effect=self._start_task)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _start_task(self, coroutine, loop=None):
+        coroutine.close()  # the snapshot loop is exercised through publish_snapshot()
+        return self.snapshot_task
+
+    def _market(self):
+        from hummingbot.remote_iface.mqtt import MQTTMarketDataPublisher
+        publisher = MQTTMarketDataPublisher(self.hb_app, self.node)
+        self.addCleanup(publisher.stop)
+        return publisher
+
+    def _account(self):
+        from hummingbot.remote_iface.mqtt import MQTTAccountDataPublisher
+        publisher = MQTTAccountDataPublisher(self.hb_app, self.node)
+        self.addCleanup(publisher.stop)
+        return publisher
+
+    @staticmethod
+    def _published(publisher):
+        return [call.args[0] for call in publisher.publisher.publish.call_args_list]
+
+    def _trade(self, price=100.5):
+        from hummingbot.core.data_type.common import TradeType
+        from hummingbot.core.event.events import OrderBookTradeEvent
+        return OrderBookTradeEvent(self.trading_pair, 1789.0, TradeType.BUY, price, 0.2, "t-9")
+
+    # ---------------------------------------------------------------- market data
+
+    def test_market_data_topic(self):
+        self._market()
+        self.assertEqual("hbot/bot-1/market_data", self.node.create_publisher.call_args.kwargs["topic"])
+
+    def test_order_book_change_publishes_immediately(self):
+        publisher = self._market()
+
+        self.connector.order_book_tracker._notify_order_book_updated(self.trading_pair)
+
+        messages = self._published(publisher)
+        self.assertEqual(1, len(messages))
+        self.assertEqual(("coindcx_perpetual", self.trading_pair, "order_book", 100.0),
+                         (messages[0].connector, messages[0].trading_pair, messages[0].trigger, messages[0].best_bid))
+
+    def test_busy_order_book_is_capped_at_ten_a_second_per_pair(self):
+        publisher = self._market()
+
+        for _ in range(20):
+            self.connector.order_book_tracker._notify_order_book_updated(self.trading_pair)
+        self.assertEqual(1, len(self._published(publisher)))
+
+        self.loop.advance(0.1)
+        self.assertEqual(2, len(self._published(publisher)))
+
+    def test_trade_publishes_with_the_last_trade(self):
+        publisher = self._market()
+
+        self.connector.get_order_book(self.trading_pair).apply_trade(self._trade())
+
+        message = self._published(publisher)[-1]
+        self.assertEqual("trade", message.trigger)
+        self.assertEqual(100.5, message.last_trade["price"])
+
+    def test_funding_update_publishes(self):
+        from hummingbot.core.data_type.funding_info import FundingInfo
+        publisher = self._market()
+
+        self.connector._perpetual_trading.initialize_funding_info(
+            FundingInfo(self.trading_pair, Decimal("100"), Decimal("100.2"), 1789142400, Decimal("0.0001")))
+
+        message = self._published(publisher)[-1]
+        self.assertEqual("funding", message.trigger)
+        self.assertEqual(0.0001, message.funding["rate"])
+
+    def test_market_snapshot_covers_every_pair_with_a_book(self):
+        publisher = self._market()
+
+        publisher.publish_snapshot()
+
+        self.assertEqual([("snapshot", self.trading_pair)],
+                         [(message.trigger, message.trading_pair) for message in self._published(publisher)])
+
+    def test_market_data_stop_detaches_every_listener(self):
+        publisher = self._market()
+
+        publisher.stop()
+        self.connector.order_book_tracker._notify_order_book_updated(self.trading_pair)
+        self.connector.get_order_book(self.trading_pair).apply_trade(self._trade())
+
+        self.assertEqual([], self._published(publisher))
+        self.assertEqual([], self.connector.order_book_tracker._order_book_update_listeners)
+        self.assertEqual([], self.connector._perpetual_trading._funding_info_update_listeners)
+        self.snapshot_task.cancel.assert_called_once()
+
+    # ---------------------------------------------------------------- account data
+
+    def test_account_data_topic(self):
+        self._account()
+        self.assertEqual("hbot/bot-1/account_data", self.node.create_publisher.call_args.kwargs["topic"])
+
+    def test_order_event_publishes_account_state(self):
+        from hummingbot.core.event.events import MarketEvent
+        publisher = self._account()
+
+        self.connector.trigger_event(MarketEvent.OrderFilled, MagicMock())
+
+        message = self._published(publisher)[-1]
+        self.assertEqual(("coindcx_perpetual", "OrderFilled"), (message.connector, message.trigger))
+        self.assertEqual({"total": 923.4, "available": 923.4}, message.balances["USDT"])
+
+    def test_position_change_publishes_account_state(self):
+        from hummingbot.connector.derivative.position import Position
+        from hummingbot.core.data_type.common import PositionSide
+        publisher = self._account()
+
+        self.connector._perpetual_trading.set_position(self.trading_pair, Position(
+            self.trading_pair, PositionSide.LONG, Decimal("0"), Decimal("797"), Decimal("0.008"), Decimal("1")))
+
+        message = self._published(publisher)[-1]
+        self.assertEqual("position", message.trigger)
+        self.assertEqual(self.trading_pair, message.positions[0]["trading_pair"])
+
+    def test_fill_burst_is_capped_per_connector(self):
+        from hummingbot.core.event.events import MarketEvent
+        publisher = self._account()
+
+        for event in (MarketEvent.OrderFilled, MarketEvent.BuyOrderCompleted, MarketEvent.BuyOrderCreated):
+            self.connector.trigger_event(event, MagicMock())
+        self.assertEqual(["OrderFilled"], [message.trigger for message in self._published(publisher)])
+
+        self.loop.advance(0.1)
+        self.assertEqual(["OrderFilled", "BuyOrderCreated"],
+                         [message.trigger for message in self._published(publisher)])
+
+    def test_account_snapshot_skips_connectors_that_are_not_ready(self):
+        publisher = self._account()
+
+        self.connector.ready = False
+        publisher.publish_snapshot()
+        self.assertEqual([], self._published(publisher))
+
+        self.connector.ready = True
+        publisher.publish_snapshot()
+        self.assertEqual(["snapshot"], [message.trigger for message in self._published(publisher)])
+
+    def test_account_data_stop_detaches_every_listener(self):
+        from hummingbot.core.event.events import MarketEvent
+        publisher = self._account()
+
+        publisher.stop()
+        self.connector.trigger_event(MarketEvent.OrderFilled, MagicMock())
+
+        self.assertEqual([], self._published(publisher))
+        self.assertEqual([], self.connector._perpetual_trading._position_update_listeners)
+
+    def test_paper_trade_connectors_are_left_out(self):
+        from hummingbot.core.event.events import MarketEvent
+        with patch("hummingbot.remote_iface.mqtt._paper_trade_exchange_class", return_value=type(self.connector)):
+            publisher = self._account()
+
+        self.connector.trigger_event(MarketEvent.OrderFilled, MagicMock())
+
+        self.assertEqual({}, publisher._connectors)
+        self.assertEqual([], self._published(publisher))
+
+    def test_connectors_removed_by_stop_publish_nothing(self):
+        # `stop` removes the strategy's connectors from the app. Their frozen state must not keep going out.
+        from hummingbot.core.event.events import MarketEvent
+        market = self._market()
+        account = self._account()
+        self.hb_app.markets = {}
+
+        market.publish_snapshot()
+        account.publish_snapshot()
+        self.connector.order_book_tracker._notify_order_book_updated(self.trading_pair)
+        self.connector.trigger_event(MarketEvent.OrderFilled, MagicMock())
+        self.loop.advance(1)
+
+        self.assertEqual([], self._published(market))
+        self.assertEqual([], self._published(account))
+
+    def test_publish_failure_is_logged_once_per_outage(self):
+        from hummingbot.core.event.events import MarketEvent
+        from hummingbot.remote_iface import mqtt as mqtt_module
+        self.node.create_publisher.return_value.publish.side_effect = Exception("broker unreachable")
+
+        with patch.object(mqtt_module._MQTTDataPublisher, "logger") as logger:
+            self._account()
+            for _ in range(3):
+                self.connector.trigger_event(MarketEvent.OrderFilled, MagicMock())
+                self.loop.advance(0.2)
+
+        self.assertEqual(1, logger.return_value.error.call_count)
+
+
+class MQTTGatewayDataPublisherWiringTests(TestCase):
+
+    def setUp(self):
+        from commlib.node import NodeState
+
+        from hummingbot.remote_iface import mqtt as mqtt_module
+        self.gateway = mqtt_module.MQTTGateway.__new__(mqtt_module.MQTTGateway)
+        self.gateway.stop = MagicMock()  # __del__ calls stop(); this bare instance has nothing to stop
+        self.gateway._hb_app = MagicMock()
+        self.gateway._market_data = None
+        self.gateway._account_data = None
+        self.gateway.state = NodeState.RUNNING
+        market_patcher = patch.object(mqtt_module, "MQTTMarketDataPublisher")
+        account_patcher = patch.object(mqtt_module, "MQTTAccountDataPublisher")
+        self.market_cls = market_patcher.start()
+        self.account_cls = account_patcher.start()
+        self.addCleanup(market_patcher.stop)
+        self.addCleanup(account_patcher.stop)
+
+    def _enable(self, market_data, account_data):
+        bridge_config = self.gateway._hb_app.client_config_map.mqtt_bridge
+        bridge_config.mqtt_market_data = market_data
+        bridge_config.mqtt_account_data = account_data
+
+    def test_config_defaults_keep_both_publishers_off(self):
+        from hummingbot.client.config.client_config_map import MQTTBridgeConfigMap
+        bridge_config = MQTTBridgeConfigMap()
+        self.assertEqual((False, 10, False, 5.0), (
+            bridge_config.mqtt_market_data, bridge_config.mqtt_market_data_depth,
+            bridge_config.mqtt_account_data, bridge_config.mqtt_data_snapshot_interval))
+
+    def test_disabled_publishers_are_not_created(self):
+        self._enable(False, False)
+
+        self.gateway._start_data_publishers()
+
+        self.market_cls.assert_not_called()
+        self.account_cls.assert_not_called()
+
+    def test_enabled_publishers_are_created_and_run(self):
+        self._enable(True, True)
+
+        self.gateway._start_data_publishers()
+
+        self.market_cls.assert_called_once_with(self.gateway._hb_app, self.gateway)
+        self.account_cls.assert_called_once_with(self.gateway._hb_app, self.gateway)
+        self.market_cls.return_value.publisher.run.assert_called_once()
+        self.account_cls.return_value.publisher.run.assert_called_once()
+
+    def test_starting_again_stops_the_previous_publishers(self):
+        self._enable(True, False)
+
+        self.gateway._start_data_publishers()
+        self.gateway._start_data_publishers()
+
+        self.market_cls.return_value.stop.assert_called_once()
+
+    def test_stopping_clears_the_publishers(self):
+        self._enable(True, True)
+        self.gateway._start_data_publishers()
+
+        self.gateway._stop_data_publishers()
+
+        self.assertIsNone(self.gateway._market_data)
+        self.assertIsNone(self.gateway._account_data)
+        self.market_cls.return_value.stop.assert_called_once()
+        self.account_cls.return_value.stop.assert_called_once()

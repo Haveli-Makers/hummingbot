@@ -86,6 +86,29 @@ class MQTTBridgeConfigMap(BaseClientModel):
         default=False,
         json_schema_extra={"prompt": lambda cm: "Enable/Disable MQTT Autostart"},
     )
+    mqtt_market_data: bool = Field(
+        default=False,
+        json_schema_extra={
+            "prompt": lambda cm: "Enable/Disable publishing market data (order book, prices, funding) over MQTT"},
+    )
+    mqtt_market_data_depth: int = Field(
+        default=10,
+        ge=1,
+        le=50,
+        json_schema_extra={"prompt": lambda cm: "Set the number of order book levels published per side (Default=10)"},
+    )
+    mqtt_account_data: bool = Field(
+        default=False,
+        json_schema_extra={
+            "prompt": lambda cm: "Enable/Disable publishing account data (balances, positions, orders) over MQTT"},
+    )
+    mqtt_data_snapshot_interval: float = Field(
+        default=5.0,
+        ge=1.0,
+        json_schema_extra={
+            "prompt": lambda cm: "Set how often, in seconds, full market and account data snapshots are published "
+                                 "(Default=5)"},
+    )
     model_config = ConfigDict(title="mqtt_bridge")
 
 

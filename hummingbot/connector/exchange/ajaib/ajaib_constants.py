@@ -15,8 +15,8 @@ WSS_URL = "wss://stream.crypto.ajaib.co.id"
 # Testnet shares the mainnet path layout on its own hosts. Both resolve to the
 # same address; access is allowlisted SEPARATELY from mainnet, so an IP cleared
 # for production is not automatically cleared here.
-TESTNET_REST_URL = "https://testnet.api.crypto.ajaib.co.id"
-TESTNET_WSS_URL = "wss://testnet.stream.crypto.ajaib.co.id"
+TESTNET_REST_URL = "https://api.testnet.crypto.ajaib.co.id"
+TESTNET_WSS_URL = "wss://stream.testnet.crypto.ajaib.co.id"
 
 REST_URLS = {DEFAULT_DOMAIN: REST_URL, TESTNET_DOMAIN: TESTNET_REST_URL}
 WSS_URLS = {DEFAULT_DOMAIN: WSS_URL, TESTNET_DOMAIN: TESTNET_WSS_URL}

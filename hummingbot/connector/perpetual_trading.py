@@ -3,7 +3,7 @@ import copy
 import logging
 import warnings
 from collections import defaultdict
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from hummingbot.connector.derivative.position import Position
 from hummingbot.connector.utils import split_hb_trading_pair
@@ -29,6 +29,9 @@ class PerpetualTrading:
         self._funding_info_stream = asyncio.Queue()
 
         self._funding_info_updater_task: Optional[asyncio.Task] = None
+
+        self._position_update_listeners: List[Callable[[str], None]] = []
+        self._funding_info_update_listeners: List[Callable[[str], None]] = []
 
     @classmethod
     def logger(cls) -> HummingbotLogger:
@@ -60,15 +63,57 @@ class PerpetualTrading:
     def set_position(self, pos_key: str, position: Position):
         self.logger().debug(f"Setting position {pos_key} to {Position}")
         self._account_positions[pos_key] = position
+        if self._position_update_listeners:
+            self._notify_listeners(self._position_update_listeners, position.trading_pair, "position update")
 
     def remove_position(self, post_key: str) -> Optional[Position]:
-        return self._account_positions.pop(post_key, None)
+        position = self._account_positions.pop(post_key, None)
+        if position is not None and self._position_update_listeners:
+            self._notify_listeners(self._position_update_listeners, position.trading_pair, "position update")
+        return position
+
+    def add_position_update_listener(self, listener: Callable[[str], None]):
+        """
+        Call `listener(trading_pair)` whenever a position is set or removed.
+
+        Connectors update positions silently, so this is the hook for consumers that need them as they
+        change, such as the MQTT account data publisher. Listeners run inline, so keep them cheap.
+        """
+        if listener not in self._position_update_listeners:
+            self._position_update_listeners.append(listener)
+
+    def remove_position_update_listener(self, listener: Callable[[str], None]):
+        if listener in self._position_update_listeners:
+            self._position_update_listeners.remove(listener)
+
+    def add_funding_info_update_listener(self, listener: Callable[[str], None]):
+        """
+        Call `listener(trading_pair)` whenever a pair's funding info is initialised or updated.
+        Same contract as add_position_update_listener.
+        """
+        if listener not in self._funding_info_update_listeners:
+            self._funding_info_update_listeners.append(listener)
+
+    def remove_funding_info_update_listener(self, listener: Callable[[str], None]):
+        if listener in self._funding_info_update_listeners:
+            self._funding_info_update_listeners.remove(listener)
+
+    def _notify_listeners(self, listeners: List[Callable[[str], None]], trading_pair: str, what: str):
+        # A failing listener must never break position or funding bookkeeping.
+        for listener in list(listeners):
+            try:
+                listener(trading_pair)
+            except Exception:
+                self.logger().error(f"Error in {what} listener for {trading_pair}.", exc_info=True)
 
     def initialize_funding_info(self, funding_info: FundingInfo):
         """
         Initializes a single trading pair funding information.
         """
         self._funding_info[funding_info.trading_pair] = funding_info
+        if self._funding_info_update_listeners:
+            self._notify_listeners(
+                self._funding_info_update_listeners, funding_info.trading_pair, "funding info update")
 
     def is_funding_info_initialized(self) -> bool:
         """
@@ -174,6 +219,8 @@ class PerpetualTrading:
                 trading_pair = funding_info_message.trading_pair
                 funding_info = self._funding_info[trading_pair]
                 funding_info.update(funding_info_message)
+                if self._funding_info_update_listeners:
+                    self._notify_listeners(self._funding_info_update_listeners, trading_pair, "funding info update")
             except asyncio.CancelledError:
                 raise
             except Exception:

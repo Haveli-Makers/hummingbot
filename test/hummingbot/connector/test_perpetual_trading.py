@@ -161,3 +161,133 @@ class PerpetualTest(unittest.TestCase):
             pass
 
         self.assertEqual(Decimal("10"), self.perpetual_trading.funding_info[self.trading_pair].index_price)
+
+
+class PerpetualTradingUpdateListenersTest(unittest.TestCase):
+    """The position and funding hooks that the MQTT account and market data publishers rely on."""
+    # logging.Level required to receive logs from the perpetual trading logger
+    level = 0
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.ev_loop = asyncio.get_event_loop()
+        cls.trading_pair = "COINALPHA-HBOT"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.log_records = []
+        self.perpetual_trading = PerpetualTrading([self.trading_pair])
+        self.perpetual_trading.logger().setLevel(1)
+        self.perpetual_trading.logger().addHandler(self)
+
+    def tearDown(self) -> None:
+        self.perpetual_trading.logger().removeHandler(self)
+        super().tearDown()
+
+    def handle(self, record):
+        self.log_records.append(record)
+
+    def _position(self) -> Position:
+        return Position(
+            trading_pair=self.trading_pair,
+            position_side=PositionSide.LONG,
+            unrealized_pnl=Decimal("0"),
+            entry_price=Decimal("100"),
+            amount=Decimal("1"),
+            leverage=Decimal("1"),
+        )
+
+    def _funding_info(self) -> FundingInfo:
+        return FundingInfo(
+            trading_pair=self.trading_pair,
+            index_price=Decimal("100"),
+            mark_price=Decimal("101"),
+            next_funding_utc_timestamp=1789142400,
+            rate=Decimal("0.0001"),
+        )
+
+    def test_position_listener_is_notified_on_set_and_remove(self):
+        listener = MagicMock()
+        self.perpetual_trading.add_position_update_listener(listener)
+
+        self.perpetual_trading.set_position("pos", self._position())
+        self.perpetual_trading.remove_position("pos")
+
+        self.assertEqual(2, listener.call_count)
+        listener.assert_called_with(self.trading_pair)
+
+    def test_removing_a_missing_position_is_not_a_change(self):
+        listener = MagicMock()
+        self.perpetual_trading.add_position_update_listener(listener)
+
+        self.assertIsNone(self.perpetual_trading.remove_position("missing"))
+
+        listener.assert_not_called()
+
+    def test_removed_position_listener_is_not_notified(self):
+        listener = MagicMock()
+        self.perpetual_trading.add_position_update_listener(listener)
+        self.perpetual_trading.remove_position_update_listener(listener)
+
+        self.perpetual_trading.set_position("pos", self._position())
+
+        listener.assert_not_called()
+
+    def test_position_listener_added_twice_is_notified_once(self):
+        listener = MagicMock()
+        self.perpetual_trading.add_position_update_listener(listener)
+        self.perpetual_trading.add_position_update_listener(listener)
+
+        self.perpetual_trading.set_position("pos", self._position())
+
+        listener.assert_called_once_with(self.trading_pair)
+
+    def test_failing_position_listener_is_logged_and_does_not_break_bookkeeping(self):
+        healthy = MagicMock()
+        self.perpetual_trading.add_position_update_listener(MagicMock(side_effect=Exception("boom")))
+        self.perpetual_trading.add_position_update_listener(healthy)
+
+        self.perpetual_trading.set_position("pos", self._position())
+
+        self.assertIn("pos", self.perpetual_trading.account_positions)
+        healthy.assert_called_once_with(self.trading_pair)
+        self.assertTrue(any(
+            record.levelname == "ERROR"
+            and record.getMessage() == f"Error in position update listener for {self.trading_pair}."
+            for record in self.log_records
+        ))
+
+    def test_funding_listener_is_notified_on_initialization(self):
+        listener = MagicMock()
+        self.perpetual_trading.add_funding_info_update_listener(listener)
+
+        self.perpetual_trading.initialize_funding_info(self._funding_info())
+
+        listener.assert_called_once_with(self.trading_pair)
+
+    def test_funding_listener_is_notified_on_stream_update(self):
+        self.perpetual_trading.initialize_funding_info(self._funding_info())
+        notified = asyncio.Event()
+        listener = MagicMock(side_effect=lambda trading_pair: notified.set())
+        self.perpetual_trading.add_funding_info_update_listener(listener)
+        self.perpetual_trading.funding_info_stream.put_nowait(
+            FundingInfoUpdate(trading_pair=self.trading_pair, mark_price=Decimal("102")))
+
+        task = self.ev_loop.create_task(self.perpetual_trading._funding_info_updater())
+        try:
+            self.ev_loop.run_until_complete(asyncio.wait_for(notified.wait(), 1))
+        finally:
+            task.cancel()
+
+        listener.assert_called_once_with(self.trading_pair)
+        self.assertEqual(Decimal("102"), self.perpetual_trading.get_funding_info(self.trading_pair).mark_price)
+
+    def test_removed_funding_listener_is_not_notified(self):
+        listener = MagicMock()
+        self.perpetual_trading.add_funding_info_update_listener(listener)
+        self.perpetual_trading.remove_funding_info_update_listener(listener)
+
+        self.perpetual_trading.initialize_funding_info(self._funding_info())
+
+        listener.assert_not_called()

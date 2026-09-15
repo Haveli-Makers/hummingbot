@@ -3,7 +3,7 @@ import logging
 import time
 from collections import defaultdict, deque
 from enum import Enum
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Callable, Deque, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -45,6 +45,7 @@ class OrderBookTracker:
         self._order_book_trade_stream: asyncio.Queue = asyncio.Queue()
         self._ev_loop: asyncio.BaseEventLoop = asyncio.get_event_loop()
         self._saved_message_queues: Dict[str, Deque[OrderBookMessage]] = defaultdict(lambda: deque(maxlen=1000))
+        self._order_book_update_listeners: List[Callable[[str], None]] = []
 
         self._emit_trade_event_task: Optional[asyncio.Task] = None
         self._init_order_books_task: Optional[asyncio.Task] = None
@@ -74,6 +75,31 @@ class OrderBookTracker:
             trading_pair: order_book.snapshot
             for trading_pair, order_book in self._order_books.items()
         }
+
+    def add_order_book_update_listener(self, listener: Callable[[str], None]):
+        """
+        Call `listener(trading_pair)` whenever a pair's order book changes from the exchange stream:
+        after every diff, and after every snapshot restore.
+
+        OrderBook itself only emits events for trades, so this is the hook for consumers that need
+        book changes as they happen, such as the MQTT market data publisher. Listeners run inline on
+        the pair's tracking loop, so they must be cheap and must never block.
+        """
+        if listener not in self._order_book_update_listeners:
+            self._order_book_update_listeners.append(listener)
+
+    def remove_order_book_update_listener(self, listener: Callable[[str], None]):
+        if listener in self._order_book_update_listeners:
+            self._order_book_update_listeners.remove(listener)
+
+    def _notify_order_book_updated(self, trading_pair: str):
+        # A listener that raises must not reach _track_single_book: its handler would log a network
+        # error and stop tracking the pair for 5 seconds.
+        for listener in list(self._order_book_update_listeners):
+            try:
+                listener(trading_pair)
+            except Exception:
+                self.logger().error(f"Order book update listener failed for {trading_pair}.", exc_info=True)
 
     def start(self):
         self.stop()
@@ -275,6 +301,8 @@ class OrderBookTracker:
                     order_book.apply_diffs(message.bids, message.asks, message.update_id)
                     past_diffs_window.append(message)
                     diff_messages_accepted += 1
+                    if self._order_book_update_listeners:
+                        self._notify_order_book_updated(trading_pair)
 
                     # Output some statistics periodically.
                     now: float = time.time()
@@ -285,6 +313,8 @@ class OrderBookTracker:
                 elif message.type is OrderBookMessageType.SNAPSHOT:
                     past_diffs: List[OrderBookMessage] = list(past_diffs_window)
                     order_book.restore_from_snapshot_and_diffs(message, past_diffs)
+                    if self._order_book_update_listeners:
+                        self._notify_order_book_updated(trading_pair)
             except asyncio.CancelledError:
                 raise
             except Exception:

@@ -8,6 +8,14 @@ from hummingbot.core.rate_oracle.sources.zebpay_rate_source import ZebpayRateSou
 
 class ZebpayRateSourceTest(IsolatedAsyncioWrapperTestCase):
 
+    def setUp(self):
+        super().setUp()
+        # async_ttl_cache keys on str(args) which embeds the instance's memory
+        # address; addresses are reused across tests, so a stale entry from a
+        # previous test's freed instance can collide. Clear for determinism.
+        ZebpayRateSource.get_prices.cache_clear()
+        ZebpayRateSource.get_bid_ask_prices.cache_clear()
+
     def _fake_exchange(self, tickers, symbol_map):
         ex = MagicMock()
         ex.get_all_pairs_prices = AsyncMock(return_value=tickers)

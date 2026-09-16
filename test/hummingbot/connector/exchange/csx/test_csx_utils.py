@@ -7,6 +7,7 @@ from hummingbot.connector.exchange.csx.csx_utils import (
     instrument_to_hb_pair,
     parse_balance_response,
     str_to_decimal,
+    unwrap_data,
 )
 
 
@@ -58,6 +59,35 @@ class CsxConfigMapTests(unittest.TestCase):
         fields = CsxConfigMap.model_fields
         self.assertIn("csx_api_key", fields)
         self.assertIn("csx_api_secret", fields)
+
+
+class CsxUnwrapDataTests(unittest.TestCase):
+    """
+    One shared unwrap for CSX's {"data": ...} envelope. This logic used to be
+    spelled out at three call sites with slightly different phrasing, so a change
+    to the envelope shape could be fixed in one and silently missed in the others.
+    """
+
+    def test_unwraps_envelope(self):
+        self.assertEqual({"orderId": "1"}, unwrap_data({"data": {"orderId": "1"}}))
+
+    def test_returns_unwrapped_payload_unchanged(self):
+        self.assertEqual({"cancelled": True}, unwrap_data({"cancelled": True}))
+
+    def test_identity_key_short_circuits_double_unwrap(self):
+        # Already the bare order object — must not be unwrapped again.
+        bare = {"orderId": "1", "data": "something else"}
+        self.assertEqual(bare, unwrap_data(bare, identity_key="orderId"))
+
+    def test_identity_key_absent_still_unwraps(self):
+        self.assertEqual({"orderId": "1"}, unwrap_data({"data": {"orderId": "1"}}, identity_key="orderId"))
+
+    def test_non_dict_passthrough(self):
+        self.assertEqual([1, 2], unwrap_data([1, 2]))
+        self.assertIsNone(unwrap_data(None))
+
+    def test_null_data_envelope_returns_none(self):
+        self.assertIsNone(unwrap_data({"data": None}))
 
 
 if __name__ == "__main__":

@@ -8,6 +8,14 @@ from hummingbot.core.rate_oracle.sources.csx_rate_source import CsxRateSource
 
 class CsxRateSourceTest(IsolatedAsyncioWrapperTestCase):
 
+    def setUp(self):
+        super().setUp()
+        # async_ttl_cache keys on str(args) which embeds the instance's memory
+        # address; addresses are reused across tests, so a stale entry from a
+        # previous test's freed instance can collide. Clear for determinism.
+        CsxRateSource.get_prices.cache_clear()
+        CsxRateSource.get_bid_ask_prices.cache_clear()
+
     @staticmethod
     def _ticker(instrument, last):
         return {"Instrument": instrument, "LastTradedPrice": last}
@@ -54,6 +62,19 @@ class CsxRateSourceTest(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(Decimal("101"), entry["ask"])
         self.assertEqual(Decimal("100"), entry["mid"])
         self.assertEqual(Decimal("2"), entry["spread"])
+
+    async def test_bid_ask_concurrent_isolates_per_pair_failure(self):
+        # bid/ask are fetched concurrently (gather); one pair's depth fetch failing
+        # must not drop the others — the failing pair falls back to its last price.
+        depth = {"BTC-INR": {"bids": [["99", "1"]], "asks": [["101", "1"]]}}  # no ETH depth
+        rs = self._rate_source_with(self._fake_exchange(
+            [self._ticker("BTC/INR", "100"), self._ticker("ETH/INR", "50")], depth))
+        ba = await rs.get_bid_ask_prices()
+        self.assertEqual(Decimal("99"), ba["BTC-INR"]["bid"])
+        self.assertEqual(Decimal("101"), ba["BTC-INR"]["ask"])
+        # ETH depth raised → falls back to last traded price (zero spread).
+        self.assertEqual(Decimal("50"), ba["ETH-INR"]["mid"])
+        self.assertEqual(Decimal("0"), ba["ETH-INR"]["spread"])
 
     async def test_bid_ask_falls_back_to_last_when_no_depth(self):
         rs = self._rate_source_with(self._fake_exchange([self._ticker("BTC/INR", "100")], depth={}))

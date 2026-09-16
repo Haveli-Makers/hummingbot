@@ -2,12 +2,15 @@ import asyncio
 import time
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from hummingbot.connector.derivative.coindcx_perpetual import coindcx_perpetual_constants as CONSTANTS
 from hummingbot.connector.derivative.coindcx_perpetual.coindcx_perpetual_derivative import CoindcxPerpetualDerivative
+from hummingbot.connector.perpetual_derivative_py_base import PerpetualDerivativePyBase
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PositionSide, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
+from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee
+from hummingbot.core.event.events import BuyOrderCreatedEvent, MarketEvent, OrderFilledEvent
 
 INSTRUMENT = {
     "pair": "B-BTC_USDT",
@@ -162,6 +165,35 @@ class CoindcxPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(60000.0, order["price"])
         self.assertEqual(0.01, order["total_quantity"])
 
+    async def _captured_order(self, position_action):
+        self._bootstrap()
+        captured = {}
+
+        async def fake_post(path_url, data, is_auth_required):
+            captured["data"] = data
+            return [{"id": "uuid-1", "created_at": 1700000000000}]
+
+        self.exchange._api_post = AsyncMock(side_effect=fake_post)
+        await self.exchange._place_order(
+            order_id="haveli-1", trading_pair=self.trading_pair, amount=Decimal("0.01"),
+            trade_type=TradeType.SELL, order_type=OrderType.LIMIT, price=Decimal("60000"),
+            position_action=position_action)
+        return captured["data"]["order"]
+
+    async def test_closing_orders_are_sent_reduce_only(self):
+        """
+        Without reduce_only the venue treats a close as a new opposite position and asks for
+        margin the wallet does not have, so closing fails with "Insufficient funds" precisely
+        when the position is large relative to the account.
+        """
+        order = await self._captured_order(PositionAction.CLOSE)
+        self.assertIs(True, order[CONSTANTS.REDUCE_ONLY_FIELD])
+
+    async def test_opening_orders_are_not_reduce_only(self):
+        for action in (PositionAction.OPEN, PositionAction.NIL):
+            order = await self._captured_order(action)
+            self.assertNotIn(CONSTANTS.REDUCE_ONLY_FIELD, order)
+
     async def test_place_order_sends_the_connectors_current_leverage(self):
         """
         The order carries ex.get_leverage(pair), which reads PerpetualTrading's
@@ -229,6 +261,46 @@ class CoindcxPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
         # Must not raise: the framework retries once the id is assigned.
         self.exchange._api_post = AsyncMock(side_effect=AssertionError("should not call the API"))
         self.assertFalse(await self.exchange._place_cancel("haveli-1", self._order(exchange_order_id=None)))
+
+    async def test_a_confirmed_cancel_re_reads_the_wallet(self):
+        """
+        Cancelling frees collateral, and this is the only place we can ask to see it.
+
+        On success the framework builds the CANCELED OrderUpdate itself and hands it to the
+        order tracker, so it never passes through _push_order_update where settling orders
+        normally trigger a refresh; and a later venue frame repeating CANCELED returns on that
+        method's dedupe check one line before the refresh. Without this call the connector
+        keeps the pre-cancel wallet until its next scheduled poll — up to 120s with the
+        websocket alive.
+
+        Live on 2026-09-03: a 6.99 USDT leg refused against a 9.11 USDT wallet, once a second
+        for 56 seconds, until the run was stopped by hand.
+        """
+        self.exchange._trading_required = True
+        self.exchange._api_post = AsyncMock(return_value={"message": "success", "status": 200, "code": 200})
+        self.exchange._update_balances = AsyncMock()
+        self.exchange._sleep = AsyncMock()
+
+        self.assertTrue(await self.exchange._place_cancel("haveli-1", self._order()))
+        await self.exchange._balance_refresh_task
+
+        self.exchange._update_balances.assert_awaited_once()
+        # Read AFTER a wait, not on the acknowledgement: CoinDCX frees the collateral a beat
+        # after it confirms, so reading immediately just caches the pre-release figure.
+        self.exchange._sleep.assert_awaited_once_with(
+            CONSTANTS.BALANCE_REFRESH_AFTER_CANCEL_DELAY)
+
+    async def test_a_refused_cancel_does_not_re_read_the_wallet(self):
+        """Nothing was released, so there is nothing new to read."""
+        self.exchange._trading_required = True
+        self.exchange._api_post = AsyncMock(return_value={"message": "something else", "code": 422})
+        self.exchange._update_balances = AsyncMock()
+
+        with self.assertRaises(IOError):
+            await self.exchange._place_cancel("haveli-1", self._order())
+
+        self.assertIsNone(self.exchange._balance_refresh_task)
+        self.exchange._update_balances.assert_not_awaited()
 
     async def test_request_order_status_finds_order_in_list(self):
         self.exchange._api_post = AsyncMock(return_value=[
@@ -1083,6 +1155,104 @@ class CoindcxPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
         self.exchange._process_order_event(self._fill_event(exchange_order_id="ex-other"))
         self.assertEqual(0, len(self.exchange._pending_order_events))
 
+    async def test_filled_frame_without_trades_fetches_the_fills_before_settling(self):
+        """
+        A FILLED status with no ``trades`` must not settle the order empty.
+
+        executed_amount_base is only written by trade updates, and the tracker stops
+        tracking an order the moment it settles — so settling first loses the size and any
+        strategy reading it believes it holds nothing while a real position is open.
+        """
+        self._bootstrap()
+        order = self._track(exchange_order_id="ex-1")
+        frame = self._fill_event()
+        frame["trades"] = []
+
+        with patch.object(self.exchange, "_all_trade_updates_for_order",
+                          new=AsyncMock(return_value=[self.exchange._trade_update_from_fill(
+                              {"fill_id": "f-1", "id": "ex-1", "pair": "B-BTC_USDT",
+                               "price": "60000", "quantity": "0.01", "fee_amount": "0.35",
+                               "timestamp": 1700000001000}, order)])) as fetch:
+            self.exchange._process_order_event(frame)
+            for _ in range(4):
+                await asyncio.sleep(0)
+
+        fetch.assert_awaited_once()
+        self.assertEqual(Decimal("0.01"), order.executed_amount_base)
+
+    async def test_repeated_order_frames_are_applied_once(self):
+        """
+        CoinDCX repeats frames. Applying one twice re-fires the created event, and
+        MarketsRecorder then fails on `UNIQUE constraint failed: Order.id`, which aborts
+        whatever was queued behind it on that frame.
+        """
+        self._bootstrap()
+        order = self._track(exchange_order_id="ex-1")
+
+        for _ in range(3):
+            self.exchange._process_order_event(self._fill_event())
+        await asyncio.sleep(0)
+
+        # One fill's worth of size, not three.
+        self.assertEqual(Decimal("0.01"), order.executed_amount_base)
+        self.assertEqual(1, len(self.exchange._applied_order_events))
+
+    def test_an_order_is_only_announced_as_created_once(self):
+        """
+        The REST placement response and the websocket frame can both drive an order out of
+        PENDING_CREATE and both fire the created event. MarketsRecorder writes a row per
+        event, so the second fails on `UNIQUE constraint failed: Order.id` and aborts
+        whatever was queued behind it.
+        """
+        self._bootstrap()
+        created = BuyOrderCreatedEvent(
+            timestamp=1700000000.0, type=OrderType.MARKET, trading_pair="BTC-USDT",
+            amount=Decimal("1"), price=Decimal("60000"), order_id="oid-1",
+            creation_timestamp=1700000000.0)
+
+        with patch.object(PerpetualDerivativePyBase, "trigger_event") as forwarded:
+            for _ in range(3):
+                self.exchange.trigger_event(MarketEvent.BuyOrderCreated, created)
+
+        self.assertEqual(1, forwarded.call_count, "created event escaped more than once")
+
+    def test_other_events_are_never_suppressed(self):
+        self._bootstrap()
+        filled = OrderFilledEvent(
+            timestamp=1700000000.0, order_id="oid-1", trading_pair="BTC-USDT",
+            trade_type=TradeType.BUY, order_type=OrderType.MARKET,
+            price=Decimal("60000"), amount=Decimal("1"),
+            trade_fee=AddedToCostTradeFee(flat_fees=[]))
+
+        with patch.object(PerpetualDerivativePyBase, "trigger_event") as forwarded:
+            for _ in range(3):
+                self.exchange.trigger_event(MarketEvent.OrderFilled, filled)
+
+        self.assertEqual(3, forwarded.call_count)
+
+    def test_a_frame_that_changes_nothing_is_not_pushed(self):
+        """
+        The REST placement response and the websocket both report a new order as open.
+        Pushing the second one lets both fire the created event, and MarketsRecorder then
+        fails its insert on `UNIQUE constraint failed: Order.id`.
+        """
+        self._bootstrap()
+        order = self._track(exchange_order_id="ex-1")
+        order.current_state = OrderState.OPEN
+
+        with patch.object(self.exchange._order_tracker, "process_order_update") as push:
+            self.exchange._apply_order_event(self._fill_event(status="open"), order)
+
+        push.assert_not_called()
+
+    def test_a_genuine_status_change_is_not_suppressed(self):
+        self._bootstrap()
+        self._track(exchange_order_id="ex-1")
+        self.exchange._process_order_event(self._fill_event(status="open"))
+        self.exchange._process_order_event(self._fill_event(status="filled"))
+        self.assertEqual(2, len(self.exchange._applied_order_events),
+                         "a real transition must still get through")
+
     def test_matched_events_still_apply_directly(self):
         self._bootstrap()
         order = self._track(exchange_order_id="ex-1")
@@ -1178,3 +1348,54 @@ class CoindcxPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
             {"currency_short_name": "USDT", "balance": "10", "locked_balance": "2"})
         self.assertEqual(Decimal("10"), self.exchange._account_available_balances["USDT"])
         self.assertEqual(Decimal("12"), self.exchange._account_balances["USDT"])
+
+    # ---- persisted tracking state ---------------------------------------------
+
+    def _tracked(self, client_order_id, exchange_order_id, state):
+        order = InFlightOrder(
+            client_order_id=client_order_id,
+            trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.SELL,
+            amount=Decimal("0.01"),
+            price=Decimal("60000"),
+            creation_timestamp=1700000000.0,
+            exchange_order_id=exchange_order_id,
+            initial_state=state,
+        )
+        return order
+
+    def test_an_order_the_venue_never_accepted_is_not_persisted(self):
+        """
+        A rejected order gets no exchange order id, and CoinDCX has no client-order-id to look
+        it up by instead — so there is nothing to reconcile against, ever. Saving it means the
+        next run restores it, polls it until the not-found counter trips, and warns that it
+        cannot be cancelled, for as many restarts as it takes someone to notice.
+        """
+        rejected = self._tracked("haveli-rejected", None, OrderState.FAILED)
+        self.exchange._order_tracker._lost_orders[rejected.client_order_id] = rejected
+
+        self.assertNotIn("haveli-rejected", self.exchange.tracking_states)
+
+    def test_a_failure_that_does_have_an_exchange_id_is_kept(self):
+        """That one can still be checked against the venue, so it is worth carrying over."""
+        failed = self._tracked("haveli-failed", "ex-9", OrderState.FAILED)
+        self.exchange._order_tracker._lost_orders[failed.client_order_id] = failed
+
+        self.assertIn("haveli-failed", self.exchange.tracking_states)
+
+    def test_an_order_still_awaiting_its_exchange_id_is_kept(self):
+        """
+        Dropping these would risk hiding a position: the venue may have accepted the order
+        while we missed the reply. Only outright failures are safe to forget.
+        """
+        pending = self._tracked("haveli-pending", None, OrderState.PENDING_CREATE)
+        self.exchange._order_tracker.start_tracking_order(pending)
+
+        self.assertIn("haveli-pending", self.exchange.tracking_states)
+
+    def test_a_live_order_is_still_persisted(self):
+        live = self._tracked("haveli-open", "ex-2", OrderState.OPEN)
+        self.exchange._order_tracker.start_tracking_order(live)
+
+        self.assertIn("haveli-open", self.exchange.tracking_states)

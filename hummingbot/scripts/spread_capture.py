@@ -211,8 +211,9 @@ class SpreadCapture:
                     }
                 )
 
-            self.store_spread_data(market_data_batch)
-            self._remove_old_market_data()
+            await asyncio.to_thread(self.store_spread_data, market_data_batch)
+            await asyncio.to_thread(self._remove_old_market_data)
+            
             self.logger().info(
                 f"Processed {len(market_data_batch)} trading pairs from {self.connector_name}"
                 + (f" (excluded {excluded_count} pairs)" if excluded_count > 0 else "")

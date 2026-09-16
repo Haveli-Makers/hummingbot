@@ -11,11 +11,12 @@ from hummingbot.connector.exchange.csx import csx_constants as CONSTANTS, csx_we
 from hummingbot.connector.exchange.csx.csx_api_order_book_data_source import CsxAPIOrderBookDataSource
 from hummingbot.connector.exchange.csx.csx_api_user_stream_data_source import CsxAPIUserStreamDataSource
 from hummingbot.connector.exchange.csx.csx_auth import CsxAuth
+from hummingbot.connector.exchange.csx.csx_utils import unwrap_data
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
 from hummingbot.core.data_type.common import OrderType, TradeType
-from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate, TradeUpdate
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
@@ -225,6 +226,18 @@ class CsxExchange(ExchangePyBase):
             api_factory=self._web_assistants_factory,
             domain=self._domain,
         )
+
+    async def stop_network(self):
+        await super().stop_network()
+        # With a proxy configured, the web-assistants factory owns a dedicated,
+        # per-connector aiohttp session (aiohttp-socks). Close it on shutdown so it
+        # doesn't leak ("Unclosed client session"). The default ConnectionsFactory
+        # is a shared singleton, so it is deliberately left alone.
+        if self._proxy_url:
+            try:
+                await self._web_assistants_factory.close()
+            except Exception:
+                self.logger().debug("Error closing CSX proxy connections factory on stop_network.", exc_info=True)
 
     # ── Exception classification ───────────────────────────────────────────────
 
@@ -521,7 +534,7 @@ class CsxExchange(ExchangePyBase):
             is_auth_required=True,
         )
         # CSX cancel response: {"data": {"cancelled": true, "info": {...}}, "message": "..."}
-        data = result.get("data", result) if isinstance(result, dict) else {}
+        data = unwrap_data(result) if isinstance(result, dict) else {}
         if data.get("cancelled") is True or data.get("canceled") is True:
             return True
         status = (data.get("status") or result.get("status") or "").upper()
@@ -543,7 +556,7 @@ class CsxExchange(ExchangePyBase):
         )
         if not isinstance(result, dict):
             return {}
-        return result if "orderId" in result else result.get("data", result)
+        return unwrap_data(result, identity_key="orderId")
 
     def _cache_order_data(self, exchange_order_id: str, order_data: Dict[str, Any]) -> None:
         now = time.monotonic()
@@ -586,68 +599,73 @@ class CsxExchange(ExchangePyBase):
     async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
         if order.exchange_order_id is None:
             return []
-
-        trade_updates: List[TradeUpdate] = []
         try:
             exchange_order_id = str(order.exchange_order_id)
             order_data = await self._fetch_order_data(exchange_order_id)
             # Cache for the state pass that immediately follows this fills pass.
             self._cache_order_data(exchange_order_id, order_data)
-
-            filled_qty = Decimal(str(order_data.get("filledQuantity", "0")))
-            if filled_qty <= 0:
-                return []
-
-            # CSX reports CUMULATIVE fills on every status poll and has no per-fill
-            # trade id. Emit only the increment since the last poll, keyed by a
-            # trade id unique to this cumulative value — otherwise
-            # InFlightOrder.update_with_trade_update dedupes the repeated id and the
-            # order stays permanently under-filled (and may never reach FILLED).
-            incremental_base = filled_qty - order.executed_amount_base
-            if incremental_base <= 0:
-                return []
-
-            filled_quote_qty = Decimal(str(order_data.get("filledQuoteQuantity", "0")))
-            if filled_quote_qty > 0:
-                avg_price = filled_quote_qty / filled_qty
-            else:
-                avg_price = Decimal(str(order_data.get("averagePrice", "0")))
-
-            incremental_quote = filled_quote_qty - order.executed_amount_quote
-            if incremental_quote <= 0:
-                incremental_quote = incremental_base * avg_price
-            fill_price = (incremental_quote / incremental_base) if incremental_quote > 0 else avg_price
-
-            is_maker = order.order_type is OrderType.LIMIT_MAKER
-            # makerFee/takerFee are whole-number percents per the CSX docs — e.g.
-            # BTC/INR returns maker 0.02 → 0.02%, taker 0.06 → 0.06% (confirmed via
-            # the GET /v1/me/orders and POST /v2/orders responses). TradeFeeBase.percent
-            # is a fraction, hence the /100. Note maker != taker on the live exchange,
-            # so selecting the correct side (see _get_fee) actually matters.
-            fee_pct = Decimal(str(
-                order_data.get("makerFee", 0) if is_maker else order_data.get("takerFee", 0)
-            ))
-            fee = DeductedFromReturnsTradeFee(percent=fee_pct / Decimal("100"))
-
-            trade_updates.append(
-                TradeUpdate(
-                    trade_id=f"{exchange_order_id}-{filled_qty}",
-                    client_order_id=order.client_order_id,
-                    exchange_order_id=exchange_order_id,
-                    trading_pair=order.trading_pair,
-                    fee=fee,
-                    fill_base_amount=incremental_base,
-                    fill_quote_amount=incremental_quote,
-                    fill_price=fill_price,
-                    fill_timestamp=float(order_data.get("updatedAt", 0)),
-                )
-            )
+            trade_update = self._build_trade_update_from_order_data(order, order_data)
+            return [trade_update] if trade_update is not None else []
         except Exception as exc:
             self.logger().error(
                 f"Error fetching trade updates for {order.exchange_order_id}: {exc}"
             )
+            return []
 
-        return trade_updates
+    def _build_trade_update_from_order_data(
+        self, order: InFlightOrder, order_data: Dict[str, Any]
+    ) -> Optional[TradeUpdate]:
+        """
+        Build the incremental TradeUpdate for ``order`` from a GET /orders/{id}
+        payload, or None when there is no new fill.
+
+        CSX reports CUMULATIVE fills with no per-fill trade id, so we emit only the
+        increment since the last applied fill, keyed by a trade id unique to the
+        cumulative value (InFlightOrder dedupes repeated ids). Shared by the
+        status-poll path and the user-stream terminal path, so the final fill can be
+        recorded BEFORE the order reaches a terminal state and stops being tracked.
+        """
+        if order.exchange_order_id is None:
+            return None
+        exchange_order_id = str(order.exchange_order_id)
+
+        filled_qty = Decimal(str(order_data.get("filledQuantity", "0")))
+        if filled_qty <= 0:
+            return None
+        incremental_base = filled_qty - order.executed_amount_base
+        if incremental_base <= 0:
+            return None
+
+        filled_quote_qty = Decimal(str(order_data.get("filledQuoteQuantity", "0")))
+        if filled_quote_qty > 0:
+            avg_price = filled_quote_qty / filled_qty
+        else:
+            avg_price = Decimal(str(order_data.get("averagePrice", "0")))
+
+        incremental_quote = filled_quote_qty - order.executed_amount_quote
+        if incremental_quote <= 0:
+            incremental_quote = incremental_base * avg_price
+        fill_price = (incremental_quote / incremental_base) if incremental_quote > 0 else avg_price
+
+        is_maker = order.order_type is OrderType.LIMIT_MAKER
+        # makerFee/takerFee are whole-number percents per the CSX docs (maker != taker
+        # on the live exchange); TradeFeeBase.percent is a fraction, hence the /100.
+        fee_pct = Decimal(str(
+            order_data.get("makerFee", 0) if is_maker else order_data.get("takerFee", 0)
+        ))
+        fee = DeductedFromReturnsTradeFee(percent=fee_pct / Decimal("100"))
+
+        return TradeUpdate(
+            trade_id=f"{exchange_order_id}-{filled_qty}",
+            client_order_id=order.client_order_id,
+            exchange_order_id=exchange_order_id,
+            trading_pair=order.trading_pair,
+            fee=fee,
+            fill_base_amount=incremental_base,
+            fill_quote_amount=incremental_quote,
+            fill_price=fill_price,
+            fill_timestamp=float(order_data.get("updatedAt", 0)),
+        )
 
     # ── Balance ────────────────────────────────────────────────────────────────
 
@@ -663,10 +681,26 @@ class CsxExchange(ExchangePyBase):
 
             # CSX wraps the payload in a "data" key:
             #   {"data": {"Available": {...}, "Locked": {...}}, "message": "..."}
-            balance_data = response.get("data", response) if isinstance(response, dict) else {}
+            balance_data = unwrap_data(response) if isinstance(response, dict) else {}
+            if not isinstance(balance_data, dict):
+                balance_data = {}
             available = balance_data.get("Available") or {}
             locked = balance_data.get("Locked") or {}
             all_assets = set(available.keys()) | set(locked.keys())
+
+            # Distinguish a genuinely-empty account from a degenerate response before
+            # the stale-removal loop below wipes every tracked balance. A real empty
+            # account still CARRIES the Available/Locked keys (they are just empty
+            # objects); a payload missing both — {"data": null}, {"data": {}}, a
+            # partial-outage body — parses to the same "no assets" and must instead
+            # keep the last known balances, or the strategy sees zero funds and stops
+            # sizing orders. Mirrors the Zebpay guard in zebpay_exchange._update_balances.
+            if not all_assets and not ("Available" in balance_data or "Locked" in balance_data):
+                self.logger().warning(
+                    "CSX balance payload was degenerate (no Available/Locked section): "
+                    f"{response!r}. Keeping last known balances."
+                )
+                return
 
             for asset in all_assets:
                 free = Decimal(str(available.get(asset, "0")))
@@ -716,9 +750,10 @@ class CsxExchange(ExchangePyBase):
                 event_type = event.get("event")
 
                 if event_type == "balance_update":
-                    balance_data = event.get("data") or {}
                     # Unwrap CSX's "data" envelope if the raw response was forwarded
-                    balance_data = balance_data.get("data", balance_data) if isinstance(balance_data, dict) else {}
+                    balance_data = unwrap_data(event.get("data") or {})
+                    if not isinstance(balance_data, dict):
+                        balance_data = {}
                     available = balance_data.get("Available") or {}
                     locked = balance_data.get("Locked") or {}
                     all_assets = set(available.keys()) | set(locked.keys())
@@ -729,7 +764,28 @@ class CsxExchange(ExchangePyBase):
                         self._account_balances[key] = free + held
                         self._account_available_balances[key] = free
 
+                elif event_type == "trade_update":
+                    # Realtime account fills from the user-stream account-trades poll.
+                    # Each entry is a GET /orders/{id} payload with the cumulative
+                    # filledQuantity; the helper turns it into the incremental fill,
+                    # deduped by trade id so re-emitting the same cumulative is a no-op.
+                    # Index once per event batch: ClientOrderTracker rebuilds this map
+                    # on every property access, so resolving it inside the loop would
+                    # be an O(entries x tracked-orders) scan every poll cycle.
+                    fillable_by_exchange_id = self._order_tracker.all_fillable_orders_by_exchange_order_id
+                    for order_data in event.get("data") or []:
+                        if not isinstance(order_data, dict):
+                            continue
+                        exchange_order_id = str(order_data.get("orderId", order_data.get("order_id", "")))
+                        tracked = fillable_by_exchange_id.get(exchange_order_id)
+                        if tracked is None:
+                            continue
+                        trade_update = self._build_trade_update_from_order_data(tracked, order_data)
+                        if trade_update is not None:
+                            self._order_tracker.process_trade_update(trade_update)
+
                 elif event_type == "order_update":
+                    updatable_by_exchange_id = self._order_tracker.all_updatable_orders_by_exchange_order_id
                     for order_data in event.get("data") or []:
                         client_order_id = order_data.get("clientOrderId") or order_data.get("client_order_id")
                         exchange_order_id = str(order_data.get("orderId", order_data.get("order_id", "")))
@@ -742,16 +798,25 @@ class CsxExchange(ExchangePyBase):
                         if client_order_id:
                             tracked = self._order_tracker.all_updatable_orders.get(client_order_id)
                         if tracked is None and exchange_order_id:
-                            for o in self._order_tracker.all_updatable_orders.values():
-                                if o.exchange_order_id == exchange_order_id:
-                                    tracked = o
-                                    break
+                            tracked = updatable_by_exchange_id.get(exchange_order_id)
                         if tracked is None:
                             continue
 
                         new_state = CONSTANTS.ORDER_STATE.get(status_str)
                         if new_state is None:
                             continue
+
+                        # Record any outstanding fill from this same payload BEFORE a
+                        # terminal transition stops tracking the order. The settled-order
+                        # fast-path emits the terminal OrderUpdate (FULFILLED→FILLED),
+                        # which removes the order from tracking; without this the final
+                        # fill increment would be lost and executed_amount_base would be
+                        # permanently under-reported. The trade-id dedup makes this a
+                        # no-op if the status poll already recorded that fill.
+                        if new_state in (OrderState.FILLED, OrderState.CANCELED, OrderState.FAILED):
+                            trade_update = self._build_trade_update_from_order_data(tracked, order_data)
+                            if trade_update is not None:
+                                self._order_tracker.process_trade_update(trade_update)
 
                         order_update = OrderUpdate(
                             trading_pair=tracked.trading_pair,

@@ -19,11 +19,27 @@ TRADES_PATH_URL = "/api/v1/public/trades/"
 
 # ── Private endpoints (auth required) ─────────────────────────────────────────
 PROFILE_PATH_URL = "/api/v1/me/"
+# Client-side timeout (seconds) for master-account REST calls, so a stalled connection (a
+# misbehaving proxy, or CSX leaving an unsupported master /me/ request open) fails fast instead
+# of hanging forever — CSX/aiohttp set no read timeout by default.
+MASTER_REQUEST_TIMEOUT = 20.0
+# Wallet transfer: move funds between the master account and a broker (sub) account, either direction.
+MASTER_TRANSFER_FUNDS_PATH_URL = "/api/v1/master/me/transferFunds"
+# Master-only balance endpoint; doubles as a check that the signing key is a real master account.
+MASTER_BALANCE_PATH_URL = "/api/v1/master/me/getBalance/"
 CREATE_ORDER_PATH_URL = "/api/v2/orders/"
 # Base path used as rate-limit ID for per-order GET/DELETE (id appended at runtime)
 ORDER_BY_ID_PATH_URL = "/api/v1/orders"
 ME_ORDERS_PATH_URL = "/api/v1/me/orders/"
 BALANCE_V2_PATH_URL = "/api/v2/me/balance/"
+
+# External transfers (crypto leaves / enters the exchange). Signed with the account's OWN creds.
+# CSX takes a RAW address (not a whitelist id) and exposes NO withdrawal-status endpoint, so an
+# accepted request is the terminal observable state. The deposit ADDRESS comes from the profile
+# (`walletAddress`); /v2/me/deposit only VERIFIES an inbound deposit by its on-chain tx hash.
+WITHDRAWAL_PATH_URL = "/api/v1/me/withdrawal"
+INR_WITHDRAWAL_PATH_URL = "/api/v1/me/inrWithdrawal"
+DEPOSIT_VERIFY_PATH_URL = "/api/v2/me/deposit/"
 
 SIDE_BUY = "BUY"
 SIDE_SELL = "SELL"
@@ -101,6 +117,12 @@ RATE_LIMITS = [
     RateLimit(limit_id=PROFILE_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
               linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, 1),
                              LinkedLimitWeightPair(RAW_REQUESTS, 1)]),
+    RateLimit(limit_id=MASTER_TRANSFER_FUNDS_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, 1),
+                             LinkedLimitWeightPair(RAW_REQUESTS, 1)]),
+    RateLimit(limit_id=MASTER_BALANCE_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, 5),
+                             LinkedLimitWeightPair(RAW_REQUESTS, 1)]),
     RateLimit(limit_id=CREATE_ORDER_PATH_URL, limit=100, time_interval=10 * ONE_SECOND,
               linked_limits=[LinkedLimitWeightPair(ORDERS, 1)]),
     RateLimit(limit_id=ORDER_BY_ID_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
@@ -111,5 +133,14 @@ RATE_LIMITS = [
                              LinkedLimitWeightPair(RAW_REQUESTS, 1)]),
     RateLimit(limit_id=BALANCE_V2_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
               linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, 5),
+                             LinkedLimitWeightPair(RAW_REQUESTS, 1)]),
+    RateLimit(limit_id=WITHDRAWAL_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, 1),
+                             LinkedLimitWeightPair(RAW_REQUESTS, 1)]),
+    RateLimit(limit_id=INR_WITHDRAWAL_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, 1),
+                             LinkedLimitWeightPair(RAW_REQUESTS, 1)]),
+    RateLimit(limit_id=DEPOSIT_VERIFY_PATH_URL, limit=MAX_REQUEST, time_interval=ONE_MINUTE,
+              linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, 1),
                              LinkedLimitWeightPair(RAW_REQUESTS, 1)]),
 ]

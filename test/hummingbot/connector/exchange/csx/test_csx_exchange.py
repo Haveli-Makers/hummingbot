@@ -81,6 +81,25 @@ class CsxExchangePropertiesTests(IsolatedAsyncioWrapperTestCase):
     def test_static_to_hb_order_type(self):
         self.assertEqual(OrderType.LIMIT, CsxExchange.to_hb_order_type("LIMIT"))
 
+    def test_authenticator_is_cached(self):
+        # The authenticator (and its Ed25519 key) is built once and reused.
+        self.assertIs(self.exchange.authenticator, self.exchange.authenticator)
+
+    async def test_stop_network_closes_proxy_factory(self):
+        # With a proxy, the dedicated aiohttp session must be closed on shutdown
+        # (else "Unclosed client session"). Use a fresh exchange, not the fixture.
+        ex = _make_exchange(csx_proxy_url="socks5://user:pass@host:1080")
+        ex._web_assistants_factory.close = AsyncMock()
+        await ex.stop_network()
+        ex._web_assistants_factory.close.assert_awaited_once()
+
+    async def test_stop_network_without_proxy_keeps_shared_factory(self):
+        # Without a proxy the connections factory is a shared singleton — never close it.
+        ex = _make_exchange()
+        ex._web_assistants_factory.close = AsyncMock()
+        await ex.stop_network()
+        ex._web_assistants_factory.close.assert_not_called()
+
 
 class CsxExchangeTradingPairTests(IsolatedAsyncioWrapperTestCase):
 
@@ -205,6 +224,31 @@ class CsxExchangeBalanceTests(IsolatedAsyncioWrapperTestCase):
             await self.exchange._update_balances()
 
         self.assertNotIn("STALE", self.exchange._account_balances)
+
+    async def test_update_balances_degenerate_payload_keeps_balances(self):
+        # A payload with no Available/Locked section at all is a transient hiccup, not
+        # a real empty account. Without this guard the stale-removal loop wiped every
+        # tracked balance and the strategy would see zero funds. (Same class of bug as
+        # the Zebpay balance guard; CSX only escaped it for the {"data": null} shape,
+        # by way of an AttributeError.)
+        self.exchange._account_balances["BTC"] = Decimal("1")
+        self.exchange._account_available_balances["BTC"] = Decimal("1")
+        for payload in ({"data": {}}, {"data": None}, {}):
+            with self.subTest(payload=payload):
+                with patch.object(self.exchange, "_api_get", new_callable=AsyncMock) as mock_get:
+                    mock_get.return_value = payload
+                    await self.exchange._update_balances()
+                self.assertEqual(Decimal("1"), self.exchange._account_balances.get("BTC"))
+
+    async def test_update_balances_genuinely_empty_account_still_wipes(self):
+        # A REAL empty account still carries the keys — it must wipe, or the strategy
+        # keeps sizing orders against funds it no longer has.
+        self.exchange._account_balances["BTC"] = Decimal("1")
+        self.exchange._account_available_balances["BTC"] = Decimal("1")
+        with patch.object(self.exchange, "_api_get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = {"data": {"Available": {}, "Locked": {}}}
+            await self.exchange._update_balances()
+        self.assertNotIn("BTC", self.exchange._account_balances)
 
 
 class CsxExchangeOrderTests(IsolatedAsyncioWrapperTestCase):
@@ -351,6 +395,65 @@ class CsxExchangeOrderTests(IsolatedAsyncioWrapperTestCase):
             with self.assertRaises(ValueError):
                 await self.exchange._request_order_status(tracked)
 
+    async def test_cumulative_fills_reported_incrementally(self):
+        # CSX reports cumulative fills per poll; they must be emitted as unique,
+        # incremental trade updates so they aren't deduped and dropped.
+        order = InFlightOrder(
+            client_order_id="x-CSX-fill", exchange_order_id="oid-1", trading_pair="BTC-INR",
+            order_type=OrderType.LIMIT, trade_type=TradeType.BUY, amount=Decimal("1.0"),
+            price=Decimal("100"), creation_timestamp=1.0,
+        )
+
+        async def poll(filled_qty, filled_quote, status):
+            resp = {"orderId": "oid-1", "status": status, "filledQuantity": filled_qty,
+                    "filledQuoteQuantity": filled_quote, "updatedAt": 1}
+            with patch.object(self.exchange, "_api_get", new_callable=AsyncMock) as mock_get:
+                mock_get.return_value = resp
+                return await self.exchange._all_trade_updates_for_order(order)
+
+        u1 = await poll("0.3", "30", "PARTIALLY_FULFILLED")
+        self.assertEqual(1, len(u1))
+        self.assertEqual(Decimal("0.3"), u1[0].fill_base_amount)
+        self.assertTrue(order.update_with_trade_update(u1[0]))
+
+        u2 = await poll("1.0", "100", "FULFILLED")
+        self.assertEqual(1, len(u2))
+        self.assertEqual(Decimal("0.7"), u2[0].fill_base_amount)  # increment, not cumulative
+        self.assertNotEqual(u1[0].trade_id, u2[0].trade_id)
+        self.assertTrue(order.update_with_trade_update(u2[0]))
+        self.assertEqual(Decimal("1.0"), order.executed_amount_base)
+
+        u3 = await poll("1.0", "100", "FULFILLED")  # repeated poll, no new fill
+        self.assertEqual([], u3)
+
+    async def test_place_order_raises_without_order_id(self):
+        # A create-order response with no orderId must raise, not return "".
+        self.exchange._username = "u"
+        with patch.object(self.exchange, "_api_post", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = {"data": {"status": "OPEN"}, "message": "missing id"}
+            with self.assertRaises(ValueError):
+                await self.exchange._place_order(
+                    order_id="xCSXtest",
+                    trading_pair="BTC-INR",
+                    amount=Decimal("0.001"),
+                    trade_type=TradeType.BUY,
+                    order_type=OrderType.LIMIT,
+                    price=Decimal("3000000"),
+                )
+
+    def test_get_fee_respects_explicit_taker(self):
+        # An explicit is_maker=False must not be clobbered to maker just because
+        # the order type is LIMIT_MAKER.
+        taker = self.exchange._get_fee(
+            "BTC", "INR", OrderType.LIMIT_MAKER, TradeType.BUY,
+            Decimal("1"), Decimal("1"), is_maker=False)
+        self.assertEqual(self.exchange.estimate_fee_pct(False), taker.percent)
+
+        inferred = self.exchange._get_fee(
+            "BTC", "INR", OrderType.LIMIT_MAKER, TradeType.BUY,
+            Decimal("1"), Decimal("1"))  # is_maker unspecified → infer maker
+        self.assertEqual(self.exchange.estimate_fee_pct(True), inferred.percent)
+
 
 class CsxExchangeUserStreamListenerTests(IsolatedAsyncioWrapperTestCase):
 
@@ -386,6 +489,44 @@ class CsxExchangeUserStreamListenerTests(IsolatedAsyncioWrapperTestCase):
             await self.exchange._user_stream_event_listener()
 
         self.assertEqual(Decimal("2.0"), self.exchange._account_balances.get("BTC"))
+
+    async def test_terminal_order_update_records_final_fill(self):
+        # A settled-order terminal update must record the final fill BEFORE the order
+        # transitions to a terminal state — otherwise executed_amount_base is
+        # permanently under-reported for the last fill.
+        order = InFlightOrder(
+            client_order_id="x-CSX-settle", exchange_order_id="oid-settle",
+            trading_pair="BTC-INR", order_type=OrderType.LIMIT, trade_type=TradeType.BUY,
+            amount=Decimal("1.0"), price=Decimal("100"), creation_timestamp=1.0,
+        )
+        self.exchange._order_tracker.start_tracking_order(order)
+        event = {"event": "order_update", "data": [{
+            "orderId": "oid-settle", "status": "FULFILLED",
+            "filledQuantity": "1.0", "filledQuoteQuantity": "100", "updatedAt": 1,
+        }]}
+        with patch.object(self.exchange, "_iter_user_event_queue",
+                          return_value=_async_gen([event])):
+            await self.exchange._user_stream_event_listener()
+
+        self.assertEqual(Decimal("1.0"), order.executed_amount_base)  # final fill recorded
+        self.assertTrue(order.is_done)
+
+    async def test_trade_update_event_records_fills(self):
+        # The realtime account-trades event records the incremental fill (from the
+        # cumulative filledQuantity) onto the tracked order.
+        order = InFlightOrder(
+            client_order_id="x-CSX-trade", exchange_order_id="oid-t", trading_pair="BTC-INR",
+            order_type=OrderType.LIMIT, trade_type=TradeType.BUY, amount=Decimal("1.0"),
+            price=Decimal("100"), creation_timestamp=1.0,
+        )
+        self.exchange._order_tracker.start_tracking_order(order)
+        event = {"event": "trade_update", "data": [{
+            "orderId": "oid-t", "status": "PARTIALLY_FULFILLED",
+            "filledQuantity": "0.5", "filledQuoteQuantity": "50", "updatedAt": 1,
+        }]}
+        with patch.object(self.exchange, "_iter_user_event_queue", return_value=_async_gen([event])):
+            await self.exchange._user_stream_event_listener()
+        self.assertEqual(Decimal("0.5"), order.executed_amount_base)
 
 
 async def _async_gen(items):

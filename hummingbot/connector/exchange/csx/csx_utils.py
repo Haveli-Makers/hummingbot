@@ -9,6 +9,27 @@ from hummingbot.core.data_type.trade_fee import TradeFeeSchema
 CENTRALIZED = True
 EXAMPLE_PAIR = "BTC-INR"
 
+
+def unwrap_data(response: Any, identity_key: Optional[str] = None) -> Any:
+    """
+    Unwrap CSX's ``{"data": ...}`` envelope and return the inner payload.
+
+    CSX wraps most payloads (e.g. ``{"data": {...}, "message": "..."}``) but not
+    all of them, and some endpoints have been seen returning the bare object. Pass
+    ``identity_key`` — a field that only ever appears on the UNWRAPPED object (e.g.
+    ``"orderId"``) — to short-circuit: if the response already carries that key it
+    is returned as-is rather than being unwrapped a second time.
+
+    Kept in one place so a future change to the envelope shape is a single edit;
+    inlining this at each call site is how one site gets missed.
+    """
+    if not isinstance(response, dict):
+        return response
+    if identity_key is not None and identity_key in response:
+        return response
+    return response.get("data", response)
+
+
 DEFAULT_FEES = TradeFeeSchema(
     maker_percent_fee_decimal=Decimal("0.001"),
     taker_percent_fee_decimal=Decimal("0.001"),

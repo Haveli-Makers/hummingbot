@@ -366,36 +366,97 @@ class WazirxExchange(ExchangePyBase):
         return
 
     async def _user_stream_event_listener(self):
+        # WazirX account-WS messages are shaped {"data": {...}, "stream": "<name>"}.
+        # Routing is on the "stream" field (NOT "event", which only appears on
+        # subscribe acks / pongs / errors). Field codes below come from
+        # https://docs.wazirx.com user-data-stream payloads.
         async for event_message in self._iter_user_event_queue():
             try:
-                event_type = event_message.get("event")
-                if event_type == "orderUpdate":
-                    order_data = event_message.get("order", {})
-                    client_order_id = order_data.get("clientOrderId")
+                stream = event_message.get("stream")
+                data = event_message.get("data", {}) or {}
+
+                if stream == "outboundAccountPosition":
+                    # data.B = [{"a": asset, "b": free, "l": locked}, ...]
+                    for bal in data.get("B", []):
+                        asset = str(bal.get("a", "")).upper()
+                        if not asset:
+                            continue
+                        # `or "0"`: an explicit JSON null would make Decimal(str(None))
+                        # raise InvalidOperation, which the broad except below turns
+                        # into a dropped message plus a 5s stall.
+                        free_balance = Decimal(str(bal.get("b") or "0"))
+                        locked_balance = Decimal(str(bal.get("l") or "0"))
+                        self._account_available_balances[asset] = free_balance
+                        self._account_balances[asset] = free_balance + locked_balance
+
+                elif stream == "orderUpdate":
+                    # i=orderId, c=clientOrderId, X=state, E=event time, O=updated time
+                    client_order_id = data.get("c")
+                    exchange_order_id = str(data.get("i", ""))
                     tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
+                    if tracked_order is None and exchange_order_id:
+                        # The tracker keeps this map pre-indexed by exchange order id.
+                        tracked_order = (
+                            self._order_tracker.all_updatable_orders_by_exchange_order_id
+                            .get(exchange_order_id))
                     if tracked_order is not None:
                         new_state = CONSTANTS.ORDER_STATE.get(
-                            order_data.get("status"),
-                            OrderState.OPEN,
-                        )
+                            data.get("X"), tracked_order.current_state)
+
+                        # orderUpdate and ownTrade are INDEPENDENT streams with no
+                        # delivery-order guarantee. If a terminal `done` is processed
+                        # first, ClientOrderTracker fires the completion event built
+                        # from executed_amount_base == 0 and stops tracking; the
+                        # ownTrade that follows still lands, but the strategy has
+                        # already consumed a zero-size completion. Synthesize the
+                        # outstanding fill from the frame's own cumulative `z` first,
+                        # the same ordering the CoinSwitch branch uses. The trade-id
+                        # dedup makes this a no-op when ownTrade already arrived.
+                        if new_state in (OrderState.FILLED, OrderState.CANCELED, OrderState.FAILED):
+                            self._record_outstanding_fill(tracked_order, data, exchange_order_id)
+
                         order_update = OrderUpdate(
                             trading_pair=tracked_order.trading_pair,
-                            update_timestamp=event_message.get("timestamp", 0) / 1000,
+                            update_timestamp=float(data.get("E") or data.get("O") or 0) / 1000,
                             new_state=new_state,
-                            client_order_id=client_order_id,
-                            exchange_order_id=str(order_data.get("orderId", "")),
+                            client_order_id=tracked_order.client_order_id,
+                            exchange_order_id=exchange_order_id or tracked_order.exchange_order_id,
                         )
                         self._order_tracker.process_order_update(order_update=order_update)
 
-                elif event_type == "balanceUpdate":
-                    balance_data = event_message.get("balance", {})
-                    asset_name = balance_data.get("asset")
-                    if asset_name is not None:
-                        free_balance = Decimal(balance_data.get("free", "0"))
-                        locked_balance = Decimal(balance_data.get("locked", "0"))
-                        total_balance = free_balance + locked_balance
-                        self._account_available_balances[asset_name] = free_balance
-                        self._account_balances[asset_name] = total_balance
+                elif stream == "ownTrade":
+                    # t=tradeId, o=orderId, c=clientOrderId, p=price, q=qty,
+                    # w=funds(quote), f=fee, U=fee currency, E=event time
+                    client_order_id = data.get("c")
+                    exchange_order_id = str(data.get("o", ""))
+                    tracked_order = self._order_tracker.all_fillable_orders.get(client_order_id)
+                    if tracked_order is None and exchange_order_id:
+                        tracked_order = (
+                            self._order_tracker.all_fillable_orders_by_exchange_order_id
+                            .get(exchange_order_id))
+                    if tracked_order is not None:
+                        fee_token = str(data.get("U") or "").upper()
+                        fee = TradeFeeBase.new_spot_fee(
+                            fee_schema=self.trade_fee_schema(),
+                            trade_type=tracked_order.trade_type,
+                            percent_token=fee_token,
+                            flat_fees=[TokenAmount(
+                                amount=Decimal(str(data.get("f") or "0")),
+                                token=fee_token,
+                            )],
+                        )
+                        trade_update = TradeUpdate(
+                            trade_id=str(data.get("t", "")),
+                            client_order_id=tracked_order.client_order_id,
+                            exchange_order_id=exchange_order_id or tracked_order.exchange_order_id,
+                            trading_pair=tracked_order.trading_pair,
+                            fee=fee,
+                            fill_base_amount=Decimal(str(data.get("q") or "0")),
+                            fill_quote_amount=Decimal(str(data.get("w") or "0")),
+                            fill_price=Decimal(str(data.get("p") or "0")),
+                            fill_timestamp=float(data.get("E") or 0) / 1000,
+                        )
+                        self._order_tracker.process_trade_update(trade_update)
 
                 else:
                     continue
@@ -405,6 +466,51 @@ class WazirxExchange(ExchangePyBase):
             except Exception:
                 self.logger().error("Unexpected error in user stream listener loop.", exc_info=True)
                 await self._sleep(5.0)
+
+    def _record_outstanding_fill(self, tracked_order: InFlightOrder, data: Dict[str, Any],
+                                 exchange_order_id: str) -> None:
+        """
+        Synthesize the not-yet-recorded portion of a terminal ``orderUpdate``.
+
+        ``z`` is the cumulative executed base quantity on the frame. If it exceeds
+        what the tracker has applied, the matching ``ownTrade`` has not arrived yet —
+        and once the terminal state is processed the completion event is already
+        emitted, so waiting for it is too late. The trade id is keyed on the
+        cumulative value, so the real ``ownTrade`` (keyed on the venue's ``t``) can
+        still land afterwards without this having over-counted: the delta is
+        recomputed from ``executed_amount_base`` each time.
+        """
+        filled_total = Decimal(str(data.get("z") or "0"))
+        delta = filled_total - tracked_order.executed_amount_base
+        if delta <= Decimal("0"):
+            return  # ownTrade already delivered everything — nothing outstanding
+
+        avg_price = Decimal(str(data.get("Z") or data.get("p") or "0"))
+        if avg_price <= Decimal("0"):
+            avg_price = tracked_order.price
+        fee_pct = self.estimate_fee_pct(tracked_order.order_type is OrderType.LIMIT_MAKER)
+        fee = TradeFeeBase.new_spot_fee(
+            fee_schema=self.trade_fee_schema(),
+            trade_type=tracked_order.trade_type,
+            percent=fee_pct,
+            percent_token=tracked_order.quote_asset,
+        )
+        self.logger().debug(
+            f"WazirX terminal orderUpdate for {exchange_order_id} reports cumulative "
+            f"filled {filled_total} but only {tracked_order.executed_amount_base} is "
+            f"recorded; synthesizing the {delta} difference before the state change."
+        )
+        self._order_tracker.process_trade_update(TradeUpdate(
+            trade_id=f"{exchange_order_id}-{filled_total}",
+            client_order_id=tracked_order.client_order_id,
+            exchange_order_id=exchange_order_id or str(tracked_order.exchange_order_id),
+            trading_pair=tracked_order.trading_pair,
+            fee=fee,
+            fill_base_amount=delta,
+            fill_quote_amount=delta * avg_price,
+            fill_price=avg_price,
+            fill_timestamp=float(data.get("E") or data.get("O") or 0) / 1000,
+        ))
 
     async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
         trade_updates: List[TradeUpdate] = []

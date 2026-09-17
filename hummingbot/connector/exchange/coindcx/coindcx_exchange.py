@@ -686,7 +686,8 @@ class CoindcxExchange(ExchangePyBase):
 
             try:
                 trade_history_params = {
-                    "limit": 100
+                    "limit": 100,
+                    "sort": "desc"
                 }
 
                 trades = await self._api_post(
@@ -696,14 +697,19 @@ class CoindcxExchange(ExchangePyBase):
                 )
 
                 if trades:
+                    # Keep EVERY trade per order, not one. A single-entry dict is
+                    # last-write-wins, and with the page sorted descending the last
+                    # write for an order is its OLDEST trade — so a multi-fill order
+                    # re-emitted only its first fill on every poll and permanently
+                    # under-reported its filled amount through this backup path.
+                    # Per-fill dedup is handled downstream by trade_id.
                     trades_by_order_id = {}
                     for trade in trades:
                         order_id = str(trade.get("order_id", ""))
-                        trades_by_order_id[order_id] = trade
+                        trades_by_order_id.setdefault(order_id, []).append(trade)
 
                     for tracked_order in self._order_tracker.all_fillable_orders.values():
-                        if tracked_order.exchange_order_id in trades_by_order_id:
-                            trade = trades_by_order_id[tracked_order.exchange_order_id]
+                        for trade in trades_by_order_id.get(tracked_order.exchange_order_id, []):
                             fee_amount = Decimal(str(trade.get("fee_amount", 0)))
                             trading_pair = tracked_order.trading_pair
                             base, quote = trading_pair.split("-")
@@ -740,7 +746,8 @@ class CoindcxExchange(ExchangePyBase):
             try:
                 trade_history_params = {
                     "symbol": await self.exchange_symbol_associated_to_pair(trading_pair=order.trading_pair),
-                    "limit": 100
+                    "limit": 100,
+                    "sort": "desc"
                 }
 
                 all_fills_response = await self._api_post(

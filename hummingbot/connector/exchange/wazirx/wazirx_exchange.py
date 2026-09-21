@@ -464,9 +464,9 @@ class WazirxExchange(ExchangePyBase):
         return trade_updates
 
     async def get_all_account_trades(self, start_time: Optional[int] = None,
-                                      end_time: Optional[int] = None,
-                                      limit: int = 500,
-                                      trading_pairs: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+                                     end_time: Optional[int] = None,
+                                     limit: int = 500,
+                                     trading_pairs: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """
         Fetches raw fills for this account from WazirX's ``myTrades`` endpoint,
         across the given (or configured) trading pairs.

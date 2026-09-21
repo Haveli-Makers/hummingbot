@@ -537,9 +537,9 @@ class ZebpayExchange(ExchangePyBase):
         return trade_updates
 
     async def get_all_account_trades(self, start_time: Optional[int] = None,
-                                      end_time: Optional[int] = None,
-                                      limit: int = 100,
-                                      trading_pairs: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+                                     end_time: Optional[int] = None,
+                                     limit: int = 100,
+                                     trading_pairs: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """
         Fetches this account's filled/partially-filled orders from Zebpay's
         account-wide orders list endpoint (``ORDERS_PATH_URL``).

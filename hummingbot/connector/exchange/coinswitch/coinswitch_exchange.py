@@ -656,6 +656,42 @@ class CoinswitchExchange(ExchangePyBase):
 
         return trade_updates
 
+    async def get_all_account_trades(self, start_time: Optional[int] = None,
+                                      end_time: Optional[int] = None,
+                                      limit: int = 100,
+                                      trading_pairs: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """
+        Fetches raw fills for this account from CoinSwitch's account-wide closed
+        orders endpoint.
+        """
+        params: Dict[str, Any] = {"count": limit, "open": "false"}
+        if start_time is not None:
+            params["from_time"] = start_time
+        if end_time is not None:
+            params["to_time"] = end_time
+
+        trades: List[Dict[str, Any]] = []
+        try:
+            response = await self._api_get(
+                path_url=CONSTANTS.CLOSED_ORDERS_PATH_URL,
+                params=params,
+                is_auth_required=True,
+            )
+            orders = (response or {}).get("data", [])
+            orders = orders if isinstance(orders, list) else []
+            for order_data in orders:
+                if not isinstance(order_data, dict):
+                    continue
+                for trade in order_data.get("trades", []) or []:
+                    if isinstance(trade, dict):
+                        trade.setdefault("order_id", order_data.get("order_id"))
+                        trade.setdefault("symbol", order_data.get("symbol"))
+                        trades.append(trade)
+        except Exception as e:
+            self.logger().error(f"Error fetching account-wide trade history: {e}")
+
+        return trades
+
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
         """
         Request order status from the exchange.

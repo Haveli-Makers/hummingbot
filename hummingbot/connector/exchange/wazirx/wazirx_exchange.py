@@ -463,6 +463,45 @@ class WazirxExchange(ExchangePyBase):
 
         return trade_updates
 
+    async def get_all_account_trades(self, start_time: Optional[int] = None,
+                                      end_time: Optional[int] = None,
+                                      limit: int = 500,
+                                      trading_pairs: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """
+        Fetches raw fills for this account from WazirX's ``myTrades`` endpoint,
+        across the given (or configured) trading pairs.
+        """
+        trades: List[Dict[str, Any]] = []
+        for trading_pair in trading_pairs or self._trading_pairs or []:
+            symbol = trading_pair.replace("-", "").lower()
+            params: Dict[str, Any] = {"symbol": symbol, "limit": limit}
+            if start_time is not None:
+                params["startTime"] = start_time
+            if end_time is not None:
+                params["endTime"] = end_time
+
+            try:
+                resp = await self._wazirx_request(
+                    method="GET",
+                    path=CONSTANTS.MY_TRADES_PATH_URL,
+                    params=params,
+                    is_auth_required=True,
+                )
+                symbol_trades = resp if isinstance(resp, list) else resp.get("trades", [])
+                for trade in symbol_trades:
+                    if isinstance(trade, dict):
+                        trade.setdefault("symbol", symbol)
+                        # WazirX's own "symbol" field is the raw concatenated
+                        # exchange symbol (e.g. "usdtinr"); surface the
+                        # hummingbot-formatted pair too so downstream display
+                        # doesn't have to reverse-parse it.
+                        trade["trading_pair"] = trading_pair
+                        trades.append(trade)
+            except Exception as e:
+                self.logger().error(f"Error fetching account-wide trade history for {symbol}: {e}")
+
+        return trades
+
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
         if tracked_order.current_state in [OrderState.FAILED, OrderState.CANCELED]:
             return OrderUpdate(

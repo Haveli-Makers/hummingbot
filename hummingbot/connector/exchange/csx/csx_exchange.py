@@ -667,6 +667,36 @@ class CsxExchange(ExchangePyBase):
             fill_timestamp=float(order_data.get("updatedAt", 0)),
         )
 
+    async def get_all_account_trades(self, start_time: Optional[int] = None,
+                                      end_time: Optional[int] = None,
+                                      limit: int = 100,
+                                      trading_pairs: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """
+        Fetches this account's filled/partially-filled orders from CSX's
+        account-wide orders endpoint.
+        """
+        params: Dict[str, Any] = {"onlyOpen": "false", "limit": limit}
+        if start_time is not None:
+            params["from"] = start_time
+        if end_time is not None:
+            params["to"] = end_time
+
+        try:
+            response = await self._api_get(
+                path_url=CONSTANTS.ME_ORDERS_PATH_URL,
+                params=params,
+                is_auth_required=True,
+            )
+            orders = unwrap_data(response) if isinstance(response, dict) else response
+            orders = orders if isinstance(orders, list) else []
+            return [
+                o for o in orders
+                if isinstance(o, dict) and str(o.get("status", "")).upper() in ("FILLED", "PARTIALLY_FILLED")
+            ]
+        except Exception as exc:
+            self.logger().error(f"Error fetching account-wide order history: {exc}")
+            return []
+
     # ── Balance ────────────────────────────────────────────────────────────────
 
     async def _update_balances(self) -> None:

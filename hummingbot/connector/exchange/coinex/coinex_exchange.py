@@ -420,6 +420,37 @@ class CoinexExchange(ExchangePyBase):
             self.logger().debug(f"Error fetching CoinEx fills for {order.exchange_order_id}: {exc}")
         return trade_updates
 
+    async def get_all_account_trades(self, start_time: Optional[int] = None,
+                                      end_time: Optional[int] = None,
+                                      limit: int = 100,
+                                      trading_pairs: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """
+        Fetches raw fills for this account from CoinEx's account-wide user-deals
+        endpoint.
+        """
+        params: Dict[str, Any] = {"market_type": CONSTANTS.MARKET_TYPE_SPOT, "limit": limit}
+        if start_time is not None:
+            params["start_time"] = start_time
+        if end_time is not None:
+            params["end_time"] = end_time
+        if trading_pairs and len(trading_pairs) == 1:
+            try:
+                params["market"] = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pairs[0])
+            except Exception:
+                pass
+
+        try:
+            response = await self._api_get(
+                path_url=CONSTANTS.USER_DEALS_PATH_URL,
+                params=params,
+                is_auth_required=True,
+            )
+            deals = _result(response)
+            return deals if isinstance(deals, list) else []
+        except Exception as exc:
+            self.logger().error(f"Error fetching account-wide trade history: {exc}")
+            return []
+
     # ── Balance ────────────────────────────────────────────────────────────────
 
     async def _update_balances(self) -> None:

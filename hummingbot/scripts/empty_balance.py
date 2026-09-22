@@ -5,7 +5,7 @@ import os
 import sys
 import time
 from decimal import Decimal
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from pydantic import Field
 
@@ -45,19 +45,11 @@ class EmptyBalanceConfig(BaseClientModel):
             "options": SUPPORTED_CONNECTORS,
         },
     )
-    dust_asset: str = Field(
-        default="INR",
-        json_schema_extra={
-            "prompt": lambda mi: "Enter the asset with the leftover balance you want to empty (e.g. INR): ",
-            "prompt_on_new": True,
-        },
-    )
-    candidate_trading_pairs: str = Field(
-        default="USDT-INR,ETH-INR",
+    trading_pairs: str = Field(
+        default="USDT-INR",
         json_schema_extra={
             "prompt": lambda mi: (
-                "Enter candidate trading pairs to try, in priority order, comma-separated "
-                "(quote asset must match the dust asset, e.g. USDT-INR,ETH-INR): "
+                "Enter trading pairs, comma-separated (each pair's base asset is the e.g. USDT-INR,ETH-INR,BTC-INR): "
             ),
             "prompt_on_new": True,
         },
@@ -74,21 +66,21 @@ class EmptyBalanceConfig(BaseClientModel):
     limit_order_price_spread: Decimal = Field(
         default=Decimal("0.001"),
         json_schema_extra={
-            "prompt": lambda mi: "If using a limit order, spread above best ask to help it fill (e.g. 0.001 = 0.1%): ",
+            "prompt": lambda mi: "If using a limit order, spread below best bid to help it fill (e.g. 0.001 = 0.1%): ",
             "prompt_on_new": True,
         },
     )
     balance_use_pct: Decimal = Field(
         default=Decimal("0.99"),
         json_schema_extra={
-            "prompt": lambda mi: "Fraction of the available dust balance to spend, leaving room for fees (e.g. 0.99): ",
+            "prompt": lambda mi: "Fraction of each dust balance to sell, leaving room for fees (e.g. 0.99): ",
             "prompt_on_new": True,
         },
     )
     min_balance_to_act: Decimal = Field(
         default=Decimal("0"),
         json_schema_extra={
-            "prompt": lambda mi: "Skip acting if the dust balance is below this amount (0 = act on any balance): ",
+            "prompt": lambda mi: "Skip a dust asset if its balance is below this amount (0 = act on any balance): ",
             "prompt_on_new": True,
         },
     )
@@ -114,12 +106,11 @@ class EmptyBalance:
 
         self.config = config
         self.exchange_name = config.exchange
-        self.dust_asset: str = config.dust_asset.strip().upper()
-        self.candidate_pairs: List[str] = self._parse_pairs(config.candidate_trading_pairs)
+        self.trading_pairs: List[str] = self._parse_pairs(config.trading_pairs)
         self.order_type = OrderType.LIMIT if config.order_type.lower() == "limit" else OrderType.MARKET
 
         self.connector: Optional[ConnectorBase] = None
-        self._active_order_id: Optional[str] = None
+        self._active_orders: Dict[str, str] = {}
         self._event_forwarders: List[EventForwarder] = []
 
     @staticmethod
@@ -142,7 +133,7 @@ class EmptyBalance:
         connector_manager = get_connector_manager()
         self.connector = connector_manager.create_connector(
             connector_name=self.exchange_name,
-            trading_pairs=self.candidate_pairs,
+            trading_pairs=self.trading_pairs,
             trading_required=True,
         )
         self._register_event_listeners()
@@ -161,17 +152,19 @@ class EmptyBalance:
     def _register_event_listeners(self):
         def _on_order_filled(event):
             self.logger().info(
-                f"Filled {event.amount} {event.trading_pair} at {event.price} {self.dust_asset} "
+                f"Filled {event.amount} {event.trading_pair} at {event.price} "
                 f"on {self.exchange_name} (order_id={event.order_id})"
             )
 
         def _on_order_terminal(event):
-            if getattr(event, "order_id", None) == self._active_order_id:
-                self._active_order_id = None
+            order_id = getattr(event, "order_id", None)
+            for trading_pair, active_order_id in list(self._active_orders.items()):
+                if active_order_id == order_id:
+                    del self._active_orders[trading_pair]
 
         for tag, handler in (
             (MarketEvent.OrderFilled, _on_order_filled),
-            (MarketEvent.BuyOrderCompleted, _on_order_terminal),
+            (MarketEvent.SellOrderCompleted, _on_order_terminal),
             (MarketEvent.OrderCancelled, _on_order_terminal),
             (MarketEvent.OrderFailure, _on_order_terminal),
             (MarketEvent.OrderExpired, _on_order_terminal),
@@ -182,81 +175,80 @@ class EmptyBalance:
 
     async def check_and_place_order(self):
         """
-        If the dust balance is available and there's no order still in flight, try each candidate
-        trading pair in order and place a single buy order on the first one whose quantized order
-        amount clears the exchange's minimum order size / notional requirements.
+        For every configured trading pair, if there's no order still in flight for it, check the
+        available balance of its base asset (the dust asset) and place a single sell order for that
+        pair if the balance clears the exchange's minimum order size / notional requirements. All
+        pairs are checked independently each cycle, so dust in several assets (e.g. USDT, ETH, BTC)
+        can each have an order open at the same time.
         """
-        if self._active_order_id is not None:
-            self.logger().info(f"Order {self._active_order_id} still open, skipping this cycle")
-            return
+        for trading_pair in self.trading_pairs:
+            if trading_pair in self._active_orders:
+                self.logger().info(
+                    f"Order {self._active_orders[trading_pair]} still open for {trading_pair}, skipping this cycle"
+                )
+                continue
 
-        available = self.connector.get_available_balance(self.dust_asset)
+            self._check_and_place_order_for_pair(trading_pair)
+
+    def _check_and_place_order_for_pair(self, trading_pair: str):
+        base, quote = split_hb_trading_pair(trading_pair)
+        dust_asset = base.upper()
+
+        available = self.connector.get_available_balance(dust_asset)
         if available <= self.config.min_balance_to_act:
-            self.logger().info(f"{available} {self.dust_asset} available, nothing to do")
+            self.logger().info(f"{available} {dust_asset} available, nothing to do for {trading_pair}")
             return
 
-        spend_amount = available * self.config.balance_use_pct
+        sell_amount = available * self.config.balance_use_pct
 
-        for trading_pair in self.candidate_pairs:
-            base, quote = split_hb_trading_pair(trading_pair)
-            if quote.upper() != self.dust_asset:
-                self.logger().warning(
-                    f"Skipping {trading_pair}: quote asset {quote} does not match dust asset {self.dust_asset}"
-                )
-                continue
-
-            order_amount = self._size_order(trading_pair, spend_amount)
-            if order_amount is None:
-                continue
-
-            price = self.connector.get_price_by_type(trading_pair, PriceType.BestAsk)
-            if self.order_type == OrderType.LIMIT:
-                order_price = self.connector.quantize_order_price(
-                    trading_pair, price * (Decimal(1) + self.config.limit_order_price_spread)
-                )
-            else:
-                order_price = price
-
-            self._active_order_id = self.connector.buy(
-                trading_pair=trading_pair,
-                amount=order_amount,
-                order_type=self.order_type,
-                price=order_price,
-            )
-            self.logger().info(
-                f"Placed {self.order_type.name} BUY {order_amount} {base} via {trading_pair} to spend "
-                f"~{spend_amount} {self.dust_asset} (available: {available} {self.dust_asset}), "
-                f"order_id={self._active_order_id}"
+        order_amount = self._size_order(trading_pair, sell_amount)
+        if order_amount is None:
+            self.logger().warning(
+                f"{available} {dust_asset} available, but {trading_pair} does not meet the "
+                f"exchange's minimum order requirements."
             )
             return
 
-        self.logger().warning(
-            f"{available} {self.dust_asset} available, but no candidate pair "
-            f"({', '.join(self.candidate_pairs)}) meets the exchange's minimum order requirements."
+        price = self.connector.get_price_by_type(trading_pair, PriceType.BestBid)
+        if self.order_type == OrderType.LIMIT:
+            order_price = self.connector.quantize_order_price(
+                trading_pair, price * (Decimal(1) - self.config.limit_order_price_spread)
+            )
+        else:
+            order_price = price
+
+        order_id = self.connector.sell(
+            trading_pair=trading_pair,
+            amount=order_amount,
+            order_type=self.order_type,
+            price=order_price,
+        )
+        self._active_orders[trading_pair] = order_id
+        self.logger().info(
+            f"Placed {self.order_type.name} SELL {order_amount} {base} via {trading_pair} "
+            f"(available: {available} {dust_asset}), order_id={order_id}"
         )
 
-    def _size_order(self, trading_pair: str, spend_amount: Decimal) -> Optional[Decimal]:
-        price = self.connector.get_price_by_type(trading_pair, PriceType.BestAsk)
+    def _size_order(self, trading_pair: str, sell_amount: Decimal) -> Optional[Decimal]:
+        price = self.connector.get_price_by_type(trading_pair, PriceType.BestBid)
         if price is None or price.is_nan() or price <= 0:
-            self.logger().warning(f"No valid ask price for {trading_pair}, skipping")
+            self.logger().warning(f"No valid bid price for {trading_pair}, skipping")
             return None
 
-        raw_amount = spend_amount / price
-        amount = self.connector.quantize_order_amount(trading_pair, raw_amount)
+        amount = self.connector.quantize_order_amount(trading_pair, sell_amount)
 
         trading_rule = self.connector.trading_rules.get(trading_pair)
         if trading_rule is not None:
             if amount < trading_rule.min_order_size:
                 self.logger().info(
                     f"{trading_pair}: quantized amount {amount} is below min_order_size "
-                    f"{trading_rule.min_order_size}, trying next candidate pair"
+                    f"{trading_rule.min_order_size}"
                 )
                 return None
             notional = amount * price
             if notional < trading_rule.min_notional_size or notional < trading_rule.min_order_value:
                 self.logger().info(
-                    f"{trading_pair}: order value {notional} {self.dust_asset} is below the exchange "
-                    f"minimum, trying next candidate pair"
+                    f"{trading_pair}: order value {notional} is below the exchange minimum"
                 )
                 return None
 
@@ -269,13 +261,12 @@ class EmptyBalance:
             await self.connector.stop_network()
 
 
-def _create_config_from_args(exchange: str, dust_asset: str, candidate_trading_pairs: str,
+def _create_config_from_args(exchange: str, trading_pairs: str,
                              order_type: str, limit_order_price_spread: Decimal,
                              balance_use_pct: Decimal, min_balance_to_act: Decimal) -> EmptyBalanceConfig:
     return EmptyBalanceConfig(
         exchange=exchange,
-        dust_asset=dust_asset,
-        candidate_trading_pairs=candidate_trading_pairs,
+        trading_pairs=trading_pairs,
         order_type=order_type,
         limit_order_price_spread=limit_order_price_spread,
         balance_use_pct=balance_use_pct,
@@ -286,30 +277,32 @@ def _create_config_from_args(exchange: str, dust_asset: str, candidate_trading_p
 def main():
     parser = argparse.ArgumentParser(description="Run empty_balance as a standalone script")
     parser.add_argument("--exchange", default="binance", help=f"Connector name, one of: {', '.join(SUPPORTED_CONNECTORS)}")
-    parser.add_argument("--dust_asset", default="INR", help="Asset with the leftover balance to empty (e.g. INR)")
     parser.add_argument(
-        "--candidate_trading_pairs",
-        default="USDT-INR,ETH-INR",
-        help="Comma-separated trading pairs to try in priority order (quote must match --dust_asset)",
+        "--trading_pairs",
+        default="USDT-INR",
+        help=(
+            "Comma-separated trading pairs to sell dust into; each pair's base asset is sold for its "
+            "quote asset, e.g. USDT-INR,ETH-INR,BTC-INR"
+        ),
     )
     parser.add_argument("--order_type", default="market", choices=list(ORDER_TYPES), help="Order type to place")
     parser.add_argument(
         "--limit_order_price_spread",
         type=Decimal,
         default=Decimal("0.001"),
-        help="Spread above best ask for limit orders (e.g. 0.001 = 0.1%%)",
+        help="Spread below best bid for limit orders (e.g. 0.001 = 0.1%%)",
     )
     parser.add_argument(
         "--balance_use_pct",
         type=Decimal,
         default=Decimal("0.99"),
-        help="Fraction of the available dust balance to spend (e.g. 0.99)",
+        help="Fraction of each dust balance to sell (e.g. 0.99)",
     )
     parser.add_argument(
         "--min_balance_to_act",
         type=Decimal,
         default=Decimal("0"),
-        help="Skip acting if the dust balance is below this amount",
+        help="Skip a dust asset if its balance is below this amount",
     )
     parser.add_argument("--interval_sec", type=int, default=60, help="Seconds between balance checks")
     parser.add_argument("--once", action="store_true", help="Run once and exit")
@@ -320,8 +313,7 @@ def main():
 
     config = _create_config_from_args(
         exchange=args.exchange,
-        dust_asset=args.dust_asset,
-        candidate_trading_pairs=args.candidate_trading_pairs,
+        trading_pairs=args.trading_pairs,
         order_type=args.order_type,
         limit_order_price_spread=args.limit_order_price_spread,
         balance_use_pct=args.balance_use_pct,
@@ -355,7 +347,7 @@ if __name__ == "__main__":
     """
     Run the empty_balance script standalone, e.g.:
     CONFIG_PASSWORD=your_password python -m hummingbot.scripts.empty_balance \
-        --exchange binance --dust_asset INR --candidate_trading_pairs USDT-INR,ETH-INR --once
+        --exchange binance --trading_pairs USDT-INR,ETH-INR,BTC-INR --once
 
     Requires the exchange's API keys to already be configured via the Hummingbot client
     (`connect <exchange>`), and CONFIG_PASSWORD set to the password used to unlock them.

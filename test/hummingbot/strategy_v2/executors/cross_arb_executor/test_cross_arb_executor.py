@@ -174,6 +174,46 @@ class CrossArbExecutorTests(IsolatedAsyncioWrapperTestCase):
 
     # ── mismatch policy and dust ──────────────────────────────────────────────
 
+    async def test_a_venue_that_refuses_the_unwind_is_not_tried_again(self):
+        """
+        Found by the dry run: when the selling venue refuses everything, the unwind kept going
+        back to it because it quoted the better price, and the position was left stranded.
+        """
+        executor = self.make(fill_timeout=10)
+        await self.tick(executor)
+        self.strategy.order("buy-1").fill()
+        await self.tick(executor, seconds=11)          # cleanup
+        self.strategy.order("sell-2").cancel()
+        await self.tick(executor, seconds=1)           # reconcile
+        await self.tick(executor)                      # unwind goes to wazirx, the better bid
+        self.assertEqual(self.strategy.sent[-1][0], "wazirx")
+
+        executor.process_order_failed_event(None, None, MarketOrderFailureEvent(
+            timestamp=self.strategy.current_timestamp, order_id="sell-3", order_type=None))
+        await self.tick(executor)
+        self.assertEqual(self.strategy.sent[-1][0], "csx")   # the other venue, worse price, accepted
+        self.strategy.order("sell-4").fill()
+        await self.tick(executor)
+        self.assertEqual(executor.result.imbalance_base, D("0"))
+
+    async def test_a_refusal_is_noticed_without_any_event(self):
+        """The dry run's venues refuse silently; a missed event must not strand the position."""
+        executor = self.make(fill_timeout=10)
+        await self.tick(executor)
+        self.strategy.order("buy-1").fill()
+        await self.tick(executor, seconds=11)
+        self.strategy.order("sell-2").cancel()
+        await self.tick(executor, seconds=1)
+        await self.tick(executor)
+        self.assertEqual(self.strategy.sent[-1][0], "wazirx")
+
+        self.strategy.order("sell-3").fail()        # refused, no event sent
+        await self.tick(executor)
+        self.assertEqual(self.strategy.sent[-1][0], "csx")
+        self.strategy.order("sell-4").fill()
+        await self.tick(executor)
+        self.assertEqual(executor.close_type, CloseType.COMPLETED)
+
     async def test_mismatch_can_be_held_instead_of_flattened(self):
         executor = self.make(fill_timeout=10, mismatch_policy=MismatchPolicy.HOLD)
         await self.tick(executor)

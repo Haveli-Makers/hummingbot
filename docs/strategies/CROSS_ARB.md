@@ -320,6 +320,47 @@ money moves.
 
 ---
 
+## 8a. The dry run
+
+`temp/arbitrage/cross_arb_dry_run.py` runs **this controller and this executor** against fake
+venues: no network, no keys, and only the exchanges are imitated. The fake venues charge what the
+real ones charge — CSX 0.05%, WazirX 0%, 1% TDS withheld from every sale — so the closing balances
+are the test of whether a run made money.
+
+```
+python cross_arb_dry_run.py --scenario all          # every situation below
+python cross_arb_dry_run.py --from-data SOL-INR     # replay the prices the scanner recorded
+```
+
+Scenarios: `easy` (a clear gap), `thin` (the selling side is a third of the size it showed),
+`reject` (a venue refuses everything), `lying_cancel` (a cancelled order fills anyway),
+`vanishing` (the gap disappears before the orders land), `stale` (a venue stops sending snapshots).
+Each run ends with a verdict, and the rule that must never break is that no run may finish holding
+coins it did not mean to.
+
+Two things it has already established:
+
+1. **It found a real bug.** With one venue refusing orders, the unwind kept going back to that same
+   venue because it quoted the better price, and gave up with the position stranded. The executor
+   now refuses to retry a venue that just rejected an unwind, and notices a refusal from the
+   order's own state rather than waiting for an event that may never arrive.
+2. **An aborted attempt costs about 1%.** When the gap vanishes between the decision and the fill,
+   the bought coin is sold straight back — and that sale pays 1% TDS. So the trigger has to clear
+   not just the cost of a completed round trip but the cost of the ones that fail.
+
+Replaying real recorded SOL-INR prices through the whole strategy, with 1% TDS counted:
+
+| Trigger | Trades | Result |
+|---|---|---|
+| 0.5% | 11 | −₹103 |
+| 1.0% | 11 | −₹20 |
+| 1.1% | 16 | +₹80 |
+| 1.25% | 11 | +₹106 |
+
+Mechanically every one of those trades was correct — both sides matched, nothing stranded. They
+lose money below about 1.1% purely because of the tax, which is the clearest statement of why the
+threshold matters more than the machinery.
+
 ## 9. Build order
 
 1. `data_types.py` + executor skeleton with the state machine and timeouts — with tests.

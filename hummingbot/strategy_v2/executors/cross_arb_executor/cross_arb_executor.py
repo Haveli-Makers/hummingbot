@@ -110,6 +110,10 @@ class CrossArbExecutor(ExecutorBase):
         self._reconcile_started_at: Optional[float] = None
         self._shutdown_deadline: Optional[float] = None
         self._flatten_attempts: int = 0
+        # Venues that refused to take the corrective order. Retrying the venue that just said no
+        # only burns the retries: when one side is refusing us, the whole point is to unwind
+        # somewhere else, even at a worse price.
+        self._flatten_refused: set = set()
         self._end_reason: str = ""
 
     # ── small helpers ─────────────────────────────────────────────────────────
@@ -278,6 +282,7 @@ class CrossArbExecutor(ExecutorBase):
         # but an event that never arrives must not make a real fill invisible: every amount here
         # is derived from these order objects.
         self._attach_orders()
+        self._notice_refusals()
         # Then, always: a fill on an order the venue said it had cancelled is still our trade.
         self._watch_cancelled_orders()
 
@@ -498,6 +503,8 @@ class CrossArbExecutor(ExecutorBase):
         """Where to flatten: whichever of our two venues quotes the better price for that side."""
         candidates = []
         for market in (self.config.buying_market, self.config.selling_market):
+            if market.connector_name in self._flatten_refused:
+                continue
             price_type = PriceType.BestBid if side == TradeType.SELL else PriceType.BestAsk
             try:
                 price = self.get_price(market.connector_name, market.trading_pair, price_type)
@@ -523,6 +530,24 @@ class CrossArbExecutor(ExecutorBase):
             in_flight = self.get_in_flight_order(order.connector_name, order.order_id)
             if in_flight is not None:
                 order.tracked.order = in_flight
+
+    def _notice_refusals(self):
+        """
+        Spot a refused order from its own state, not only from the failure event.
+
+        The event is the normal path, but an event that never arrives must not cost us the
+        knowledge: if the unwind was refused we have to take it somewhere else, and that decision
+        cannot wait for a message that may not come.
+        """
+        for order in self._orders:
+            in_flight = order.tracked.order
+            if order.failed or in_flight is None or in_flight.current_state != OrderState.FAILED:
+                continue
+            order.failed = True
+            self.logger().warning(f"{self._tag} {order.role} {order.side.name} order "
+                                  f"{order.order_id} was refused by {order.connector_name}")
+            if order.role == "flatten":
+                self._flatten_refused.add(order.connector_name)
 
     def _watch_cancelled_orders(self):
         """
@@ -635,6 +660,9 @@ class CrossArbExecutor(ExecutorBase):
         order.failed = True
         self.logger().warning(f"{self._tag} {order.role} {order.side.name} order {event.order_id} on "
                               f"{order.connector_name} was refused by the venue")
+        if order.role == "flatten":
+            # Do not go back to a venue that has just refused the unwind; try the other one.
+            self._flatten_refused.add(order.connector_name)
         if order.role == "leg" and self._phase in (CrossArbPhase.PLACING, CrossArbPhase.WAITING):
             self._start_cleanup(f"{order.side.name} leg refused by {order.connector_name}")
 

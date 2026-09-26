@@ -779,6 +779,31 @@ class CoindcxExchange(ExchangePyBase):
 
         return trade_updates
 
+    async def get_all_account_trades(self, start_time: Optional[int] = None,
+                                     end_time: Optional[int] = None,
+                                     limit: int = 100,
+                                     trading_pairs: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """
+        Fetches raw fills for this account directly from CoinDCX's account-wide
+        trade history endpoint.
+        """
+        params: Dict[str, Any] = {"limit": limit}
+        if start_time is not None:
+            params["from_timestamp"] = start_time
+        if end_time is not None:
+            params["to_timestamp"] = end_time
+
+        try:
+            trades = await self._api_post(
+                path_url=CONSTANTS.TRADE_HISTORY_ACCOUNT_PATH_URL,
+                data=params,
+                is_auth_required=True,
+            )
+            return trades if isinstance(trades, list) else []
+        except Exception as e:
+            self.logger().error(f"Error fetching account-wide trade history: {e}")
+            return []
+
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
         """
         Requests the status of an order from CoinDCX.

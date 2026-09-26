@@ -215,7 +215,8 @@ class ClientConfigAdapter:
             value = traversal_item.value
             if isinstance(value, SecretStr):
                 value = value.get_secret_value()
-            if value == "" or Security.secrets_manager is None:
+            if value is None or value == "" or Security.secrets_manager is None:
+                # Optional secure fields that were never set are stored as None - nothing to decrypt.
                 decrypted_value = value
             else:
                 decrypted_value = Security.secrets_manager.decrypt_secret_value(attr=traversal_item.attr, value=value)

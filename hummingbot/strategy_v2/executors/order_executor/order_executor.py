@@ -53,16 +53,16 @@ class OrderExecutor(ExecutorBase):
         self._partial_filled_orders: list[TrackedOrder] = []
         self._current_retries = 0
         self._max_retries = max_retries
+        self._pending_cancel_order_ids: set = set()
 
     @property
     def current_market_price(self) -> Decimal:
         """
         Get the current market price based on the order side.
-
-        :return: The current market price.
+        Uses MidPrice so the chaser tracks both sides of the book and
+        reprices whenever either the best bid or best ask moves.
         """
-        price_type = PriceType.BestBid if self.config.side == TradeType.BUY else PriceType.BestAsk
-        return self.get_price(self.config.connector_name, self.config.trading_pair, price_type=price_type)
+        return self.get_price(self.config.connector_name, self.config.trading_pair, price_type=PriceType.MidPrice)
 
     async def control_task(self):
         """
@@ -87,19 +87,29 @@ class OrderExecutor(ExecutorBase):
         """
         Control the limit chaser strategy by updating the order price based on market conditions.
         The distance is treated as a percentage of the current market price.
+
+        Reprice only when the new target price has moved more than refresh_threshold away
+        from the current order price.
         """
+        if self._pending_cancel_order_ids:
+            return
         if not self._order or not self._order.order or not self._order.order.is_open:
             return
 
-        current_price = self.current_market_price
-        threshold = self.config.chaser_config.refresh_threshold
+        new_target = self.get_order_price()
+        current_order_price = self._order.order.price
 
-        if self.config.side == TradeType.BUY:
-            if current_price - self._order.order.price > (current_price * threshold):
-                self.renew_order()
-        else:  # SELL
-            if self._order.order.price - current_price > (current_price * threshold):
-                self.renew_order()
+        if current_order_price == 0:
+            return
+
+        price_drift = abs(new_target - current_order_price) / current_order_price
+        if price_drift > self.config.chaser_config.refresh_threshold:
+            self.logger().info(
+                f"[LimitChaser] Repricing {self.config.side.name} {self.config.trading_pair} | "
+                f"order={current_order_price} → target={new_target:.5f} | "
+                f"drift={price_drift:.4%} > threshold={self.config.chaser_config.refresh_threshold:.4%}"
+            )
+            self.renew_order()
 
     def early_stop(self, keep_position: bool = True):
         """
@@ -148,7 +158,6 @@ class OrderExecutor(ExecutorBase):
             position_action=self.config.position_action,
         )
         self._order = TrackedOrder(order_id=order_id)
-        self.logger().debug(f"Executor ID: {self.config.id} - Placing order {order_id}")
 
     def get_order_type(self) -> OrderType:
         """
@@ -187,12 +196,10 @@ class OrderExecutor(ExecutorBase):
     def renew_order(self):
         """
         Renew the order with a new price.
-
-        :param new_price: The new price for the order.
         """
+        if self._order:
+            self._pending_cancel_order_ids.add(self._order.order_id)
         self.cancel_order()
-        self.place_open_order()
-        self.logger().debug("Renewing order")
 
     def cancel_order(self):
         """
@@ -204,7 +211,6 @@ class OrderExecutor(ExecutorBase):
                 trading_pair=self.config.trading_pair,
                 order_id=self._order.order_id
             )
-            self.logger().debug("Cancelling order")
 
     def update_tracked_order_with_order_id(self, order_id: str):
         """
@@ -234,6 +240,7 @@ class OrderExecutor(ExecutorBase):
         """
         self.update_tracked_order_with_order_id(event.order_id)
         if self._order and self._order.order_id == event.order_id:
+            self._pending_cancel_order_ids.discard(event.order_id)
             self._held_position_orders.append(self._order.order.to_json())
             self.close_type = CloseType.POSITION_HOLD
             self.stop()
@@ -242,12 +249,17 @@ class OrderExecutor(ExecutorBase):
         """
         Process the order canceled event.
         """
+        is_reprice_cancel = event.order_id in self._pending_cancel_order_ids
+        if is_reprice_cancel:
+            self._pending_cancel_order_ids.discard(event.order_id)
         if self._order and event.order_id == self._order.order_id:
             if self._order.executed_amount_base > Decimal("0"):
                 self._partial_filled_orders.append(self._order)
             else:
                 self._canceled_orders.append(self._order)
             self._order = None
+        if is_reprice_cancel and self.status == RunnableStatus.RUNNING:
+            self.place_open_order()
 
     def process_order_failed_event(self, _, market, event: MarketOrderFailureEvent):
         """

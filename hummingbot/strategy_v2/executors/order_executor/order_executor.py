@@ -4,7 +4,7 @@ from decimal import Decimal
 from typing import Dict, Optional, Union
 
 from hummingbot.connector.connector_base import ConnectorBase
-from hummingbot.core.data_type.common import OrderType, PriceType, TradeType
+from hummingbot.core.data_type.common import OrderType, PositionAction, PriceType, TradeType
 from hummingbot.core.data_type.order_candidate import OrderCandidate, PerpetualOrderCandidate
 from hummingbot.core.event.events import (
     BuyOrderCompletedEvent,
@@ -298,6 +298,10 @@ class OrderExecutor(ExecutorBase):
                 amount=self.config.amount,
                 price=self.config.price,
                 leverage=Decimal(self.config.leverage),
+                # A close is collateralised by the contract itself. Without this the budget
+                # check demands margin for a fresh position and refuses exactly when the
+                # position being closed is what is holding the collateral.
+                position_close=self.config.position_action == PositionAction.CLOSE,
             )
         else:
             order_candidate = OrderCandidate(

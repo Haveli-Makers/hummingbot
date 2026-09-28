@@ -519,7 +519,7 @@ def main():
                 balancer = CapitalBalancer(config=config)
                 await balancer.run()
             except Exception as e:
-                logging.getLogger("capital_balancer_standalone").exception(f"Error during balancer run: {e}")
+                logging.getLogger("capital_balancer").exception(f"Error during balancer run: {e}")
 
             if args.once:
                 return
@@ -533,5 +533,5 @@ def main():
 
 
 if __name__ == "__main__":
-    """Run standalone using python -m hummingbot.scripts.capital_balancer_standalone -c conf/scripts/conf_capital_balancer_sub1.yml --once"""
+    """Run standalone using python -m hummingbot.scripts.capital_balancer -c conf/scripts/conf_capital_balancer_sub1.yml --once"""
     main()

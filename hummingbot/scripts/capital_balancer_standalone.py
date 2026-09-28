@@ -507,7 +507,7 @@ def main():
 
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO) #add force=True to override existing logging config to get logs for dry-run.
 
     config = load_config_from_yml(args.conf)
     if args.dry_run:

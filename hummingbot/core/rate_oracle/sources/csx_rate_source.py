@@ -1,5 +1,6 @@
+import asyncio
 from decimal import Decimal
-from typing import TYPE_CHECKING, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from hummingbot.core.rate_oracle.sources.rate_source_base import RateSourceBase
 from hummingbot.core.utils import async_ttl_cache
@@ -41,7 +42,11 @@ class CsxRateSource(RateSourceBase):
         self._ensure_exchange()
         tickers = await self._csx_exchange.get_all_pairs_prices()
 
-        results: Dict[str, Dict[str, Decimal]] = {}
+        # Resolve the pairs we care about first, then fetch every order book
+        # CONCURRENTLY. Each _best_bid_ask is a REST round-trip to the depth endpoint;
+        # doing them serially is N x latency (worse through the IP-whitelist proxy CSX
+        # requires). The connector throttler still bounds the request rate.
+        pairs: List[Tuple[str, dict]] = []
         for ticker in tickers:
             if not isinstance(ticker, dict):
                 continue
@@ -52,8 +57,20 @@ class CsxRateSource(RateSourceBase):
                 continue
             if quote_token and not tp.endswith(f"-{quote_token}"):
                 continue
+            pairs.append((tp, ticker))
 
-            bid, ask = await self._best_bid_ask(tp)
+        bid_asks = await asyncio.gather(
+            *(self._best_bid_ask(tp) for tp, _ in pairs),
+            return_exceptions=True,
+        )
+
+        results: Dict[str, Dict[str, Decimal]] = {}
+        for (tp, ticker), bid_ask in zip(pairs, bid_asks):
+            if isinstance(bid_ask, Exception):
+                self.logger().warning(f"CSX bid/ask fetch failed for {tp}: {bid_ask}")
+                bid, ask = Decimal("0"), Decimal("0")
+            else:
+                bid, ask = bid_ask
             if bid > 0 and ask > 0 and bid <= ask:
                 mid = (bid + ask) / Decimal("2")
                 spread = ((ask - bid) / mid) * Decimal("100") if mid > 0 else Decimal("0")

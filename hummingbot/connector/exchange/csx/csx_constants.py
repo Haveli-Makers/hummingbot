@@ -60,7 +60,22 @@ ONE_SECOND = 1
 
 MAX_REQUEST = 2000
 
-USER_STREAM_POLL_INTERVAL = 5.0  # seconds between REST polls in user-stream source
+# ── Realtime REST poll intervals (seconds), per data type ─────────────────────
+# CSX exposes no WebSocket, so account + market data is kept "realtime" by tight
+# polling. Each data type has its OWN cadence (the user-stream source runs them in
+# concurrent loops), so latency can be traded against the weighted rate limit
+# (2000/min) independently and a slow data type never blocks a fast one. Lower =
+# fresher data but more requests; raise these if you track many pairs/orders.
+BALANCE_POLL_INTERVAL = 3.0          # GET /api/v2/me/balance/
+ACTIVE_ORDERS_POLL_INTERVAL = 2.0    # GET /api/v1/me/orders/?onlyOpen=true (+ settled detection)
+ACCOUNT_TRADES_POLL_INTERVAL = 2.0   # GET /api/v1/orders/{id} per in-flight order (cumulative fills)
+ORDER_BOOK_POLL_INTERVAL = 2.0       # GET /api/v1/public/depth/ snapshot (was 30s)
+PUBLIC_TRADES_POLL_INTERVAL = 3.0    # GET /api/v1/public/trades/
+
+# Ceiling for the exponential backoff each poll loop applies after consecutive
+# failures. The loops are independent, so without a backoff a sustained outage has
+# all of them retrying at their full 2-3s cadence at once.
+MAX_POLL_BACKOFF_INTERVAL = 60.0
 
 RATE_LIMITS = [
     RateLimit(limit_id=REQUEST_WEIGHT, limit=2000, time_interval=ONE_MINUTE),

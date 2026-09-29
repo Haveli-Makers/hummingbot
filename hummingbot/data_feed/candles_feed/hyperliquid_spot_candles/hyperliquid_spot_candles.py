@@ -21,10 +21,23 @@ class HyperliquidSpotCandles(CandlesBase):
     def __init__(self, trading_pair: str, interval: str = "1m", max_records: int = 150):
         self._universe = None
         self._coins_dict = None
-        self._base_asset = trading_pair.split("-")[0]
+        self._base_asset, self._quote_asset = trading_pair.split("-")
         self._universe_ready = asyncio.Event()
         super().__init__(trading_pair, interval, max_records)
         self._ping_timeout = CONSTANTS.PING_TIMEOUT
+
+    def _resolve_coin(self) -> str:
+        coin = (self._coins_dict or {}).get((self._base_asset, self._quote_asset))
+        if coin is None:
+            available_quotes = sorted(
+                quote for (base, quote) in (self._coins_dict or {}) if base == self._base_asset
+            )
+            raise ValueError(
+                f"Hyperliquid spot has no '{self._base_asset}-{self._quote_asset}' market. "
+                + (f"{self._base_asset} is only listed against: {available_quotes}."
+                   if available_quotes else f"'{self._base_asset}' is not a listed Hyperliquid spot asset.")
+            )
+        return coin
 
     @property
     def name(self):
@@ -78,7 +91,7 @@ class HyperliquidSpotCandles(CandlesBase):
             "type": "candleSnapshot",
             "req": {
                 "interval": CONSTANTS.INTERVALS[self.interval],
-                "coin": self._coins_dict[self._base_asset],
+                "coin": self._resolve_coin(),
                 "startTime": kwargs.get("start_time", kwargs.get("end_time", 0)) * 1000,
             }
         }
@@ -109,11 +122,12 @@ class HyperliquidSpotCandles(CandlesBase):
         return {"Content-Type": "application/json"}
 
     def _parse_rest_candles(self, data: dict, end_time: Optional[int] = None) -> List[List[float]]:
-        if len(data) > 0:
+        if data and len(data) > 0:
             return [
                 [self.ensure_timestamp_in_seconds(row["t"]), row["o"], row["h"], row["l"], row["c"], row["v"], 0.,
                  row["n"], 0., 0.] for row in data
             ]
+        return []
 
     def ws_subscription_payload(self):
         interval = CONSTANTS.INTERVALS[self.interval]
@@ -121,7 +135,7 @@ class HyperliquidSpotCandles(CandlesBase):
             "method": "subscribe",
             "subscription": {
                 "type": "candle",
-                "coin": self._coins_dict[self._base_asset],
+                "coin": self._resolve_coin(),
                 "interval": interval
             },
         }
@@ -156,6 +170,12 @@ class HyperliquidSpotCandles(CandlesBase):
                                                               method=RESTMethod.POST,
                                                               throttler_limit_id=self.rest_url,
                                                               data=CONSTANTS.HEALTH_CHECK_PAYLOAD)
-        universe = {token["tokens"][0]: token["name"] for token in self._universe["universe"]}
-        tokens = {token["index"]: token["name"] for token in self._universe["tokens"]}
-        self._coins_dict = {tokens[index]: universe[index] for index in universe.keys()}
+        token_names = {token["index"]: token["name"] for token in self._universe["tokens"]}
+        coins_dict = {}
+        for pair in self._universe["universe"]:
+            base_idx, quote_idx = pair["tokens"]
+            base_name = token_names.get(base_idx)
+            quote_name = token_names.get(quote_idx)
+            if base_name is not None and quote_name is not None:
+                coins_dict[(base_name, quote_name)] = pair["name"]
+        self._coins_dict = coins_dict

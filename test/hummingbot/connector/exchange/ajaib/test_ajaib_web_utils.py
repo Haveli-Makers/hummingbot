@@ -41,10 +41,10 @@ class AjaibDomainRoutingTests(TestCase):
 
     def test_testnet_domain_selects_testnet_hosts(self):
         self.assertEqual(
-            'https://testnet.api.crypto.ajaib.co.id/v1/account',
+            'https://api.testnet.crypto.ajaib.co.id/v1/account',
             web_utils.public_rest_url('/v1/account', domain=CONSTANTS.TESTNET_DOMAIN))
         self.assertEqual(
-            'wss://testnet.stream.crypto.ajaib.co.id',
+            'wss://stream.testnet.crypto.ajaib.co.id',
             web_utils.wss_url(domain=CONSTANTS.TESTNET_DOMAIN))
 
     def test_unknown_domain_falls_back_to_mainnet(self):

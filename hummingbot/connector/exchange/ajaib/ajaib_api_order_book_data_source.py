@@ -82,10 +82,15 @@ class AjaibAPIOrderBookDataSource(OrderBookTrackerDataSource):
         # stream, public ones included, is reached at /ws/<listenKey>, so the
         # order book needs a key exactly as the user stream does.
         #
-        # A fresh key is minted per connection (Ajaib allows one key per
-        # connection, and they expire after ~60 min). When it lapses the socket
-        # closes and the tracker's reconnect loop mints another, so no keepalive
-        # task is needed here -- at the cost of one reconnect per hour.
+        # Ajaib issues ONE listen key per API key, not per mint: every POST
+        # returns the same string and simply pushes its expiry out to now+60min.
+        # It is also safe to hold several connections on that one key at once
+        # (verified live: two concurrent connections both stayed up for 90s).
+        # So this shares the key with the user stream rather than owning it,
+        # and the user stream's 30-minute keepalive keeps it alive for both.
+        #
+        # Never DELETE this key: being account-global, deleting it drops every
+        # connection using it -- the user stream as well as this one.
         listen_key = await self._get_listen_key()
         ws: WSAssistant = await self._api_factory.get_ws_assistant()
         await ws.connect(

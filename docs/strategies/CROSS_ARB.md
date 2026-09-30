@@ -160,7 +160,7 @@ executor acts on `mismatch_policy`:
 | Policy | Behaviour |
 |---|---|
 | `flatten` (default) | Immediately trade the difference away with a crossing limit on the exchange with the better price, accepting a small loss |
-| `hold` | Keep it, mark the executor `MISMATCH_HELD`, and raise an alert; the controller pauses that pair |
+| `hold` | Keep it: the executor ends as `POSITION_HOLD`, only the matched part counts as profit, and the leftover goes to the framework as a held position (shown under "Positions Held"). The controller logs a warning and pauses that pair until the bot is restarted |
 
 Both are recorded. "Do nothing quietly" is not an option.
 
@@ -257,6 +257,7 @@ outcome, the guard-rejection counters, and any open rebalance need.
 | `gst_pct` | `18` | tax on the fee |
 | `tds_pct` | `1` | withheld from every sale |
 | `order_amount_quote` | `10000` | maximum per trade |
+| `total_amount_quote` | `10000` | most money in live attempts at once, across all pairs (replaces the framework's default of 100) |
 | `min_order_amount_quote` | `2000` | skip anything smaller |
 | `max_book_age` | `10` | seconds |
 | `cooldown` | `5` | seconds between attempts on a pair |
@@ -291,7 +292,7 @@ outcome, the guard-rejection counters, and any open rebalance need.
 
 | Situation | Behaviour |
 |---|---|
-| One leg rejected (size, balance, venue error) | Other leg is cancelled at once; if it already filled, flatten; attempt recorded as `ONE_LEG_FAILED` |
+| One leg rejected (size, balance, venue error) | Other leg is cancelled at once; if it already filled, flatten — on the other exchange first, since the refusing one just said no to that side; attempt recorded as `ONE_LEG_FAILED` |
 | One leg partly filled | Cancel the remainder, then match the two sides and flatten the difference |
 | Both partly filled, different amounts | Keep the matched part, flatten the difference |
 | Cancel acknowledged but the order fills later | Detected by re-reading after `cancel_settle_delay`; the late fill is counted and flattened if needed |

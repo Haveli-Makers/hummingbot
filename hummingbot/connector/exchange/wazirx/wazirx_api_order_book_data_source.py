@@ -89,7 +89,10 @@ class WazirxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         if timestamp > 1e12:
             timestamp = timestamp / 1e3
 
-        update_id = int(snapshot.get("lastUpdateId", 0)) or int(self._time() * 1e3)
+        # The poll time, not the exchange's lastUpdateId: a REST poll replaces the whole book, and
+        # the id becomes the book's snapshot_uid — the only way a strategy can tell a live feed from
+        # a frozen one. An unchanged book polled twice must still read as two fresh snapshots.
+        update_id = int(self._time() * 1e3)
         content = {
             "trading_pair": trading_pair,
             "update_id": update_id,
@@ -119,8 +122,10 @@ class WazirxAPIOrderBookDataSource(OrderBookTrackerDataSource):
     async def _parse_order_book_diff_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
         return
 
-    async def _parse_order_book_snapshot_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
-        return
+    async def _parse_order_book_snapshot_message(self, raw_message: OrderBookMessage, message_queue: asyncio.Queue):
+        # listen_for_subscriptions has already turned each REST poll into an OrderBookMessage; pass
+        # it on. While this returned nothing, every WazirX book stayed at its startup snapshot.
+        message_queue.put_nowait(raw_message)
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         raise NotImplementedError("WazirX order book streaming not implemented; using REST polling instead.")

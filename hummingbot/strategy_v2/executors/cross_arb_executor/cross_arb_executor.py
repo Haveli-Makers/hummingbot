@@ -93,7 +93,11 @@ class CrossArbExecutor(ExecutorBase):
     SHUTDOWN_SECONDS = 15.0
 
     def __init__(self, strategy: ScriptStrategyBase, config: CrossArbExecutorConfig,
-                 update_interval: float = 1.0):
+                 update_interval: float = 1.0, max_retries: int = 10):
+        # ExecutorOrchestrator passes max_retries to every executor it builds. It is accepted and
+        # deliberately not used: the generic meaning is "re-send a failed order", which for a
+        # hedge is how a two-sided trade becomes a one-sided bet. The only retries here are the
+        # re-priced flatten attempts in config.max_retries.
         super().__init__(
             strategy=strategy,
             connectors=[config.buying_market.connector_name, config.selling_market.connector_name],
@@ -114,6 +118,10 @@ class CrossArbExecutor(ExecutorBase):
         # only burns the retries: when one side is refusing us, the whole point is to unwind
         # somewhere else, even at a worse price.
         self._flatten_refused: set = set()
+        # (venue, side) pairs where a LEG was refused. An unwind on the same side goes to the other
+        # venue first; the refusal may have been about that order alone, so the venue stays a
+        # fallback rather than being ruled out.
+        self._leg_refused: set = set()
         self._end_reason: str = ""
 
     # ── small helpers ─────────────────────────────────────────────────────────
@@ -235,15 +243,62 @@ class CrossArbExecutor(ExecutorBase):
     def _imbalance_is_dust(self, imbalance: Decimal) -> bool:
         return abs(imbalance) * self.reference_price <= self.dust_threshold_quote
 
+    @property
+    def holds_position(self) -> bool:
+        return self.close_type == CloseType.POSITION_HOLD
+
+    def _matched_and_held(self, result: ArbResult):
+        """
+        Split an attempt that keeps a mismatch: the matched part, whose profit is realised, and the
+        remainder, which is still ours to sell (or still owed) and goes to the framework as a
+        position — the way the grid executor hands over what it holds.
+
+        Counting the remainder's cost as a loss would make a kept coin look like money gone, and
+        trip the daily loss limit over a position that is merely open.
+        """
+        matched = min(result.bought_base, result.sold_base)
+        avg_buy = result.bought_quote / result.bought_base if result.bought_base > s_decimal_0 else s_decimal_0
+        avg_sell = result.sold_quote / result.sold_base if result.sold_base > s_decimal_0 else s_decimal_0
+        traded = result.bought_base + result.sold_base
+        matched_fees = result.fees_quote * 2 * matched / traded if traded > s_decimal_0 else s_decimal_0
+        tds_rate = self.config.tds_pct / Decimal("100")
+        realized = matched * (avg_sell - avg_buy) - matched_fees - matched * avg_sell * tds_rate
+
+        held = result.imbalance_base
+        held_fees = result.fees_quote - matched_fees
+        if held > s_decimal_0:
+            order = {"trade_type": TradeType.BUY.name, "executed_amount_base": held,
+                     "executed_amount_quote": held * avg_buy, "cumulative_fee_paid_quote": held_fees}
+        elif held < s_decimal_0:
+            # Coin sold that was never bought: the tax on that sale is a cost of the short, too.
+            order = {"trade_type": TradeType.SELL.name, "executed_amount_base": -held,
+                     "executed_amount_quote": -held * avg_sell,
+                     "cumulative_fee_paid_quote": held_fees - held * avg_sell * tds_rate}
+        else:
+            order = None
+        if order is not None:
+            order["client_order_id"] = f"{self.config.id}-held"
+        return realized, order
+
+    def _mark_held(self):
+        """Tell the framework where the held remainder lives, for its position tracking."""
+        if self.result.imbalance_base > s_decimal_0:
+            self.config.mark_held(self.config.buying_market, TradeType.BUY)
+        else:
+            self.config.mark_held(self.config.selling_market, TradeType.SELL)
+
     def get_net_pnl_quote(self) -> Decimal:
-        return self.result.net_quote
+        result = self.result
+        if self.holds_position:
+            return self._matched_and_held(result)[0]
+        return result.net_quote
 
     def get_net_pnl_pct(self) -> Decimal:
         """Profit as a share of what we SPENT. Dividing by the coin amount is the upstream bug."""
         result = self.result
         if result.bought_quote <= s_decimal_0:
             return s_decimal_0
-        return result.net_quote / result.bought_quote
+        return self.get_net_pnl_quote() / result.bought_quote
 
     def get_cum_fees_quote(self) -> Decimal:
         return self.result.fees_quote
@@ -451,6 +506,7 @@ class CrossArbExecutor(ExecutorBase):
             return
 
         if self.config.mismatch_policy == MismatchPolicy.HOLD:
+            self._mark_held()
             self._finish(CloseType.POSITION_HOLD,
                          f"mismatch of {imbalance} {self.config.base_asset} held on purpose")
             return
@@ -500,10 +556,22 @@ class CrossArbExecutor(ExecutorBase):
         self._place(side, quantized, price, connector_name, trading_pair, role="flatten")
 
     def _best_venue_for(self, side: TradeType):
-        """Where to flatten: whichever of our two venues quotes the better price for that side."""
+        """
+        Where to flatten: whichever of our two venues quotes the better price for that side.
+
+        A venue that refused an unwind is never asked again. A venue that refused a leg on this
+        same side is asked last — it said no seconds ago, and asking again first costs a round trip
+        while the price moves.
+        """
+        return self._best_venue_among(side, avoid_leg_refusals=True) or \
+            self._best_venue_among(side, avoid_leg_refusals=False)
+
+    def _best_venue_among(self, side: TradeType, avoid_leg_refusals: bool):
         candidates = []
         for market in (self.config.buying_market, self.config.selling_market):
             if market.connector_name in self._flatten_refused:
+                continue
+            if avoid_leg_refusals and (market.connector_name, side) in self._leg_refused:
                 continue
             price_type = PriceType.BestBid if side == TradeType.SELL else PriceType.BestAsk
             try:
@@ -546,8 +614,13 @@ class CrossArbExecutor(ExecutorBase):
             order.failed = True
             self.logger().warning(f"{self._tag} {order.role} {order.side.name} order "
                                   f"{order.order_id} was refused by {order.connector_name}")
-            if order.role == "flatten":
-                self._flatten_refused.add(order.connector_name)
+            self._remember_refusal(order)
+
+    def _remember_refusal(self, order: ArbOrder):
+        if order.role == "flatten":
+            self._flatten_refused.add(order.connector_name)
+        else:
+            self._leg_refused.add((order.connector_name, order.side))
 
     def _watch_cancelled_orders(self):
         """
@@ -579,11 +652,13 @@ class CrossArbExecutor(ExecutorBase):
         self._end_reason = reason
         self.close_type = close_type
         self._phase = CrossArbPhase.DONE
+        held = (f" — {result.imbalance_base} {self.config.base_asset} kept as a position; the net is "
+                f"the matched part only" if self.holds_position else "")
         self.logger().info(
             f"{self._tag} {close_type.name}: {reason}. bought {result.bought_base} for "
             f"{result.bought_quote}, sold {result.sold_base} for {result.sold_quote}, fees "
-            f"{result.fees_quote}, tds {result.tds_quote}, net {result.net_quote} "
-            f"{self.config.quote_asset}")
+            f"{result.fees_quote}, tds {result.tds_quote}, net {self.get_net_pnl_quote()} "
+            f"{self.config.quote_asset}{held}")
         self.stop()
 
     # ── shutdown ──────────────────────────────────────────────────────────────
@@ -619,6 +694,13 @@ class CrossArbExecutor(ExecutorBase):
 
     def _control_shutdown(self):
         if self.close_type == CloseType.POSITION_HOLD:
+            if self._imbalance_is_dust(self.result.imbalance_base):
+                # Asked to keep a position, but there is none: an empty held position would only
+                # show up in the framework's position table as a zero row.
+                self.close_type = CloseType.EARLY_STOP
+                self._end_reason = "stopped; nothing was left to keep"
+            else:
+                self._mark_held()
             self.stop()
             return
         self._cancel_unfinished_orders()
@@ -660,9 +742,7 @@ class CrossArbExecutor(ExecutorBase):
         order.failed = True
         self.logger().warning(f"{self._tag} {order.role} {order.side.name} order {event.order_id} on "
                               f"{order.connector_name} was refused by the venue")
-        if order.role == "flatten":
-            # Do not go back to a venue that has just refused the unwind; try the other one.
-            self._flatten_refused.add(order.connector_name)
+        self._remember_refusal(order)
         if order.role == "leg" and self._phase in (CrossArbPhase.PLACING, CrossArbPhase.WAITING):
             self._start_cleanup(f"{order.side.name} leg refused by {order.connector_name}")
 
@@ -671,6 +751,7 @@ class CrossArbExecutor(ExecutorBase):
     def get_custom_info(self) -> Dict:
         result = self.result
         buy_leg, sell_leg = self.buy_leg, self.sell_leg
+        held_order = self._matched_and_held(result)[1] if self.holds_position else None
         return {
             "phase": self._phase.value,
             "pair": self.config.buying_market.trading_pair,
@@ -688,9 +769,11 @@ class CrossArbExecutor(ExecutorBase):
             "sell_avg_price": self._avg_price(sell_leg) if sell_leg else None,
             "fees_quote": result.fees_quote,
             "tds_quote": result.tds_quote,
-            "net_quote": result.net_quote,
+            "net_quote": self.get_net_pnl_quote(),
             "net_pct": self.get_net_pnl_pct() * Decimal("100"),
             "imbalance_base": result.imbalance_base,
+            # Read by ExecutorOrchestrator when the attempt ends holding a mismatch.
+            "held_position_orders": [held_order] if held_order else [],
             "flatten_orders": len(self.flatten_orders),
             "flatten_base": result.flatten_base,
             "late_fills": sum(1 for o in self._orders if o.late_fill_logged),
@@ -704,7 +787,7 @@ class CrossArbExecutor(ExecutorBase):
   Cross-exchange arbitrage | {self.config.buying_market.trading_pair} | {self._phase.value} | {self.close_type.name if self.close_type else '-'}
   - BUY {self.config.buying_market.connector_name} @ <= {self.config.buy_price_cap} | SELL {self.config.selling_market.connector_name} @ >= {self.config.sell_price_floor} | amount {self.config.order_amount}
   - filled: bought {result.bought_base} / sold {result.sold_base} | imbalance {result.imbalance_base}
-  - fees {result.fees_quote} | tds {result.tds_quote} | net {result.net_quote} {self.config.quote_asset} ({self.get_net_pnl_pct() * Decimal('100'):.3f}%)
+  - fees {result.fees_quote} | tds {result.tds_quote} | net {self.get_net_pnl_quote()} {self.config.quote_asset} ({self.get_net_pnl_pct() * Decimal('100'):.3f}%)
   {('  - ' + self._end_reason) if self._end_reason else ''}
 """
         ]

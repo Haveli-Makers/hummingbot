@@ -9,7 +9,7 @@ from decimal import Decimal
 from test.hummingbot.strategy_v2.executors.cross_arb_executor.fakes import FakeConnector, FakeStrategy
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 
-from hummingbot.core.data_type.common import TradeType
+from hummingbot.core.data_type.common import PriceType, TradeType
 from hummingbot.core.event.events import MarketOrderFailureEvent
 from hummingbot.strategy_v2.executors.cross_arb_executor.cross_arb_executor import CrossArbExecutor
 from hummingbot.strategy_v2.executors.cross_arb_executor.data_types import (
@@ -107,7 +107,8 @@ class CrossArbExecutorTests(IsolatedAsyncioWrapperTestCase):
         flatten = self.strategy.sent[-1]
         self.assertEqual(flatten[2], TradeType.SELL)
         self.assertEqual(flatten[3], D("1"))
-        self.assertEqual(flatten[0], "wazirx")    # the better bid of the two venues
+        # WazirX quotes the better bid, but it has just refused this SELL: CSX is asked first.
+        self.assertEqual(flatten[0], "csx")
         self.strategy.order("sell-3").fill()
         await self.tick(executor)
         self.assertEqual(executor.close_type, CloseType.COMPLETED)
@@ -214,6 +215,37 @@ class CrossArbExecutorTests(IsolatedAsyncioWrapperTestCase):
         await self.tick(executor)
         self.assertEqual(executor.close_type, CloseType.COMPLETED)
 
+    async def unwind_order(self, executor):
+        """Tick until the first order after the two legs goes out, and return it."""
+        for _ in range(5):
+            await self.tick(executor, seconds=1)
+            if len(self.strategy.sent) > 2:
+                return self.strategy.sent[2]
+        self.fail("no unwind order was sent")
+
+    async def test_the_unwind_skips_a_venue_that_just_refused_the_same_side(self):
+        """
+        WazirX refused the SELL leg, so the unwind SELL goes to CSX first. Asking WazirX again (it
+        quotes the better bid) only buys a second refusal while the price moves — seen in the dry
+        run's reject scenario as two refusals per attempt.
+        """
+        self.strategy.refuse_next["wazirx"] = True
+        executor = self.make(fill_timeout=10)
+        await self.tick(executor)                       # both legs out; the sell is refused
+        self.strategy.order("buy-1").fill()
+        unwind = await self.unwind_order(executor)
+        self.assertEqual((unwind[0], unwind[2]), ("csx", TradeType.SELL))
+
+    async def test_a_venue_that_refused_a_leg_is_still_the_fallback(self):
+        """The refusal may have been about that order alone; with no price elsewhere, ask again."""
+        self.strategy.refuse_next["wazirx"] = True
+        executor = self.make(fill_timeout=10)
+        await self.tick(executor)
+        self.strategy.order("buy-1").fill()
+        self.csx.prices[PriceType.BestBid] = D("0")    # CSX has no bid to sell into
+        unwind = await self.unwind_order(executor)
+        self.assertEqual((unwind[0], unwind[2]), ("wazirx", TradeType.SELL))
+
     async def test_mismatch_can_be_held_instead_of_flattened(self):
         executor = self.make(fill_timeout=10, mismatch_policy=MismatchPolicy.HOLD)
         await self.tick(executor)
@@ -225,6 +257,38 @@ class CrossArbExecutorTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(executor.close_type, CloseType.POSITION_HOLD)
         self.assertEqual(executor.result.imbalance_base, D("1"))
         self.assertEqual(len([s for s in self.strategy.sent if s[3] == D("1")]), 2)  # no third order
+
+    async def test_a_held_mismatch_counts_only_the_matched_part_as_profit(self):
+        """
+        Bought 1, sold 0.3: the 0.3 is a finished trade, the 0.7 is coin we still own. Reporting the
+        0.7's cost (−70) as a loss would trip the daily loss limit over a position that is open.
+        """
+        executor = self.make(fill_timeout=10, mismatch_policy=MismatchPolicy.HOLD, tds_pct=D("1"))
+        await self.tick(executor)
+        self.strategy.order("buy-1").fill()
+        self.strategy.order("sell-2").fill(amount=D("0.3"))
+        await self.tick(executor, seconds=11)           # deadline: cancel the rest of the sell
+        self.strategy.order("sell-2").cancel()
+        await self.tick(executor, seconds=1)
+        await self.tick(executor)
+        self.assertEqual(executor.close_type, CloseType.POSITION_HOLD)
+
+        # 0.3 x (102 - 100), less 1% TDS on the 0.3 sold at 102: 0.6 - 0.306
+        self.assertEqual(executor.get_net_pnl_quote(), D("0.294"))
+        held = executor.get_custom_info()["held_position_orders"]
+        self.assertEqual([(h["trade_type"], h["executed_amount_base"], h["executed_amount_quote"]) for h in held],
+                         [("BUY", D("0.7"), D("70"))])
+        # What the orchestrator reads to file the position: the coin is on the buying venue.
+        self.assertEqual((executor.config.connector_name, executor.config.trading_pair, executor.config.side),
+                         ("csx", "SOL-INR", TradeType.BUY))
+
+    async def test_keep_position_with_nothing_to_keep_is_a_plain_stop(self):
+        """An empty held position would only show up as a zero row in the framework's table."""
+        executor = self.make()
+        await self.tick(executor)                       # both legs out, nothing filled
+        executor.early_stop(keep_position=True)
+        await self.tick(executor)
+        self.assertEqual(executor.close_type, CloseType.EARLY_STOP)
 
     async def test_leftover_below_the_venue_minimum_is_reported_not_traded(self):
         # dust_threshold below the venue's own 10 INR minimum: the leftover is worth chasing by

@@ -2,9 +2,10 @@ from decimal import Decimal
 from enum import Enum
 from typing import Literal, Optional
 
-from pydantic import Field, model_validator
+from pydantic import Field, PrivateAttr, model_validator
 
 from hummingbot.connector.utils import split_hb_trading_pair
+from hummingbot.core.data_type.common import TradeType
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair, ExecutorConfigBase
 
 
@@ -97,6 +98,10 @@ class CrossArbExecutorConfig(ExecutorConfigBase):
     # sale is not in any connector, so the net figure needs it from configuration.
     tds_pct: Decimal = Decimal("0")
 
+    # Where a held remainder lives, once the executor keeps one (see mark_held). Not settings.
+    _held_market: Optional[ConnectorPair] = PrivateAttr(default=None)
+    _held_side: TradeType = PrivateAttr(default=TradeType.BUY)
+
     @model_validator(mode="after")
     def validate_markets(self):
         buy_base, buy_quote = split_hb_trading_pair(self.buying_market.trading_pair)
@@ -123,6 +128,27 @@ class CrossArbExecutorConfig(ExecutorConfigBase):
     @property
     def quote_asset(self) -> str:
         return split_hb_trading_pair(self.buying_market.trading_pair)[1]
+
+    # ── what the framework reads from every executor config ──────────────────
+    # ExecutorInfo.trading_pair / .connector_name, and config.side when the orchestrator tracks a
+    # held position. A two-venue attempt has no single answer, so these name where a held remainder
+    # lives: the buying venue for extra coin, the selling venue for coin sold short. Until something
+    # is held they describe the buying side.
+
+    @property
+    def trading_pair(self) -> str:
+        return self.buying_market.trading_pair
+
+    @property
+    def connector_name(self) -> str:
+        return (self._held_market or self.buying_market).connector_name
+
+    @property
+    def side(self) -> TradeType:
+        return self._held_side
+
+    def mark_held(self, market: ConnectorPair, side: TradeType):
+        self._held_market, self._held_side = market, side
 
     @property
     def expected_gross_pct(self) -> Optional[Decimal]:

@@ -50,13 +50,19 @@ class CrossArbConfig(ControllerConfigBase):
 
     # Costs, for the net figure. Measured live on 2026-09-23: CSX taker 0.05%, WazirX 0%, and 1%
     # TDS on the sell at both. A venue missing here is treated as free, which flatters the net
-    # number — set it.
+    # number — set it. gst_pct is added on top of the fee; for CSX and WazirX set it to 0: the live
+    # balances (2026-09-30) matched to the paisa only with CSX's 0.05% as the whole charge.
     taker_fee_pct: Dict[str, Decimal] = Field(default_factory=dict, json_schema_extra={"is_updatable": True})
     gst_pct: Decimal = Field(default=Decimal("18"), json_schema_extra={"is_updatable": True})
     tds_pct: Decimal = Field(default=Decimal("1"), json_schema_extra={"is_updatable": True})
 
-    # Sizing. total_amount_quote is inherited and caps the strategy as a whole.
+    # Sizing. order_amount_quote caps one attempt. total_amount_quote caps the money tied up in
+    # live attempts at once, across every pair. Each attempt gives its money back within seconds,
+    # so this limits exposure at any moment, not turnover — max_trades_per_hour and max_loss_quote
+    # limit the rest. It overrides the framework's default of 100, which would silently shrink
+    # every trade.
     order_amount_quote: Decimal = Field(default=Decimal("10000"), json_schema_extra={"is_updatable": True})
+    total_amount_quote: Decimal = Field(default=Decimal("10000"), json_schema_extra={"is_updatable": True})
     # Both venues enforce a minimum order VALUE that they do not publish: ₹60 on CSX, ₹50 on
     # WazirX (found by being rejected live). The trading rules claim about ₹1, so this is the
     # only guard that stops an order the venue will refuse.
@@ -121,11 +127,17 @@ class Opportunity:
         return self
 
     def as_row(self) -> Dict[str, Any]:
+        # A price we do not have is shown as "-", never as 0: a zero reads like a real quote.
+        priced = self.ask > s_decimal_0 and self.bid > s_decimal_0
+        sized = self.amount > s_decimal_0
         return {
             "pair": self.pair, "buy": self.buy_exchange, "sell": self.sell_exchange,
-            "ask": f"{self.ask:.8g}", "bid": f"{self.bid:.8g}",
-            "gross %": f"{self.gross_pct:.3f}", "net %": f"{self.net_pct:.3f}",
-            "size": f"{self.amount:.8g}", "size quote": f"{self.amount_quote:.2f}",
+            "ask": f"{self.ask:.8g}" if self.ask > s_decimal_0 else "-",
+            "bid": f"{self.bid:.8g}" if self.bid > s_decimal_0 else "-",
+            "gross %": f"{self.gross_pct:.3f}" if priced else "-",
+            "net %": f"{self.net_pct:.3f}" if priced else "-",
+            "size": f"{self.amount:.8g}" if sized else "-",
+            "size quote": f"{self.amount_quote:.2f}" if sized else "-",
             "blocked by": self.blocked_by or "-",
         }
 
@@ -152,6 +164,9 @@ class CrossArbController(ControllerBase):
         self._book_seen: Dict[Tuple[str, str], Tuple[int, float]] = {}   # (venue, pair) -> (uid, when)
         self._rebalance_needs: Dict[str, str] = {}
         self._stopped_reason: Optional[str] = None
+        # Pairs whose last attempt ended keeping a mismatch (mismatch_policy: hold). They stay
+        # paused until the bot restarts: someone has to look at the leftover first.
+        self._paused_pairs: Dict[str, str] = {}
 
     # ── costs ────────────────────────────────────────────────────────────────
 
@@ -216,30 +231,47 @@ class CrossArbController(ControllerBase):
 
         Quantizing per venue separately is what leaves dust behind, so the amount is rounded on
         one venue, then the other, and only accepted if it survives both.
+
+        When the size comes out too small to trade, the refusal names the limit that made it so.
+        If that limit is money — a balance, or the total budget — the fix is a transfer or a
+        setting, and saying "rounds to zero" instead sends the operator looking for a rounding
+        problem.
         """
         pair = opportunity.pair
         base, quote = pair.split("-")
-        wanted = min(
-            self.config.order_amount_quote / opportunity.ask,   # what the operator allows
-            opportunity.ask_qty,                                # what the seller is offering
-            opportunity.bid_qty,                                # what the buyer wants
-            self.available(opportunity.buy_exchange, quote) / opportunity.ask,
-            self.available(opportunity.sell_exchange, base),
-        )
+        budget = self.budget_left()
+        limits = [
+            ("order size", self.config.order_amount_quote / opportunity.ask),
+            ("total budget in use", max(budget, s_decimal_0) / opportunity.ask),
+            ("seller's size", opportunity.ask_qty),
+            ("buyer's size", opportunity.bid_qty),
+            (f"not enough {quote} on {opportunity.buy_exchange}",
+             self.available(opportunity.buy_exchange, quote) / opportunity.ask),
+            (f"not enough {base} on {opportunity.sell_exchange}",
+             self.available(opportunity.sell_exchange, base)),
+        ]
+        binding, wanted = min(limits, key=lambda limit: limit[1])
+        money = binding if binding.startswith(("not enough", "total budget")) else None
         if wanted <= s_decimal_0:
-            return opportunity.block("no balance")
+            return opportunity.block(money or "nothing on offer")
 
         amount = self._quantize_for_both(opportunity, wanted)
         if amount <= s_decimal_0:
-            return opportunity.block("rounds to zero")
+            return opportunity.block(money or "rounds to zero")
 
         opportunity.amount = amount
         opportunity.amount_quote = amount * opportunity.ask
         if opportunity.amount_quote < self.config.min_order_amount_quote:
-            return opportunity.block(f"below min order value ({self.config.min_order_amount_quote})")
+            return opportunity.block(money or f"below min order value ({self.config.min_order_amount_quote})")
         if not self._clears_venue_rules(opportunity):
-            return opportunity.block("below a venue minimum")
+            return opportunity.block(money or "below a venue minimum")
         return opportunity
+
+    def budget_left(self) -> Decimal:
+        """total_amount_quote, less what the live attempts have committed across all pairs."""
+        in_play = sum((executor.config.order_amount * executor.config.buy_price_cap
+                       for executor in self.executors_info if executor.is_active), s_decimal_0)
+        return self.config.total_amount_quote - in_play
 
     def _quantize_for_both(self, opportunity: Opportunity, wanted: Decimal) -> Decimal:
         amount = wanted
@@ -280,19 +312,30 @@ class CrossArbController(ControllerBase):
             "realized_pnl": self._realized_pnl,
             "rebalance_needs": dict(self._rebalance_needs),
             "halted": self._stopped_reason,
+            "paused": dict(self._paused_pairs),
         }
 
     def evaluate(self, pair: str, buy_exchange: str, sell_exchange: str) -> Opportunity:
         opportunity = Opportunity(pair, buy_exchange, sell_exchange)
         buy_book = self.top_of_book(buy_exchange, pair)
         sell_book = self.top_of_book(sell_exchange, pair)
+        # Keep whichever side we do have, and name the venue that is silent: "no fresh book" on
+        # its own left the operator guessing which feed had stopped.
+        if buy_book is not None:
+            _, _, opportunity.ask, opportunity.ask_qty = buy_book
+        if sell_book is not None:
+            opportunity.bid, opportunity.bid_qty, _, _ = sell_book
         if buy_book is None or sell_book is None:
-            return self._skip(opportunity, "no fresh book")
-        _, _, opportunity.ask, opportunity.ask_qty = buy_book
-        opportunity.bid, opportunity.bid_qty, _, _ = sell_book
+            silent = [name for name, book in ((buy_exchange, buy_book), (sell_exchange, sell_book))
+                      if book is None]
+            self._skips["no fresh book"] += 1
+            return opportunity.block(f"no fresh book: {', '.join(silent)}")
 
         opportunity.gross_pct = (opportunity.bid - opportunity.ask) / opportunity.ask * Decimal("100")
         opportunity.net_pct = self.net_pct(opportunity.ask, opportunity.bid, buy_exchange, sell_exchange)
+
+        if pair in self._paused_pairs:
+            return self._skip(opportunity, "paused: holding a mismatch")
 
         measured = opportunity.gross_pct if self.config.trigger_on == TriggerOn.GROSS else opportunity.net_pct
         if measured < self.config.min_profitability * Decimal("100"):
@@ -346,7 +389,15 @@ class CrossArbController(ControllerBase):
             return []
 
         actions: List[ExecutorAction] = []
+        # Sizing saw the budget left by the attempts already live; attempts started in this same
+        # tick, for other pairs, have to come out of it too.
+        budget = self.budget_left()
         for pair in self.config.trading_pairs:
+            if pair in self._paused_pairs:
+                # Checked here as well as when pricing: the attempt that caused the pause is only
+                # counted at the top of this method, after this tick's prices were read.
+                self._skips["paused: holding a mismatch"] += 1
+                continue
             if self.has_live_executor(pair):
                 self._skips["executor already running"] += 1
                 continue
@@ -358,6 +409,10 @@ class CrossArbController(ControllerBase):
             if not candidates:
                 continue
             best = max(candidates, key=lambda o: o.gross_pct)
+            if best.amount_quote > budget:
+                self._skips["total budget in use"] += 1
+                continue
+            budget -= best.amount_quote
             actions.append(self.create_action(best))
             self._last_attempt[pair] = self.market_data_provider.time()
             self._recent_trades.append(self.market_data_provider.time())
@@ -430,6 +485,21 @@ class CrossArbController(ControllerBase):
                 self._consecutive_failures += 1
             elif executor.close_type == CloseType.COMPLETED:
                 self._consecutive_failures = 0
+            elif executor.close_type == CloseType.POSITION_HOLD:
+                self.pause_for_held_mismatch(executor)
+
+    def pause_for_held_mismatch(self, executor):
+        """
+        mismatch_policy: hold keeps a one-sided leftover instead of paying to unwind it. Trading the
+        pair on top of that would pile more on, so the pair stops until someone has looked at it.
+        """
+        pair = executor.config.buying_market.trading_pair
+        held = executor.custom_info.get("imbalance_base", "?")
+        base = pair.split("-")[0]
+        self._paused_pairs[pair] = f"attempt {executor.id} kept {held} {base} unmatched"
+        self.logger().warning(
+            f"cross_arb: {pair} PAUSED — attempt {executor.id} ended holding {held} {base} unmatched "
+            f"(mismatch_policy: hold). Clear it by hand, then restart the bot to trade {pair} again.")
 
     # ── status ───────────────────────────────────────────────────────────────
 
@@ -438,12 +508,14 @@ class CrossArbController(ControllerBase):
         lines = [
             f"\n  Cross-exchange arbitrage | {self.config.exchange_a} <-> {self.config.exchange_b} | "
             f"trigger {self.config.min_profitability * 100:.2f}% on {self.config.trigger_on.value} | "
-            f"size <= {self.config.order_amount_quote}",
+            f"size <= {self.config.order_amount_quote} | in play <= {self.config.total_amount_quote}",
             f"  realised today: {self._realized_pnl:.2f} | failures in a row: {self._consecutive_failures} | "
             f"trades this hour: {self.trades_in_last_hour()}",
         ]
         if self._stopped_reason:
             lines.append(f"  HALTED: {self._stopped_reason}")
+        for pair, reason in self._paused_pairs.items():
+            lines.append(f"  PAUSED {pair}: {reason} — clear it by hand, then restart the bot")
         if opportunities:
             header = f"  {'pair':<10} {'buy':<9} {'sell':<9} {'ask':>12} {'bid':>12} {'gross %':>9} {'net %':>9} {'size':>12} {'blocked by':<28}"
             lines.append(header)

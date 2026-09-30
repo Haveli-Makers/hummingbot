@@ -81,10 +81,13 @@ class CrossArbControllerTests(IsolatedAsyncioWrapperTestCase):
         params.update(overrides)
         return CrossArbController(CrossArbConfig(**params), self.provider, asyncio.Queue())
 
-    def executor(self, active=True, pair=PAIR, close_type=None, pnl=D("0"), executor_id="e1"):
+    def executor(self, active=True, pair=PAIR, close_type=None, pnl=D("0"), executor_id="e1",
+                 amount=D("10"), price=D("99"), custom_info=None):
         return SimpleNamespace(
             id=executor_id, is_active=active, close_type=close_type, net_pnl_quote=pnl,
-            config=SimpleNamespace(buying_market=SimpleNamespace(trading_pair=pair)))
+            custom_info=custom_info or {},
+            config=SimpleNamespace(buying_market=SimpleNamespace(trading_pair=pair),
+                                   order_amount=amount, buy_price_cap=price))
 
     async def opportunities(self, controller):
         await controller.update_processed_data()
@@ -114,7 +117,21 @@ class CrossArbControllerTests(IsolatedAsyncioWrapperTestCase):
         await controller.update_processed_data()          # first look: remembers the snapshot id
         self.now += 11                                    # max_book_age is 10s, id unchanged
         found = await self.opportunities(controller)
-        self.assertEqual(found[("csx", "wazirx")].blocked_by, "no fresh book")
+        self.assertEqual(found[("csx", "wazirx")].blocked_by, "no fresh book: csx, wazirx")
+        self.assertGreater(controller.processed_data["skips"]["no fresh book"], 0)
+
+    async def test_a_stale_row_names_the_silent_venue_and_shows_no_fake_price(self):
+        """B3 live: every row read 'no fresh book' with ask 0 / bid 0, and nothing said which feed."""
+        controller = self.controller()
+        await controller.update_processed_data()
+        self.now += 11
+        self.books[("csx", PAIR)].snapshot_uid += 1       # CSX still talking, WazirX silent
+        found = await self.opportunities(controller)
+        row = found[("csx", "wazirx")]
+        self.assertEqual(row.blocked_by, "no fresh book: wazirx")
+        shown = row.as_row()
+        self.assertEqual(shown["ask"], "99.0")            # CSX's price is real and still shown
+        self.assertEqual((shown["bid"], shown["gross %"], shown["size quote"]), ("-", "-", "-"))
 
     async def test_a_quiet_but_live_book_is_fine(self):
         """Prices repeating is normal here; a new snapshot id is what proves the venue is talking."""
@@ -170,7 +187,46 @@ class CrossArbControllerTests(IsolatedAsyncioWrapperTestCase):
         self.balances[("wazirx", "USDT")] = D("0")
         controller = self.controller()
         found = await self.opportunities(controller)
-        self.assertEqual(found[("csx", "wazirx")].blocked_by, "no balance")
+        self.assertEqual(found[("csx", "wazirx")].blocked_by, "not enough USDT on wazirx")
+
+    async def test_a_balance_too_small_for_one_step_is_named_not_called_rounding(self):
+        """The replay: WazirX ran out of INR and the status said 'rounds to zero' 467 times."""
+        self.balances[("csx", "INR")] = D("0.5")          # less than one 0.01 step at 99
+        controller = self.controller()
+        found = await self.opportunities(controller)
+        self.assertEqual(found[("csx", "wazirx")].blocked_by, "not enough INR on csx")
+
+    async def test_a_balance_below_the_minimum_is_named_too(self):
+        self.balances[("csx", "INR")] = D("50")           # 0.5 USDT, under the 100 minimum
+        controller = self.controller()
+        found = await self.opportunities(controller)
+        self.assertEqual(found[("csx", "wazirx")].blocked_by, "not enough INR on csx")
+
+    # ── the total budget ─────────────────────────────────────────────────────
+
+    async def test_the_total_budget_caps_an_attempt(self):
+        controller = self.controller(order_amount_quote=D("10000"), total_amount_quote=D("500"))
+        found = await self.opportunities(controller)
+        self.assertEqual(found[("csx", "wazirx")].amount, D("5.05"))              # 500 / 99, stepped
+
+    async def test_live_attempts_use_up_the_budget(self):
+        controller = self.controller(total_amount_quote=D("1000"))
+        controller.executors_info = [self.executor(active=True, pair="SOL-INR", amount=D("10"), price=D("99"))]
+        found = await self.opportunities(controller)                              # 990 already in play
+        self.assertEqual(found[("csx", "wazirx")].blocked_by, "total budget in use")
+
+    async def test_attempts_started_together_share_the_budget(self):
+        second = "SOL-INR"
+        self.books[("csx", second)] = FakeBook("98.90", "500", "99.00", "500")
+        self.books[("wazirx", second)] = FakeBook("100.00", "500", "100.10", "500")
+        self.balances.update({("csx", "SOL"): D("1000"), ("wazirx", "SOL"): D("1000")})
+        controller = self.controller(trading_pairs=[PAIR, second], order_amount_quote=D("990"),
+                                     total_amount_quote=D("1500"))
+        await controller.update_processed_data()
+        actions = controller.determine_executor_actions()
+        self.assertEqual(len(actions), 1)                  # 990 + 990 would exceed 1500
+        self.assertEqual(controller.processed_data["skips"].get("total budget in use", 0) +
+                         controller._skips["total budget in use"], 1)
 
     # ── deciding ─────────────────────────────────────────────────────────────
 
@@ -255,6 +311,21 @@ class CrossArbControllerTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(controller.halt_reason(), "trades per hour reached")
         self.now += 3601
         self.assertIsNone(controller.halt_reason())
+
+    async def test_a_held_mismatch_pauses_the_pair(self):
+        """mismatch_policy: hold — the design says the controller pauses that pair; now it does."""
+        controller = self.controller()
+        controller.executors_info = [self.executor(
+            active=False, close_type=CloseType.POSITION_HOLD, pnl=D("0.29"), executor_id="held-1",
+            custom_info={"imbalance_base": D("0.7")})]
+        await controller.update_processed_data()          # priced before the held attempt is counted
+        self.assertEqual(controller.determine_executor_actions(), [])
+        await controller.update_processed_data()          # and from now on it shows in the table
+        found = {(o.buy_exchange, o.sell_exchange): o for o in controller.processed_data["opportunities"]}
+        self.assertEqual(found[("csx", "wazirx")].blocked_by, "paused: holding a mismatch")
+        self.assertEqual(controller.determine_executor_actions(), [])
+        self.assertIn("PAUSED USDT-INR", "\n".join(controller.to_format_status()))
+        self.assertEqual(controller._realized_pnl, D("0.29"))   # the kept coin is not counted as a loss
 
     async def test_finished_attempts_are_counted_once(self):
         controller = self.controller()

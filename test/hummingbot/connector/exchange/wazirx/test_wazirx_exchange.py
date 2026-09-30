@@ -1005,3 +1005,29 @@ async def test_all_trade_updates_for_order_and_request_order_status():
     tu = updates[0]
     assert tu.trade_id == "1"
     assert float(tu.fill_price) == 123.0
+
+
+@pytest.mark.asyncio
+async def test_trade_fee_currency_is_upper_cased():
+    """
+    WazirX reports feeCurrency in lower case ("inr"). Left as it is, the fee is in a currency
+    nothing else in Hummingbot knows: every fee lookup asks the rate oracle for inr-INR, fails and
+    logs an ERROR — 3,101 of them in 90 seconds on the first live cross-arb run.
+    """
+    from unittest.mock import AsyncMock
+    exchange = WazirxExchange("k", "s", trading_pairs=["USDT-INR"])
+    order = InFlightOrder("c1", "USDT-INR", OrderType.LIMIT, TradeType.SELL, Decimal("1.19"), 0,
+                          price=Decimal("99.98"), exchange_order_id="5036007276")
+    # The shape of the live fill (GET /sapi/v1/myTrades, 2026-09-30).
+    live_fill = [{"id": 422191424, "symbol": "usdtinr", "price": "99.98", "qty": "1.19", "quoteQty": "118.9762",
+                  "fee": "0.00", "feeCurrency": "inr", "tdsAmount": "1.19", "tdsCurrency": "inr",
+                  "side": "sell", "orderId": 5036007276, "time": 1790763830000}]
+    exchange._wazirx_request = AsyncMock(return_value=live_fill)
+
+    fee = (await exchange._all_trade_updates_for_order(order))[0].fee
+
+    assert fee.percent_token == "INR"
+    assert [flat.token for flat in fee.flat_fees] == ["INR"]
+    # In the order's own quote currency, so no exchange rate is needed and nothing can fail.
+    assert fee.fee_amount_in_token(trading_pair="USDT-INR", price=Decimal("99.98"),
+                                   order_amount=Decimal("1.19"), token="INR") == Decimal("0")

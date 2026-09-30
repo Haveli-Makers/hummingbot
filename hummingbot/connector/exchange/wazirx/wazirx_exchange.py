@@ -863,14 +863,18 @@ class WazirxExchange(WalletTransferExecutorMixin, ExchangePyBase):
                 trades = resp if isinstance(resp, list) else resp.get("trades", [])
 
                 for trade in trades:
+                    # WazirX sends the fee currency in lower case ("inr"). Hummingbot compares
+                    # tokens exactly, so "inr" is a currency it cannot price: every fee lookup then
+                    # asks the rate oracle for inr-INR and logs an error.
+                    fee_token = str(trade.get("feeCurrency", trade.get("commissionAsset", ""))).upper()
                     fee = TradeFeeBase.new_spot_fee(
                         fee_schema=self.trade_fee_schema(),
                         trade_type=order.trade_type,
-                        percent_token=trade.get("feeCurrency", trade.get("commissionAsset", "")),
+                        percent_token=fee_token,
                         flat_fees=[
                             TokenAmount(
                                 amount=Decimal(trade.get("fee", trade.get("commission", "0"))),
-                                token=trade.get("feeCurrency", trade.get("commissionAsset", "")),
+                                token=fee_token,
                             )
                         ],
                     )

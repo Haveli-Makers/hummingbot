@@ -15,6 +15,7 @@ from hummingbot.core.volume_oracle.sources.coinex_volume_source import CoinexVol
 from hummingbot.core.volume_oracle.sources.coinswitch_volume_source import CoinswitchVolumeSource
 from hummingbot.core.volume_oracle.sources.csx_volume_source import CsxVolumeSource
 from hummingbot.core.volume_oracle.sources.cube_volume_source import CubeVolumeSource
+from hummingbot.core.volume_oracle.sources.delta_perpetual_volume_source import DeltaPerpetualVolumeSource
 from hummingbot.core.volume_oracle.sources.derive_volume_source import DeriveVolumeSource
 from hummingbot.core.volume_oracle.sources.dexalot_volume_source import DexalotVolumeSource
 from hummingbot.core.volume_oracle.sources.gate_io_volume_source import GateIoVolumeSource
@@ -39,6 +40,7 @@ VOLUME_ORACLE_SOURCES = {
     "coinswitch": CoinswitchVolumeSource,
     "csx": CsxVolumeSource,
     "cube": CubeVolumeSource,
+    "delta_perpetual": DeltaPerpetualVolumeSource,
     "derive": DeriveVolumeSource,
     "dexalot": DexalotVolumeSource,
     "gate_io": GateIoVolumeSource,

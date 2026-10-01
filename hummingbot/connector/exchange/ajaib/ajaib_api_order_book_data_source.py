@@ -50,21 +50,56 @@ class AjaibAPIOrderBookDataSource(OrderBookTrackerDataSource):
         return await self._connector.get_last_traded_prices(trading_pairs=trading_pairs)
 
     async def _order_book_snapshot(self, trading_pair: str) -> OrderBookMessage:
-        # GET /v1/depth works on both environments, so seed a REAL book rather
-        # than an empty one. Seeding empty used to let the tracker report itself
-        # ready while holding 0 bids / 0 asks, and a strategy would start quoting
-        # against nothing.
-        symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-        snapshot = await self._connector._api_get(
-            path_url=CONSTANTS.DEPTH_PATH_URL,
-            params={"symbol": symbol, "limit": CONSTANTS.DEPTH_SNAPSHOT_LIMIT},
-            is_auth_required=True,
-        )
+        """
+        Seed the book from GET /v1/depth, so the tracker does not report ready
+        while holding 0 bids / 0 asks and a strategy quote against nothing.
+
+        The order book tracker calls this exactly ONCE per pair and never
+        retries: if it raises, that book is never initialised and the connector
+        can never become ready. Both calls below go through the allowlisted
+        proxy, which drops connections intermittently, so:
+
+          * a transient failure (the request, or the symbol map failing to load)
+            is retried with backoff, and as a last resort the book starts empty
+            and the @depth20 stream populates it -- never a dead connector;
+          * a pair that is genuinely not listed fails fast with a message that
+            says so, since no amount of retrying can help.
+        """
+        attempts = CONSTANTS.DEPTH_SNAPSHOT_MAX_ATTEMPTS
+        delay = 1.0
+        error: Any = None
+        for attempt in range(1, attempts + 1):
+            try:
+                symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+                snapshot = await self._connector._api_get(
+                    path_url=CONSTANTS.DEPTH_PATH_URL,
+                    params={"symbol": symbol, "limit": CONSTANTS.DEPTH_SNAPSHOT_LIMIT},
+                    is_auth_required=True,
+                )
+                return AjaibOrderBook.snapshot_message_from_exchange(
+                    snapshot, time.time(), metadata={"trading_pair": trading_pair})
+            except asyncio.CancelledError:
+                raise
+            except KeyError:
+                if self._connector.trading_pair_symbol_map_ready():
+                    raise ValueError(
+                        f"{trading_pair} is not listed on Ajaib: it is absent from /v1/exchange-info. "
+                        f"Check the pair, or whether it has been delisted.") from None
+                error = "the symbol map is unavailable (the exchange-info request failed)"
+            except Exception as exception:
+                error = exception
+            if attempt < attempts:
+                self.logger().warning(
+                    f"Order book snapshot for {trading_pair} failed (attempt {attempt}/{attempts}): "
+                    f"{error}. Retrying in {delay:.0f}s.")
+                await self._sleep(delay)
+                delay *= 2
+
+        self.logger().warning(
+            f"Could not seed the {trading_pair} order book after {attempts} attempts ({error}). "
+            f"Starting it empty; the @{CONSTANTS.WS_DEPTH_STREAM_SUFFIX} stream will populate it.")
         return AjaibOrderBook.snapshot_message_from_exchange(
-            snapshot,
-            time.time(),
-            metadata={"trading_pair": trading_pair},
-        )
+            {"bids": [], "asks": []}, time.time(), metadata={"trading_pair": trading_pair})
 
     async def _get_listen_key(self) -> str:
         rest_assistant = await self._api_factory.get_rest_assistant()

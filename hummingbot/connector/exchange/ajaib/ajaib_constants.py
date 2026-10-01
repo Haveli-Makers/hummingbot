@@ -50,6 +50,10 @@ DEPTH_PATH_URL = "/v1/depth"
 # Levels requested when seeding a book from REST. Matches WS_DEPTH_STREAM_SUFFIX
 # so the seed and the stream that replaces it describe the same depth.
 DEPTH_SNAPSHOT_LIMIT = 20
+# Attempts to seed a book before falling back to an empty one (1s, 2s, 4s
+# between them). The tracker never retries a failed seed, so this is the only
+# place a dropped request at startup can be recovered.
+DEPTH_SNAPSHOT_MAX_ATTEMPTS = 4
 # Note the hyphen and the PLURAL ``symbols`` parameter (max 50 per call);
 # "/v1/ticker/bookTicker" does not exist and 404s at the gateway.
 BOOK_TICKER_PATH_URL = "/v1/ticker/book-ticker"

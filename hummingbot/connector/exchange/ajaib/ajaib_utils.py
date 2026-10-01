@@ -5,6 +5,7 @@ from typing import Any, Dict
 from pydantic import ConfigDict, Field, SecretStr
 
 from hummingbot.client.config.config_data_types import BaseConnectorConfigMap
+from hummingbot.connector.exchange.ajaib import ajaib_constants as CONSTANTS
 from hummingbot.core.data_type.trade_fee import TradeFeeSchema
 
 CENTRALIZED = True
@@ -112,3 +113,55 @@ class AjaibConfigMap(BaseConnectorConfigMap):
 
 
 KEYS = AjaibConfigMap.model_construct()
+
+
+class AjaibTestnetConfigMap(BaseConnectorConfigMap):
+    """
+    Lets the client select Ajaib's testnet as its own connector, ``ajaib_testnet``.
+
+    Testnet uses DIFFERENT credentials from mainnet (its own API key and its own
+    Ed25519 PEM), so it gets separate fields rather than reusing the mainnet ones.
+    The client maps ``ajaib_testnet_*`` back onto the constructor's ``ajaib_*``
+    parameters and passes ``domain=OTHER_DOMAINS_PARAMETER["ajaib_testnet"]``.
+    """
+    connector: str = CONSTANTS.TESTNET_DOMAIN
+    ajaib_testnet_api_key: SecretStr = Field(
+        default=...,
+        json_schema_extra={
+            "prompt": lambda cm: "Enter your Ajaib TESTNET API key",
+            "is_secure": True,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        }
+    )
+    ajaib_testnet_api_secret: SecretStr = Field(
+        default=...,
+        json_schema_extra={
+            "prompt": lambda cm: ("Enter the path to your Ajaib TESTNET Ed25519 private key PEM file "
+                                  "(or paste the PEM contents)"),
+            "is_secure": True,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        }
+    )
+    ajaib_testnet_proxy_url: SecretStr = Field(
+        default=SecretStr(""),
+        json_schema_extra={
+            "prompt": lambda cm: (
+                "Enter a proxy URL to route Ajaib testnet traffic through an IP-allowlisted "
+                "egress (e.g. http://user:pass@host:3128), or leave blank to connect directly"
+            ),
+            "is_secure": True,
+            # Must stay True, for the same reason as ajaib_proxy_url above.
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        }
+    )
+    model_config = ConfigDict(title=CONSTANTS.TESTNET_DOMAIN)
+
+
+OTHER_DOMAINS = [CONSTANTS.TESTNET_DOMAIN]
+OTHER_DOMAINS_PARAMETER = {CONSTANTS.TESTNET_DOMAIN: CONSTANTS.TESTNET_DOMAIN}
+OTHER_DOMAINS_EXAMPLE_PAIR = {CONSTANTS.TESTNET_DOMAIN: EXAMPLE_PAIR}
+OTHER_DOMAINS_DEFAULT_FEES = {CONSTANTS.TESTNET_DOMAIN: DEFAULT_FEES}
+OTHER_DOMAINS_KEYS = {CONSTANTS.TESTNET_DOMAIN: AjaibTestnetConfigMap.model_construct()}

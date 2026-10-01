@@ -184,12 +184,62 @@ class AjaibExchangeTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual("105.5", prices[0]["bidPrice"])
         self.assertEqual("105.5", prices[0]["askPrice"])
 
+    async def test_failed_book_ticker_batch_warns_and_falls_back_to_klines(self):
+        """
+        A failed batch used to be logged at DEBUG, so the connector would quietly
+        drop to one klines call per symbol -- and klines have no bid/ask, so the
+        rate oracle would report zero spread with nothing in the logs.
+        """
+        self.exchange._make_trading_pairs_request = AsyncMock(return_value={"symbols": [_symbol_info()]})
+
+        async def api_get(path_url, **kwargs):
+            if path_url == CONSTANTS.BOOK_TICKER_PATH_URL:
+                raise IOError("HTTP status is 401. Error: {\"code\":-1022}")
+            return [[1700000000000, "100", "110", "90", "105.5", "1000", 1700000059999]]
+
+        self.exchange._api_get = AsyncMock(side_effect=api_get)
+
+        with self.assertLogs(self.exchange.logger(), level="WARNING") as logs:
+            prices = await self.exchange.get_all_pairs_prices()
+
+        self.assertTrue(any("book-ticker batch 0" in line and "falling back" in line
+                            for line in logs.output), logs.output)
+        self.assertEqual("105.5", prices[0]["bidPrice"])  # served by the klines fallback
+
     async def test_get_last_traded_price(self):
         self._bootstrap()
         self.exchange._api_get = AsyncMock(return_value=[
             [1700000000000, "100", "110", "90", "61234.5", "1000", 1700000059999]])
         price = await self.exchange._get_last_traded_price(self.trading_pair)
         self.assertEqual(61234.5, price)
+
+
+class AjaibDomainNameTests(TestCase):
+    """The client keys connectors, balances and fee schemas by name."""
+
+    def _exchange(self, **kwargs):
+        return AjaibExchange(ajaib_api_key="k", ajaib_api_secret="s",
+                             trading_pairs=[], trading_required=False, **kwargs)
+
+    def test_mainnet_is_named_ajaib(self):
+        self.assertEqual("ajaib", self._exchange().name)
+
+    def test_testnet_is_named_ajaib_testnet(self):
+        self.assertEqual("ajaib_testnet", self._exchange(domain=CONSTANTS.TESTNET_DOMAIN).name)
+
+    def test_client_discovers_testnet_and_can_price_its_fees(self):
+        """
+        Fee lookup raises for a name the client has not registered, so renaming
+        the testnet connector is only safe because OTHER_DOMAINS registers it.
+        """
+        from hummingbot.client.config.trade_fee_schema_loader import TradeFeeSchemaLoader
+        from hummingbot.client.settings import AllConnectorSettings
+
+        settings = AllConnectorSettings.create_connector_settings()
+        self.assertIn("ajaib_testnet", settings)
+        self.assertEqual("ajaib", settings["ajaib_testnet"].parent_name)
+        self.assertEqual(CONSTANTS.TESTNET_DOMAIN, settings["ajaib_testnet"].domain_parameter)
+        TradeFeeSchemaLoader.configured_schema_for_exchange("ajaib_testnet")  # must not raise
 
 
 class AjaibOrderStateResolutionTests(TestCase):

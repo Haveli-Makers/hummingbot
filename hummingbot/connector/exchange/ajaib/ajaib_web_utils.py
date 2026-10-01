@@ -60,15 +60,15 @@ def _build_connections_factory(proxy_url: Optional[str], domain: str = CONSTANTS
     import cost.
 
     TLS verification is disabled for TESTNET ONLY, because Ajaib's testnet
-    certificate is expired and no compliant client will complete the handshake.
-    Mainnet is structurally incapable of running unverified -- see the assert
-    below -- so this cannot silently become the default for real funds.
+    certificate was expired and no compliant client would complete the
+    handshake. ``verify_ssl`` is derived from the domain alone, so only the
+    testnet domain can relax it: mainnet and any unrecognised domain always
+    verify, and this cannot silently become the default for real funds. The
+    TLS-scoping tests in test_ajaib_web_utils.py pin that down.
     """
     if proxy_url:
         from hummingbot.core.web_assistant.connections.proxy_connections_factory import ProxyConnectionsFactory
-        verify_ssl = not is_testnet(domain)
-        assert verify_ssl or is_testnet(domain), "TLS may only be relaxed on testnet"
-        return ProxyConnectionsFactory(proxy_url=proxy_url, verify_ssl=verify_ssl)
+        return ProxyConnectionsFactory(proxy_url=proxy_url, verify_ssl=not is_testnet(domain))
 
     from hummingbot.core.web_assistant.connections.connections_factory import ConnectionsFactory
     return ConnectionsFactory()

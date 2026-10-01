@@ -89,7 +89,13 @@ class AjaibExchange(ExchangePyBase):
 
     @property
     def name(self) -> str:
-        return "ajaib"
+        # The client keys connectors, balances, events AND fee schemas by name,
+        # and the fee lookup raises for an unregistered name. So the testnet
+        # domain must report "ajaib_testnet" (registered via OTHER_DOMAINS in
+        # ajaib_utils), never pass itself off as mainnet "ajaib".
+        if self._domain == CONSTANTS.TESTNET_DOMAIN:
+            return CONSTANTS.TESTNET_DOMAIN
+        return CONSTANTS.EXCHANGE_NAME
 
     @property
     def rate_limits_rules(self):
@@ -210,8 +216,13 @@ class AjaibExchange(ExchangePyBase):
                     params={"symbols": json.dumps(batch)},
                     is_auth_required=True)
             except Exception as exception:
-                self.logger().debug(
-                    f"book-ticker batch {start // batch_size} failed: {exception}")
+                # WARNING, not debug: a failed batch silently falls back to one
+                # /v1/klines call per symbol (up to 50 per refresh), and klines
+                # carry no bid/ask, so the rate oracle would show zero spread.
+                # That degradation must be visible in the logs.
+                self.logger().warning(
+                    f"book-ticker batch {start // batch_size} ({len(batch)} symbols) failed; "
+                    f"falling back to per-symbol klines, which carry no bid/ask. Error: {exception}")
                 continue
 
             for ticker in tickers if isinstance(tickers, list) else []:

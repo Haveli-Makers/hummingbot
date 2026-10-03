@@ -386,6 +386,3 @@ hummingbot/core/web_assistant/connections/proxy_connections_factory.py
 ```
 
 ---
-
-*This document was written alongside the `feat/proxy-server-support` PR.*
-*For questions, see that PR's description or the inline code comments.*

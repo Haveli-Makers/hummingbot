@@ -1,0 +1,167 @@
+import uuid
+from decimal import Decimal
+from typing import Any, Dict
+
+from pydantic import ConfigDict, Field, SecretStr
+
+from hummingbot.client.config.config_data_types import BaseConnectorConfigMap
+from hummingbot.connector.exchange.ajaib import ajaib_constants as CONSTANTS
+from hummingbot.core.data_type.trade_fee import TradeFeeSchema
+
+CENTRALIZED = True
+EXAMPLE_PAIR = "BTC-IDR"
+
+DEFAULT_FEES = TradeFeeSchema(
+    maker_percent_fee_decimal=Decimal("0.001"),
+    taker_percent_fee_decimal=Decimal("0.001"),
+    buy_percent_fee_deducted_from_returns=True
+)
+
+
+def is_exchange_information_valid(exchange_info: Dict[str, Any]) -> bool:
+    """
+    Validate if exchange market information is valid for trading.
+
+    Ajaib exchange-info symbol format:
+    {
+        "symbol": "BTC_USDT",
+        "baseAsset": "BTC",
+        "quoteAsset": "USDT",
+        "isSpotTradingAllowed": true,
+        "filters": [...]
+    }
+    """
+    if not exchange_info.get("isSpotTradingAllowed", False):
+        return False
+
+    filters = exchange_info.get("filters", [])
+    for f in filters:
+        if f.get("filterType") == "LOT_SIZE":
+            try:
+                min_qty = float(f.get("minQty", 0))
+                max_qty = float(f.get("maxQty", 0))
+                if min_qty < 0 or max_qty <= 0:
+                    return False
+            except (ValueError, TypeError):
+                return False
+
+    return bool(exchange_info.get("symbol"))
+
+
+def ajaib_symbol_to_hb_pair(symbol: str) -> str:
+    """
+    Converts Ajaib symbol format to Hummingbot trading pair format.
+    Ajaib uses "BTC_USDT", Hummingbot uses "BTC-USDT".
+    """
+    return symbol.replace("_", "-")
+
+
+def hb_pair_to_ajaib_symbol(hb_pair: str) -> str:
+    """
+    Converts Hummingbot trading pair format to Ajaib symbol format.
+    Hummingbot uses "BTC-USDT", Ajaib uses "BTC_USDT".
+    """
+    return hb_pair.replace("-", "_")
+
+
+def generate_client_order_id() -> str:
+    """
+    Ajaib requires ``newClientOrderId`` in UUIDv4 form, so the connector uses a
+    UUIDv4 as Hummingbot's client order id (strategies treat the id as opaque).
+    """
+    return str(uuid.uuid4())
+
+
+class AjaibConfigMap(BaseConnectorConfigMap):
+    connector: str = "ajaib"
+    ajaib_api_key: SecretStr = Field(
+        default=...,
+        json_schema_extra={
+            "prompt": lambda cm: "Enter your Ajaib API key",
+            "is_secure": True,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        }
+    )
+    ajaib_api_secret: SecretStr = Field(
+        default=...,
+        json_schema_extra={
+            "prompt": lambda cm: "Enter the path to your Ajaib Ed25519 private key PEM file (or paste the PEM contents)",
+            "is_secure": True,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        }
+    )
+    ajaib_proxy_url: SecretStr = Field(
+        default=SecretStr(""),
+        json_schema_extra={
+            "prompt": lambda cm: (
+                "Enter a proxy URL to route Ajaib traffic through an IP-allowlisted egress "
+                "(e.g. http://user:pass@host:3128), or leave blank to connect directly"
+            ),
+            "is_secure": True,
+            # Must stay True. Fields flagged False are prompted and stored but
+            # DROPPED before reaching the connector constructor, so the proxy
+            # would be silently ignored and `connect ajaib` would validate the
+            # keys over a direct connection -- which Ajaib rejects with 403
+            # because only the proxy's IP is allowlisted.
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        }
+    )
+    model_config = ConfigDict(title="ajaib")
+
+
+KEYS = AjaibConfigMap.model_construct()
+
+
+class AjaibTestnetConfigMap(BaseConnectorConfigMap):
+    """
+    Lets the client select Ajaib's testnet as its own connector, ``ajaib_testnet``.
+
+    Testnet uses DIFFERENT credentials from mainnet (its own API key and its own
+    Ed25519 PEM), so it gets separate fields rather than reusing the mainnet ones.
+    The client maps ``ajaib_testnet_*`` back onto the constructor's ``ajaib_*``
+    parameters and passes ``domain=OTHER_DOMAINS_PARAMETER["ajaib_testnet"]``.
+    """
+    connector: str = CONSTANTS.TESTNET_DOMAIN
+    ajaib_testnet_api_key: SecretStr = Field(
+        default=...,
+        json_schema_extra={
+            "prompt": lambda cm: "Enter your Ajaib TESTNET API key",
+            "is_secure": True,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        }
+    )
+    ajaib_testnet_api_secret: SecretStr = Field(
+        default=...,
+        json_schema_extra={
+            "prompt": lambda cm: ("Enter the path to your Ajaib TESTNET Ed25519 private key PEM file "
+                                  "(or paste the PEM contents)"),
+            "is_secure": True,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        }
+    )
+    ajaib_testnet_proxy_url: SecretStr = Field(
+        default=SecretStr(""),
+        json_schema_extra={
+            "prompt": lambda cm: (
+                "Enter a proxy URL to route Ajaib testnet traffic through an IP-allowlisted "
+                "egress (e.g. http://user:pass@host:3128), or leave blank to connect directly"
+            ),
+            "is_secure": True,
+            # Must stay True, for the same reason as ajaib_proxy_url above.
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        }
+    )
+    model_config = ConfigDict(title=CONSTANTS.TESTNET_DOMAIN)
+
+
+OTHER_DOMAINS = [CONSTANTS.TESTNET_DOMAIN]
+OTHER_DOMAINS_PARAMETER = {CONSTANTS.TESTNET_DOMAIN: CONSTANTS.TESTNET_DOMAIN}
+OTHER_DOMAINS_EXAMPLE_PAIR = {CONSTANTS.TESTNET_DOMAIN: EXAMPLE_PAIR}
+OTHER_DOMAINS_DEFAULT_FEES = {CONSTANTS.TESTNET_DOMAIN: DEFAULT_FEES}
+OTHER_DOMAINS_KEYS = {CONSTANTS.TESTNET_DOMAIN: AjaibTestnetConfigMap.model_construct()}

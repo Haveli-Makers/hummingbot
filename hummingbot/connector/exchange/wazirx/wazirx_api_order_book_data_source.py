@@ -100,12 +100,19 @@ class WazirxAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     async def listen_for_subscriptions(self):
         """
-        Listen for order book subscription updates.
+        WazirX uses REST polling — no WebSocket subscriptions needed.
         """
-        snapshot_queue = self._message_queue[self._snapshot_messages_queue_key]
+        while True:
+            await self._sleep(3600)
+
+    async def listen_for_order_book_snapshots(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
+        """
+        Poll the WazirX REST depth endpoint every snapshot_poll_interval seconds
+        and feed OrderBookMessage objects directly into the tracker output queue.
+        """
         while True:
             try:
-                await self._request_order_book_snapshots(output=snapshot_queue)
+                await self._request_order_book_snapshots(output=output)
                 await self._sleep(self._snapshot_poll_interval)
             except asyncio.CancelledError:
                 raise

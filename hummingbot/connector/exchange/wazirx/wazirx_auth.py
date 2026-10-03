@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import time
 from typing import Any, Dict, Optional
+from urllib.parse import urlencode
 
 import aiohttp
 
@@ -58,8 +59,14 @@ class WazirxAuth(AuthBase):
     def _generate_query_string(self, params: Dict[str, Any]) -> str:
         """
         Generate query string from parameters, preserving order.
+
+        Values are URL-encoded (the canonical WazirX/Binance scheme). This is required for
+        parameters that contain reserved characters such as the ``+`` and ``@`` in sub-account
+        emails: in a form-urlencoded body an unencoded ``+`` is decoded by the server as a space,
+        which would make the recomputed signature mismatch ("Signature is incorrect"). For
+        alphanumeric params (e.g. order fields) this produces the same string as before.
         """
-        return "&".join([f"{k}={v}" for k, v in params.items()])
+        return urlencode(params)
 
     def generate_signature(self, query_string: str) -> str:
         """Generate HMAC-SHA256 signature from query string."""

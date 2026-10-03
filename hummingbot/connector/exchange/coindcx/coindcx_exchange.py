@@ -17,15 +17,23 @@ from hummingbot.connector.exchange.coindcx.coindcx_auth import CoinDCXAuth
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
+from hummingbot.connector.wallet_transfer.wallet_transfer_data_types import (
+    TransferState,
+    TransferType,
+    TransferUpdate,
+    WalletTransfer,
+)
+from hummingbot.connector.wallet_transfer.wallet_transfer_executor import WalletTransferExecutorMixin
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
+from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
 
-class CoindcxExchange(ExchangePyBase):
+class CoindcxExchange(WalletTransferExecutorMixin, ExchangePyBase):
     """
     CoinDCX exchange connector implementation.
     Supports spot trading on CoinDCX exchange.
@@ -35,9 +43,19 @@ class CoindcxExchange(ExchangePyBase):
 
     web_utils = web_utils
 
+    # Wallet-transfer capabilities (see WalletTransferExecutorMixin)
+    supports_sub_to_master_transfer = True
+    supports_master_to_sub_transfer = True
+    # The sub/master coindcx_id can be resolved from the configured credentials (users/info), so
+    # callers may omit the sub id — no need to prompt for it.
+    requires_explicit_sub_account = False
+    supports_withdrawal = False  # CoinDCX does not expose an external withdrawal endpoint
+
     def __init__(self,
                  coindcx_api_key: str,
                  coindcx_api_secret: str,
+                 coindcx_master_api_key: Optional[str] = None,
+                 coindcx_master_api_secret: Optional[str] = None,
                  balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
                  rate_limits_share_pct: Decimal = Decimal("100"),
                  trading_pairs: Optional[List[str]] = None,
@@ -46,6 +64,11 @@ class CoindcxExchange(ExchangePyBase):
                  ):
         self.api_key = coindcx_api_key
         self.secret_key = coindcx_api_secret
+        self._master_api_key = coindcx_master_api_key or None
+        self._master_api_secret = coindcx_master_api_secret or None
+        self._master_account_id: Optional[str] = None
+        self._own_account_id: Optional[str] = None  # this (primary/sub) account's coindcx_id
+        self._master_web_assistants_factory: Optional[WebAssistantsFactory] = None
         self._domain = domain
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
@@ -271,6 +294,146 @@ class CoindcxExchange(ExchangePyBase):
             connector=self,
             api_factory=self._web_assistants_factory,
             domain=self.domain,
+        )
+
+    # ------------------------------------------------------------------
+    # Wallet transfer support
+    # ------------------------------------------------------------------
+    @property
+    def _master_authenticator(self) -> CoinDCXAuth:
+        return CoinDCXAuth(
+            api_key=self._master_api_key,
+            secret_key=self._master_api_secret,
+            time_provider=self._time_synchronizer,
+        )
+
+    @property
+    def _master_web_factory(self) -> WebAssistantsFactory:
+        if self._master_web_assistants_factory is None:
+            self._master_web_assistants_factory = web_utils.build_api_factory(
+                throttler=self._throttler,
+                time_synchronizer=self._time_synchronizer,
+                domain=self._domain,
+                auth=self._master_authenticator,
+            )
+        return self._master_web_assistants_factory
+
+    def _verify_master_credentials(self) -> None:
+        if not self._master_api_key or not self._master_api_secret:
+            raise ValueError(
+                "CoinDCX master account API key and secret are required for sub-account to master "
+                "transfers. Configure coindcx_master_api_key and coindcx_master_api_secret."
+            )
+
+    async def _master_post(self, path_url: str, data: Dict[str, Any]) -> Any:
+        """POST to a private endpoint signed with the master-account credentials."""
+        rest_assistant = await self._master_web_factory.get_rest_assistant()
+        url = web_utils.private_rest_url(path_url, domain=self._domain)
+        return await rest_assistant.execute_request(
+            url=url,
+            data=data,
+            method=RESTMethod.POST,
+            is_auth_required=True,
+            throttler_limit_id=path_url,
+        )
+
+    async def get_user_info(self, use_master: bool = False) -> Dict[str, Any]:
+        """
+        Fetch the account profile from POST /exchange/v1/users/info
+        (coindcx_id, first_name, last_name, email, mobile_number).
+
+        :param use_master: sign with the master credentials instead of the primary ones
+        """
+        if use_master:
+            self._verify_master_credentials()
+            response = await self._master_post(CONSTANTS.USER_INFO_PATH_URL, data={})
+        else:
+            response = await self._api_post(
+                path_url=CONSTANTS.USER_INFO_PATH_URL,
+                data={},
+                is_auth_required=True,
+            )
+        return response[0] if isinstance(response, list) else response
+
+    async def get_balances(self, use_master: bool = False, non_zero_only: bool = True) -> List[Dict[str, Any]]:
+        """
+        Fetch wallet balances from POST /exchange/v1/users/balances as a raw list of
+        ``{"currency", "balance", "locked_balance"}`` records.
+
+        :param use_master: sign with the master credentials instead of the primary ones
+        :param non_zero_only: drop assets whose free and locked balances are both zero
+        """
+        if use_master:
+            self._verify_master_credentials()
+            response = await self._master_post(CONSTANTS.USER_BALANCES_PATH_URL, data={})
+        else:
+            response = await self._api_post(
+                path_url=CONSTANTS.USER_BALANCES_PATH_URL,
+                data={},
+                is_auth_required=True,
+            )
+        balances = response if isinstance(response, list) else response.get("balances", [])
+        if non_zero_only:
+            balances = [
+                entry for entry in balances
+                if Decimal(str(entry.get("balance", 0))) != 0 or Decimal(str(entry.get("locked_balance", 0))) != 0
+            ]
+        return balances
+
+    async def _get_master_account_id(self) -> str:
+        """Resolve the master account's coindcx_id via users/info signed with the master creds."""
+        if self._master_account_id is None:
+            record = await self.get_user_info(use_master=True)
+            self._master_account_id = str(record.get("coindcx_id"))
+        return self._master_account_id
+
+    async def _get_own_account_id(self) -> str:
+        """Resolve this (primary/sub) account's coindcx_id via users/info signed with its own creds."""
+        if self._own_account_id is None:
+            record = await self.get_user_info(use_master=False)
+            self._own_account_id = str(record.get("coindcx_id"))
+        return self._own_account_id
+
+    async def _place_internal_transfer(self, transfer: WalletTransfer, **kwargs) -> TransferUpdate:
+        """
+        Transfer funds between the master account and a sub-account (either direction) using
+        master credentials. CoinDCX identifies accounts by coindcx_id. Either side may be omitted:
+        the master side defaults to the id resolved from the master creds (users/info), and the sub
+        side defaults to this connector's own id resolved from its primary creds. Explicitly
+        provided ids always take precedence.
+        """
+        if transfer.transfer_type == TransferType.MASTER_TO_SUB:
+            transfer.source = transfer.source or await self._get_master_account_id()
+            transfer.destination = transfer.destination or await self._get_own_account_id()
+        else:  # SUB_TO_MASTER
+            transfer.source = transfer.source or await self._get_own_account_id()
+            transfer.destination = transfer.destination or await self._get_master_account_id()
+
+        data = {
+            "from_account_id": transfer.source,
+            "to_account_id": transfer.destination,
+            "currency_short_name": transfer.asset.upper(),
+            "amount": float(transfer.amount),
+        }
+        resp = await self._master_post(CONSTANTS.SUB_ACCOUNT_TRANSFER_PATH_URL, data=data)
+
+        # The docs describe {"status": "success", "message": 200} but the live API swaps the
+        # fields ({"message": "success", "status": 200}), so accept "success" in either one,
+        # or any 2xx numeric status/code.
+        if isinstance(resp, dict):
+            indicators = {str(resp.get(key, "")).strip().lower() for key in ("status", "message")}
+            numeric_codes = [
+                int(value) for value in (resp.get("status"), resp.get("code"))
+                if isinstance(value, int) or (isinstance(value, str) and value.isdigit())
+            ]
+            is_success = "success" in indicators or any(200 <= code < 300 for code in numeric_codes)
+            if not is_success:
+                raise IOError(f"CoinDCX rejected the transfer: {resp}")
+
+        return TransferUpdate(
+            client_transfer_id=transfer.client_transfer_id,
+            new_state=TransferState.COMPLETED,
+            update_timestamp=self.current_timestamp,
         )
 
     def _get_fee(self,

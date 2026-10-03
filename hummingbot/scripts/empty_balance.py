@@ -30,6 +30,7 @@ SUPPORTED_CONNECTORS = sorted(
 ORDER_TYPES = ("market", "limit")
 MODES = ("dry_run", "live")
 RESULT_MARKER = "EMPTY_BALANCE_RESULT "
+ERROR_MARKER = "EMPTY_BALANCE_ERROR "
 ORDER_ACK_TIMEOUT_SEC = 30
 WORKFLOW_RUN_TIMEOUT_SEC = 200
 
@@ -167,6 +168,7 @@ class EmptyBalance:
         self._register_event_listeners()
 
         await self.connector.start_network()
+        await self._check_api_keys()
 
         start_time = time.time()
         while not self.connector.ready:
@@ -180,6 +182,20 @@ class EmptyBalance:
             self.logger().info("DRY RUN mode: orders will be logged but NOT placed")
         else:
             self.logger().warning("LIVE mode: real orders WILL be placed")
+
+    async def _check_api_keys(self):
+        """
+        Fetches balances once so a rejected API key / secret fails immediately with the exchange's
+        error, instead of the connector retrying in the background until the ready timeout.
+        """
+        try:
+            await self.connector._update_balances()
+        except Exception as e:
+            raise RuntimeError(
+                f"Could not authenticate with '{self.exchange_name}' using the given API key / secret. "
+                f"Check that the keys are correct, active and have the required permissions. "
+                f"Exchange response: {e}"
+            ) from e
 
     def _register_event_listeners(self):
         def _on_order_created(event):
@@ -501,6 +517,8 @@ class EmptyBalanceWorkflow:
         for line in reversed(output.splitlines()):
             if line.startswith(RESULT_MARKER):
                 return json.loads(line[len(RESULT_MARKER):])
+            if line.startswith(ERROR_MARKER):
+                raise RuntimeError(line[len(ERROR_MARKER):])
 
         log_tail = "\n".join(output.strip().splitlines()[-30:])
         raise RuntimeError(f"empty_balance exited with code {proc.returncode} without a result:\n{log_tail}")
@@ -590,6 +608,10 @@ def main():
         asyncio.run(run_loop())
     except KeyboardInterrupt:
         print("Interrupted, exiting")
+    except Exception as e:
+        logging.getLogger(__name__).exception("empty_balance failed")
+        print(ERROR_MARKER + " ".join(str(e).split()), flush=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

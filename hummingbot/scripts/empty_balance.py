@@ -13,10 +13,8 @@ from pydantic import Field
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
-from hummingbot.client.config.config_crypt import ETHKeyFileSecretManger
 from hummingbot.client.config.config_data_types import BaseClientModel
 from hummingbot.client.config.config_helpers import load_client_config_map_from_file, read_system_configs_from_yml
-from hummingbot.client.config.security import Security
 from hummingbot.client.settings import AllConnectorSettings, ConnectorType
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.connector.utils import split_hb_trading_pair
@@ -94,6 +92,20 @@ class EmptyBalanceConfig(BaseClientModel):
             "options": list(MODES),
         },
     )
+    api_key: str = Field(
+        default="",
+        json_schema_extra={
+            "prompt": lambda mi: "Exchange API key",
+            "prompt_on_new": True,
+        },
+    )
+    secret_key: str = Field(
+        default="",
+        json_schema_extra={
+            "prompt": lambda mi: "Exchange API secret",
+            "prompt_on_new": True,
+        },
+    )
     db_target: str = Field(default="local", json_schema_extra={"show_on_dashboard": False})
 
     @property
@@ -123,18 +135,26 @@ class EmptyBalance:
         self._order_status: Dict[str, str] = {}
         self._event_forwarders: List[EventForwarder] = []
 
-    async def initialize_connector(self, timeout_sec: float = 60):
-        password_var = "HUMMINGBOT_CONFIG_PASSWORD" if os.environ.get("HUMMINGBOT_CONFIG_PASSWORD") else "CONFIG_PASSWORD"
-        password = os.environ.get(password_var)
-        if not password:
-            raise RuntimeError(
-                "Set the HUMMINGBOT_CONFIG_PASSWORD (or CONFIG_PASSWORD) environment variable to the password used "
-                "to unlock your encrypted Hummingbot API keys (the same password you use to log into the Hummingbot client)."
-            )
+    def _connector_key_params(self) -> Dict[str, str]:
+        """
+        Each connector's constructor takes its keys under its own parameter names
+        (e.g. wazirx_api_key / wazirx_api_secret, gate_io_api_key / gate_io_secret_key),
+        so --api_key / --secret_key are passed under those names.
+        """
+        api_key, secret_key = self.config.api_key, self.config.secret_key
+        if not api_key or not secret_key:
+            raise ValueError("Both --api_key and --secret_key are required.")
 
-        if not Security.login(ETHKeyFileSecretManger(password)):
-            raise RuntimeError(f"Invalid {password_var}; could not decrypt the Hummingbot client's API keys.")
-        await Security.wait_til_decryption_done()
+        config_keys = AllConnectorSettings.get_connector_config_keys(self.exchange_name)
+        field_names = list(type(config_keys).model_fields) if config_keys is not None else []
+        key_field = next((f for f in field_names if f.endswith("_api_key")), None)
+        secret_field = next((f for f in field_names if f.endswith(("_api_secret", "_secret_key"))), None)
+        if key_field is None or secret_field is None:
+            raise ValueError(f"Could not find API key / secret parameters for '{self.exchange_name}' (fields: {field_names}).")
+        return {key_field: api_key, secret_field: secret_key}
+
+    async def initialize_connector(self, timeout_sec: float = 60):
+        api_keys = self._connector_key_params()
         await read_system_configs_from_yml()
 
         connector_manager = ConnectorManager(load_client_config_map_from_file())
@@ -142,6 +162,7 @@ class EmptyBalance:
             connector_name=self.exchange_name,
             trading_pairs=self.trading_pairs,
             trading_required=True,
+            api_keys=api_keys,
         )
         self._register_event_listeners()
 
@@ -462,6 +483,8 @@ class EmptyBalanceWorkflow:
             "--balance_use_pct", str(c.balance_use_pct),
             "--min_balance_to_act", str(c.min_balance_to_act),
             "--mode", c.mode,
+            "--api_key", c.api_key,
+            "--secret_key", c.secret_key,
             "--once",
         ]
 
@@ -521,6 +544,8 @@ def main():
         choices=list(MODES),
         help="dry_run (default): only log the orders that would be placed. live: actually place orders.",
     )
+    parser.add_argument("--api_key", required=True, help="Exchange API key")
+    parser.add_argument("--secret_key", required=True, help="Exchange API secret")
 
     args = parser.parse_args()
 
@@ -538,6 +563,8 @@ def main():
         balance_use_pct=args.balance_use_pct,
         min_balance_to_act=args.min_balance_to_act,
         mode=args.mode,
+        api_key=args.api_key,
+        secret_key=args.secret_key,
     )
 
     async def run_loop():
@@ -569,16 +596,13 @@ if __name__ == "__main__":
     """
     Sells the dust balance of each trading pair's base asset (e.g. USDT in USDT-INR) for its quote asset.
 
-    Run standalone (PowerShell):
-        $env:CONFIG_PASSWORD = "your_password"
-        python -m hummingbot.scripts.empty_balance --exchange wazirx --trading_pairs USDT-INR --once --mode dry_run
+    Run standalone:
+        python -m hummingbot.scripts.empty_balance --exchange wazirx --trading_pairs USDT-INR --once --mode dry_run --api_key <key> --secret_key <secret>
 
+    --api_key and --secret_key are required.
     --mode dry_run (default) only logs the orders that would be placed; --mode live places them.
     --order_type market (default) or limit; limit orders are priced --limit_order_price_spread below the best bid.
 
-    ex: python -m hummingbot.scripts.empty_balance --exchange wazirx --trading_pairs USDT-INR --once --mode dry_run --order_type limit --limit_order_price_spread 0.001
-
-    Requires the exchange's API keys to already be configured via the Hummingbot client
-    (`connect <exchange>`), and CONFIG_PASSWORD set to the password used to unlock them.
+    ex: python -m hummingbot.scripts.empty_balance --exchange wazirx --trading_pairs USDT-INR --once --mode dry_run --order_type limit --limit_order_price_spread 0.001 --api_key <key> --secret_key <secret>
     """
     main()

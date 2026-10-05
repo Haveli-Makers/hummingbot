@@ -156,7 +156,13 @@ class AjaibRateSource(RateSourceBase):
         Build an Ajaib exchange connector with API keys from saved config.
         Ajaib requires Ed25519 authentication for every endpoint, and the API is
         geo-blocked, so the configured proxy URL is forwarded as well.
+
+        The saved config is only readable once the CLI has decrypted it, so the
+        API server and standalone runs see no keys there. AJAIB_API_KEY /
+        AJAIB_API_SECRET / AJAIB_PROXY_URL environment variables take precedence.
         """
+        import os
+
         from hummingbot.connector.exchange.ajaib.ajaib_exchange import AjaibExchange
 
         api_key = ""
@@ -172,6 +178,10 @@ class AjaibRateSource(RateSourceBase):
                 proxy_url = keys.get("ajaib_proxy_url", "") or ""
         except Exception:
             pass
+
+        api_key = os.environ.get("AJAIB_API_KEY", "") or api_key
+        api_secret = os.environ.get("AJAIB_API_SECRET", "") or api_secret
+        proxy_url = os.environ.get("AJAIB_PROXY_URL", "") or proxy_url
 
         return AjaibExchange(
             ajaib_api_key=api_key,

@@ -1,377 +1,251 @@
 # Cross-exchange arbitrage (`cross_arb`)
 
-Buy a coin on the exchange where it is cheap and sell it on the exchange where it is dear, at the
-same moment, using only the best price on each side.
+Buys a coin on the exchange where it is cheaper and sells it on the exchange where it is dearer, at
+the same time, at the best price on each side. It has two parts: a **controller** that decides when
+to trade, and an **executor** that carries out one trade from start to finish.
 
-The
-pairs, the trigger percentage, the fee and tax rates and the sizes are all settings. This document
-describes the machinery that has to be right whatever those settings are.
+## How it works
 
----
+1. Every tick, the controller reads the best bid and best ask of each pair on both exchanges and works
+   out the gap in both directions:
+   - **gross** = (best bid on the selling exchange − best ask on the buying exchange) / best ask
+   - **net** = the same after both fees and the TDS withheld from the sale
+2. If the gap reaches the trigger and every check passes, it starts an executor with the plan already
+   decided: where to buy, where to sell, how much, and the price limit on each side.
+3. The executor sends both orders, watches them fill, cancels whatever did not fill, and fixes any
+   difference between what was bought and what was sold.
+4. It reports the result. The controller counts it, waits out the cooldown, and looks again.
 
-## 1. What it does, in one cycle
+At most one trade runs per pair at a time.
 
-1. Watch the best bid and best ask of the same trading pair on two exchanges.
-2. When (best bid on B − best ask on A) / best ask on A is at or above `min_profitability`, and every
-   guard passes, start one executor for that opportunity.
-3. The executor buys on A and sells on B at those prices, for the amount both top levels can absorb.
-4. It confirms what actually filled, cancels whatever did not, and fixes any mismatch between the two
-   sides.
-5. It records the result: prices, amounts, fees, tax withheld, and the net outcome in the quote
-   currency.
-6. The controller updates its inventory picture, waits out the cooldown, and looks again.
-
-Both directions are watched: A→B and B→A.
-
----
-
-## 2. Why this is new code
-
-The upstream `arbitrage_controller` + `arbitrage_executor` cannot be made to do this safely:
-
-| Upstream behaviour | Why it fails here |
-|---|---|
-| Sends `MARKET` orders | **WazirX has no market order type at all**: its docs allow only `limit` and `stop_limit`, and a live attempt was refused with code 1999 "type does not have a valid value" (2026-09-23, `temp/arbitrage/data/order_probe_*.json`). CSX does document `"type": "MARKET"`, and our CSX/CoinSwitch/Zebpay *connectors* separately only ever send `LIMIT`. So a market order cannot be the common execution path, whatever we do to the connectors |
-| No price cap | Our books are REST snapshots up to 5 s old, so a market order can fill far from the quoted price |
-| Waits for both orders to be *fully* filled, forever | A partial fill or a cancel leaves the executor stuck, and its direction is then blocked for good |
-| No clean-up when one side fails | Leaves a one-sided position nobody unwinds |
-| Counts executors, not balances | Failed and skipped attempts count as trades; inventory is never actually checked |
-| Profit % divides quote by base | Reports ~1300% for a 1.3% trade |
-
-We leave that code untouched (other strategies use it) and add our own under new names.
-
----
-
-## 3. Pieces and files
+## Files
 
 | File | Role |
 |---|---|
-| `hummingbot/strategy_v2/executors/cross_arb_executor/data_types.py` | `CrossArbExecutorConfig`, `CrossArbSide`, `MismatchPolicy` |
-| `hummingbot/strategy_v2/executors/cross_arb_executor/cross_arb_executor.py` | `CrossArbExecutor`: one opportunity, start to finish |
-| `controllers/generic/cross_arb.py` | `CrossArbController` + `CrossArbConfig`: scanning, guards, inventory, rebalance proposals |
-| `hummingbot/strategy_v2/executors/executor_orchestrator.py` | register `"cross_arb_executor"` (one import + one registry line) |
-| `hummingbot/strategy_v2/models/executors_info.py` | add the config to `AnyExecutorConfig` |
-| `test/hummingbot/strategy_v2/executors/cross_arb_executor/test_cross_arb_executor.py` | executor tests |
+| `controllers/generic/cross_arb.py` | `CrossArbController` and `CrossArbConfig`: prices, checks, sizing, limits, status |
+| `hummingbot/strategy_v2/executors/cross_arb_executor/cross_arb_executor.py` | `CrossArbExecutor`: one trade |
+| `hummingbot/strategy_v2/executors/cross_arb_executor/data_types.py` | `CrossArbExecutorConfig`, `CrossArbPhase`, `MismatchPolicy`, `LegOrder` |
+| `hummingbot/strategy_v2/executors/executor_orchestrator.py`, `hummingbot/strategy_v2/models/executors_info.py` | register the executor |
 | `test/controllers/generic/test_cross_arb.py` | controller tests |
-| `conf/controllers/conf_cross_arb_*.yml`, `conf/scripts/conf_cross_arb_*.yml` | run configuration |
+| `test/hummingbot/strategy_v2/executors/cross_arb_executor/` | executor tests, including the bot's own executor-creation path |
 
-Same shape as `simple_grid`, so the dashboard, the api-server and `v2_with_controllers.py` pick it up
-with no special handling.
+It runs under `scripts/v2_with_controllers.py`, like any other controller.
 
----
+## The controller
 
-## 4. The executor: one opportunity, start to finish
+### Checks before a trade
 
-One executor handles exactly one attempt and then terminates. It is created with the plan already
-decided (which exchange to buy on, at what price cap, how much), so it never re-decides the trade.
+Each check that fails is counted and named, so `status` shows why the bot is not trading.
 
-### 4.1 States
-
-```
-CREATED ──► PLACING ──► WAITING ──► CLEANUP ──► RECONCILE ──► TERMINATED
-                │           │           │            │
-                └───────────┴───────────┴────────────┴──► (failure paths, all time-bounded)
-```
-
-| State | What happens | Leaves when |
-|---|---|---|
-| **PLACING** | Re-check balances, size the trade, send both orders | both orders acknowledged, or a send fails |
-| **WAITING** | Watch fills on both sides | both fully filled, or `fill_timeout` (default 15 s) |
-| **CLEANUP** | Cancel whatever is unfilled, then *verify* the cancel really happened | both orders terminal, or `cleanup_timeout` (default 20 s) |
-| **RECONCILE** | Compare filled amounts; fix any difference | flattened, held on purpose, or `flatten_timeout` (default 20 s) |
-| **TERMINATED** | Write the result | — |
-
-Every state has a timeout. No state can wait forever, which is the specific way the upstream executor
-hangs.
-
-### 4.2 Orders: a crossing limit, never a market order
-
-Each leg is a `LIMIT` order priced at the other side's quote, optionally `slippage_ticks` (default 0)
-through it:
-
-- buy at the seller's best ask, sell at the buyer's best bid.
-
-At the top of the book this fills exactly like a market order, but:
-
-- it is the only order type that can hedge an exact quantity on both venues. WazirX has no market
-  order at all, and CSX's takes a **whole number of rupees**, not a coin amount: asking it for ₹60
-  sold 0.60 USDT when we held 0.61, stranding the remainder below the ₹60 floor (verified live
-  2026-09-23). Two legs of an arbitrage have to match in coins, which only a limit order can express;
-- it cannot fill at a worse price than we decided, which matters because WazirX's book is up to 5 s
-  old when we act on it;
-- if the price has moved away, it simply rests unfilled and we cancel it. An unfilled order costs
-  nothing; a bad fill costs money.
-
-This is the same reasoning as the CoinDCX closing orders in `simple_grid`.
-
-### 4.3 Sizing
-
-```
-amount = min(order_amount_quote / ask,        # what the operator allows per trade
-             ask_qty,                         # what the seller is offering
-             bid_qty,                         # what the buyer is asking for
-             quote_balance_on_buy_side / ask, # what we can pay with
-             base_balance_on_sell_side)       # what we can deliver
-```
-
-then:
-
-1. Quantize to **both** exchanges' quantity steps and take the coarser result, so the same number is
-   valid on both sides. Quantizing per exchange separately is what leaves dust behind.
-2. Check the result against **both** exchanges' minimum order size and minimum order value, plus the
-   operator's `min_order_amount_quote`.
-3. If it fails any minimum, **do not send anything**. A rejected order is the beginning of a one-sided
-   position, so it is avoided before it happens, not handled afterwards.
-
-The minimums are large and undocumented, found by being rejected live: **₹60 on CSX, ₹50 on WazirX**,
-neither of them published in the venue's market list (which implies about ₹1). The practical
-consequence is that **a leftover worth less than the floor cannot be traded away on that venue at
-all**, so `dust_threshold_quote` defaults to the venue minimums and a smaller mismatch is reported
-for a human to clear rather than chased with an order that would be refused.
-
-Balances are read at this moment, not when the executor was created.
-
-### 4.4 Both legs at once
-
-Both orders are sent in the same pass, without waiting for the first to fill. Sequential legging is a
-config option (`leg_order: simultaneous | risky_side_first`) but simultaneous is the default: the
-price cap already bounds the loss on each leg, while waiting for leg one doubles the time the gap has
-to disappear.
-
-### 4.5 Fills, cancels and the mismatch
-
-- A fill is only believed from the connector's order state (`executed_amount_base`), never from the
-  placement acknowledgement.
-- After a cancel, the order is re-read. **A cancel acknowledgement is not proof**: CoinDCX has
-  confirmed a cancel for an order that filled 30 seconds later, and WazirX's cancel response returns
-  the order still `"status": "wait"` — only the next read shows `"cancel"` (verified live 2026-09-23). The executor waits
-  `cancel_settle_delay` (default 0.25 s), re-reads, and only then treats the leg as final. Late fills
-  found in this window are added to the filled amount, not ignored.
-- Then the two sides are compared:
-
-```
-matched   = min(bought, sold)
-mismatch  = bought − sold        # positive: we hold extra coin; negative: we are short
-```
-
-If `|mismatch| × price` is above `dust_threshold_quote` (default: the larger exchange minimum), the
-executor acts on `mismatch_policy`:
-
-| Policy | Behaviour |
+| Check | Shown as |
 |---|---|
-| `flatten` (default) | Immediately trade the difference away with a crossing limit on the exchange with the better price, accepting a small loss |
-| `hold` | Keep it: the executor ends as `POSITION_HOLD`, only the matched part counts as profit, and the leftover goes to the framework as a held position (shown under "Positions Held"). The controller logs a warning and pauses that pair until the bot is restarted |
+| Both order books have sent a new snapshot within `max_book_age` | `no fresh book: <exchange>` |
+| The pair is not paused after a kept mismatch (see `hold` below) | `paused: holding a mismatch` |
+| The gap reaches `min_profitability` (gross or net, per `trigger_on`) | `gap below threshold` |
+| A trade size exists that both exchanges accept and both balances cover | `not enough <INR or coin> on <exchange>`, `total budget in use`, `nothing on offer`, `rounds to zero`, `below min order value (100)`, `below a venue minimum` |
+| No trade already running for the pair | `executor already running` |
+| The cooldown since the last trade on the pair has passed | `cooldown` |
 
-Both are recorded. "Do nothing quietly" is not an option.
+A book counts as stale when the exchange stops sending snapshots, not when prices stay the same:
+quiet books are normal on these exchanges.
 
-### 4.6 Shutdown
+### Sizing
 
-`early_stop()` must leave nothing in the air, and the framework only allows about 20 seconds:
+```
+amount = min(order_amount_quote / ask,
+             (total_amount_quote − money already in running trades) / ask,
+             size at the best ask, size at the best bid,
+             quote balance on the buying exchange / ask,
+             coin balance on the selling exchange)
+```
 
-1. Cancel both legs (no waiting for confirmation first).
-2. If one side is filled and the other is not, flatten immediately with a crossing limit.
-3. Write the result with `CloseType.EARLY_STOP`.
+The amount is rounded to the buying exchange's step, then the selling exchange's, and is used only if
+it survives both unchanged, so the two orders are for exactly the same amount. It must also clear
+both exchanges' minimum order size and value and `min_order_amount_quote`. If it does not, nothing is
+sent. The exchanges' real minimums (₹60 on CSX, ₹50 on WazirX) are higher than their published rules
+say, which is what `min_order_amount_quote` guards against.
 
-This is the `simple_grid` shutdown lesson: a bot stopped mid-trade must not leave a leg behind.
+### Limits that stop all trading
 
-### 4.7 What the executor reports
-
-`get_custom_info()` carries, per attempt: both exchanges and prices, intended and actual amounts,
-which side filled first, fees per side, tax withheld, the mismatch and what was done about it, the
-net result in the quote currency, and the reason it ended. This is what makes a live run auditable.
-
-**Profit** is `sold_value − bought_value − fees − tax`, all converted to one currency, with the
-percentage taken against the amount spent (not against the coin amount, which is the upstream bug).
-
-Fees and tax have to be read from **different places per venue**, both verified live: CSX puts
-`takerFee`, `makerFee` and `tdsPerc` on the order itself and has no trades endpoint at all, while
-WazirX puts `fee` and `tdsAmount` on each fill in `myTrades` and nothing on the order. Measured
-rates: CSX taker 0.05%, WazirX 0%, and 1% TDS on the sell side at both.
-
----
-
-## 5. The controller: when to start an executor
-
-Each tick:
-
-1. Read both books for every configured pair.
-2. For each direction, compute the gross gap, and the net after fees, GST and tax (all settings).
-3. Take the best direction and check every guard below. Any failure is **counted and named**, so the
-   status display answers "why is it not trading?".
-
-| Guard | Default | Why |
-|---|---|---|
-| gap at or above `min_profitability` | 1% | the operator's trigger; `trigger_on: gross \| net` decides which number is compared |
-| both books fresher than `max_book_age` | 10 s | a frozen feed shows a gap that is not there |
-| both connectors ready and trading enabled | — | never act on a half-started connector |
-| size passes both exchanges' minimums | — | see §4.3 |
-| balances sufficient on both sides | — | read now, not at startup |
-| no executor already running for this pair | 1 | keeps the inventory picture simple |
-| cooldown since the last attempt on this pair | 5 s | stops a tight loop against a refusing venue |
-| `max_trades_per_hour` not reached | 60 | blunt rate limiter |
-| daily loss under `max_loss_quote` / `max_loss_pct` | off | stops the day |
-| consecutive failures under `max_consecutive_failures` | 5 | a venue refusing everything stops the strategy instead of grinding |
-| `manual_kill_switch` off | off | one flag to stand down |
-
-### 5.1 Inventory and rebalancing
-
-The controller tracks, per pair and per exchange, the base and quote balance, and compares them with
-the operator's targets (`target_base_per_exchange`, `target_quote_per_exchange`).
-
-Because a coin's gap usually runs one way, one side drains. So:
-
-- When the side that must deliver falls below `min_base_balance` / `min_quote_balance`, that
-  **direction** is paused (the opposite one keeps trading) and a rebalance need is raised.
-- A rebalance proposal says what to move, from where to where, and the expected fee: e.g. "move 8,000
-  GALA from CSX to WazirX; WazirX withdrawal fee 725 GALA".
-- `rebalance_mode`:
-
-| Mode | Behaviour |
+| Limit | Shown as |
 |---|---|
-| `alert` (default) | Log + alert only. A person moves the funds |
-| `propose` | Prepare the transfer through the wallet-transfer framework and wait for an explicit approval before sending |
-| `auto` | Send it, within `max_transfer_quote` per transfer and per day, to whitelisted addresses only |
+| `manual_kill_switch` | `kill switch on` |
+| Today's realised loss reaches `max_loss_quote` | `daily loss limit reached` |
+| `max_consecutive_failures` failed trades in a row | `N failed attempts in a row` |
+| `max_trades_per_hour` reached | `trades per hour reached` |
 
-Only crypto legs can be automated at all, and only where the connector supports withdrawal (WazirX
-yes, CSX built but untested, CoinDCX not at all). INR always needs a person.
+These show as `HALTED` in the status. In `v2_with_controllers.py` the kill switch also stops the
+controller.
 
-### 5.2 Status display
+### Low balances
 
-`to_format_status()` shows, per pair: the current gap both ways (gross and net), the amount available
-at the top, balances on both exchanges against their targets, the last few attempts with their
-outcome, the guard-rejection counters, and any open rebalance need.
+Trades usually run one way, so one side's money runs down. When a direction has no money left it
+simply stops (`not enough … on …`) while the other direction keeps trading. Below
+`rebalance_below_quote` the status shows a `REBALANCE:` line saying which balance is low.
 
----
+### Status
 
-## 6. Settings
+`status` shows the trigger and size limits; profit realised today, failures in a row and trades this
+hour; any `HALTED` or `PAUSED` line; a table of every pair and direction (ask, bid, gross %, net %,
+size, and what blocked it); the most common reasons for not trading; any `REBALANCE` lines; and how
+many trades are running.
 
-### Controller (`conf/controllers/conf_cross_arb_*.yml`)
+## The executor
+
+### Orders: limit orders priced to fill immediately
+
+Each order is a `LIMIT` order at the other side's best price: buy at the best ask, sell at the best
+bid (optionally `slippage_ticks` further). It fills like a market order, but cannot fill at a worse
+price, and both orders can be for exactly the same coin amount. Market orders cannot do this here:
+WazirX has none, and CSX's take an amount in rupees, not in coins.
+
+`leg_order: simultaneous` (default) sends both orders together. `buy_first` / `sell_first` send one,
+then the other sized to what the first actually filled.
+
+### Phases
+
+| Phase | What happens | Ends when |
+|---|---|---|
+| (start) | Check both balances | short of money: ends `INSUFFICIENT_BALANCE`, nothing sent |
+| `placing` | Send the orders | at once |
+| `waiting` | Watch both orders fill | both are finished, or `fill_timeout` |
+| `cleanup` | Cancel what did not fill, then wait `cancel_settle_delay` before believing the cancel | all orders final, or `cleanup_timeout` |
+| `reconcile` | Compare bought and sold; fix any difference | matched, kept on purpose, or `flatten_timeout` |
+
+Every phase has a deadline, so a trade can never hang.
+
+How a trade ends:
+
+| Close type | Meaning |
+|---|---|
+| `COMPLETED` | Both sides matched (or the leftover is too small to trade and is reported) |
+| `EXPIRED` | Nothing filled in time |
+| `FAILED` | A mismatch could not be fixed, or an order would not cancel in time |
+| `POSITION_HOLD` | The leftover was kept on purpose (`mismatch_policy: hold`) |
+| `EARLY_STOP` | The bot was stopped during the trade |
+| `INSUFFICIENT_BALANCE` | Not enough money at the start |
+
+### Fills, cancels and refused orders
+
+- Amounts filled are read only from the exchange's order state.
+- A cancel confirmation is not trusted: an exchange can confirm a cancel and still fill the order
+  afterwards. Cancelled orders stay watched for `cancelled_order_watch_seconds`; a late fill is
+  counted and the two sides are compared again.
+- A refused order is noticed from its own state, not only from the failure event.
+
+### A mismatch between the two sides
+
+`mismatch = bought − sold`. A leftover worth no more than `dust_threshold_quote` (default: the
+exchanges' own minimums) is reported, not traded, because no exchange would accept the order.
+Otherwise `mismatch_policy` decides:
+
+| Policy | What happens |
+|---|---|
+| `flatten` (default) | Trade the difference away at once at the better of the two exchanges, up to `max_retries` attempts, each re-priced. An exchange that refused the unwind is not used again; one that just refused that side's order is tried last |
+| `hold` | Keep it. The trade ends `POSITION_HOLD`, only the matched part counts as profit, the leftover is passed to the framework as a held position, and the controller pauses that pair: clear the leftover by hand, then restart the bot |
+
+### Stopping the bot mid-trade
+
+The framework allows about 20 seconds after a stop. `early_stop()` acts at once: it cancels open
+orders and, under `flatten`, sends the unwind in the same call. If the sides still do not match after
+15 seconds, it logs an error naming the unmatched amount, which then needs clearing by hand, and stops.
+
+### The result
+
+Each trade reports both exchanges and prices, planned and filled amounts, average prices, fees, TDS,
+the mismatch and how it was handled, late fills, the net result and why it ended.
+
+**Net = money from the sale − money paid for the buy − fees − TDS**, and the percentage is taken
+against the money paid. TDS is not reported by the connectors, so it is computed from `tds_pct`.
+
+## Settings
+
+### Controller
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `exchange_a`, `exchange_b` | — | any two spot connectors |
-| `trading_pairs` | — | list, e.g. `[SOL-INR, GALA-INR]` |
-| `min_profitability` | `0.01` | trigger, as a fraction |
-| `trigger_on` | `gross` | compare the raw gap or the after-cost number |
-| `taker_fee_pct` | per exchange | used for the net number |
-| `gst_pct` | `18` | tax on the fee |
-| `tds_pct` | `1` | withheld from every sale |
-| `order_amount_quote` | `10000` | maximum per trade |
-| `total_amount_quote` | `10000` | most money in live attempts at once, across all pairs (replaces the framework's default of 100) |
-| `min_order_amount_quote` | `2000` | skip anything smaller |
-| `max_book_age` | `10` | seconds |
-| `cooldown` | `5` | seconds between attempts on a pair |
+| `exchange_a`, `exchange_b` | `csx`, `wazirx` | the two exchanges |
+| `trading_pairs` | `[USDT-INR]` | pairs to trade |
+| `min_profitability` | `0.01` | the trigger, as a fraction (0.01 = 1%) |
+| `trigger_on` | `gross` | compare the gross gap or the net |
+| `taker_fee_pct` | `{}` | fee per exchange in %; an exchange left out counts as free |
+| `gst_pct` | `18` | GST added on top of the fee (0 when the fee already includes it) |
+| `tds_pct` | `1` | TDS withheld from every sale, in % |
+| `order_amount_quote` | `10000` | most money per trade |
+| `total_amount_quote` | `10000` | most money in running trades at once, across all pairs |
+| `min_order_amount_quote` | `100` | smallest trade |
+| `max_book_age` | `10` | seconds without a new snapshot before a book counts as stale |
+| `cooldown` | `5` | seconds between trades on a pair |
 | `max_trades_per_hour` | `60` | |
-| `max_loss_quote` / `max_loss_pct` | off | daily stop |
+| `max_loss_quote` | off | realised loss that stops trading for the day |
 | `max_consecutive_failures` | `5` | |
-| `target_base_per_exchange`, `target_quote_per_exchange` | — | inventory targets per pair |
-| `min_base_balance`, `min_quote_balance` | — | pause level per direction |
-| `rebalance_mode` | `alert` | `alert` / `propose` / `auto` |
 | `manual_kill_switch` | `false` | |
+| `rebalance_below_quote` | `500` | balance below which a `REBALANCE` line appears |
+| `rebalance_alerts` | `true` | |
 
-### Executor (set by the controller)
+The controller also passes these to each executor: `fill_timeout`, `cleanup_timeout`,
+`flatten_timeout`, `cancel_settle_delay`, `mismatch_policy`, `leg_order`, `slippage_ticks`,
+`dust_threshold_quote`.
+
+### Executor
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `buying_market`, `selling_market` | — | connector + pair for each leg |
-| `order_amount` | — | base units, already valid on both venues |
-| `buy_price_cap`, `sell_price_floor` | — | the crossing limit prices |
-| `slippage_ticks` | `0` | ticks through the touch |
-| `leg_order` | `simultaneous` | or `risky_side_first` |
+| `buying_market`, `selling_market` | — | exchange and pair for each side (same coin, same quote currency) |
+| `order_amount` | — | coin amount, already valid on both exchanges |
+| `buy_price_cap`, `sell_price_floor` | — | the price limit on each side |
+| `leg_order` | `simultaneous` | or `buy_first` / `sell_first` |
 | `fill_timeout` | `15` | seconds |
 | `cleanup_timeout` | `20` | seconds |
 | `flatten_timeout` | `20` | seconds |
 | `cancel_settle_delay` | `0.25` | seconds before believing a cancel |
+| `cancelled_order_watch_seconds` | `30` | how long a cancelled order is watched for late fills |
 | `mismatch_policy` | `flatten` | or `hold` |
-| `dust_threshold_quote` | venue minimum | below this, a mismatch is ignored |
-| `max_retries` | `2` | per leg, re-priced each time, never blind |
+| `dust_threshold_quote` | `0` (the exchanges' minimums) | smaller leftovers are reported, not traded |
+| `max_retries` | `2` | unwind attempts; the original orders are never re-sent |
+| `slippage_ticks` | `0` | price steps beyond the best price |
+| `tds_pct` | from the controller | for the reported net |
 
----
+## Running it
 
-## 7. What can go wrong, and what happens
+A controller config, in `conf/controllers/`:
 
-| Situation | Behaviour |
-|---|---|
-| One leg rejected (size, balance, venue error) | Other leg is cancelled at once; if it already filled, flatten — on the other exchange first, since the refusing one just said no to that side; attempt recorded as `ONE_LEG_FAILED` |
-| One leg partly filled | Cancel the remainder, then match the two sides and flatten the difference |
-| Both partly filled, different amounts | Keep the matched part, flatten the difference |
-| Cancel acknowledged but the order fills later | Detected by re-reading after `cancel_settle_delay`; the late fill is counted and flattened if needed |
-| Price moves before the orders land | Orders rest unfilled at our cap and are cancelled; no loss beyond fees |
-| A book goes stale or a connector disconnects | Guard blocks new attempts; running executors finish on their timeouts |
-| Exchange returns 429 / 5xx | Connector throttling handles it; repeated failures trip `max_consecutive_failures` |
-| Bot stopped mid-trade | `early_stop`: cancel, flatten, record, inside the ~20 s window |
-| Inventory exhausted on one side | That direction pauses; rebalance need raised; the other direction keeps trading |
-
----
-
-## 8. Tests
-
-Executor: sizing against both venues' rules; below-minimum is skipped, not sent; both legs fill;
-one leg rejected; one leg times out; partial fill on one side; partial on both; cancel that lies;
-late fill after cleanup; mismatch flattened; mismatch held; shutdown mid-flight; profit and
-percentage arithmetic including fees and tax; retries bounded.
-
-Controller: trigger on gross and on net; every guard blocks and is counted; the best direction wins;
-one executor per pair; cooldown; daily loss stop; inventory pause on one direction only; rebalance
-proposal contents; status output.
-
-Plus an offline dry-run harness (scripted books, no network) in the style of
-`temp/strategies/simple_grid_dry_run.py`, so the whole cycle can be watched end to end before any
-money moves.
-
----
-
-## 8a. The dry run
-
-`temp/arbitrage/cross_arb_dry_run.py` runs **this controller and this executor** against fake
-venues: no network, no keys, and only the exchanges are imitated. The fake venues charge what the
-real ones charge — CSX 0.05%, WazirX 0%, 1% TDS withheld from every sale — so the closing balances
-are the test of whether a run made money.
-
-```
-python cross_arb_dry_run.py --scenario all          # every situation below
-python cross_arb_dry_run.py --from-data SOL-INR     # replay the prices the scanner recorded
+```yaml
+id: cross_arb_sol
+controller_type: generic
+controller_name: cross_arb
+exchange_a: csx
+exchange_b: wazirx
+trading_pairs:
+  - SOL-INR
+min_profitability: 0.0125
+trigger_on: gross
+taker_fee_pct:
+  csx: 0.05
+  wazirx: 0
+gst_pct: 0
+tds_pct: 1
+order_amount_quote: 500
+total_amount_quote: 500
+min_order_amount_quote: 100
+max_book_age: 15
+cooldown: 10
+max_trades_per_hour: 10
+max_loss_quote: 50
+max_consecutive_failures: 3
 ```
 
-Scenarios: `easy` (a clear gap), `thin` (the selling side is a third of the size it showed),
-`reject` (a venue refuses everything), `lying_cancel` (a cancelled order fills anyway),
-`vanishing` (the gap disappears before the orders land), `stale` (a venue stops sending snapshots).
-Each run ends with a verdict, and the rule that must never break is that no run may finish holding
-coins it did not mean to.
+And a script config with the same name in `conf/scripts/`:
 
-Two things it has already established:
+```yaml
+script_file_name: v2_with_controllers.py
+markets: {}
+candles_config: []
+controllers_config:
+  - conf_cross_arb_sol.yml
+```
 
-1. **It found a real bug.** With one venue refusing orders, the unwind kept going back to that same
-   venue because it quoted the better price, and gave up with the position stranded. The executor
-   now refuses to retry a venue that just rejected an unwind, and notices a refusal from the
-   order's own state rather than waiting for an event that may never arrive.
-2. **An aborted attempt costs about 1%.** When the gap vanishes between the decision and the fill,
-   the bought coin is sold straight back — and that sale pays 1% TDS. So the trigger has to clear
-   not just the cost of a completed round trip but the cost of the ones that fail.
+Then, in the bot: `start --script v2_with_controllers.py --conf conf_cross_arb_sol.yml`.
 
-Replaying real recorded SOL-INR prices through the whole strategy, with 1% TDS counted:
-
-| Trigger | Trades | Result |
-|---|---|---|
-| 0.5% | 11 | −₹103 |
-| 1.0% | 11 | −₹20 |
-| 1.1% | 16 | +₹80 |
-| 1.25% | 11 | +₹106 |
-
-Mechanically every one of those trades was correct — both sides matched, nothing stranded. They
-lose money below about 1.1% purely because of the tax, which is the clearest statement of why the
-threshold matters more than the machinery.
-
-## 9. Build order
-
-1. `data_types.py` + executor skeleton with the state machine and timeouts — with tests.
-2. Sizing, order placement, fills and cancel verification — with tests.
-3. Mismatch handling and shutdown — with tests.
-4. Controller: scan, guards, executor creation, status — with tests.
-5. Inventory tracking and rebalance proposals (`alert` mode) — with tests.
-6. Dry-run harness on scripted books.
-7. Config files, then a paper run, then a live run at the smallest size the venues allow.
-8. Later: `propose`/`auto` rebalancing, dashboard page, api-server wiring.
-
-Each step is offline and tested before the next. Nothing touches an exchange until step 7, which
-needs funded accounts and an explicit go-ahead.
+Both exchanges' keys must be saved with `connect`. CSX accepts calls only from whitelisted IPs, so its
+connector goes through a proxy (see `docs/PROXY_SERVER_GUIDE.md`).

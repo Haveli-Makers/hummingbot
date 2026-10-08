@@ -7,12 +7,13 @@ would be unsafe — each refusal named, because "why is it not trading?" is the 
 asks first.
 """
 import asyncio
+from datetime import datetime, timedelta
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from controllers.generic.cross_arb import CrossArbConfig, CrossArbController, TriggerOn
+from controllers.generic.cross_arb import IST, CrossArbConfig, CrossArbController, TriggerOn
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.order_book_row import OrderBookRow
 from hummingbot.data_feed.market_data_provider import MarketDataProvider
@@ -82,12 +83,28 @@ class CrossArbControllerTests(IsolatedAsyncioWrapperTestCase):
         return CrossArbController(CrossArbConfig(**params), self.provider, asyncio.Queue())
 
     def executor(self, active=True, pair=PAIR, close_type=None, pnl=D("0"), executor_id="e1",
-                 amount=D("10"), price=D("99"), custom_info=None):
+                 amount=D("10"), price=D("99"), sell_price=D("100"), custom_info=None):
         return SimpleNamespace(
             id=executor_id, is_active=active, close_type=close_type, net_pnl_quote=pnl,
             custom_info=custom_info or {},
-            config=SimpleNamespace(buying_market=SimpleNamespace(trading_pair=pair),
-                                   order_amount=amount, buy_price_cap=price))
+            config=SimpleNamespace(buying_market=SimpleNamespace(connector_name="csx", trading_pair=pair),
+                                   selling_market=SimpleNamespace(connector_name="wazirx", trading_pair=pair),
+                                   order_amount=amount, buy_price_cap=price, sell_price_floor=sell_price))
+
+    def made_today(self, controller, pnl):
+        """Today's cash so far: one finished attempt that made ``pnl``."""
+        controller.executors_info.append(self.executor(active=False, close_type=CloseType.COMPLETED, pnl=D(pnl),
+                                                       executor_id=f"done-{len(controller.executors_info)}"))
+        controller.account_for_finished_executors()
+
+    def relaxed(self, **overrides) -> CrossArbController:
+        """The team lead's TDS rule: 1.25% always, 0.8% on cash already made, floor 100. The default
+        market's 1.01% gap sits between the two; one 10,000 trade there is 101.01 USDT and, at its
+        price limits, takes 101.01 * (100 * 0.99 - 99 * 1.00059) = -5.90 from today's cash."""
+        params = dict(min_profitability=D("0.0125"), relaxed_min_profitability=D("0.008"),
+                      cash_floor_quote=D("100"))
+        params.update(overrides)
+        return self.controller(**params)
 
     async def opportunities(self, controller):
         await controller.update_processed_data()
@@ -334,6 +351,96 @@ class CrossArbControllerTests(IsolatedAsyncioWrapperTestCase):
         controller.account_for_finished_executors()
         controller.account_for_finished_executors()
         self.assertEqual(controller._realized_pnl, D("7"))
+
+    # ── TDS: the cash floor ──────────────────────────────────────────────────
+
+    async def test_between_the_triggers_it_waits_for_cash_already_made(self):
+        controller = self.relaxed()
+        found = await self.opportunities(controller)
+        self.assertEqual(found[("csx", "wazirx")].blocked_by, "cash floor: needs 1.25%")
+        self.assertTrue(found[("csx", "wazirx")].relaxed)
+
+    async def test_the_trade_must_leave_cash_at_or_above_the_floor(self):
+        """Doubt 2, decided: not 'cash above X', but 'cash still at or above X after this trade'."""
+        controller = self.relaxed()
+        self.made_today(controller, "105")                # 105 - 5.90 = 99.10: below the floor
+        found = await self.opportunities(controller)
+        self.assertEqual(found[("csx", "wazirx")].blocked_by, "cash floor: needs 1.25%")
+
+        self.made_today(controller, "1")                  # 106 - 5.90 = 100.10: clears it
+        found = await self.opportunities(controller)
+        opportunity = found[("csx", "wazirx")]
+        self.assertIsNone(opportunity.blocked_by)
+        self.assertAlmostEqual(float(opportunity.worst_cash), -5.90, places=2)
+        self.assertEqual(len(controller.determine_executor_actions()), 1)
+
+    async def test_a_gap_at_the_main_trigger_never_waits_for_the_floor(self):
+        controller = self.relaxed(min_profitability=D("0.01"))     # the 1.01% gap is now above it
+        await controller.update_processed_data()
+        self.assertEqual(len(controller.determine_executor_actions()), 1)
+
+    async def test_below_the_relaxed_trigger_is_below_threshold(self):
+        controller = self.relaxed(min_profitability=D("0.02"), relaxed_min_profitability=D("0.0105"))
+        self.made_today(controller, "1000")
+        found = await self.opportunities(controller)
+        self.assertEqual(found[("csx", "wazirx")].blocked_by, "gap below threshold")
+
+    async def test_live_attempts_count_against_the_room(self):
+        """A live attempt's possible loss is reserved; its possible gain is not counted yet."""
+        controller = self.relaxed(total_amount_quote=D("100000"))
+        self.made_today(controller, "110")                # room 10
+        controller.executors_info.append(self.executor(active=True, pair="SOL-INR", amount=D("101.01")))
+        found = await self.opportunities(controller)      # 10 - 5.90 live - 5.90 this one < 0
+        self.assertEqual(found[("csx", "wazirx")].blocked_by, "cash floor: needs 1.25%")
+
+    async def test_attempts_started_together_share_the_room(self):
+        second = "SOL-INR"
+        self.books[("csx", second)] = FakeBook("98.90", "500", "99.00", "500")
+        self.books[("wazirx", second)] = FakeBook("100.00", "500", "100.10", "500")
+        self.balances.update({("csx", "SOL"): D("1000"), ("wazirx", "SOL"): D("1000")})
+        controller = self.relaxed(trading_pairs=[PAIR, second], total_amount_quote=D("100000"))
+        self.made_today(controller, "110")                # room 10: one -5.90 trade fits, not two
+        await controller.update_processed_data()
+        self.assertEqual(len(controller.determine_executor_actions()), 1)
+        self.assertEqual(controller._skips["cash floor: needs 1.25%"], 1)
+
+    async def test_slippage_counts_in_the_worst_case(self):
+        for exchange in ("csx", "wazirx"):
+            self.rules[exchange] = TradingRule(PAIR, min_order_size=D("0.01"), min_notional_size=D("50"),
+                                               min_price_increment=D("0.01"))
+        plain = (await self.opportunities(self.relaxed()))[("csx", "wazirx")]
+        slipped = (await self.opportunities(self.relaxed(slippage_ticks=2)))[("csx", "wazirx")]
+        # buy 0.02 higher with its fee, sell 0.02 lower after fee and TDS: 101.01 * 0.0398 = 4.02 worse
+        self.assertAlmostEqual(float(plain.worst_cash - slipped.worst_cash), 4.02, places=2)
+
+    async def test_off_when_not_set_or_not_lower(self):
+        for relaxed in (None, D("0.0125"), D("0.02")):
+            controller = self.relaxed(relaxed_min_profitability=relaxed)
+            self.made_today(controller, "1000")
+            found = await self.opportunities(controller)
+            self.assertEqual(found[("csx", "wazirx")].blocked_by, "gap below threshold")
+            self.assertNotIn("relaxed", "\n".join(controller.to_format_status()))
+
+    async def test_the_day_starts_again_at_midnight_in_india(self):
+        controller = self.relaxed()
+        self.made_today(controller, "106")
+        today = datetime.fromtimestamp(self.now, IST).date()
+        midnight_ist = datetime.combine(today + timedelta(days=1), datetime.min.time(), IST).timestamp()
+        self.now = midnight_ist - 1
+        controller.account_for_finished_executors()
+        self.assertEqual(controller._realized_pnl, D("106"))
+        self.now = midnight_ist                           # 18:30 UTC: a UTC clock would not reset yet
+        controller.account_for_finished_executors()
+        self.assertEqual(controller._realized_pnl, D("0"))
+
+    async def test_status_shows_both_triggers_and_the_room(self):
+        controller = self.relaxed()
+        self.made_today(controller, "130.5")
+        await controller.update_processed_data()
+        text = "\n".join(controller.to_format_status())
+        self.assertIn("trigger 1.25% on gross (0.80% while today's cash stays >= 100)", text)
+        self.assertIn("realised today (IST): 130.50", text)
+        self.assertIn("room for relaxed trades: 30.50", text)
 
     # ── inventory and status ─────────────────────────────────────────────────
 

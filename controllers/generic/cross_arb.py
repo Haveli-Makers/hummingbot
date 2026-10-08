@@ -1,5 +1,5 @@
 from collections import defaultdict, deque
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
@@ -19,6 +19,10 @@ from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction,
 from hummingbot.strategy_v2.models.executors import CloseType
 
 s_decimal_0 = Decimal("0")
+
+# The trading day is India's: today's realised result, which the loss limit and the cash floor
+# both read, starts again at midnight IST.
+IST = timezone(timedelta(hours=5, minutes=30))
 
 
 class TriggerOn(str, Enum):
@@ -44,9 +48,19 @@ class CrossArbConfig(ControllerConfigBase):
     exchange_b: str = "wazirx"
     trading_pairs: List[str] = Field(default_factory=lambda: ["USDT-INR"])
 
-    # The trigger, as a fraction: 0.01 is 1%.
-    min_profitability: Decimal = Field(default=Decimal("0.01"), json_schema_extra={"is_updatable": True})
+    # The trigger, as a fraction: 0.0125 is 1.25%.
+    min_profitability: Decimal = Field(default=Decimal("0.0125"), json_schema_extra={"is_updatable": True})
     trigger_on: TriggerOn = TriggerOn.GROSS
+
+    # TDS. Every sale has 1% withheld, and it comes back only after 1.5–2 years, so on CSX↔WazirX a
+    # gap below about 1.06% loses cash today even though it earns once the TDS is refunded. Gaps
+    # from relaxed_min_profitability up to min_profitability are traded only on cash the day has
+    # already made: today's realised result, after this trade's worst case and the worst case of
+    # the attempts still live, must stay at or above cash_floor_quote. None, or a value not below
+    # min_profitability, turns this off.
+    relaxed_min_profitability: Optional[Decimal] = Field(default=Decimal("0.008"),
+                                                         json_schema_extra={"is_updatable": True})
+    cash_floor_quote: Decimal = Field(default=Decimal("100"), json_schema_extra={"is_updatable": True})
 
     # Costs, for the net figure. Measured live on 2026-09-23: CSX taker 0.05%, WazirX 0%, and 1%
     # TDS on the sell at both. A venue missing here is treated as free, which flatters the net
@@ -111,6 +125,8 @@ class Opportunity:
         self.gross_pct = self.net_pct = s_decimal_0
         self.amount = s_decimal_0            # base units, valid on both venues
         self.amount_quote = s_decimal_0
+        self.worst_cash = s_decimal_0        # what this trade adds to today's cash, at its price limits
+        self.relaxed = False                 # the gap is between the two triggers
         self.blocked_by: Optional[str] = None
 
     @property
@@ -158,8 +174,10 @@ class CrossArbController(ControllerBase):
         self._last_attempt: Dict[str, float] = {}          # pair -> timestamp
         self._recent_trades: deque = deque(maxlen=1000)    # timestamps of executors started
         self._counted_executors: set = set()
+        # Every finished attempt's net after fees and the full TDS: the day's cash result. Only this
+        # run's attempts are known, so a restart starts the day again at 0, which is the safe side.
         self._realized_pnl: Decimal = s_decimal_0
-        self._pnl_day: date = date.today()
+        self._pnl_day: Optional[date] = None
         self._consecutive_failures: int = 0
         self._book_seen: Dict[Tuple[str, str], Tuple[int, float]] = {}   # (venue, pair) -> (uid, when)
         self._rebalance_needs: Dict[str, str] = {}
@@ -183,6 +201,64 @@ class CrossArbController(ControllerBase):
         cost = buy_price * (Decimal("1") + self.fee_rate(buy_exchange))
         proceeds = sell_price * (Decimal("1") - self.fee_rate(sell_exchange) - self.config.tds_pct / Decimal("100"))
         return (proceeds - cost) / buy_price * Decimal("100")
+
+    def worst_cash(self, buy_exchange: str, sell_exchange: str, pair: str, amount: Decimal,
+                   buy_price: Decimal, sell_price: Decimal) -> Decimal:
+        """
+        What a trade adds to today's cash if both sides fill at their price limits: the sale, less
+        the buy, both fees and the TDS withheld. The executor's orders cannot fill at worse prices
+        than these, so a trade that fills on both sides cannot do worse. (An unwind after a one-sided
+        fill can — that is what max_loss_quote is for.)
+        """
+        buy_limit = buy_price + self._slippage(buy_exchange, pair)
+        sell_limit = max(sell_price - self._slippage(sell_exchange, pair), s_decimal_0)
+        cost = buy_limit * (Decimal("1") + self.fee_rate(buy_exchange))
+        proceeds = sell_limit * (Decimal("1") - self.fee_rate(sell_exchange) - self.config.tds_pct / Decimal("100"))
+        return amount * (proceeds - cost)
+
+    def _slippage(self, exchange: str, pair: str) -> Decimal:
+        """How far past the quoted price the executor prices its order (slippage_ticks)."""
+        if self.config.slippage_ticks <= 0:
+            return s_decimal_0
+        rules = self.market_data_provider.get_trading_rules(exchange, pair)
+        tick = rules.min_price_increment if rules is not None else s_decimal_0
+        return tick * self.config.slippage_ticks
+
+    # ── the cash floor ───────────────────────────────────────────────────────
+
+    def relaxed_trigger_pct(self) -> Optional[Decimal]:
+        """The lower trigger in %, or None when it is off or not actually lower."""
+        relaxed = self.config.relaxed_min_profitability
+        if relaxed is None or relaxed >= self.config.min_profitability:
+            return None
+        return relaxed * Decimal("100")
+
+    def cash_room(self) -> Decimal:
+        """
+        How much cash the relaxed trades may still spend today: the day's realised result, less what
+        the live attempts could still cost, less the floor. A live attempt's gain is not counted
+        until it has happened.
+        """
+        at_risk = sum((min(self._worst_cash_of(executor), s_decimal_0)
+                       for executor in self.executors_info if executor.is_active), s_decimal_0)
+        return self._realized_pnl + at_risk - self.config.cash_floor_quote
+
+    def _worst_cash_of(self, executor) -> Decimal:
+        config = executor.config
+        return self.worst_cash(config.buying_market.connector_name, config.selling_market.connector_name,
+                               config.buying_market.trading_pair, config.order_amount,
+                               config.buy_price_cap, config.sell_price_floor)
+
+    def cash_floor_reason(self) -> str:
+        return f"cash floor: needs {self.config.min_profitability * Decimal('100'):.2f}%"
+
+    def trading_day(self) -> date:
+        return datetime.fromtimestamp(self.market_data_provider.time(), IST).date()
+
+    def _start_new_day_if_due(self):
+        today = self.trading_day()
+        if today != self._pnl_day:
+            self._pnl_day, self._realized_pnl = today, s_decimal_0
 
     # ── market data ──────────────────────────────────────────────────────────
 
@@ -298,6 +374,7 @@ class CrossArbController(ControllerBase):
     # ── the per-tick picture ─────────────────────────────────────────────────
 
     async def update_processed_data(self):
+        self._start_new_day_if_due()
         opportunities: List[Opportunity] = []
         for pair in self.config.trading_pairs:
             for buy_exchange, sell_exchange in ((self.config.exchange_a, self.config.exchange_b),
@@ -310,6 +387,7 @@ class CrossArbController(ControllerBase):
                         key=lambda o: o.gross_pct, default=None),
             "skips": dict(self._skips),
             "realized_pnl": self._realized_pnl,
+            "cash_room": self.cash_room(),
             "rebalance_needs": dict(self._rebalance_needs),
             "halted": self._stopped_reason,
             "paused": dict(self._paused_pairs),
@@ -338,12 +416,23 @@ class CrossArbController(ControllerBase):
             return self._skip(opportunity, "paused: holding a mismatch")
 
         measured = opportunity.gross_pct if self.config.trigger_on == TriggerOn.GROSS else opportunity.net_pct
-        if measured < self.config.min_profitability * Decimal("100"):
+        trigger = self.config.min_profitability * Decimal("100")
+        relaxed = self.relaxed_trigger_pct()
+        if measured < (trigger if relaxed is None else relaxed):
             return self._skip(opportunity, "gap below threshold")
 
         self.size_for(opportunity)
         if opportunity.blocked_by:
             self._skips[opportunity.blocked_by] += 1
+            return opportunity
+
+        opportunity.worst_cash = self.worst_cash(buy_exchange, sell_exchange, pair, opportunity.amount,
+                                                 opportunity.ask, opportunity.bid)
+        if measured < trigger:
+            # Between the two triggers: only on cash the day has already made.
+            opportunity.relaxed = True
+            if self.cash_room() + opportunity.worst_cash < s_decimal_0:
+                return self._skip(opportunity, self.cash_floor_reason())
         return opportunity
 
     def _skip(self, opportunity: Opportunity, reason: str) -> Opportunity:
@@ -389,9 +478,10 @@ class CrossArbController(ControllerBase):
             return []
 
         actions: List[ExecutorAction] = []
-        # Sizing saw the budget left by the attempts already live; attempts started in this same
-        # tick, for other pairs, have to come out of it too.
+        # Sizing saw the budget and the cash room left by the attempts already live; attempts
+        # started in this same tick, for other pairs, have to come out of them too.
         budget = self.budget_left()
+        room = self.cash_room()
         for pair in self.config.trading_pairs:
             if pair in self._paused_pairs:
                 # Checked here as well as when pricing: the attempt that caused the pause is only
@@ -412,14 +502,19 @@ class CrossArbController(ControllerBase):
             if best.amount_quote > budget:
                 self._skips["total budget in use"] += 1
                 continue
+            if best.relaxed and room + best.worst_cash < s_decimal_0:
+                self._skips[self.cash_floor_reason()] += 1
+                continue
             budget -= best.amount_quote
+            room += min(best.worst_cash, s_decimal_0)
             actions.append(self.create_action(best))
             self._last_attempt[pair] = self.market_data_provider.time()
             self._recent_trades.append(self.market_data_provider.time())
             self.logger().info(
                 f"cross_arb: {best.pair} buy {best.buy_exchange} @ {best.ask} / sell "
                 f"{best.sell_exchange} @ {best.bid} | {best.amount} ({best.amount_quote:.2f}) | "
-                f"gross {best.gross_pct:.3f}% net {best.net_pct:.3f}%")
+                f"gross {best.gross_pct:.3f}% net {best.net_pct:.3f}% | cash {best.worst_cash:+.2f}"
+                + (f" on the relaxed trigger, cash room left {room:.2f}" if best.relaxed else ""))
         return actions
 
     def create_action(self, opportunity: Opportunity) -> CreateExecutorAction:
@@ -473,9 +568,7 @@ class CrossArbController(ControllerBase):
         A run of failures usually means the venue is refusing us — carrying on would just repeat
         the same refusal every tick, which is how a stuck position gets hidden behind noise.
         """
-        today = date.today()
-        if today != self._pnl_day:
-            self._pnl_day, self._realized_pnl = today, s_decimal_0
+        self._start_new_day_if_due()
         for executor in self.executors_info:
             if executor.is_active or executor.id in self._counted_executors:
                 continue
@@ -505,12 +598,17 @@ class CrossArbController(ControllerBase):
 
     def to_format_status(self) -> List[str]:
         opportunities: List[Opportunity] = self.processed_data.get("opportunities", [])
+        relaxed = self.relaxed_trigger_pct()
+        trigger = f"trigger {self.config.min_profitability * 100:.2f}% on {self.config.trigger_on.value}"
+        if relaxed is not None:
+            trigger += f" ({relaxed:.2f}% while today's cash stays >= {self.config.cash_floor_quote})"
+        room = (f"room for relaxed trades: {max(self.cash_room(), s_decimal_0):.2f} | "
+                if relaxed is not None else "")
         lines = [
             f"\n  Cross-exchange arbitrage | {self.config.exchange_a} <-> {self.config.exchange_b} | "
-            f"trigger {self.config.min_profitability * 100:.2f}% on {self.config.trigger_on.value} | "
-            f"size <= {self.config.order_amount_quote} | in play <= {self.config.total_amount_quote}",
-            f"  realised today: {self._realized_pnl:.2f} | failures in a row: {self._consecutive_failures} | "
-            f"trades this hour: {self.trades_in_last_hour()}",
+            f"{trigger} | size <= {self.config.order_amount_quote} | in play <= {self.config.total_amount_quote}",
+            f"  realised today (IST): {self._realized_pnl:.2f} | {room}failures in a row: "
+            f"{self._consecutive_failures} | trades this hour: {self.trades_in_last_hour()}",
         ]
         if self._stopped_reason:
             lines.append(f"  HALTED: {self._stopped_reason}")

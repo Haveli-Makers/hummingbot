@@ -41,7 +41,7 @@ Each check that fails is counted and named, so `status` shows why the bot is not
 |---|---|
 | Both order books have sent a new snapshot within `max_book_age` | `no fresh book: <exchange>` |
 | The pair is not paused after a kept mismatch (see `hold` below) | `paused: holding a mismatch` |
-| The gap reaches `min_profitability` (gross or net, per `trigger_on`) | `gap below threshold` |
+| The gap reaches `min_profitability` (gross or net, per `trigger_on`), or `relaxed_min_profitability` while the cash floor allows (see [TDS](#tds-two-triggers-and-a-cash-floor)) | `gap below threshold`, `cash floor: needs 1.25%` |
 | A trade size exists that both exchanges accept and both balances cover | `not enough <INR or coin> on <exchange>`, `total budget in use`, `nothing on offer`, `rounds to zero`, `below min order value (100)`, `below a venue minimum` |
 | No trade already running for the pair | `executor already running` |
 | The cooldown since the last trade on the pair has passed | `cooldown` |
@@ -65,12 +65,34 @@ both exchanges' minimum order size and value and `min_order_amount_quote`. If it
 sent. The exchanges' real minimums (₹60 on CSX, ₹50 on WazirX) are higher than their published rules
 say, which is what `min_order_amount_quote` guards against.
 
+### TDS: two triggers and a cash floor
+
+Every sale has 1% TDS withheld, and it comes back only after 1.5–2 years. On CSX ↔ WazirX (0.05%
+fee), a gap below about 1.06% therefore loses cash today, even though it makes money once the TDS is
+refunded. Two triggers handle this:
+
+- A gap at or above `min_profitability` (1.25%) is always traded.
+- A gap from `relaxed_min_profitability` (0.8%) up to `min_profitability` is traded only on cash the
+  day has already made: today's cash, less the worst case of the trades still running and of this
+  one, must stay at or above `cash_floor_quote` (₹100). Otherwise it is refused as
+  `cash floor: needs 1.25%`.
+
+Today's cash is the sum of every finished trade's net, after fees and the full TDS, since midnight
+IST. A trade's worst case is its result if both orders fill at their price limits; an unwind after a
+one-sided fill can lose more, which `max_loss_quote` covers. Only this run's trades are counted, so a
+restart starts the day at ₹0. Setting `relaxed_min_profitability` to `null`, or to a value not below
+`min_profitability`, turns the lower trigger off.
+
+For example, with ₹10,000 trades: two trades on a 2% gap add ₹92.90 each, so cash reaches ₹185.80.
+Trades on a 0.9% gap (−₹15.95 each) can then run five times, leaving ₹106.05, and the sixth is
+refused because it would leave ₹90.10.
+
 ### Limits that stop all trading
 
 | Limit | Shown as |
 |---|---|
 | `manual_kill_switch` | `kill switch on` |
-| Today's realised loss reaches `max_loss_quote` | `daily loss limit reached` |
+| Today's (IST) realised loss reaches `max_loss_quote` | `daily loss limit reached` |
 | `max_consecutive_failures` failed trades in a row | `N failed attempts in a row` |
 | `max_trades_per_hour` reached | `trades per hour reached` |
 
@@ -85,8 +107,8 @@ simply stops (`not enough … on …`) while the other direction keeps trading. 
 
 ### Status
 
-`status` shows the trigger and size limits; profit realised today, failures in a row and trades this
-hour; any `HALTED` or `PAUSED` line; a table of every pair and direction (ask, bid, gross %, net %,
+`status` shows both triggers and the size limits; the result realised today (IST), the cash room left
+for relaxed trades, failures in a row and trades this hour; any `HALTED` or `PAUSED` line; a table of every pair and direction (ask, bid, gross %, net %,
 size, and what blocked it); the most common reasons for not trading; any `REBALANCE` lines; and how
 many trades are running.
 
@@ -166,7 +188,9 @@ against the money paid. TDS is not reported by the connectors, so it is computed
 |---|---|---|
 | `exchange_a`, `exchange_b` | `csx`, `wazirx` | the two exchanges |
 | `trading_pairs` | `[USDT-INR]` | pairs to trade |
-| `min_profitability` | `0.01` | the trigger, as a fraction (0.01 = 1%) |
+| `min_profitability` | `0.0125` | the trigger, as a fraction (0.0125 = 1.25%) |
+| `relaxed_min_profitability` | `0.008` | the lower trigger, used only on cash already made today; `null` turns it off |
+| `cash_floor_quote` | `100` | the day's cash may not fall below this through relaxed trades |
 | `trigger_on` | `gross` | compare the gross gap or the net |
 | `taker_fee_pct` | `{}` | fee per exchange in %; an exchange left out counts as free |
 | `gst_pct` | `18` | GST added on top of the fee (0 when the fee already includes it) |
@@ -177,7 +201,7 @@ against the money paid. TDS is not reported by the connectors, so it is computed
 | `max_book_age` | `10` | seconds without a new snapshot before a book counts as stale |
 | `cooldown` | `5` | seconds between trades on a pair |
 | `max_trades_per_hour` | `60` | |
-| `max_loss_quote` | off | realised loss that stops trading for the day |
+| `max_loss_quote` | off | realised loss that stops trading for the day (IST) |
 | `max_consecutive_failures` | `5` | |
 | `manual_kill_switch` | `false` | |
 | `rebalance_below_quote` | `500` | balance below which a `REBALANCE` line appears |
@@ -219,6 +243,8 @@ exchange_b: wazirx
 trading_pairs:
   - SOL-INR
 min_profitability: 0.0125
+relaxed_min_profitability: 0.008
+cash_floor_quote: 100
 trigger_on: gross
 taker_fee_pct:
   csx: 0.05

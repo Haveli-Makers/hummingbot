@@ -99,6 +99,10 @@ refused because it would leave ₹90.10.
 These show as `HALTED` in the status. In `v2_with_controllers.py` the kill switch also stops the
 controller.
 
+A trade counts as failed if it ends `FAILED` or `INSUFFICIENT_BALANCE`, or if one side had to be
+unwound: it ends `COMPLETED` with nothing left over, but the unwind cost about 1.2% (an exchange that
+refuses every order looks exactly like this). A trade that matches cleanly resets the count.
+
 ### Low balances
 
 Trades usually run one way, so one side's money runs down. When a direction has no money left it

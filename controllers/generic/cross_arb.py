@@ -576,10 +576,22 @@ class CrossArbController(ControllerBase):
             self._realized_pnl += executor.net_pnl_quote or s_decimal_0
             if executor.close_type in (CloseType.FAILED, CloseType.INSUFFICIENT_BALANCE):
                 self._consecutive_failures += 1
+            elif executor.close_type == CloseType.COMPLETED and self.needed_an_unwind(executor):
+                # It ends COMPLETED — nothing is left over — but one side did not fill as planned and
+                # the other was traded back, at about 1.2% with the TDS on that sale. A venue that
+                # refuses every order looks exactly like this, so it must count towards the brake.
+                self._consecutive_failures += 1
+                self.logger().warning(
+                    f"cross_arb: attempt {executor.id} needed an unwind (net {executor.net_pnl_quote}); "
+                    f"counted as a failure ({self._consecutive_failures} in a row)")
             elif executor.close_type == CloseType.COMPLETED:
                 self._consecutive_failures = 0
             elif executor.close_type == CloseType.POSITION_HOLD:
                 self.pause_for_held_mismatch(executor)
+
+    @staticmethod
+    def needed_an_unwind(executor) -> bool:
+        return (executor.custom_info or {}).get("flatten_orders", 0) > 0
 
     def pause_for_held_mismatch(self, executor):
         """

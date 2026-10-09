@@ -319,6 +319,30 @@ class CrossArbControllerTests(IsolatedAsyncioWrapperTestCase):
         controller.account_for_finished_executors()
         self.assertIsNone(controller.halt_reason())
 
+    async def test_an_attempt_that_needed_an_unwind_counts_as_a_failure(self):
+        """Dry-run 'reject': WazirX refused every sell, each attempt ended COMPLETED after selling
+        back on CSX at -59.94, and 'failures in a row' stayed at 0 — the brake never fired."""
+        controller = self.controller(max_consecutive_failures=2)
+        unwound = {"flatten_orders": 1}
+        controller.executors_info = [
+            self.executor(active=False, close_type=CloseType.COMPLETED, pnl=D("-6"), executor_id="u1",
+                          custom_info=unwound),
+            self.executor(active=False, close_type=CloseType.COMPLETED, pnl=D("-6"), executor_id="u2",
+                          custom_info=unwound)]
+        await controller.update_processed_data()
+        self.assertEqual(controller.determine_executor_actions(), [])
+        self.assertEqual(controller.halt_reason(), "2 failed attempts in a row")
+
+    async def test_a_clean_attempt_still_clears_the_count(self):
+        controller = self.controller(max_consecutive_failures=2)
+        controller.executors_info = [
+            self.executor(active=False, close_type=CloseType.COMPLETED, pnl=D("-6"), executor_id="u1",
+                          custom_info={"flatten_orders": 1}),
+            self.executor(active=False, close_type=CloseType.COMPLETED, pnl=D("5"), executor_id="w1",
+                          custom_info={"flatten_orders": 0})]
+        controller.account_for_finished_executors()
+        self.assertEqual(controller._consecutive_failures, 0)
+
     async def test_trades_per_hour(self):
         controller = self.controller(max_trades_per_hour=1, cooldown=0)
         await controller.update_processed_data()

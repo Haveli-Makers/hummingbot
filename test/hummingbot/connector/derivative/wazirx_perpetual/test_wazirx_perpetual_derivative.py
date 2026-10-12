@@ -406,6 +406,41 @@ class WazirxPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
         self.assertTrue(self.exchange._is_request_exception_related_to_time_synchronizer(err(2098)))
         self.assertFalse(self.exchange._is_request_exception_related_to_time_synchronizer(err(2005)))
 
+    # ---- time sync ---------------------------------------------------------------------
+
+    async def test_time_sync_runs_at_most_once_per_interval_even_after_a_failure(self):
+        from unittest.mock import patch
+
+        now = [1000.0]
+        self.exchange._time = lambda: now[0]
+        target = "hummingbot.connector.exchange_py_base.ExchangePyBase._update_time_synchronizer"
+        with patch(target, new=AsyncMock(side_effect=IOError("HTTP status is 429"))) as base_sync:
+            with self.assertRaises(IOError):
+                await self.exchange._update_time_synchronizer()
+            # The status loop retries ~0.5s later; that must not hit /fapi/v1/time again.
+            now[0] += 0.5
+            await self.exchange._update_time_synchronizer()
+            self.assertEqual(1, base_sync.call_count)
+
+            base_sync.side_effect = None
+            now[0] += CONSTANTS.TIME_SYNC_INTERVAL
+            await self.exchange._update_time_synchronizer()
+            self.assertEqual(2, base_sync.call_count)
+
+    async def test_recv_window_rejection_forces_a_resync(self):
+        from unittest.mock import patch
+
+        now = [1000.0]
+        self.exchange._time = lambda: now[0]
+        target = "hummingbot.connector.exchange_py_base.ExchangePyBase._update_time_synchronizer"
+        with patch(target, new=AsyncMock()) as base_sync:
+            await self.exchange._update_time_synchronizer()
+            now[0] += 1
+            error = IOError('HTTP status is 400. Error: {"code":2098,"message":"Request out of receiving window."}')
+            self.assertTrue(self.exchange._is_request_exception_related_to_time_synchronizer(error))
+            await self.exchange._update_time_synchronizer()
+            self.assertEqual(2, base_sync.call_count)
+
     # ---- fills -----------------------------------------------------------------------
 
     async def test_trade_updates_from_user_trades(self):

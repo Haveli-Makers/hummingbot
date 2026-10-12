@@ -96,6 +96,8 @@ class WazirxPerpetualDerivative(PerpetualDerivativePyBase):
         # Open position id per trading pair; a CLOSE order must name it.
         self._position_ids: Dict[str, int] = {}
         self._derived_balance_logged = False
+        # When the clock was last resynced, successfully or not (see _update_time_synchronizer).
+        self._last_time_sync_attempt: float = 0.0
 
         # ownTrade frames that arrived before their order's exchange id was
         # known, held as (exchange_order_id, payload, buffered_at).
@@ -239,7 +241,25 @@ class WazirxPerpetualDerivative(PerpetualDerivativePyBase):
         return int(match.group(1)) if match else None
 
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception) -> bool:
-        return self._error_code(request_exception) == CONSTANTS.OUT_OF_RECV_WINDOW_ERROR_CODE
+        related = self._error_code(request_exception) == CONSTANTS.OUT_OF_RECV_WINDOW_ERROR_CODE
+        if related:
+            # _api_request resyncs right after this returns True; let that one through.
+            self._last_time_sync_attempt = 0.0
+        return related
+
+    async def _update_time_synchronizer(self, pass_on_non_cancelled_error: bool = False):
+        """
+        Resync the clock at most once per ``TIME_SYNC_INTERVAL`` instead of on every
+        status poll. The attempt is recorded before the call, so a failure (e.g. a
+        429) also waits the full interval: the status loop otherwise retries every
+        ~0.5s straight into /fapi/v1/time again. A recvWindow rejection (2098)
+        forces an immediate resync (see above).
+        """
+        now = self._time()
+        if now - self._last_time_sync_attempt < CONSTANTS.TIME_SYNC_INTERVAL:
+            return
+        self._last_time_sync_attempt = now
+        await super()._update_time_synchronizer(pass_on_non_cancelled_error=pass_on_non_cancelled_error)
 
     def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
         return self._error_code(status_update_exception) in (

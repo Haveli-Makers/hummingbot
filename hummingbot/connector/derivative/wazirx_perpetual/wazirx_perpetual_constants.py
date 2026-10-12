@@ -137,30 +137,42 @@ TONCE_USED_ERROR_CODE = 2006            # "The tonce has already been used."
 FUTURES_NOT_ACTIVATED_ERROR_CODE = 2191
 NO_OPEN_POSITIONS_ERROR_CODE = 3216
 
-ONE_SECOND = 1
+# The clock is resynced at most this often (seconds). The base class does it on
+# every status poll, and after a failure the poll loop retries every ~0.5s, which
+# against WazirX's 1/s limit means a stream of 429s; WazirX warns that hammering
+# after 429s can get the API key blocked.
+TIME_SYNC_INTERVAL = 60
 
 # Futures rate limits: 10/s for create and cancel, 2/s for depth, 1/s for every
 # other endpoint. Depth is declared at 1/s: the spot depth endpoint answered
 # HTTP 429 to 21% of calls at its documented 2/s, and the book is streamed over
 # the websocket anyway, so REST depth is only a start-up / fallback path.
+#
+# Each window is stretched to 1.5s. The throttler spaces calls by when they are
+# SENT (with a 5% margin, ~50ms), while WazirX counts them when they ARRIVE; on
+# 2026-10-12 calls spaced ~1.05s apart still got 429 (code 2136) on
+# /fapi/v1/time and /fapi/v1/ticker/24hr, because ordinary network jitter is
+# larger than that margin.
+RATE_LIMIT_WINDOW = 1.5
+
 RATE_LIMITS = [
-    RateLimit(limit_id=PING_PATH_URL, limit=1, time_interval=ONE_SECOND),
-    RateLimit(limit_id=SERVER_TIME_PATH_URL, limit=1, time_interval=ONE_SECOND),
-    RateLimit(limit_id=EXCHANGE_INFO_PATH_URL, limit=1, time_interval=ONE_SECOND),
-    RateLimit(limit_id=MARK_PRICE_PATH_URL, limit=1, time_interval=ONE_SECOND),
-    RateLimit(limit_id=DEPTH_PATH_URL, limit=1, time_interval=ONE_SECOND),
-    RateLimit(limit_id=TICKER_24HR_PATH_URL, limit=1, time_interval=ONE_SECOND),
-    RateLimit(limit_id=KLINES_PATH_URL, limit=1, time_interval=ONE_SECOND),
-    RateLimit(limit_id=POSITION_RISK_PATH_URL, limit=1, time_interval=ONE_SECOND),
-    RateLimit(limit_id=INCOME_PATH_URL, limit=1, time_interval=ONE_SECOND),
-    RateLimit(limit_id=USER_TRADES_PATH_URL, limit=1, time_interval=ONE_SECOND),
-    RateLimit(limit_id=CREATE_ORDER_LIMIT_ID, limit=10, time_interval=ONE_SECOND),
-    RateLimit(limit_id=CANCEL_ORDER_LIMIT_ID, limit=10, time_interval=ONE_SECOND),
-    RateLimit(limit_id=QUERY_ORDER_LIMIT_ID, limit=1, time_interval=ONE_SECOND),
-    RateLimit(limit_id=OPEN_ORDERS_PATH_URL, limit=1, time_interval=ONE_SECOND),
-    RateLimit(limit_id=ALL_ORDERS_PATH_URL, limit=1, time_interval=ONE_SECOND),
-    RateLimit(limit_id=CANCEL_ALL_OPEN_ORDERS_PATH_URL, limit=1, time_interval=ONE_SECOND),
-    RateLimit(limit_id=POSITION_MARGIN_PATH_URL, limit=1, time_interval=ONE_SECOND),
-    RateLimit(limit_id=FUNDS_PATH_URL, limit=1, time_interval=ONE_SECOND),
-    RateLimit(limit_id=CREATE_AUTH_TOKEN_PATH_URL, limit=1, time_interval=ONE_SECOND),
+    RateLimit(limit_id=PING_PATH_URL, limit=1, time_interval=RATE_LIMIT_WINDOW),
+    RateLimit(limit_id=SERVER_TIME_PATH_URL, limit=1, time_interval=RATE_LIMIT_WINDOW),
+    RateLimit(limit_id=EXCHANGE_INFO_PATH_URL, limit=1, time_interval=RATE_LIMIT_WINDOW),
+    RateLimit(limit_id=MARK_PRICE_PATH_URL, limit=1, time_interval=RATE_LIMIT_WINDOW),
+    RateLimit(limit_id=DEPTH_PATH_URL, limit=1, time_interval=RATE_LIMIT_WINDOW),
+    RateLimit(limit_id=TICKER_24HR_PATH_URL, limit=1, time_interval=RATE_LIMIT_WINDOW),
+    RateLimit(limit_id=KLINES_PATH_URL, limit=1, time_interval=RATE_LIMIT_WINDOW),
+    RateLimit(limit_id=POSITION_RISK_PATH_URL, limit=1, time_interval=RATE_LIMIT_WINDOW),
+    RateLimit(limit_id=INCOME_PATH_URL, limit=1, time_interval=RATE_LIMIT_WINDOW),
+    RateLimit(limit_id=USER_TRADES_PATH_URL, limit=1, time_interval=RATE_LIMIT_WINDOW),
+    RateLimit(limit_id=CREATE_ORDER_LIMIT_ID, limit=10, time_interval=RATE_LIMIT_WINDOW),
+    RateLimit(limit_id=CANCEL_ORDER_LIMIT_ID, limit=10, time_interval=RATE_LIMIT_WINDOW),
+    RateLimit(limit_id=QUERY_ORDER_LIMIT_ID, limit=1, time_interval=RATE_LIMIT_WINDOW),
+    RateLimit(limit_id=OPEN_ORDERS_PATH_URL, limit=1, time_interval=RATE_LIMIT_WINDOW),
+    RateLimit(limit_id=ALL_ORDERS_PATH_URL, limit=1, time_interval=RATE_LIMIT_WINDOW),
+    RateLimit(limit_id=CANCEL_ALL_OPEN_ORDERS_PATH_URL, limit=1, time_interval=RATE_LIMIT_WINDOW),
+    RateLimit(limit_id=POSITION_MARGIN_PATH_URL, limit=1, time_interval=RATE_LIMIT_WINDOW),
+    RateLimit(limit_id=FUNDS_PATH_URL, limit=1, time_interval=RATE_LIMIT_WINDOW),
+    RateLimit(limit_id=CREATE_AUTH_TOKEN_PATH_URL, limit=1, time_interval=RATE_LIMIT_WINDOW),
 ]

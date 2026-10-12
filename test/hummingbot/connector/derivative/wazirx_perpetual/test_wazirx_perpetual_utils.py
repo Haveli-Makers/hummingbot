@@ -92,6 +92,12 @@ class WazirxPerpetualConstantsTests(TestCase):
         self.assertEqual(10, limits[CONSTANTS.CREATE_ORDER_LIMIT_ID])
         self.assertEqual(10, limits[CONSTANTS.CANCEL_ORDER_LIMIT_ID])
 
+    def test_windows_have_headroom_for_network_jitter(self):
+        # Calls spaced ~1.05s apart (1s window + the throttler's 5% margin) still
+        # drew HTTP 429 live, because WazirX counts arrival, not send time.
+        for limit in CONSTANTS.RATE_LIMITS:
+            self.assertGreaterEqual(limit.time_interval, 1.5, limit.limit_id)
+
 
 class WazirxPerpetualWebUtilsTests(TestCase):
     def test_urls(self):

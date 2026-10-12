@@ -106,14 +106,28 @@ class DexalotSpotCandles(CandlesBase):
         return params
 
     def _parse_rest_candles(self, data: dict, end_time: Optional[int] = None) -> List[List[float]]:
-        if data is not None and len(data) > 0:
-            return [[self.ensure_timestamp_in_seconds(datetime.strptime(row["date"], '%Y-%m-%dT%H:%M:%S.%fZ').timestamp()),
-                     row["open"] if row["open"] != 'None' else None,
-                     row["high"] if row["high"] != 'None' else None,
-                     row["low"] if row["low"] != 'None' else None,
-                     row["close"] if row["close"] != 'None' else None,
-                     row["volume"] if row["volume"] != 'None' else None,
-                     0., 0., 0., 0.] for row in data]
+        if data is None:
+            return []
+        parsed_candles = []
+        last_close = None
+        for row in data:
+            open_, high_, low_, close_, volume_ = (row.get(f) for f in ("open", "high", "low", "close", "volume"))
+            if None in (open_, high_, low_, close_):
+                if last_close is None:
+                    continue
+                open_ = high_ = low_ = close_ = last_close
+                volume_ = 0.
+            else:
+                last_close = close_
+            parsed_candles.append([
+                self.ensure_timestamp_in_seconds(datetime.strptime(row["date"], '%Y-%m-%dT%H:%M:%S.%fZ').timestamp()),
+                open_,
+                high_,
+                low_,
+                close_,
+                volume_ if volume_ is not None else 0.,
+                0., 0., 0., 0.])
+        return parsed_candles
 
     def ws_subscription_payload(self):
         interval = CONSTANTS.INTERVALS[self.interval]
@@ -130,7 +144,7 @@ class DexalotSpotCandles(CandlesBase):
         candles_row_dict: Dict[str, Any] = {}
         if data is not None and data.get("type") == 'liveCandle':
             candle = data.get("data")[-1]
-            timestamp = datetime.strptime(candle["date"], '%Y-%m-%dT%H:%M:%SZ').timestamp()
+            timestamp = datetime.strptime(candle["date"], '%Y-%m-%dT%H:%M:%S.%fZ').timestamp()
             candles_row_dict["timestamp"] = self.ensure_timestamp_in_seconds(timestamp)
             candles_row_dict["open"] = candle["open"]
             candles_row_dict["low"] = candle["low"]

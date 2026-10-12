@@ -24,6 +24,7 @@ class CoinDCXSpotCandles(CandlesBase):
     def __init__(self, trading_pair: str, interval: str = "1m", max_records: int = 150):
         super().__init__(trading_pair, interval, max_records)
         self._polling_task: Optional[asyncio.Task] = None
+        self._historical_fill_task: Optional[asyncio.Task] = None
         self._is_running = False
         self._shutdown_event = asyncio.Event()
         self._historical_fill_in_progress = False
@@ -54,7 +55,7 @@ class CoinDCXSpotCandles(CandlesBase):
 
     @property
     def candles_max_result_per_rest_request(self) -> int:
-        return CONSTANTS.MAX_RESULTS_PER_CANDLESTICK_REST_REQUEST
+        return max(1, CONSTANTS.MAX_RESULTS_PER_CANDLESTICK_REST_REQUEST // self._resample_ratio)
 
     @property
     def rate_limits(self):
@@ -63,6 +64,31 @@ class CoinDCXSpotCandles(CandlesBase):
     @property
     def intervals(self):
         return CONSTANTS.INTERVALS
+
+    def _resolve_native_interval(self) -> str:
+        """
+        CoinDCX's public candles REST endpoint only accepts a handful of native intervals
+        (CONSTANTS.NATIVE_INTERVALS). Resolve the largest one that evenly divides the
+        requested self.interval so it can be fetched and then resampled client-side.
+        """
+        target_seconds = self.interval_in_seconds
+        for native in CONSTANTS.NATIVE_INTERVALS:
+            native_seconds = self.get_seconds_from_interval(native)
+            if native_seconds <= target_seconds and target_seconds % native_seconds == 0:
+                return native
+        raise ValueError(
+            f"CoinDCX cannot provide '{self.interval}' candles: its public API only supports "
+            f"{CONSTANTS.NATIVE_INTERVALS} as base intervals, and none of them evenly divide "
+            f"'{self.interval}'."
+        )
+
+    @property
+    def _native_interval(self) -> str:
+        return self._resolve_native_interval()
+
+    @property
+    def _resample_ratio(self) -> int:
+        return self.interval_in_seconds // self.get_seconds_from_interval(self._native_interval)
 
     async def check_network(self) -> NetworkStatus:
         rest_assistant = await self._api_factory.get_rest_assistant()
@@ -207,6 +233,14 @@ class CoinDCXSpotCandles(CandlesBase):
                     pass
         self._polling_task = None
         self._is_running = False
+        if self._historical_fill_task and not self._historical_fill_task.done():
+            self._historical_fill_task.cancel()
+            try:
+                await self._historical_fill_task
+            except asyncio.CancelledError:
+                pass
+        self._historical_fill_task = None
+        self._historical_fill_in_progress = False
 
     def _get_rest_candles_params(
         self,
@@ -214,10 +248,11 @@ class CoinDCXSpotCandles(CandlesBase):
         end_time: Optional[int] = None,
         limit: Optional[int] = CONSTANTS.MAX_RESULTS_PER_CANDLESTICK_REST_REQUEST,
     ) -> dict:
+        native_limit = (limit or CONSTANTS.MAX_RESULTS_PER_CANDLESTICK_REST_REQUEST) * self._resample_ratio
         params: dict = {
             "pair": self._ex_trading_pair,
-            "interval": self.interval,
-            "limit": limit or CONSTANTS.MAX_RESULTS_PER_CANDLESTICK_REST_REQUEST,
+            "interval": self._native_interval,
+            "limit": min(native_limit, CONSTANTS.MAX_RESULTS_PER_CANDLESTICK_REST_REQUEST),
         }
         if start_time:
             params["startTime"] = int(start_time * 1000)
@@ -225,19 +260,44 @@ class CoinDCXSpotCandles(CandlesBase):
             params["endTime"] = int(end_time * 1000)
         return params
 
+    def _resample_candles(self, native_candles: List[List[float]]) -> List[List[float]]:
+        """Aggregate CoinDCX's native-interval candles into self.interval bars."""
+        if not native_candles or self._native_interval == self.interval:
+            return native_candles
+
+        grouped: dict = {}
+        for candle in native_candles:
+            bucket_ts = self._round_timestamp_to_interval_multiple(candle[0])
+            grouped.setdefault(bucket_ts, []).append(candle)
+
+        resampled: List[List[float]] = []
+        for bucket_ts in sorted(grouped.keys()):
+            bucket = sorted(grouped[bucket_ts], key=lambda c: c[0])
+            resampled.append([
+                bucket_ts,
+                bucket[0][1],
+                max(c[2] for c in bucket),
+                min(c[3] for c in bucket),
+                bucket[-1][4],
+                sum(c[5] for c in bucket),
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            ])
+        return resampled
+
     def _parse_rest_candles(
         self, data: list, end_time: Optional[int] = None
     ) -> List[List[float]]:
         if not data:
             return []
 
-        candles = []
+        native_candles = []
         for row in data:
             try:
                 timestamp = self.ensure_timestamp_in_seconds(row["time"])
-                if end_time and timestamp > end_time:
-                    continue
-                candles.append([
+                native_candles.append([
                     timestamp,
                     float(row["open"]),
                     float(row["high"]),
@@ -251,7 +311,11 @@ class CoinDCXSpotCandles(CandlesBase):
                 ])
             except Exception as e:
                 self.logger().error(f"CoinDCX: error parsing candle row {row}: {e}")
-        candles.sort(key=lambda x: x[0])
+        native_candles.sort(key=lambda x: x[0])
+
+        candles = self._resample_candles(native_candles)
+        if end_time:
+            candles = [c for c in candles if c[0] <= end_time]
         return candles
 
     async def listen_for_subscriptions(self):
@@ -310,7 +374,7 @@ class CoinDCXSpotCandles(CandlesBase):
             if candles.size > 0:
                 self._candles.extend(candles)
                 self._ws_candle_available.set()
-                safe_ensure_future(self.fill_historical_candles())
+                self._historical_fill_task = safe_ensure_future(self.fill_historical_candles())
                 self.logger().info(
                     f"CoinDCX candles seeded with {len(self._candles)} recent candles "
                     f"for {self._trading_pair} [{self.interval}]; backfill scheduled."
@@ -357,13 +421,14 @@ class CoinDCXSpotCandles(CandlesBase):
     async def _poll_and_update(self):
         try:
             rest_assistant = await self._api_factory.get_rest_assistant()
+            limit = min(10 * self._resample_ratio, CONSTANTS.MAX_RESULTS_PER_CANDLESTICK_REST_REQUEST)
             data = await rest_assistant.execute_request(
                 url=self.candles_url,
                 throttler_limit_id=self._rest_throttler_limit_id,
                 params={
                     "pair": self._ex_trading_pair,
-                    "interval": self.interval,
-                    "limit": 10,
+                    "interval": self._native_interval,
+                    "limit": limit,
                 },
                 method=self._rest_method,
             )
@@ -374,7 +439,7 @@ class CoinDCXSpotCandles(CandlesBase):
                 if candles:
                     self._candles.append(candles[-1])
                     self._ws_candle_available.set()
-                    safe_ensure_future(self.fill_historical_candles())
+                    self._historical_fill_task = safe_ensure_future(self.fill_historical_candles())
                 return
 
             for candle in candles:

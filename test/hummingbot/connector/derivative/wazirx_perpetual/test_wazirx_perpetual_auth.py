@@ -4,12 +4,15 @@ import json
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from urllib.parse import parse_qsl
 
+from hummingbot.connector.derivative.wazirx_perpetual import wazirx_perpetual_constants as CONSTANTS
 from hummingbot.connector.derivative.wazirx_perpetual.wazirx_perpetual_auth import WazirxPerpetualAuth
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod, RESTRequest
 
 
 class _FixedTime:
-    def __init__(self, now: float = 1_700_000_000.0):
+    # Ahead by the safety margin, so the back-dated signed timestamp lands exactly
+    # on 1700000000000 — the value used in the docs' signing examples.
+    def __init__(self, now: float = 1_700_000_000.0 + CONSTANTS.TIMESTAMP_SAFETY_MARGIN_MS / 1e3):
         self.now = now
 
     def time(self) -> float:
@@ -94,6 +97,15 @@ class WazirxPerpetualAuthTests(IsolatedAsyncioWrapperTestCase):
         self.clock.now += 5
         third, _ = self.auth.add_auth_to_params({})
         self.assertEqual(1700000005000, third["timestamp"])
+
+    def test_timestamps_are_back_dated_by_the_safety_margin(self):
+        # WazirX rejects a timestamp >= serverTime + 1000 (2098) but accepts one up to
+        # recvWindow (60s) late, so the signed time trails the synced clock.
+        params, _ = self.auth.add_auth_to_params({})
+        synced_ms = int(self.clock.now * 1e3)
+        self.assertEqual(synced_ms - CONSTANTS.TIMESTAMP_SAFETY_MARGIN_MS, params["timestamp"])
+        self.assertGreaterEqual(CONSTANTS.TIMESTAMP_SAFETY_MARGIN_MS, 1000)
+        self.assertLessEqual(CONSTANTS.TIMESTAMP_SAFETY_MARGIN_MS, 10_000)
 
     def test_none_values_are_not_sent(self):
         params, payload = self.auth.add_auth_to_params({"symbol": "BTCINR", "orderId": None})

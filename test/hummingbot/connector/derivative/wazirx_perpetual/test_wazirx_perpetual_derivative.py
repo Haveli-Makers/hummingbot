@@ -441,6 +441,19 @@ class WazirxPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
             await self.exchange._update_time_synchronizer()
             self.assertEqual(2, base_sync.call_count)
 
+    def test_recv_window_rejection_drops_the_old_clock_samples(self):
+        # The offset averages the last samples; keeping the one that caused the 2098
+        # made the immediate retry fail as well.
+        synchronizer = self.exchange._time_synchronizer
+        synchronizer.add_time_offset_ms_sample(1500.0)
+        other = IOError('HTTP status is 400. Error: {"code":2005,"message":"Signature is incorrect."}')
+        self.assertFalse(self.exchange._is_request_exception_related_to_time_synchronizer(other))
+        self.assertEqual(1, len(synchronizer._time_offset_ms))
+
+        error = IOError('HTTP status is 400. Error: {"code":2098,"message":"Request out of receiving window."}')
+        self.assertTrue(self.exchange._is_request_exception_related_to_time_synchronizer(error))
+        self.assertEqual(0, len(synchronizer._time_offset_ms))
+
     # ---- fills -----------------------------------------------------------------------
 
     async def test_trade_updates_from_user_trades(self):

@@ -143,6 +143,15 @@ NO_OPEN_POSITIONS_ERROR_CODE = 3216
 # after 429s can get the API key blocked.
 TIME_SYNC_INTERVAL = 60
 
+# Signed timestamps are back-dated by this much. WazirX's window is lopsided: a
+# request is accepted when serverTime - timestamp <= recvWindow (60000 ms by
+# default) but REJECTED when timestamp >= serverTime + 1000, i.e. more than 1s
+# early (error 2098). The synced clock can sit a little ahead of the server —
+# a time sample taken on a fresh connection counts DNS/TLS setup in its outbound
+# leg — and on 2026-10-13 positionRisk was refused with 2098 twice in a row.
+# Being up to a few seconds late costs nothing; being 1s early fails the call.
+TIMESTAMP_SAFETY_MARGIN_MS = 2000
+
 # Futures rate limits: 10/s for create and cancel, 2/s for depth, 1/s for every
 # other endpoint. Depth is declared at 1/s: the spot depth endpoint answered
 # HTTP 429 to 21% of calls at its documented 2/s, and the book is streamed over

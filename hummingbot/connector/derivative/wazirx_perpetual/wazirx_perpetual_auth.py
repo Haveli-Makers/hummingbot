@@ -5,6 +5,7 @@ from collections import OrderedDict
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlencode
 
+from hummingbot.connector.derivative.wazirx_perpetual import wazirx_perpetual_constants as CONSTANTS
 from hummingbot.connector.time_synchronizer import TimeSynchronizer
 from hummingbot.core.web_assistant.auth import AuthBase
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod, RESTRequest, WSRequest
@@ -88,7 +89,9 @@ class WazirxPerpetualAuth(AuthBase):
         return {"X-Api-Key": self.api_key}
 
     def _next_timestamp_ms(self) -> int:
-        timestamp = int(self.time_provider.time() * 1e3)
+        # Back-dated: WazirX tolerates late timestamps but rejects early ones (see
+        # TIMESTAMP_SAFETY_MARGIN_MS).
+        timestamp = int(self.time_provider.time() * 1e3) - CONSTANTS.TIMESTAMP_SAFETY_MARGIN_MS
         if timestamp <= self._last_timestamp_ms:
             timestamp = self._last_timestamp_ms + 1
         self._last_timestamp_ms = timestamp

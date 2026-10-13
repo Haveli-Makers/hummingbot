@@ -245,6 +245,10 @@ class WazirxPerpetualDerivative(PerpetualDerivativePyBase):
         if related:
             # _api_request resyncs right after this returns True; let that one through.
             self._last_time_sync_attempt = 0.0
+            # The offset is a median/average over the last samples, so a resync that
+            # only ADDS a sample leaves the bad one in play and the retry can fail
+            # too (seen 2026-10-13: two 2098s in a row). Start from a clean slate.
+            self._time_synchronizer.clear_time_offset_ms_samples()
         return related
 
     async def _update_time_synchronizer(self, pass_on_non_cancelled_error: bool = False):

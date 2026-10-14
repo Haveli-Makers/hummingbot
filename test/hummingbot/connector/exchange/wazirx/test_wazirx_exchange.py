@@ -5,10 +5,12 @@ from decimal import Decimal
 
 import pytest
 from aioresponses import aioresponses
+from bidict import bidict
 from aioresponses.core import RequestCall
 
 from hummingbot.connector.exchange.wazirx import wazirx_constants as CONSTANTS, wazirx_web_utils as web_utils
 from hummingbot.connector.exchange.wazirx.wazirx_exchange import WazirxExchange
+from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from hummingbot.connector.test_support.exchange_connector_test import AbstractExchangeConnectorTests
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, TradeType
@@ -1005,3 +1007,66 @@ async def test_all_trade_updates_for_order_and_request_order_status():
     tu = updates[0]
     assert tu.trade_id == "1"
     assert float(tu.fill_price) == 123.0
+
+
+class WazirxFillOrderingReviewFixTests(IsolatedAsyncioWrapperTestCase):
+    """
+    Regression cover for PR #34 finding 7: `orderUpdate` and `ownTrade` are
+    independent streams with no delivery-order guarantee.
+    """
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.trading_pair = "COINALPHA-HBOT"
+        self.exchange = WazirxExchange(
+            wazirx_api_key="k", wazirx_api_secret="s",
+            trading_pairs=[self.trading_pair], trading_required=False,
+        )
+        self.exchange._set_trading_pair_symbol_map(
+            bidict({"coinalphahbot": self.trading_pair}))
+
+    def _order(self, amount="1.0") -> InFlightOrder:
+        order = InFlightOrder(
+            client_order_id="x-WZ-1", exchange_order_id="ex-1",
+            trading_pair=self.trading_pair, order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY, price=Decimal("100"),
+            amount=Decimal(amount), creation_timestamp=1_700_000_000.0,
+        )
+        self.exchange._order_tracker.start_tracking_order(order)
+        return order
+
+    async def test_terminal_order_update_records_fill_before_completing(self):
+        # If `done` is processed first, ClientOrderTracker fires the completion
+        # event built from executed_amount_base == 0 and stops tracking. The
+        # ownTrade that follows still lands, but the strategy has already consumed
+        # a zero-size completion.
+        order = self._order()
+        self.exchange._record_outstanding_fill(
+            order, {"z": "1.0", "p": "100", "E": 1_700_000_001_000}, "ex-1")
+        self.assertEqual(Decimal("1.0"), order.executed_amount_base)
+
+    async def test_no_synthesis_when_own_trade_already_delivered(self):
+        # ownTrade arrived first: nothing is outstanding, so the terminal frame
+        # must not add a second fill.
+        order = self._order()
+        self.exchange._record_outstanding_fill(
+            order, {"z": "1.0", "p": "100", "E": 1}, "ex-1")
+        before = order.executed_amount_base
+        self.exchange._record_outstanding_fill(
+            order, {"z": "1.0", "p": "100", "E": 2}, "ex-1")
+        self.assertEqual(before, order.executed_amount_base)
+
+    async def test_synthesized_fill_carries_a_modelled_fee(self):
+        order = self._order()
+        self.exchange._record_outstanding_fill(
+            order, {"z": "1.0", "p": "100", "E": 1}, "ex-1")
+        self.assertGreater(order.cumulative_fee_paid("HBOT"), Decimal("0"))
+
+    async def test_null_numeric_fields_do_not_raise(self):
+        # An explicit JSON null makes Decimal(str(None)) raise InvalidOperation,
+        # which the listener's broad `except Exception` turns into a dropped
+        # message plus a 5s stall.
+        order = self._order()
+        self.exchange._record_outstanding_fill(
+            order, {"z": "0.5", "p": None, "E": None}, "ex-1")
+        self.assertEqual(Decimal("0.5"), order.executed_amount_base)

@@ -6,10 +6,13 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pytest
 from aioresponses import aioresponses
+from bidict import bidict
 from aioresponses.core import RequestCall
 
 from hummingbot.connector.exchange.coindcx import coindcx_constants as CONSTANTS, coindcx_web_utils as web_utils
 from hummingbot.connector.exchange.coindcx.coindcx_exchange import CoindcxExchange
+from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
+from unittest.mock import AsyncMock, patch
 from hummingbot.connector.test_support.exchange_connector_test import AbstractExchangeConnectorTests
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, TradeType
@@ -665,3 +668,62 @@ async def test_place_order_and_cancel_are_called(monkeypatch):
 def test_order_type_mappings():
     assert CoindcxExchange.coindcx_order_type(OrderType.MARKET) != ""
     assert CoindcxExchange.to_hb_order_type("market_order") == OrderType.MARKET or True
+
+
+class CoindcxBulkFillPollerReviewFixTests(IsolatedAsyncioWrapperTestCase):
+    """
+    Regression cover for PR #34 finding 3: the bulk fill poller kept ONE trade per
+    order (last-write-wins). With the page now sorted descending, that last write
+    is the order's OLDEST trade, so a multi-fill order permanently under-reported
+    its filled amount through this backup path.
+    """
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.trading_pair = "COINALPHA-HBOT"
+        self.exchange = CoindcxExchange(
+            coindcx_api_key="k", coindcx_api_secret="s",
+            trading_pairs=[self.trading_pair], trading_required=False,
+        )
+        self.exchange._set_trading_pair_symbol_map(
+            bidict({"COINALPHAHBOT": self.trading_pair}))
+        self.order = InFlightOrder(
+            client_order_id="x-DCX-1", exchange_order_id="ord-1",
+            trading_pair=self.trading_pair, order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY, price=Decimal("100"),
+            amount=Decimal("3.0"), creation_timestamp=1_700_000_000.0,
+        )
+        self.exchange._order_tracker.start_tracking_order(self.order)
+
+    @staticmethod
+    def _trade(trade_id, qty, ts):
+        return {"id": trade_id, "order_id": "ord-1", "quantity": qty,
+                "price": "100", "fee_amount": "0.1", "timestamp": ts}
+
+    async def test_every_trade_for_an_order_is_emitted(self):
+        # Page arrives NEWEST-first (sort=desc), exactly as the API now returns it.
+        trades = [self._trade("t3", "1.0", 3_000), self._trade("t2", "1.0", 2_000),
+                  self._trade("t1", "1.0", 1_000)]
+        self.exchange._last_poll_timestamp = 0
+        self.exchange._set_current_timestamp(1_700_000_100)
+
+        with patch.object(self.exchange, "_api_post", new=AsyncMock(return_value=trades)):
+            await self.exchange._update_order_fills_from_trades()
+
+        # All three fills applied — not just the oldest one the dict used to keep.
+        self.assertEqual(Decimal("3.0"), self.order.executed_amount_base)
+        self.assertEqual({"t1", "t2", "t3"}, set(self.order.order_fills.keys()))
+
+    async def test_repeated_polls_do_not_double_count(self):
+        # Per-fill dedup is by trade_id, so re-emitting the same page is a no-op.
+        trades = [self._trade("t2", "1.0", 2_000), self._trade("t1", "1.0", 1_000)]
+        self.exchange._last_poll_timestamp = 0
+        self.exchange._set_current_timestamp(1_700_000_100)
+
+        with patch.object(self.exchange, "_api_post", new=AsyncMock(return_value=trades)):
+            await self.exchange._update_order_fills_from_trades()
+            self.exchange._last_poll_timestamp = 0
+            self.exchange._set_current_timestamp(1_700_000_200)
+            await self.exchange._update_order_fills_from_trades()
+
+        self.assertEqual(Decimal("2.0"), self.order.executed_amount_base)

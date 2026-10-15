@@ -1,18 +1,15 @@
-from hummingbot.core.api_throttler.data_types import RateLimit
+from hummingbot.core.api_throttler.data_types import LinkedLimitWeightPair, RateLimit
 from hummingbot.core.data_type.in_flight_order import OrderState
 
 EXCHANGE_NAME = "coindcx_perpetual"
 DEFAULT_DOMAIN = "coindcx_perpetual"
 
-# CoinDCX serves private/instrument data from api.coindcx.com and public market data
-# (order book, current prices) from public.coindcx.com.
-REST_URL = "https://api.coindcx.com"
-PUBLIC_REST_URL = "https://public.coindcx.com"
-WSS_URL = "wss://stream.coindcx.com"
-
-# Every futures instrument is prefixed with the "B" exchange code and quoted in USDT
-# (verified: all 485 active instruments are B-<BASE>_USDT).
-ECODE = "B"
+# The FAPI (Futures API Market Maker Integration Guide v1.2) is served from REST and
+# WebSocket hosts that CoinDCX assigns per account at onboarding; the public hosts
+# (api.coindcx.com, public.coindcx.com) answer 404 under /fapi. The hosts are kept out
+# of the repo and read from these environment variables whenever a URL is built.
+REST_URL_ENV_VAR = "COINDCX_FAPI_REST_URL"
+WSS_URL_ENV_VAR = "COINDCX_FAPI_WS_URL"
 
 # Contracts are USDT-quoted, but margin may be posted in USDT or INR — chosen per
 # connector instance with ``coindcx_perpetual_margin_currency``.
@@ -32,18 +29,51 @@ FEE_CURRENCY = "USDT"
 HBOT_ORDER_ID_PREFIX = "haveli-"
 MAX_ORDER_ID_LEN = 36
 
-# ---- Public / market data --------------------------------------------------
-ACTIVE_INSTRUMENTS_PATH_URL = "/exchange/v1/derivatives/futures/data/active_instruments"
-INSTRUMENT_PATH_URL = "/exchange/v1/derivatives/futures/data/instrument"
+# ---- Public market data (FAPI) -----------------------------------------------
+# Public REST takes its parameters as a query string and needs no credentials.
+PING_PATH_URL = "/fapi/v1/ping"
+SERVER_TIME_PATH_URL = "/fapi/v1/time"
+EXCHANGE_INFO_PATH_URL = "/fapi/v1/exchangeInfo"
+DEPTH_PATH_URL = "/fapi/v1/depth"
+BOOK_TICKER_PATH_URL = "/fapi/v1/ticker/bookTicker"
+TICKER_24HR_PATH_URL = "/fapi/v1/ticker/24hr"
+# The latest-price endpoint is the only public one under /fapi/v2.
+TICKER_PRICE_PATH_URL = "/fapi/v2/ticker/price"
+# Mark price, index price, funding rate and next funding time in one call.
+PREMIUM_INDEX_PATH_URL = "/fapi/v1/premiumIndex"
 
-# Order book lives on the public host and REQUIRES the "-futures" suffix; without it
-# the very same path silently returns the SPOT book.
-ORDER_BOOK_PATH_URL = "/market_data/v3/orderbook"
-ORDER_BOOK_SUFFIX = "-futures"
-ORDER_BOOK_DEPTH = 20
+# Only these instruments are tradable perpetuals.
+SYMBOL_STATUS_TRADING = "TRADING"
+CONTRACT_TYPE_PERPETUAL = "PERPETUAL"
 
-# Funding rate + mark price + last price + 24h volume for every pair in one call.
-CURRENT_PRICES_PATH_URL = "/market_data/v3/current_prices/futures/rt"
+# Snapshot depth for the local order book. 500 is the documented default; the
+# allowed values and their weights are not documented.
+ORDER_BOOK_SNAPSHOT_LIMIT = 500
+
+# ---- Market data WebSocket (FAPI) ---------------------------------------------
+# One multiplexed connection; streams are added with SUBSCRIBE messages. The guide
+# names the path but not the message format, so the Binance one is assumed.
+PUBLIC_WS_PATH = "/ws"
+SUBSCRIBE_METHOD = "SUBSCRIBE"
+PUBLIC_WS_HEARTBEAT_INTERVAL = 30
+
+# Stream suffixes, appended to the lowercase exchange symbol (btcusdt@depth).
+DIFF_DEPTH_STREAM = "@depth"
+AGG_TRADE_STREAM = "@aggTrade"
+MARK_PRICE_STREAM = "@markPrice"
+
+# Values of the ``e`` field that route a frame to its queue.
+DIFF_EVENT_TYPE = "depthUpdate"
+TRADE_EVENT_TYPE = "aggTrade"
+MARK_PRICE_EVENT_TYPE = "markPriceUpdate"
+
+# Local order book protocol (guide §9): diffs are chained by ``pu`` (the previous
+# event's ``u``); a break means updates were missed and the book is rebuilt from a
+# fresh snapshot. Re-snapshots for one pair are spaced at least this far apart so a
+# stream that never chains cleanly cannot hammer the depth endpoint.
+MIN_RESYNC_INTERVAL = 5.0
+# Diffs held per pair while waiting for the snapshot they must line up with.
+MAX_BUFFERED_DIFFS = 1000
 
 # ---- Private ---------------------------------------------------------------
 LIST_ORDERS_PATH_URL = "/exchange/v1/derivatives/futures/orders"
@@ -57,7 +87,9 @@ WALLETS_PATH_URL = "/exchange/v1/derivatives/futures/wallets"
 TRANSACTIONS_PATH_URL = "/exchange/v1/derivatives/futures/positions/transactions"
 
 # Public spot ticker, used only to price the margin wallet in the quote currency
-# when margining in something other than USDT (e.g. INR).
+# when margining in something other than USDT (e.g. INR). It is part of CoinDCX's
+# public spot API, not the FAPI, so it keeps its own host.
+SPOT_REST_URL = "https://api.coindcx.com"
 SPOT_TICKER_PATH_URL = "/exchange/ticker"
 # Spot market that prices one unit of the quote currency in the margin currency.
 CONVERSION_MARKET = "{quote}{margin}"
@@ -71,20 +103,10 @@ PRIVATE_CHANNEL = "coindcx"
 
 WS_HEARTBEAT_TIME_INTERVAL = 25
 
-# Public events
-DEPTH_SNAPSHOT_EVENT_TYPE = "depth-snapshot"
-TRADE_EVENT_TYPE = "new-trade"
-CURRENT_PRICES_EVENT_TYPE = "currentPrices@futures#update"
-
 # Private events (df- prefix = derivatives futures)
 ORDER_UPDATE_EVENT_TYPE = "df-order-update"
 POSITION_UPDATE_EVENT_TYPE = "df-position-update"
 BALANCE_UPDATE_EVENT_TYPE = "balance-update"
-
-# Channel name templates. ``{pair}`` is the CoinDCX pair, e.g. B-BTC_USDT.
-ORDER_BOOK_CHANNEL = "{pair}@orderbook@{depth}-futures"
-TRADES_CHANNEL = "{pair}@trades-futures"
-CURRENT_PRICES_CHANNEL = "currentPrices@futures@rt"
 
 
 # ---- Order enums ------------------------------------------------------------
@@ -99,8 +121,6 @@ TIME_IN_FORCE_GTC = "good_till_cancel"
 NO_NOTIFICATION = "no_notification"
 
 
-# Funding is settled every ``funding_frequency`` hours (8 for most instruments).
-DEFAULT_FUNDING_FREQUENCY_HOURS = 8
 FUNDING_FEE_POLL_INTERVAL = 120
 
 ONE_MINUTE = 60
@@ -128,11 +148,6 @@ ALL_ORDER_STATUSES = "open,filled,partially_filled,partially_cancelled,cancelled
 PAGE_SIZE = 100
 MAX_PAGES = 20
 
-# Instrument details are fetched one request per pair; cap the fan-out so a
-# connector built without trading pairs (as TradingPairFetcher does) cannot fire
-# hundreds of concurrent requests.
-INSTRUMENT_FETCH_CONCURRENCY = 10
-
 # Substrings that mark an error as "this order is already gone". HTTP 422 alone is
 # a generic validation status on CoinDCX (malformed params, wrong margin currency,
 # permissions), so it must be paired with one of these before an order is treated
@@ -155,11 +170,30 @@ PENDING_ORDER_EVENT_TTL = 15.0
 PENDING_ORDER_EVENT_RETRY_INTERVAL = 0.2
 MAX_PENDING_ORDER_EVENTS = 256
 
+# The FAPI tiers are unpublished (exchangeInfo ``rateLimits`` is empty until they
+# are), so public calls share one weight pool sized at half of Binance's 2400/min.
+# Weights are the guide's where it states them (bookTicker and 24hr are charged at
+# their all-symbols cost, which is how the oracles call them) and Binance's
+# otherwise (exchangeInfo, depth at limit=500).
+REQUEST_WEIGHT = "REQUEST_WEIGHT"
+REQUEST_WEIGHT_LIMIT = 1200
+
+
+def _weighted(path_url: str, weight: int) -> RateLimit:
+    return RateLimit(limit_id=path_url, limit=REQUEST_WEIGHT_LIMIT, time_interval=ONE_MINUTE,
+                     linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=weight)])
+
+
 RATE_LIMITS = [
-    RateLimit(limit_id=ACTIVE_INSTRUMENTS_PATH_URL, limit=2000, time_interval=ONE_MINUTE),
-    RateLimit(limit_id=INSTRUMENT_PATH_URL, limit=2000, time_interval=ONE_MINUTE),
-    RateLimit(limit_id=ORDER_BOOK_PATH_URL, limit=2000, time_interval=ONE_MINUTE),
-    RateLimit(limit_id=CURRENT_PRICES_PATH_URL, limit=2000, time_interval=ONE_MINUTE),
+    RateLimit(limit_id=REQUEST_WEIGHT, limit=REQUEST_WEIGHT_LIMIT, time_interval=ONE_MINUTE),
+    _weighted(PING_PATH_URL, 1),
+    _weighted(SERVER_TIME_PATH_URL, 1),
+    _weighted(EXCHANGE_INFO_PATH_URL, 1),
+    _weighted(DEPTH_PATH_URL, 10),
+    _weighted(BOOK_TICKER_PATH_URL, 5),
+    _weighted(TICKER_24HR_PATH_URL, 40),
+    _weighted(TICKER_PRICE_PATH_URL, 1),
+    _weighted(PREMIUM_INDEX_PATH_URL, 1),
     RateLimit(limit_id=LIST_ORDERS_PATH_URL, limit=2000, time_interval=ONE_MINUTE),
     RateLimit(limit_id=CREATE_ORDER_PATH_URL, limit=2000, time_interval=ONE_MINUTE),
     RateLimit(limit_id=CANCEL_ORDER_PATH_URL, limit=2000, time_interval=ONE_MINUTE),

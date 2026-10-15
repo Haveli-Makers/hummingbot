@@ -1,41 +1,42 @@
-import time
+import os
 from typing import Callable, Optional
 
 from hummingbot.connector.derivative.coindcx_perpetual import coindcx_perpetual_constants as CONSTANTS
 from hummingbot.connector.time_synchronizer import TimeSynchronizer
 from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
 from hummingbot.core.web_assistant.auth import AuthBase
+from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
 
+def _host(env_var: str, kind: str) -> str:
+    """
+    The FAPI hosts are assigned per account at onboarding and kept out of the repo,
+    so they come from the environment. An empty host would otherwise surface as an
+    opaque "invalid URL" deep inside aiohttp.
+    """
+    url = os.environ.get(env_var, "").strip()
+    if not url:
+        raise ValueError(
+            f"The CoinDCX FAPI {kind} host is not configured. Set the {env_var} "
+            f"environment variable (hosts are assigned at onboarding).")
+    return url.rstrip("/")
+
+
+def rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
+    return _host(CONSTANTS.REST_URL_ENV_VAR, "REST") + path_url
+
+
 def private_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
-    """Private + instrument endpoints live on api.coindcx.com."""
-    return CONSTANTS.REST_URL + path_url
+    return rest_url(path_url=path_url, domain=domain)
 
 
 def public_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
-    return private_rest_url(path_url=path_url, domain=domain)
+    return rest_url(path_url=path_url, domain=domain)
 
 
-def public_market_data_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
-    """Public market data (order book, current prices) lives on public.coindcx.com."""
-    return CONSTANTS.PUBLIC_REST_URL + path_url
-
-
-def order_book_url(coindcx_pair: str, depth: int = CONSTANTS.ORDER_BOOK_DEPTH,
-                   domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
-    """
-    Build the futures order-book URL.
-
-    The ``-futures`` suffix is mandatory: the same path without it returns the
-    SPOT book for the pair, which would silently feed wrong prices.
-    """
-    return (f"{CONSTANTS.PUBLIC_REST_URL}{CONSTANTS.ORDER_BOOK_PATH_URL}/"
-            f"{coindcx_pair}{CONSTANTS.ORDER_BOOK_SUFFIX}/{depth}")
-
-
-def wss_url(domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
-    return CONSTANTS.WSS_URL
+def wss_url(path: str = "", domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
+    return _host(CONSTANTS.WSS_URL_ENV_VAR, "WebSocket") + path
 
 
 def build_api_factory(
@@ -80,9 +81,13 @@ async def get_current_server_time(
         throttler: Optional[AsyncThrottler] = None,
         domain: str = CONSTANTS.DEFAULT_DOMAIN,
 ) -> float:
-    """
-    CoinDCX exposes no futures server-time endpoint; the API only requires the
-    request timestamp to be within ~10s of its clock, so local time is used.
-    Returned in milliseconds to match the TimeSynchronizer convention.
-    """
-    return time.time() * 1e3
+    """Server time in milliseconds, from ``GET /fapi/v1/time``."""
+    throttler = throttler or create_throttler()
+    api_factory = build_api_factory_without_time_synchronizer_pre_processor(throttler=throttler)
+    rest_assistant = await api_factory.get_rest_assistant()
+    response = await rest_assistant.execute_request(
+        url=public_rest_url(path_url=CONSTANTS.SERVER_TIME_PATH_URL, domain=domain),
+        method=RESTMethod.GET,
+        throttler_limit_id=CONSTANTS.SERVER_TIME_PATH_URL,
+    )
+    return float(response["serverTime"])

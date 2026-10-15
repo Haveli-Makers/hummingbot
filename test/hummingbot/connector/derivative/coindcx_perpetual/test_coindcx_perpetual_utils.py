@@ -1,4 +1,3 @@
-from decimal import Decimal
 from unittest import TestCase
 
 from hummingbot.connector.derivative.coindcx_perpetual import (
@@ -9,29 +8,38 @@ from hummingbot.connector.derivative.coindcx_perpetual import (
 from hummingbot.core.web_assistant.connections.connections_factory import ConnectionsFactory
 
 
-def _instrument(**overrides):
-    instrument = {
-        "pair": "B-BTC_USDT",
-        "status": "active",
-        "kind": "perpetual",
-        "is_inverse": False,
-        "exit_only": False,
-        "min_quantity": 0.001,
-        "max_quantity": 950.0,
+def _symbol(**overrides):
+    symbol = {
+        "symbol": "BTCUSDT",
+        "status": "TRADING",
+        "contractType": "PERPETUAL",
+        "baseAsset": "BTC",
+        "quoteAsset": "USDT",
+        "filters": [
+            {"filterType": "PRICE_FILTER", "tickSize": "0.1"},
+            {"filterType": "MIN_NOTIONAL", "notional": "50.0"},
+        ],
     }
-    instrument.update(overrides)
-    return instrument
+    symbol.update(overrides)
+    return symbol
 
 
 class CoinDCXPerpetualUtilsTests(TestCase):
-    def test_pair_conversions_round_trip(self):
+    def test_legacy_pair_conversion(self):
+        # Still used by the legacy private code to read positions.
         self.assertEqual("BTC-USDT", utils.coindcx_pair_to_hb_pair("B-BTC_USDT"))
-        self.assertEqual("B-BTC_USDT", utils.hb_pair_to_coindcx_pair("BTC-USDT"))
 
-    def test_market_symbol_conversion(self):
-        # depth-snapshot frames identify instruments by this market symbol.
-        self.assertEqual("BTCUSDT", utils.coindcx_pair_to_market_symbol("B-BTC_USDT"))
-        self.assertEqual("BTCUSDT", utils.hb_pair_to_market_symbol("BTC-USDT"))
+    def test_is_exchange_information_valid(self):
+        self.assertTrue(utils.is_exchange_information_valid(_symbol()))
+        self.assertFalse(utils.is_exchange_information_valid(_symbol(status="SETTLING")))
+        self.assertFalse(utils.is_exchange_information_valid(_symbol(contractType="CURRENT_QUARTER")))
+        self.assertFalse(utils.is_exchange_information_valid(_symbol(symbol="")))
+        self.assertFalse(utils.is_exchange_information_valid(_symbol(baseAsset=None)))
+
+    def test_symbol_filter(self):
+        self.assertEqual("0.1", utils.symbol_filter(_symbol(), "PRICE_FILTER")["tickSize"])
+        self.assertEqual({}, utils.symbol_filter(_symbol(), "LOT_SIZE"))
+        self.assertEqual({}, utils.symbol_filter(_symbol(filters=None), "PRICE_FILTER"))
 
     def test_normalize_margin_currency_accepts_usdt_and_inr(self):
         self.assertEqual("USDT", utils.normalize_margin_currency("usdt"))
@@ -42,19 +50,6 @@ class CoinDCXPerpetualUtilsTests(TestCase):
         for bad in ("BTC", "USD", "eth"):
             with self.assertRaises(ValueError):
                 utils.normalize_margin_currency(bad)
-
-    def test_percent_fee_converted_to_decimal_fraction(self):
-        # CoinDCX reports 0.0236 meaning 0.0236 %.
-        self.assertEqual(Decimal("0.000236"), utils.percent_fee_to_decimal(0.0236))
-        self.assertEqual(Decimal("0"), utils.percent_fee_to_decimal(None))
-
-    def test_is_exchange_information_valid(self):
-        self.assertTrue(utils.is_exchange_information_valid(_instrument()))
-        self.assertFalse(utils.is_exchange_information_valid(_instrument(status="delisted")))
-        self.assertFalse(utils.is_exchange_information_valid(_instrument(is_inverse=True)))
-        self.assertFalse(utils.is_exchange_information_valid(_instrument(exit_only=True)))
-        self.assertFalse(utils.is_exchange_information_valid(_instrument(max_quantity=0)))
-        self.assertFalse(utils.is_exchange_information_valid(_instrument(pair="")))
 
     def test_config_map_fields(self):
         fields = utils.CoinDCXPerpetualConfigMap.model_fields
@@ -77,24 +72,6 @@ class CoinDCXPerpetualUtilsTests(TestCase):
 
 
 class CoinDCXPerpetualWebUtilsTests(TestCase):
-    def test_private_rest_url(self):
-        self.assertEqual(
-            "https://api.coindcx.com/exchange/v1/derivatives/futures/orders/create",
-            web_utils.private_rest_url(CONSTANTS.CREATE_ORDER_PATH_URL),
-        )
-
-    def test_public_market_data_url_uses_public_host(self):
-        self.assertEqual(
-            "https://public.coindcx.com/market_data/v3/current_prices/futures/rt",
-            web_utils.public_market_data_url(CONSTANTS.CURRENT_PRICES_PATH_URL),
-        )
-
-    def test_order_book_url_includes_futures_suffix(self):
-        # Without "-futures" the same path returns the SPOT book.
-        url = web_utils.order_book_url("B-BTC_USDT", depth=20)
-        self.assertEqual("https://public.coindcx.com/market_data/v3/orderbook/B-BTC_USDT-futures/20", url)
-        self.assertIn("-futures", url)
-
     def test_build_connections_factory_default(self):
         self.assertIsInstance(web_utils._build_connections_factory(None), ConnectionsFactory)
 

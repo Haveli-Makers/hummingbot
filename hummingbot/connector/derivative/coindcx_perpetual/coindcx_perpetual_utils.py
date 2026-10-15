@@ -1,4 +1,4 @@
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Any, Dict
 
 from pydantic import ConfigDict, Field, SecretStr
@@ -10,8 +10,8 @@ from hummingbot.core.data_type.trade_fee import TradeFeeSchema
 CENTRALIZED = True
 EXAMPLE_PAIR = "BTC-USDT"
 
-# Fallback only — real per-instrument maker/taker fees come from the instrument
-# details endpoint (see ``percent_fee_to_decimal``).
+# The FAPI publishes no per-instrument fees (exchangeInfo carries none; the account
+# has a ``feeTier``), so these estimates stand until fills report the real charge.
 DEFAULT_FEES = TradeFeeSchema(
     maker_percent_fee_decimal=Decimal("0.000236"),
     taker_percent_fee_decimal=Decimal("0.00059"),
@@ -19,75 +19,30 @@ DEFAULT_FEES = TradeFeeSchema(
 )
 
 
-def is_exchange_information_valid(instrument: Dict[str, Any]) -> bool:
+def is_exchange_information_valid(symbol_info: Dict[str, Any]) -> bool:
     """
-    Returns True when an instrument is an active, non-inverse perpetual that can be traded.
+    True for an exchangeInfo symbol that is a perpetual currently open for trading.
     """
-    if str(instrument.get("status", "")).lower() != "active":
-        return False
-    if str(instrument.get("kind", "perpetual")).lower() != "perpetual":
-        return False
-    if instrument.get("is_inverse", False):
-        return False
-    if instrument.get("exit_only", False):
-        return False
-    try:
-        min_quantity = float(instrument.get("min_quantity", 0) or 0)
-        max_quantity = float(instrument.get("max_quantity", 0) or 0)
-    except (TypeError, ValueError):
-        return False
-    if min_quantity < 0 or max_quantity <= 0 or min_quantity > max_quantity:
-        return False
-    return bool(instrument.get("pair"))
+    return (symbol_info.get("status") == CONSTANTS.SYMBOL_STATUS_TRADING
+            and symbol_info.get("contractType") == CONSTANTS.CONTRACT_TYPE_PERPETUAL
+            and bool(symbol_info.get("symbol"))
+            and bool(symbol_info.get("baseAsset"))
+            and bool(symbol_info.get("quoteAsset")))
+
+
+def symbol_filter(symbol_info: Dict[str, Any], filter_type: str) -> Dict[str, Any]:
+    """The exchangeInfo filter of the given type for a symbol, or an empty dict."""
+    return next((f for f in symbol_info.get("filters") or []
+                 if isinstance(f, dict) and f.get("filterType") == filter_type), {})
 
 
 def coindcx_pair_to_hb_pair(coindcx_pair: str) -> str:
     """
-    "B-BTC_USDT" -> "BTC-USDT"
+    Legacy-API pair to Hummingbot pair: "B-BTC_USDT" -> "BTC-USDT".
+    Only the legacy private code still reads legacy pairs.
     """
     without_ecode = coindcx_pair.split("-", 1)[1] if "-" in coindcx_pair else coindcx_pair
     return without_ecode.replace("_", "-")
-
-
-def hb_pair_to_coindcx_pair(hb_pair: str, ecode: str = CONSTANTS.ECODE) -> str:
-    """
-    "BTC-USDT" -> "B-BTC_USDT"
-    """
-    return f"{ecode}-{hb_pair.replace('-', '_')}"
-
-
-def coindcx_pair_to_market_symbol(coindcx_pair: str) -> str:
-    """
-    "B-BTC_USDT" -> "BTCUSDT".
-
-    ``depth-snapshot`` frames carry this market symbol in their ``s`` field,
-    where every other stream puts the CoinDCX pair. Confirmed against a live
-    multi-pair capture: a depth frame reads
-    ``{"s": "ETHUSDT", "bids": ..., "asks": ...}`` and carries no ``mkt`` key,
-    while a ``new-trade`` frame on the same socket reads ``{"s": "B-BTC_USDT"}``.
-    The same value appears as ``mkt`` on the current-prices REST endpoint.
-    Verified unique across all active instruments.
-    """
-    without_ecode = coindcx_pair.split("-", 1)[1] if "-" in coindcx_pair else coindcx_pair
-    return without_ecode.replace("_", "")
-
-
-def split_coindcx_pair(coindcx_pair: str) -> tuple:
-    """
-    "B-BTC_USDT" -> ("BTC", "USDT"); ("", "") when the name is not parseable.
-    """
-    without_ecode = coindcx_pair.split("-", 1)[1] if "-" in coindcx_pair else coindcx_pair
-    if "_" not in without_ecode:
-        return "", ""
-    base, quote = without_ecode.split("_", 1)
-    return base, quote
-
-
-def hb_pair_to_market_symbol(hb_pair: str) -> str:
-    """
-    "BTC-USDT" -> "BTCUSDT"
-    """
-    return hb_pair.replace("-", "")
 
 
 def normalize_margin_currency(margin_currency: Any) -> str:
@@ -104,17 +59,6 @@ def normalize_margin_currency(margin_currency: Any) -> str:
             f"Supported: {', '.join(CONSTANTS.SUPPORTED_MARGIN_CURRENCIES)}."
         )
     return candidate
-
-
-def percent_fee_to_decimal(percent_fee: Any) -> Decimal:
-    """
-    CoinDCX reports fees as percentages (``maker_fee: 0.0236`` means 0.0236%),
-    while Hummingbot works with decimal fractions.
-    """
-    try:
-        return Decimal(str(percent_fee)) / Decimal("100")
-    except (TypeError, ValueError, InvalidOperation):
-        return Decimal("0")
 
 
 class CoinDCXPerpetualConfigMap(BaseConnectorConfigMap):

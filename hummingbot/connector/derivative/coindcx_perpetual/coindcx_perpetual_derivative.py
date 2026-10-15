@@ -27,7 +27,7 @@ from hummingbot.core.data_type.funding_info import FundingInfo
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.trade_fee import TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
-from hummingbot.core.utils.async_utils import safe_ensure_future, safe_gather
+from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
@@ -41,18 +41,21 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
     """
     CoinDCX perpetual futures connector.
 
-    Contracts are USDT-quoted; the margin posted against them is chosen with
-    ``coindcx_perpetual_margin_currency`` (``USDT`` — the default — or ``INR``,
-    which CoinDCX converts at its own ``settlement_currency_conversion_price``).
+    The connector is moving to the CoinDCX FAPI (Futures API Market Maker
+    Integration Guide v1.2), a Binance-style API on hosts assigned per account.
+    Market data already uses it: instruments and trading rules from
+    ``exchangeInfo``, the order book from a ``depth`` snapshot plus ``@depth``
+    diffs, trades from ``@aggTrade``, funding from ``premiumIndex`` and
+    ``@markPrice``, and prices from ``ticker/price`` and ``ticker/bookTicker``.
 
-    Notable exchange traits handled here:
+    Order management, balances, positions and the private stream below still
+    speak the legacy API (``/exchange/v1/derivatives/futures/*`` and Socket.IO)
+    and are replaced next; until then this connector cannot trade.
+
+    Legacy-API traits the remaining private code handles:
 
     * Orders have **no client-order-id**; CoinDCX only returns its own UUID, so
       the connector tracks orders by exchange id and reconciles fills by pair.
-    * Order quantities are plain base units (``unit_contract_value`` is 1), so no
-      contract-size conversion is needed.
-    * Post-only is not supported (``allow_post_only`` is false on every
-      instrument), so only LIMIT and MARKET order types are advertised.
     * Positions expose no unrealised PnL, so it is derived from the mark price.
     * Fees and every margin figure the API reports are in USDT even when the
       margin currency is INR, so fee tokens are always USDT.
@@ -90,9 +93,6 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs or []
 
-        # Instrument metadata keyed by CoinDCX pair, populated from exchange info.
-        self._instruments: Dict[str, Dict[str, Any]] = {}
-        self._funding_frequency_hours: Dict[str, int] = {}
         # Cached margin-currency -> quote-currency rate (see _margin_conversion_rate).
         self._conversion_rate: Optional[Decimal] = None
         self._conversion_rate_ts: float = 0.0
@@ -136,15 +136,15 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
 
     @property
     def trading_rules_request_path(self) -> str:
-        return CONSTANTS.ACTIVE_INSTRUMENTS_PATH_URL
+        return CONSTANTS.EXCHANGE_INFO_PATH_URL
 
     @property
     def trading_pairs_request_path(self) -> str:
-        return CONSTANTS.ACTIVE_INSTRUMENTS_PATH_URL
+        return CONSTANTS.EXCHANGE_INFO_PATH_URL
 
     @property
     def check_network_request_path(self) -> str:
-        return CONSTANTS.ACTIVE_INSTRUMENTS_PATH_URL
+        return CONSTANTS.PING_PATH_URL
 
     @property
     def trading_pairs(self) -> List[str]:
@@ -301,137 +301,41 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
 
     # ---- exchange info / trading rules ---------------------------------------
 
-    async def _make_trading_pairs_request(self) -> Any:
-        # The symbol map only needs pair/base/quote, all of which are encoded in
-        # the instrument name (B-BTC_USDT). Skipping the per-instrument detail
-        # calls matters: TradingPairFetcher builds this connector with no trading
-        # pairs at every startup, which would otherwise fan out to one request
-        # per listed instrument.
-        return await self._fetch_instrument_names()
-
-    async def _make_trading_rules_request(self) -> Any:
-        return await self._fetch_instruments()
-
-    async def _fetch_instruments(self) -> List[Dict[str, Any]]:
-        """
-        ``active_instruments`` only returns pair NAMES, so the details of each
-        pair we care about are fetched individually. When the strategy declares
-        trading pairs only those are resolved, keeping start-up to a couple of
-        calls instead of ~485.
-        """
-        rest_assistant = await self._web_assistants_factory.get_rest_assistant()
-        pair_names: List[str] = await rest_assistant.execute_request(
-            url=web_utils.public_rest_url(CONSTANTS.ACTIVE_INSTRUMENTS_PATH_URL, domain=self._domain),
-            method=RESTMethod.GET,
-            throttler_limit_id=CONSTANTS.ACTIVE_INSTRUMENTS_PATH_URL,
-        )
-        if not isinstance(pair_names, list):
-            return []
-
-        if self._trading_pairs:
-            wanted = {utils.hb_pair_to_coindcx_pair(tp) for tp in self._trading_pairs}
-            pair_names = [p for p in pair_names if p in wanted]
-
-        # One request per instrument, so bound the fan-out.
-        semaphore = asyncio.Semaphore(CONSTANTS.INSTRUMENT_FETCH_CONCURRENCY)
-
-        async def _fetch(pair_name: str):
-            async with semaphore:
-                return await self._fetch_instrument(pair_name)
-
-        results = await safe_gather(*[_fetch(p) for p in pair_names], return_exceptions=True)
-        instruments: List[Dict[str, Any]] = []
-        for pair_name, result in zip(pair_names, results):
-            if isinstance(result, Exception) or not result:
-                self.logger().debug(f"Could not fetch instrument details for {pair_name}: {result}")
-                continue
-            instruments.append(result)
-            self._instruments[result.get("pair", pair_name)] = result
-        return instruments
-
-    async def _fetch_instrument_names(self) -> List[Dict[str, Any]]:
-        """
-        Minimal instrument records built from the active-instrument names alone,
-        for callers that only need the symbol map. One request, no fan-out.
-        """
-        rest_assistant = await self._web_assistants_factory.get_rest_assistant()
-        pair_names = await rest_assistant.execute_request(
-            url=web_utils.public_rest_url(CONSTANTS.ACTIVE_INSTRUMENTS_PATH_URL, domain=self._domain),
-            method=RESTMethod.GET,
-            throttler_limit_id=CONSTANTS.ACTIVE_INSTRUMENTS_PATH_URL,
-        )
-        instruments: List[Dict[str, Any]] = []
-        for pair_name in pair_names if isinstance(pair_names, list) else []:
-            base, quote = utils.split_coindcx_pair(pair_name)
-            if not (base and quote):
-                continue
-            instruments.append({
-                "pair": pair_name,
-                "underlying_currency_short_name": base,
-                "quote_currency_short_name": quote,
-                # Listed by active_instruments, so it is tradable by definition.
-                "status": "active",
-                "kind": "perpetual",
-                "is_inverse": False,
-                "exit_only": False,
-                "min_quantity": 0,
-                "max_quantity": 1,
-            })
-        return instruments
-
-    async def _fetch_instrument(self, coindcx_pair: str) -> Optional[Dict[str, Any]]:
-        rest_assistant = await self._web_assistants_factory.get_rest_assistant()
-        response = await rest_assistant.execute_request(
-            url=web_utils.public_rest_url(CONSTANTS.INSTRUMENT_PATH_URL, domain=self._domain),
-            params={"pair": coindcx_pair},
-            method=RESTMethod.GET,
-            throttler_limit_id=CONSTANTS.INSTRUMENT_PATH_URL,
-        )
-        if isinstance(response, dict):
-            return response.get("instrument", response)
-        return None
-
-    def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: List[Dict[str, Any]]):
+    def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Dict[str, Any]):
         mapping = bidict()
-        for instrument in filter(utils.is_exchange_information_valid, exchange_info or []):
-            coindcx_pair = instrument.get("pair", "")
-            base = instrument.get("underlying_currency_short_name") or instrument.get("position_currency_short_name")
-            quote = instrument.get("quote_currency_short_name")
-            if not (coindcx_pair and base and quote):
-                continue
-            trading_pair = combine_to_hb_trading_pair(base=base, quote=quote)
+        for symbol_info in filter(utils.is_exchange_information_valid, exchange_info.get("symbols") or []):
+            trading_pair = combine_to_hb_trading_pair(base=symbol_info["baseAsset"], quote=symbol_info["quoteAsset"])
             if trading_pair in mapping.inverse:
                 continue
-            mapping[coindcx_pair] = trading_pair
-            self._funding_frequency_hours[trading_pair] = int(
-                instrument.get("funding_frequency", CONSTANTS.DEFAULT_FUNDING_FREQUENCY_HOURS) or
-                CONSTANTS.DEFAULT_FUNDING_FREQUENCY_HOURS)
+            mapping[symbol_info["symbol"]] = trading_pair
         self._set_trading_pair_symbol_map(mapping)
 
-    async def _format_trading_rules(self, exchange_info: List[Dict[str, Any]]) -> List[TradingRule]:
+    async def _format_trading_rules(self, exchange_info: Dict[str, Any]) -> List[TradingRule]:
         rules: List[TradingRule] = []
-        for instrument in filter(utils.is_exchange_information_valid, exchange_info or []):
+        for symbol_info in filter(utils.is_exchange_information_valid, exchange_info.get("symbols") or []):
             try:
-                coindcx_pair = instrument["pair"]
-                trading_pair = utils.coindcx_pair_to_hb_pair(coindcx_pair)
+                price_filter = utils.symbol_filter(symbol_info, "PRICE_FILTER")
+                lot_size = utils.symbol_filter(symbol_info, "LOT_SIZE")
+                min_notional = utils.symbol_filter(symbol_info, "MIN_NOTIONAL")
                 rules.append(TradingRule(
-                    trading_pair=trading_pair,
-                    min_order_size=Decimal(str(instrument.get("min_quantity", instrument.get("min_trade_size", 0)))),
-                    max_order_size=Decimal(str(instrument.get("max_quantity", 0))),
-                    min_price_increment=Decimal(str(instrument.get("price_increment", 0))),
-                    min_base_amount_increment=Decimal(str(instrument.get("quantity_increment", 0))),
-                    min_notional_size=Decimal(str(instrument.get("min_notional", 0))),
+                    trading_pair=combine_to_hb_trading_pair(base=symbol_info["baseAsset"],
+                                                            quote=symbol_info["quoteAsset"]),
+                    min_order_size=Decimal(lot_size["minQty"]),
+                    max_order_size=Decimal(lot_size["maxQty"]),
+                    min_price_increment=Decimal(price_filter["tickSize"]),
+                    min_base_amount_increment=Decimal(lot_size["stepSize"]),
+                    min_notional_size=Decimal(str(min_notional.get("notional", 0))),
                     # Must match get_buy/sell_collateral_token: collateral is
                     # denominated in the quote currency, not the wallet currency.
                     buy_order_collateral_token=CONSTANTS.QUOTE_CURRENCY,
                     sell_order_collateral_token=CONSTANTS.QUOTE_CURRENCY,
                 ))
             except Exception:
-                self.logger().exception(f"Error parsing the trading rule for {instrument}.")
+                self.logger().exception(f"Error parsing the trading rule for {symbol_info.get('symbol')}.")
         return rules
 
     async def _update_trading_fees(self):
-        """Per-instrument maker/taker fees are already captured with the trading rules."""
+        """The FAPI publishes no per-instrument fees; ``_get_fee`` uses the default schema."""
         pass
 
     # ---- fees ---------------------------------------------------------------
@@ -445,23 +349,13 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
                  amount: Decimal,
                  price: Decimal = s_decimal_NaN,
                  is_maker: Optional[bool] = None) -> TradeFeeBase:
-        is_maker = is_maker if is_maker is not None else (order_type is OrderType.LIMIT)
-        trading_pair = combine_to_hb_trading_pair(base=base_currency, quote=quote_currency)
-        instrument = self._instruments.get(utils.hb_pair_to_coindcx_pair(trading_pair))
-        if instrument is not None:
-            fee_percent = instrument.get("maker_fee" if is_maker else "taker_fee")
-            if fee_percent is not None:
-                return TradeFeeBase.new_perpetual_fee(
-                    fee_schema=self.trade_fee_schema(),
-                    position_action=position_action,
-                    percent=utils.percent_fee_to_decimal(fee_percent),
-                    # Fees are charged in USDT even on INR-margined futures.
-                    percent_token=CONSTANTS.FEE_CURRENCY,
-                )
+        is_maker = is_maker if is_maker is not None else (order_type in (OrderType.LIMIT, OrderType.LIMIT_MAKER))
         return TradeFeeBase.new_perpetual_fee(
             fee_schema=self.trade_fee_schema(),
             position_action=position_action,
             percent=self.estimate_fee_pct(is_maker),
+            # Fees are charged in USDT even on INR-margined futures.
+            percent_token=CONSTANTS.FEE_CURRENCY,
         )
 
     # ---- orders --------------------------------------------------------------
@@ -711,7 +605,7 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
         try:
             rest_assistant = await self._web_assistants_factory.get_rest_assistant()
             tickers = await rest_assistant.execute_request(
-                url=web_utils.public_rest_url(CONSTANTS.SPOT_TICKER_PATH_URL, domain=self._domain),
+                url=CONSTANTS.SPOT_REST_URL + CONSTANTS.SPOT_TICKER_PATH_URL,
                 method=RESTMethod.GET,
                 throttler_limit_id=CONSTANTS.SPOT_TICKER_PATH_URL,
             )
@@ -814,44 +708,23 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
 
     # ---- funding -------------------------------------------------------------
 
-    def next_funding_timestamp(self, trading_pair: str) -> int:
-        """
-        CoinDCX settles funding every ``funding_frequency`` hours on the UTC
-        clock, so the next boundary is derived rather than fetched.
-        """
-        frequency = self._funding_frequency_hours.get(trading_pair, CONSTANTS.DEFAULT_FUNDING_FREQUENCY_HOURS)
-        interval = max(int(frequency), 1) * 3600
-        now = int(self._time_synchronizer.time() or time.time())
-        return ((now // interval) + 1) * interval
-
-    async def _fetch_current_prices(self) -> Dict[str, Dict[str, Any]]:
-        rest_assistant = await self._web_assistants_factory.get_rest_assistant()
-        response = await rest_assistant.execute_request(
-            url=web_utils.public_market_data_url(CONSTANTS.CURRENT_PRICES_PATH_URL, domain=self._domain),
-            method=RESTMethod.GET,
-            throttler_limit_id=CONSTANTS.CURRENT_PRICES_PATH_URL,
-        )
-        prices = response.get("prices", {}) if isinstance(response, dict) else {}
-        return prices if isinstance(prices, dict) else {}
-
     async def build_funding_info(self, trading_pair: str) -> FundingInfo:
-        prices = await self._fetch_current_prices()
-        info = prices.get(utils.hb_pair_to_coindcx_pair(trading_pair))
-        if not info:
+        """Mark price, index price, funding rate and next funding time from ``premiumIndex``."""
+        symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+        info = await self._api_get(path_url=CONSTANTS.PREMIUM_INDEX_PATH_URL, params={"symbol": symbol})
+        if isinstance(info, list):
+            info = next((entry for entry in info if isinstance(entry, dict) and entry.get("symbol") == symbol), None)
+        mark_price = Decimal(str((info or {}).get("markPrice") or 0))
+        if mark_price <= s_decimal_0:
             # A zero mark price would silently corrupt PnL and funding maths.
-            raise ValueError(
-                f"No entry for {trading_pair} in the CoinDCX current-prices feed.")
-        mark_price = Decimal(str(info.get("mp", 0) or 0))
-        last_price = Decimal(str(info.get("ls", 0) or 0))
-        if mark_price <= s_decimal_0 and last_price <= s_decimal_0:
-            raise ValueError(f"CoinDCX reported no usable price for {trading_pair}.")
-        rate = Decimal(str(info.get("fr", 0) or 0))
+            raise ValueError(f"CoinDCX reported no usable mark price for {trading_pair}: {info}")
+        index_price = Decimal(str(info.get("indexPrice") or 0))
         return FundingInfo(
             trading_pair=trading_pair,
-            index_price=mark_price if mark_price > 0 else last_price,
-            mark_price=mark_price if mark_price > 0 else last_price,
-            next_funding_utc_timestamp=self.next_funding_timestamp(trading_pair),
-            rate=rate,
+            index_price=index_price if index_price > s_decimal_0 else mark_price,
+            mark_price=mark_price,
+            next_funding_utc_timestamp=int(float(info["nextFundingTime"]) * 1e-3),
+            rate=Decimal(str(info.get("lastFundingRate") or 0)),
         )
 
     async def _fetch_last_fee_payment(self, trading_pair: str) -> Tuple[float, Decimal, Decimal]:
@@ -861,7 +734,7 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
         Funding shows up in the position-transaction ledger under
         ``stage="funding"``; ``amount`` is the PnL of that transaction (negative
         when funding was paid). The record carries no rate, so — as Binance's
-        connector does — the current rate is read from the live prices feed.
+        connector does — the current rate is read from ``premiumIndex``.
 
         Returns ``(0, -1, -1)`` when the account has never paid/received funding
         on this pair, which is what the base class expects.
@@ -892,10 +765,7 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
 
         rate = Decimal("-1")
         try:
-            prices = await self._fetch_current_prices()
-            info = prices.get(coindcx_pair, {})
-            if info.get("fr") is not None:
-                rate = Decimal(str(info["fr"]))
+            rate = (await self.build_funding_info(trading_pair)).rate
         except Exception as exception:
             self.logger().debug(f"Could not read the funding rate for {trading_pair}: {exception}")
 
@@ -904,30 +774,27 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
     # ---- prices --------------------------------------------------------------
 
     async def _get_last_traded_price(self, trading_pair: str) -> float:
-        prices = await self._fetch_current_prices()
-        info = prices.get(utils.hb_pair_to_coindcx_pair(trading_pair), {})
-        last = info.get("ls") or info.get("mp")
-        if last is None:
+        symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+        response = await self._api_get(path_url=CONSTANTS.TICKER_PRICE_PATH_URL, params={"symbol": symbol})
+        price = response.get("price") if isinstance(response, dict) else None
+        if price is None or Decimal(str(price)) <= s_decimal_0:
             # Returning 0 would feed a zero price straight into strategy maths.
-            raise ValueError(f"No price for {trading_pair} in the CoinDCX current-prices feed.")
-        return float(last)
+            raise ValueError(f"CoinDCX reported no last price for {trading_pair}: {response}")
+        return float(price)
 
     async def get_all_pairs_prices(self) -> List[Dict[str, str]]:
-        """Ticker-shaped view over the public current-prices feed (rate oracle)."""
-        prices = await self._fetch_current_prices()
-        results: List[Dict[str, str]] = []
-        for coindcx_pair, info in prices.items():
-            last = info.get("ls") or info.get("mp")
-            if last is None:
-                continue
-            results.append({
-                "symbol": coindcx_pair,
-                "lastPrice": str(last),
-                "markPrice": str(info.get("mp", last)),
-                "fundingRate": str(info.get("fr", 0)),
-                "volume": str(info.get("v", 0)),
-            })
-        return results
+        """Best bid and ask for every symbol, from ``ticker/bookTicker`` (rate oracle)."""
+        tickers = await self._api_get(path_url=CONSTANTS.BOOK_TICKER_PATH_URL)
+        return tickers if isinstance(tickers, list) else []
+
+    async def get_all_24h_volume_tickers(self, trading_pairs: Optional[List[str]] = None) -> List[Dict[str, str]]:
+        """
+        24h statistics for every symbol, from ``ticker/24hr`` (volume oracle). One
+        all-symbols call is cheaper than one call per pair once there are more than
+        a handful, so callers filter.
+        """
+        tickers = await self._api_get(path_url=CONSTANTS.TICKER_24HR_PATH_URL)
+        return tickers if isinstance(tickers, list) else []
 
     # ---- user stream ---------------------------------------------------------
 

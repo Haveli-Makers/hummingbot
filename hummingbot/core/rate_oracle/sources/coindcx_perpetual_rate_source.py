@@ -1,6 +1,7 @@
 from decimal import Decimal
 from typing import TYPE_CHECKING, Dict, Optional
 
+from hummingbot.connector.utils import split_hb_trading_pair
 from hummingbot.core.rate_oracle.sources.rate_source_base import RateSourceBase
 from hummingbot.core.utils import async_ttl_cache
 
@@ -12,11 +13,10 @@ if TYPE_CHECKING:
 
 class CoinDCXPerpetualRateSource(RateSourceBase):
     """
-    Rate source for CoinDCX USDT-margined perpetual futures.
+    Rate source for CoinDCX perpetual futures.
 
-    Backed by the public ``current_prices/futures/rt`` feed (no credentials
-    needed), which reports the last price (``ls``) and mark price (``mp``) for
-    every instrument in a single call.
+    Backed by the public FAPI ``ticker/bookTicker`` (no credentials), which gives
+    the best bid and ask of every symbol in one call, so the spread is real.
     """
 
     def __init__(self):
@@ -29,12 +29,8 @@ class CoinDCXPerpetualRateSource(RateSourceBase):
 
     @async_ttl_cache(ttl=30, maxsize=1)
     async def get_prices(self, quote_token: Optional[str] = None) -> Dict[str, Decimal]:
-        results: Dict[str, Decimal] = {}
-        for trading_pair, prices in (await self._get_bid_ask_prices(quote_token=quote_token)).items():
-            mid = prices.get("mid", Decimal("0"))
-            if mid > 0:
-                results[trading_pair] = mid
-        return results
+        return {trading_pair: prices["mid"]
+                for trading_pair, prices in (await self._get_bid_ask_prices(quote_token=quote_token)).items()}
 
     @async_ttl_cache(ttl=30, maxsize=1)
     async def get_bid_ask_prices(self, quote_token: Optional[str] = None) -> Dict[str, Dict[str, Decimal]]:
@@ -53,27 +49,28 @@ class CoinDCXPerpetualRateSource(RateSourceBase):
             )
             return results
 
-        from hummingbot.connector.derivative.coindcx_perpetual import coindcx_perpetual_utils as utils
-
         for ticker in tickers:
-            trading_pair = utils.coindcx_pair_to_hb_pair(ticker.get("symbol", ""))
-            if "-" not in trading_pair:
-                continue
-            if quote_token is not None and trading_pair.split("-")[1] != quote_token:
+            try:
+                trading_pair = await self._exchange.trading_pair_associated_to_exchange_symbol(
+                    symbol=ticker.get("symbol", ""))
+            except KeyError:
+                continue  # not a tradable perpetual
+            if quote_token is not None and split_hb_trading_pair(trading_pair)[1] != quote_token:
                 continue
             try:
-                last = Decimal(str(ticker.get("lastPrice", "0")))
+                bid = Decimal(str(ticker["bidPrice"]))
+                ask = Decimal(str(ticker["askPrice"]))
             except Exception:
                 continue
-            if last <= 0:
+            # An empty side or a crossed book is not a quotable market.
+            if not (0 < bid <= ask):
                 continue
-            # The feed carries no book, so last price stands in for both sides
-            # and the spread is reported as zero.
+            mid = (bid + ask) / Decimal("2")
             results[trading_pair] = {
-                "bid": last,
-                "ask": last,
-                "mid": last,
-                "spread": Decimal("0"),
+                "bid": bid,
+                "ask": ask,
+                "mid": mid,
+                "spread": (ask - bid) / mid * Decimal("100"),
             }
         return results
 

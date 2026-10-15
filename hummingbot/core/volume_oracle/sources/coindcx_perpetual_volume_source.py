@@ -13,9 +13,9 @@ class CoinDCXPerpetualVolumeSource(VolumeSourceBase):
     """
     24h volume source for CoinDCX perpetual futures.
 
-    Reads the public ``current_prices/futures/rt`` feed (no credentials), where
-    ``ls`` is the last traded price and ``v`` is the 24h **quote** (USDT) volume,
-    so the base volume is derived as ``v / last_price``.
+    Reads the public FAPI ``ticker/24hr`` for every symbol in one call (no
+    credentials): ``volume`` is the base volume and ``quoteVolume`` the quote
+    volume, as on Binance.
     """
 
     @property
@@ -23,33 +23,31 @@ class CoinDCXPerpetualVolumeSource(VolumeSourceBase):
         return "coindcx_perpetual"
 
     async def get_all_24h_volumes(self, trading_pairs: Optional[List[str]] = None) -> Dict[str, Dict[str, Decimal]]:
-        from hummingbot.connector.derivative.coindcx_perpetual import coindcx_perpetual_utils as utils
-
         self._ensure_exchange()
-        tickers = await self._exchange.get_all_pairs_prices()
+        tickers = await self._exchange.get_all_24h_volume_tickers(trading_pairs)
 
         wanted = set(trading_pairs) if trading_pairs else None
         results: Dict[str, Dict[str, Decimal]] = {}
-
         for ticker in tickers:
-            trading_pair = utils.coindcx_pair_to_hb_pair(ticker.get("symbol", ""))
-            if "-" not in trading_pair:
+            if not isinstance(ticker, dict):
                 continue
+            try:
+                trading_pair = await self._exchange.trading_pair_associated_to_exchange_symbol(
+                    symbol=str(ticker.get("symbol", "")))
+            except KeyError:
+                continue  # not a tradable perpetual
             if wanted is not None and trading_pair not in wanted:
                 continue
             try:
-                quote_volume = Decimal(str(ticker.get("volume", "0")))
-                last_price = Decimal(str(ticker.get("lastPrice", "0")))
-            except Exception:
+                results[trading_pair] = {
+                    "exchange": self.name,
+                    "symbol": trading_pair,
+                    "base_volume": Decimal(str(ticker["volume"])),
+                    "last_price": Decimal(str(ticker["lastPrice"])),
+                    "quote_volume": Decimal(str(ticker["quoteVolume"])),
+                }
+            except (KeyError, ArithmeticError, ValueError):
                 continue
-
-            results[trading_pair] = {
-                "exchange": self.name,
-                "symbol": trading_pair,
-                "base_volume": (quote_volume / last_price) if last_price > 0 else Decimal("0"),
-                "last_price": last_price,
-                "quote_volume": quote_volume,
-            }
         return results
 
     def _build_exchange(self) -> "CoindcxPerpetualDerivative":

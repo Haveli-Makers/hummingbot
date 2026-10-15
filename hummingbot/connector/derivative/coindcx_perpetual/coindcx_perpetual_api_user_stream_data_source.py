@@ -1,6 +1,6 @@
 import asyncio
 import json
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import socketio
 
@@ -8,7 +8,6 @@ from hummingbot.connector.derivative.coindcx_perpetual import (
     coindcx_perpetual_constants as CONSTANTS,
     coindcx_perpetual_web_utils as web_utils,
 )
-from hummingbot.connector.derivative.coindcx_perpetual.coindcx_perpetual_api_order_book_data_source import unwrap_frame
 from hummingbot.connector.derivative.coindcx_perpetual.coindcx_perpetual_auth import CoinDCXPerpetualAuth
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
@@ -18,6 +17,31 @@ if TYPE_CHECKING:
     from hummingbot.connector.derivative.coindcx_perpetual.coindcx_perpetual_derivative import (
         CoindcxPerpetualDerivative,
     )
+
+
+def unwrap_frame(message: Any) -> Optional[Dict[str, Any]]:
+    """
+    Normalise a CoinDCX Socket.IO payload into a dict.
+
+    Frames arrive double-wrapped as ``{"event": ..., "data": "<json string>"}``
+    — note ``data`` is a JSON *string*, not an object as the docs suggest — but
+    plain dicts are also accepted so callers/tests can pass either shape.
+    """
+    if isinstance(message, str):
+        try:
+            message = json.loads(message)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(message, dict):
+        return None
+
+    data = message.get("data", message)
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except (TypeError, ValueError):
+            return None
+    return data if isinstance(data, dict) else None
 
 
 class CoinDCXPerpetualAPIUserStreamDataSource(UserStreamTrackerDataSource):
@@ -55,7 +79,7 @@ class CoinDCXPerpetualAPIUserStreamDataSource(UserStreamTrackerDataSource):
         while True:
             try:
                 self._client = self._build_client(output)
-                await self._client.connect(web_utils.wss_url(self._domain), transports=["websocket"])
+                await self._client.connect(web_utils.wss_url(domain=self._domain), transports=["websocket"])
                 await self._client.emit("join", self._auth.generate_ws_auth_payload())
                 self.logger().info("Subscribed to CoinDCX futures private account channel.")
                 self._last_recv_time = self._time()

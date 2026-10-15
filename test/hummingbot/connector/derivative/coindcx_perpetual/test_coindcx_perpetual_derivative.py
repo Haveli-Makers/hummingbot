@@ -1,35 +1,57 @@
 import asyncio
+import os
 import time
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
-from hummingbot.connector.derivative.coindcx_perpetual import coindcx_perpetual_constants as CONSTANTS
+from bidict import bidict
+
+from hummingbot.connector.derivative.coindcx_perpetual import (
+    coindcx_perpetual_constants as CONSTANTS,
+    coindcx_perpetual_web_utils as web_utils,
+)
 from hummingbot.connector.derivative.coindcx_perpetual.coindcx_perpetual_derivative import CoindcxPerpetualDerivative
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PositionSide, TradeType
+from hummingbot.core.data_type.funding_info import FundingInfo
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
 
-INSTRUMENT = {
-    "pair": "B-BTC_USDT",
-    "status": "active",
-    "kind": "perpetual",
-    "is_inverse": False,
-    "exit_only": False,
-    "underlying_currency_short_name": "BTC",
-    "position_currency_short_name": "BTC",
-    "quote_currency_short_name": "USDT",
-    "settle_currency_short_name": "USDT",
-    "price_increment": 0.1,
-    "quantity_increment": 0.001,
-    "min_quantity": 0.001,
-    "min_trade_size": 0.001,
-    "max_quantity": 950.0,
-    "min_notional": 60.0,
-    "maker_fee": 0.0236,
-    "taker_fee": 0.059,
-    "funding_frequency": 8,
-    "max_leverage_long": 20.0,
+
+def _symbol(symbol, base, quote, status="TRADING", contract_type="PERPETUAL"):
+    """An exchangeInfo symbol in the shape of the FAPI guide's example."""
+    return {
+        "symbol": symbol, "pair": symbol, "contractType": contract_type, "status": status,
+        "baseAsset": base, "quoteAsset": quote, "marginAsset": quote,
+        "pricePrecision": 1, "quantityPrecision": 3,
+        "filters": [
+            {"filterType": "PRICE_FILTER", "maxPrice": "794445.0", "minPrice": "261.1", "tickSize": "0.1"},
+            {"filterType": "LOT_SIZE", "maxQty": "10000.0", "minQty": "0.001", "stepSize": "0.001"},
+            {"filterType": "MARKET_LOT_SIZE", "maxQty": "120.0", "minQty": "0.001", "stepSize": "0.001"},
+            {"filterType": "MAX_NUM_ORDERS", "limit": 200},
+            {"filterType": "MIN_NOTIONAL", "notional": "50.0"},
+            {"filterType": "PERCENT_PRICE", "multiplierUp": "5.0", "multiplierDown": "5.0",
+             "multiplierDecimal": "4"},
+        ],
+        "orderTypes": ["LIMIT", "MARKET", "STOP", "STOP_MARKET", "TAKE_PROFIT", "TAKE_PROFIT_MARKET"],
+        "timeInForce": ["GTC", "IOC", "FOK", "GTX"],
+    }
+
+
+EXCHANGE_INFO = {
+    "timezone": "UTC",
+    "serverTime": 1715692200000,
+    "rateLimits": [],
+    "assets": [{"asset": "USDT", "marginAvailable": True}, {"asset": "INR", "marginAvailable": True}],
+    "symbols": [
+        _symbol("BTCUSDT", "BTC", "USDT"),
+        _symbol("ETHUSDT", "ETH", "USDT"),
+        _symbol("OLDUSDT", "OLD", "USDT", status="SETTLING"),
+        _symbol("BTCUSDT_261225", "BTC", "USDT", contract_type="CURRENT_QUARTER"),
+    ],
 }
+
+# The private code still speaks the legacy API, which names pairs B-<BASE>_<QUOTE>.
+LEGACY_SYMBOL_MAP = {"B-BTC_USDT": "BTC-USDT"}
 
 
 class CoindcxPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
@@ -42,10 +64,10 @@ class CoindcxPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
             trading_pairs=[self.trading_pair],
             trading_required=False,
         )
-        self.exchange._instruments["B-BTC_USDT"] = INSTRUMENT
 
     def _bootstrap(self):
-        self.exchange._initialize_trading_pair_symbols_from_exchange_info([INSTRUMENT])
+        """Legacy symbol map, for the private code that still sends legacy pairs."""
+        self.exchange._set_trading_pair_symbol_map(bidict(LEGACY_SYMBOL_MAP))
 
     def _order(self, exchange_order_id="ex-1", trade_type=TradeType.BUY):
         return InFlightOrder(
@@ -111,28 +133,56 @@ class CoindcxPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual("buy", CoindcxPerpetualDerivative.coindcx_side(TradeType.BUY))
         self.assertEqual("sell", CoindcxPerpetualDerivative.coindcx_side(TradeType.SELL))
 
-    async def test_symbol_map_and_trading_rules(self):
-        self._bootstrap()
-        symbol = await self.exchange.exchange_symbol_associated_to_pair(trading_pair=self.trading_pair)
-        self.assertEqual("B-BTC_USDT", symbol)
+    async def test_symbol_map_comes_from_tradable_perpetuals_in_exchange_info(self):
+        self.exchange._initialize_trading_pair_symbols_from_exchange_info(EXCHANGE_INFO)
+        self.assertEqual("BTCUSDT", await self.exchange.exchange_symbol_associated_to_pair(self.trading_pair))
+        self.assertEqual("ETH-USDT", await self.exchange.trading_pair_associated_to_exchange_symbol("ETHUSDT"))
+        symbol_map = await self.exchange.trading_pair_symbol_map()
+        # A settling contract and a dated future are not tradable perpetuals.
+        self.assertNotIn("OLDUSDT", symbol_map)
+        self.assertNotIn("BTCUSDT_261225", symbol_map)
 
-        rules = await self.exchange._format_trading_rules([INSTRUMENT])
-        self.assertEqual(1, len(rules))
+    async def test_trading_rules_come_from_the_symbol_filters(self):
+        rules = await self.exchange._format_trading_rules(EXCHANGE_INFO)
+        self.assertEqual(["BTC-USDT", "ETH-USDT"], [rule.trading_pair for rule in rules])
         rule = rules[0]
-        self.assertEqual(self.trading_pair, rule.trading_pair)
         self.assertEqual(Decimal("0.1"), rule.min_price_increment)
         self.assertEqual(Decimal("0.001"), rule.min_base_amount_increment)
         self.assertEqual(Decimal("0.001"), rule.min_order_size)
-        self.assertEqual(Decimal("60.0"), rule.min_notional_size)
+        self.assertEqual(Decimal("10000.0"), rule.max_order_size)
+        self.assertEqual(Decimal("50.0"), rule.min_notional_size)
         self.assertEqual("USDT", rule.buy_order_collateral_token)
 
-    def test_fee_uses_instrument_percentages(self):
-        fee = self.exchange._get_fee(
+    async def test_a_symbol_with_broken_filters_is_skipped_not_fatal(self):
+        broken = _symbol("XRPUSDT", "XRP", "USDT")
+        broken["filters"] = [{"filterType": "PRICE_FILTER", "tickSize": "0.0001"}]
+        rules = await self.exchange._format_trading_rules(
+            {"symbols": [broken, _symbol("BTCUSDT", "BTC", "USDT")]})
+        self.assertEqual(["BTC-USDT"], [rule.trading_pair for rule in rules])
+
+    def test_exchange_info_and_ping_are_the_request_paths(self):
+        self.assertEqual("/fapi/v1/exchangeInfo", self.exchange.trading_rules_request_path)
+        self.assertEqual("/fapi/v1/exchangeInfo", self.exchange.trading_pairs_request_path)
+        self.assertEqual("/fapi/v1/ping", self.exchange.check_network_request_path)
+
+    async def test_symbol_map_costs_a_single_exchange_info_call(self):
+        self.exchange._api_get = AsyncMock(return_value=EXCHANGE_INFO)
+        await self.exchange._initialize_trading_pair_symbol_map()
+        self.exchange._api_get.assert_awaited_once_with(path_url=CONSTANTS.EXCHANGE_INFO_PATH_URL)
+        self.assertEqual("BTC-USDT", await self.exchange.trading_pair_associated_to_exchange_symbol("BTCUSDT"))
+
+    def test_fee_uses_the_default_schema(self):
+        # The FAPI publishes no per-instrument fees.
+        maker = self.exchange._get_fee(
             base_currency="BTC", quote_currency="USDT", order_type=OrderType.LIMIT,
             order_side=TradeType.BUY, position_action=PositionAction.OPEN,
-            amount=Decimal("1"), price=Decimal("60000"), is_maker=True)
-        # 0.0236 (percent) -> 0.000236 as a fraction
-        self.assertEqual(Decimal("0.000236"), fee.percent)
+            amount=Decimal("1"), price=Decimal("60000"))
+        taker = self.exchange._get_fee(
+            base_currency="BTC", quote_currency="USDT", order_type=OrderType.MARKET,
+            order_side=TradeType.BUY, position_action=PositionAction.OPEN,
+            amount=Decimal("1"), price=Decimal("60000"))
+        self.assertEqual(Decimal("0.000236"), maker.percent)
+        self.assertEqual(Decimal("0.00059"), taker.percent)
 
     # ---- orders --------------------------------------------------------------
 
@@ -346,6 +396,7 @@ class CoindcxPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual("B-BTC_USDT", captured["pair"])
 
     async def test_set_leverage_failure_reports_message(self):
+        self._bootstrap()
         self.exchange._api_post = AsyncMock(return_value={"message": "leverage too high", "code": 422})
         success, msg = await self.exchange._set_trading_pair_leverage(self.trading_pair, 500)
         self.assertFalse(success)
@@ -359,30 +410,59 @@ class CoindcxPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
 
     # ---- funding / prices -----------------------------------------------------
 
-    def test_next_funding_timestamp_aligns_to_interval(self):
-        self._bootstrap()
-        ts = self.exchange.next_funding_timestamp(self.trading_pair)
-        self.assertEqual(0, ts % (8 * 3600))
-        self.assertGreater(ts, self.exchange._time_synchronizer.time())
+    async def test_build_funding_info_reads_premium_index(self):
+        self.exchange._initialize_trading_pair_symbols_from_exchange_info(EXCHANGE_INFO)
+        self.exchange._api_get = AsyncMock(return_value={
+            "symbol": "BTCUSDT", "markPrice": "63175.30000000", "indexPrice": "63120.95434782",
+            "lastFundingRate": "0.00124107", "interestRate": "0.00010000",
+            "nextFundingTime": 1780934400000, "time": 1780914420078})
 
-    async def test_build_funding_info(self):
-        self._bootstrap()
-        self.exchange._fetch_current_prices = AsyncMock(return_value={
-            "B-BTC_USDT": {"mp": 65500.5, "ls": 65499.0, "fr": 0.0001},
-        })
         info = await self.exchange.build_funding_info(self.trading_pair)
-        self.assertEqual(Decimal("65500.5"), info.mark_price)
-        self.assertEqual(Decimal("0.0001"), info.rate)
 
-    async def test_get_all_pairs_prices(self):
-        self.exchange._fetch_current_prices = AsyncMock(return_value={
-            "B-BTC_USDT": {"mp": 65500.5, "ls": 65499.0, "fr": 0.0001, "v": 5260392600},
-            "B-BAD_USDT": {},
-        })
-        prices = await self.exchange.get_all_pairs_prices()
-        self.assertEqual(1, len(prices))
-        self.assertEqual("B-BTC_USDT", prices[0]["symbol"])
-        self.assertEqual("65499.0", prices[0]["lastPrice"])
+        self.exchange._api_get.assert_awaited_once_with(
+            path_url=CONSTANTS.PREMIUM_INDEX_PATH_URL, params={"symbol": "BTCUSDT"})
+        self.assertEqual(Decimal("63175.30000000"), info.mark_price)
+        self.assertEqual(Decimal("63120.95434782"), info.index_price)
+        self.assertEqual(Decimal("0.00124107"), info.rate)
+        self.assertEqual(1780934400, info.next_funding_utc_timestamp)
+
+    async def test_build_funding_info_picks_the_symbol_from_a_list_response(self):
+        self.exchange._initialize_trading_pair_symbols_from_exchange_info(EXCHANGE_INFO)
+        self.exchange._api_get = AsyncMock(return_value=[
+            {"symbol": "ETHUSDT", "markPrice": "3000", "lastFundingRate": "0.1", "nextFundingTime": 1},
+            {"symbol": "BTCUSDT", "markPrice": "63175.3", "indexPrice": "0",
+             "lastFundingRate": "0.0001", "nextFundingTime": 1780934400000},
+        ])
+        info = await self.exchange.build_funding_info(self.trading_pair)
+        self.assertEqual(Decimal("63175.3"), info.mark_price)
+        # A missing index price falls back to the mark price rather than zero.
+        self.assertEqual(Decimal("63175.3"), info.index_price)
+
+    async def test_last_traded_price_reads_ticker_price(self):
+        self.exchange._initialize_trading_pair_symbols_from_exchange_info(EXCHANGE_INFO)
+        self.exchange._api_get = AsyncMock(return_value={
+            "symbol": "BTCUSDT", "price": "63175.30000000", "time": 1780914420078})
+        self.assertEqual(63175.3, await self.exchange._get_last_traded_price(self.trading_pair))
+        self.exchange._api_get.assert_awaited_once_with(
+            path_url=CONSTANTS.TICKER_PRICE_PATH_URL, params={"symbol": "BTCUSDT"})
+
+    async def test_get_all_pairs_prices_returns_book_tickers(self):
+        tickers = [{"symbol": "BTCUSDT", "bidPrice": "67070.0", "bidQty": "9.866",
+                    "askPrice": "67070.2", "askQty": "9.866", "time": 1780915240114}]
+        self.exchange._api_get = AsyncMock(return_value=tickers)
+        self.assertEqual(tickers, await self.exchange.get_all_pairs_prices())
+        self.exchange._api_get.assert_awaited_once_with(path_url=CONSTANTS.BOOK_TICKER_PATH_URL)
+
+    async def test_get_all_24h_volume_tickers_is_one_all_symbols_call(self):
+        tickers = [{"symbol": "BTCUSDT", "volume": "45230.500", "quoteVolume": "3068420750.115"}]
+        self.exchange._api_get = AsyncMock(return_value=tickers)
+        self.assertEqual(tickers, await self.exchange.get_all_24h_volume_tickers(["BTC-USDT"]))
+        self.exchange._api_get.assert_awaited_once_with(path_url=CONSTANTS.TICKER_24HR_PATH_URL)
+
+    async def test_non_list_ticker_responses_become_empty(self):
+        self.exchange._api_get = AsyncMock(return_value={"code": -1000})
+        self.assertEqual([], await self.exchange.get_all_pairs_prices())
+        self.assertEqual([], await self.exchange.get_all_24h_volume_tickers())
 
     # ---- margin currency ------------------------------------------------------
 
@@ -401,7 +481,7 @@ class CoindcxPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
             self.assertEqual(["USDT"], data["margin_currency_short_name"])
 
     async def test_trading_rules_use_usdt_collateral(self):
-        rules = await self.exchange._format_trading_rules([INSTRUMENT])
+        rules = await self.exchange._format_trading_rules(EXCHANGE_INFO)
         self.assertEqual("USDT", rules[0].buy_order_collateral_token)
         self.assertEqual("USDT", rules[0].sell_order_collateral_token)
 
@@ -413,8 +493,7 @@ class CoindcxPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
             trading_pairs=[self.trading_pair],
             trading_required=False,
         )
-        ex._instruments["B-BTC_USDT"] = INSTRUMENT
-        ex._initialize_trading_pair_symbols_from_exchange_info([INSTRUMENT])
+        ex._set_trading_pair_symbol_map(bidict(LEGACY_SYMBOL_MAP))
         return ex
 
     def test_margin_currency_is_configurable(self):
@@ -527,6 +606,7 @@ class CoindcxPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(Decimal("100.25"), await inr._margin_conversion_rate())
         self.assertEqual(Decimal("100.25"), await inr._margin_conversion_rate())
         self.assertEqual(1, len(calls), "rate should be cached, not re-fetched every poll")
+        self.assertEqual("https://api.coindcx.com/exchange/ticker", calls[0])
 
     async def test_conversion_rate_is_one_for_usdt_margin(self):
         self.assertEqual(Decimal("1"), await self.exchange._margin_conversion_rate())
@@ -575,7 +655,7 @@ class CoindcxPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
     async def test_trading_rule_collateral_matches_the_collateral_token(self):
         # Both must be the quote currency, whatever the margin wallet is.
         for exchange in (self.exchange, self._inr_exchange()):
-            rules = await exchange._format_trading_rules([INSTRUMENT])
+            rules = await exchange._format_trading_rules(EXCHANGE_INFO)
             self.assertEqual(exchange.get_buy_collateral_token(self.trading_pair),
                              rules[0].buy_order_collateral_token)
             self.assertEqual("USDT", rules[0].sell_order_collateral_token)
@@ -697,8 +777,9 @@ class CoindcxPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
             ]
 
         self.exchange._api_post = AsyncMock(side_effect=fake_post)
-        self.exchange._fetch_current_prices = AsyncMock(
-            return_value={"B-BTC_USDT": {"fr": 0.0001}})
+        self.exchange.build_funding_info = AsyncMock(return_value=FundingInfo(
+            trading_pair="BTC-USDT", index_price=Decimal("1"), mark_price=Decimal("1"),
+            next_funding_utc_timestamp=0, rate=Decimal("0.0001")))
 
         timestamp, rate, payment = await self.exchange._fetch_last_fee_payment(self.trading_pair)
 
@@ -723,7 +804,7 @@ class CoindcxPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
         self._bootstrap()
         self.exchange._api_post = AsyncMock(return_value=[
             {"pair": "B-BTC_USDT", "amount": -0.5, "created_at": 1728462694499}])
-        self.exchange._fetch_current_prices = AsyncMock(side_effect=IOError("prices down"))
+        self.exchange.build_funding_info = AsyncMock(side_effect=IOError("prices down"))
         timestamp, rate, payment = await self.exchange._fetch_last_fee_payment(self.trading_pair)
         self.assertEqual(Decimal("-0.5"), payment)
         self.assertEqual(Decimal("-1"), rate)
@@ -791,7 +872,9 @@ class CoindcxPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
                  for _ in range(CONSTANTS.PAGE_SIZE)]
         page2 = [{"pair": "B-BTC_USDT", "amount": -0.25, "created_at": 1728462694499}]
         self.exchange._api_post = AsyncMock(side_effect=self._pages(page1, page2))
-        self.exchange._fetch_current_prices = AsyncMock(return_value={"B-BTC_USDT": {"fr": 0.0001}})
+        self.exchange.build_funding_info = AsyncMock(return_value=FundingInfo(
+            trading_pair="BTC-USDT", index_price=Decimal("1"), mark_price=Decimal("1"),
+            next_funding_utc_timestamp=0, rate=Decimal("0.0001")))
 
         timestamp, rate, payment = await self.exchange._fetch_last_fee_payment(self.trading_pair)
         self.assertEqual(Decimal("-0.25"), payment, "funding entry on page 2 was missed")
@@ -808,53 +891,6 @@ class CoindcxPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
         self.exchange._api_post = AsyncMock(side_effect=_post)
         await self.exchange._fetch_order_by_id(self._order())
         self.assertEqual(CONSTANTS.MAX_PAGES, len(calls), "paging must be bounded")
-
-    # ---- start-up fan-out -----------------------------------------------------
-
-    async def test_symbol_map_request_makes_a_single_call(self):
-        """TradingPairFetcher builds this connector with no trading pairs at every
-        startup; the symbol map must not fan out to one request per instrument."""
-        calls = []
-
-        async def _execute(url, method, throttler_limit_id, **kwargs):
-            calls.append(url)
-            return ["B-BTC_USDT", "B-ETH_USDT", "B-SOL_USDT"]
-
-        assistant = AsyncMock()
-        assistant.execute_request = AsyncMock(side_effect=_execute)
-        self.exchange._web_assistants_factory.get_rest_assistant = AsyncMock(return_value=assistant)
-
-        instruments = await self.exchange._make_trading_pairs_request()
-        self.assertEqual(1, len(calls), "symbol map must cost exactly one request")
-        self.assertEqual(3, len(instruments))
-
-        self.exchange._initialize_trading_pair_symbols_from_exchange_info(instruments)
-        self.assertEqual(
-            "BTC-USDT",
-            await self.exchange.trading_pair_associated_to_exchange_symbol(symbol="B-BTC_USDT"))
-
-    async def test_instrument_detail_fetches_are_concurrency_capped(self):
-        in_flight = 0
-        peak = 0
-
-        async def _fetch(pair):
-            nonlocal in_flight, peak
-            in_flight += 1
-            peak = max(peak, in_flight)
-            await asyncio.sleep(0)
-            in_flight -= 1
-            return {**INSTRUMENT, "pair": pair}
-
-        names = [f"B-X{i}_USDT" for i in range(60)]
-        assistant = AsyncMock()
-        assistant.execute_request = AsyncMock(return_value=names)
-        self.exchange._web_assistants_factory.get_rest_assistant = AsyncMock(return_value=assistant)
-        self.exchange._trading_pairs = []
-        self.exchange._fetch_instrument = _fetch
-
-        await self.exchange._fetch_instruments()
-        self.assertLessEqual(peak, CONSTANTS.INSTRUMENT_FETCH_CONCURRENCY,
-                             f"fan-out peaked at {peak} concurrent requests")
 
     # ---- error classification / cancel safety ---------------------------------
 
@@ -890,19 +926,57 @@ class CoindcxPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
     # ---- missing price data ---------------------------------------------------
 
     async def test_missing_price_raises_instead_of_returning_zero(self):
-        self._bootstrap()
-        self.exchange._fetch_current_prices = AsyncMock(return_value={})
+        self.exchange._initialize_trading_pair_symbols_from_exchange_info(EXCHANGE_INFO)
+        self.exchange._api_get = AsyncMock(return_value={})
         with self.assertRaises(ValueError):
             await self.exchange._get_last_traded_price(self.trading_pair)
         with self.assertRaises(ValueError):
             await self.exchange.build_funding_info(self.trading_pair)
 
+    async def test_zero_last_price_raises(self):
+        self.exchange._initialize_trading_pair_symbols_from_exchange_info(EXCHANGE_INFO)
+        self.exchange._api_get = AsyncMock(return_value={"symbol": "BTCUSDT", "price": "0"})
+        with self.assertRaises(ValueError):
+            await self.exchange._get_last_traded_price(self.trading_pair)
+
     async def test_funding_info_raises_when_prices_are_zero(self):
-        self._bootstrap()
-        self.exchange._fetch_current_prices = AsyncMock(
-            return_value={"B-BTC_USDT": {"mp": 0, "ls": 0, "fr": 0.0001}})
+        self.exchange._initialize_trading_pair_symbols_from_exchange_info(EXCHANGE_INFO)
+        self.exchange._api_get = AsyncMock(return_value={
+            "symbol": "BTCUSDT", "markPrice": "0", "indexPrice": "0",
+            "lastFundingRate": "0.0001", "nextFundingTime": 1780934400000})
         with self.assertRaises(ValueError):
             await self.exchange.build_funding_info(self.trading_pair)
+
+    # ---- hosts ---------------------------------------------------------------
+
+    def test_unconfigured_hosts_fail_with_a_clear_message(self):
+        with patch.dict(os.environ, {CONSTANTS.REST_URL_ENV_VAR: "", CONSTANTS.WSS_URL_ENV_VAR: " "}):
+            with self.assertRaisesRegex(ValueError, "Set the COINDCX_FAPI_REST_URL environment variable"):
+                web_utils.public_rest_url(CONSTANTS.PING_PATH_URL)
+            with self.assertRaisesRegex(ValueError, "Set the COINDCX_FAPI_WS_URL environment variable"):
+                web_utils.wss_url(CONSTANTS.PUBLIC_WS_PATH)
+
+    def test_urls_are_built_on_the_configured_hosts(self):
+        with patch.dict(os.environ, {CONSTANTS.REST_URL_ENV_VAR: "https://fapi.example/",
+                                     CONSTANTS.WSS_URL_ENV_VAR: "wss://stream.example"}):
+            self.assertEqual("https://fapi.example/fapi/v1/depth", web_utils.public_rest_url(CONSTANTS.DEPTH_PATH_URL))
+            self.assertEqual("https://fapi.example/fapi/v2/balance", web_utils.private_rest_url("/fapi/v2/balance"))
+            self.assertEqual("wss://stream.example/ws", web_utils.wss_url(CONSTANTS.PUBLIC_WS_PATH))
+
+    def test_hosts_are_read_when_a_url_is_built_not_at_import(self):
+        with patch.dict(os.environ, {CONSTANTS.REST_URL_ENV_VAR: "https://first.example"}):
+            self.assertEqual("https://first.example/fapi/v1/ping", web_utils.rest_url(CONSTANTS.PING_PATH_URL))
+        with patch.dict(os.environ, {CONSTANTS.REST_URL_ENV_VAR: "https://second.example"}):
+            self.assertEqual("https://second.example/fapi/v1/ping", web_utils.rest_url(CONSTANTS.PING_PATH_URL))
+
+    async def test_server_time_comes_from_the_time_endpoint(self):
+        assistant = AsyncMock()
+        assistant.execute_request = AsyncMock(return_value={"serverTime": 1780915597863})
+        with patch.dict(os.environ, {CONSTANTS.REST_URL_ENV_VAR: "https://fapi.example"}), \
+                patch("hummingbot.core.web_assistant.web_assistants_factory.WebAssistantsFactory.get_rest_assistant",
+                      AsyncMock(return_value=assistant)):
+            self.assertEqual(1780915597863.0, await web_utils.get_current_server_time())
+        self.assertEqual("https://fapi.example/fapi/v1/time", assistant.execute_request.call_args.kwargs["url"])
 
     # ---- websocket balance frames ---------------------------------------------
 
@@ -969,7 +1043,6 @@ class CoindcxPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
                          sent[0]["margin_currency_short_name"],
                          "list orders requires a list; a string returns HTTP 500")
 
-        self.exchange._fetch_current_prices = AsyncMock(return_value={})
         sent = await self._capture_post(
             lambda: self.exchange._fetch_last_fee_payment(self.trading_pair))
         self.assertEqual([self.exchange.margin_currency],

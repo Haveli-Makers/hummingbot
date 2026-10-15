@@ -10,7 +10,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import numpy as np
 from aioresponses import aioresponses
 
-from hummingbot.data_feed.candles_feed.ajaib_spot_candles import ajaib_spot_candles as ajaib_module, constants as CONSTANTS
+from hummingbot.data_feed.candles_feed.ajaib_spot_candles import (
+    ajaib_spot_candles as ajaib_module,
+    constants as CONSTANTS,
+)
 from hummingbot.data_feed.candles_feed.ajaib_spot_candles.ajaib_spot_candles import (
     AjaibSpotCandles,
     _AjaibSigningPreProcessor,

@@ -1,8 +1,7 @@
 import asyncio
 import logging
 import os
-import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 
@@ -52,19 +51,37 @@ class _AjaibSigningPreProcessor(RESTPreProcessorBase):
         return await self._get_auth().rest_authenticate(request)
 
 
-_CONNECTIONS_FACTORIES: Dict[Optional[str], Any] = {}
+_CONNECTIONS_FACTORIES: Dict[Tuple[asyncio.AbstractEventLoop, Optional[str]], Any] = {}
 
 
-def _shared_connections_factory(proxy_url: Optional[str]):
+class _SharedConnectionsFactory:
     """
-    One connections factory (hence one aiohttp session) per proxy URL, shared by
-    every Ajaib candles feed. A session per feed leaves a pile of idle proxy
-    tunnels open, and the proxy then resets new connections with
-    ``[WinError 64] The specified network name is no longer available``.
+    Ajaib's API is geo-blocked, so the proxy URL is forwarded to every connection.
+    The factory is shared across all Ajaib feeds in the same event loop so the proxy
+    is not reconnected for every feed. The factory is keyed by (loop, proxy_url) so
+    multiple loops can each have their own factory.
     """
-    if proxy_url not in _CONNECTIONS_FACTORIES:
-        _CONNECTIONS_FACTORIES[proxy_url] = ajaib_web_utils._build_connections_factory(proxy_url)
-    return _CONNECTIONS_FACTORIES[proxy_url]
+
+    def __init__(self, proxy_url: Optional[str]):
+        self._proxy_url = proxy_url
+
+    def _factory(self):
+        loop = asyncio.get_running_loop()
+        for key in [key for key in _CONNECTIONS_FACTORIES if key[0].is_closed()]:
+            del _CONNECTIONS_FACTORIES[key]
+        key = (loop, self._proxy_url)
+        if key not in _CONNECTIONS_FACTORIES:
+            _CONNECTIONS_FACTORIES[key] = ajaib_web_utils._build_connections_factory(self._proxy_url)
+        return _CONNECTIONS_FACTORIES[key]
+
+    async def get_rest_connection(self):
+        return await self._factory().get_rest_connection()
+
+    async def get_ws_connection(self):
+        return await self._factory().get_ws_connection()
+
+    async def close(self):
+        pass
 
 
 class AjaibSpotCandles(CandlesBase):
@@ -85,12 +102,10 @@ class AjaibSpotCandles(CandlesBase):
 
     def __init__(self, trading_pair: str, interval: str = "1m", max_records: int = 150):
         super().__init__(trading_pair, interval, max_records)
-        # Ajaib allowlists API access by IP, so traffic goes through the same
-        # proxy the connector and rate source use.
         proxy_url = os.environ.get(CONSTANTS.PROXY_URL_ENV_VAR, "") or None
         self._api_factory = WebAssistantsFactory(
             throttler=AsyncThrottler(rate_limits=self.rate_limits),
-            connections_factory=_shared_connections_factory(proxy_url),
+            connections_factory=_SharedConnectionsFactory(proxy_url),
             rest_pre_processors=[_AjaibSigningPreProcessor()],
         )
         self._polling_task: Optional[asyncio.Task] = None
@@ -197,33 +212,34 @@ class AjaibSpotCandles(CandlesBase):
         try:
             await self._ws_candle_available.wait()
             iteration = 0
-            max_iterations = 20
-            while not self.ready and len(self._candles) > 0 and iteration < max_iterations:
+            page_end: Optional[float] = None
+            while (not self.ready and len(self._candles) > 0
+                   and iteration < CONSTANTS.HISTORICAL_FILL_MAX_PAGES):
                 iteration += 1
                 try:
                     oldest_timestamp = self._candles[0][0]
-                    missing_records = self._candles.maxlen - len(self._candles)
-                    if missing_records <= 0:
-                        break
                     end_timestamp = oldest_timestamp - self.interval_in_seconds
-                    start_timestamp = end_timestamp - (missing_records * self.interval_in_seconds)
-                    candles_np = await self.fetch_candles(
-                        start_time=start_timestamp,
-                        end_time=end_timestamp + self.interval_in_seconds,
-                    )
+                    if page_end is None:
+                        page_end = end_timestamp
+                    page_size = self.candles_max_result_per_rest_request
+                    candles_np = await self.fetch_candles(end_time=int(page_end), limit=page_size)
                     real_candles = candles_np.tolist() if candles_np.size > 0 else []
-                    filled = self._fill_historical_gaps_with_heartbeats(
-                        real_candles, start_timestamp, end_timestamp
-                    )
+
+                    if not self._candles or self._candles[0][0] != oldest_timestamp:
+                        page_end = None
+                        continue
+                    filled = self._fill_historical_gaps_with_heartbeats(real_candles, end_timestamp)
                     if not filled:
+                        page_end -= page_size * self.interval_in_seconds
+                        await self._sleep(0.1)
+                        continue
+
+                    room = self._candles.maxlen - len(self._candles)
+                    if room <= 0:
                         break
-                    candles_to_add = (
-                        filled[-missing_records:]
-                        if len(filled) > missing_records
-                        else filled
-                    )
-                    for candle in reversed(candles_to_add):
+                    for candle in reversed(filled[-room:]):
                         self._candles.appendleft(candle)
+                    page_end = None
                     await self._sleep(0.1)
                 except asyncio.CancelledError:
                     raise
@@ -232,37 +248,37 @@ class AjaibSpotCandles(CandlesBase):
                         f"Error during historical fill iteration {iteration}: {e}"
                     )
                     await self._sleep(1.0)
+            if not self.ready and self._candles:
+                self.logger().warning(
+                    f"Ajaib candles for {self._trading_pair} [{self.interval}] hold "
+                    f"{len(self._candles)}/{self._candles.maxlen} records: no older trades were "
+                    f"found within {CONSTANTS.HISTORICAL_FILL_MAX_PAGES} pages."
+                )
         finally:
             self._historical_fill_in_progress = False
 
     def _fill_historical_gaps_with_heartbeats(
-        self, candles: List[List[float]], start_timestamp: float, end_timestamp: float
+        self, candles: List[List[float]], end_timestamp: float
     ) -> List[List[float]]:
-        fallback_close = self._candles[0][4] if self._candles else 0.0
-
         candle_map = {
             self._round_timestamp_to_interval_multiple(c[0]): c
             for c in candles
+            if c[0] <= end_timestamp
         }
+        if not candle_map:
+            return []
 
         result: List[List[float]] = []
-        current_ts = float(self._round_timestamp_to_interval_multiple(start_timestamp))
-        prev_close = fallback_close
-        interval_count = 0
-
-        while current_ts <= end_timestamp and interval_count < 1000:
-            if current_ts in candle_map:
-                candle = candle_map[current_ts]
+        current_ts = float(min(candle_map))
+        prev_close = candle_map[min(candle_map)][4]
+        while current_ts <= end_timestamp:
+            candle = candle_map.get(current_ts)
+            if candle is not None:
                 result.append(candle)
                 prev_close = candle[4]
             else:
-                result.append(
-                    [current_ts, prev_close, prev_close, prev_close, prev_close,
-                     0.0, 0.0, 0.0, 0.0, 0.0]
-                )
+                result.append(self._heartbeat(current_ts, prev_close))
             current_ts += self.interval_in_seconds
-            interval_count += 1
-
         return result
 
     async def start_network(self):
@@ -403,128 +419,117 @@ class AjaibSpotCandles(CandlesBase):
         raise NotImplementedError("WebSocket not supported for Ajaib candles; polling is used instead.")
 
     async def _polling_loop(self):
+        consecutive_errors = 0
+        last_config_error: Optional[str] = None
         try:
             self.logger().info(
                 f"Starting Ajaib candles polling for {self._trading_pair} [{self.interval}]"
             )
-            await self._initialize_candles()
-
             while self._is_running and not self._shutdown_event.is_set():
                 try:
                     await self._poll_and_update()
-                    try:
-                        await asyncio.wait_for(
-                            self._shutdown_event.wait(),
-                            timeout=CONSTANTS.POLL_INTERVAL,
-                        )
-                        break
-                    except asyncio.TimeoutError:
-                        continue
+                    consecutive_errors = 0
+                    last_config_error = None
                 except asyncio.CancelledError:
                     raise
+                except ValueError as e:
+                    consecutive_errors += 1
+                    if str(e) != last_config_error:
+                        last_config_error = str(e)
+                        self.logger().error(
+                            f"Ajaib candles misconfigured for {self._trading_pair}: {e} "
+                            f"This feed will keep retrying but will stay empty until this is fixed."
+                        )
                 except Exception as e:
+                    consecutive_errors += 1
                     self.logger().exception(f"Ajaib candles polling error: {e}")
-                    try:
-                        await asyncio.wait_for(self._shutdown_event.wait(), timeout=5.0)
-                        break
-                    except asyncio.TimeoutError:
-                        continue
+                try:
+                    await asyncio.wait_for(
+                        self._shutdown_event.wait(),
+                        timeout=self._poll_delay(consecutive_errors),
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    continue
         finally:
             self._is_running = False
             self.logger().info("Ajaib candles polling loop stopped.")
 
-    async def _initialize_candles(self):
-        try:
-            candles = await self.fetch_candles(
-                end_time=int(time.time()),
-                limit=10,
-            )
-            if candles.size > 0:
-                self._candles.extend(candles)
-                self._ws_candle_available.set()
-                self._historical_fill_task = safe_ensure_future(self.fill_historical_candles())
-                self.logger().info(
-                    f"Ajaib candles seeded with {len(self._candles)} recent candles "
-                    f"for {self._trading_pair} [{self.interval}]; backfill scheduled."
-                )
-        except ValueError as e:
-            # Most commonly missing API credentials (see _AjaibSigningPreProcessor).
-            self.logger().error(
-                f"Ajaib candles misconfigured for {self._trading_pair}: {e} "
-                f"This feed will keep retrying every {CONSTANTS.POLL_INTERVAL}s but will stay "
-                f"empty until this is fixed.",
-            )
-        except Exception as e:
-            self.logger().error(
-                f"Error initialising Ajaib candles for {self._trading_pair}: {e}",
-                exc_info=True,
-            )
+    @staticmethod
+    def _poll_delay(consecutive_errors: int) -> float:
+        if consecutive_errors == 0:
+            return CONSTANTS.POLL_INTERVAL
+        return min(CONSTANTS.POLL_INTERVAL * 2 ** (consecutive_errors - 1), CONSTANTS.POLL_ERROR_BACKOFF_MAX)
 
-    def _fill_gaps_and_append(self, new_candle: List[float]) -> None:
-        """Insert heartbeat candles for any skipped intervals then append new_candle."""
-        if not self._candles:
-            self._candles.append(new_candle)
-            return
+    async def _seed_candles(self) -> bool:
+        end_time = int(self._time())
+        candles = await self.fetch_candles(end_time=end_time, limit=CONSTANTS.SEED_RECENT_INTERVALS)
+        page = 0
+        while candles.size == 0 and page < CONSTANTS.SEED_LOOKBACK_PAGES:
+            candles = await self.fetch_candles(end_time=end_time)
+            end_time -= self.interval_in_seconds * self.candles_max_result_per_rest_request
+            page += 1
+        if candles.size == 0 or self._candles:
+            return False
 
-        last_ts = self._candles[-1][0]
-        new_ts = new_candle[0]
-        next_ts = last_ts + self.interval_in_seconds
+        for candle in candles.tolist():
+            self._fill_gaps_and_append(candle)
+        self._ensure_heartbeats_to_current_time()
+        self._ws_candle_available.set()
+        self._historical_fill_task = safe_ensure_future(self.fill_historical_candles())
+        self.logger().info(
+            f"Ajaib candles seeded with {len(self._candles)} candles "
+            f"for {self._trading_pair} [{self.interval}]; backfill scheduled."
+        )
+        return True
 
-        while next_ts < new_ts:
-            prev = self._candles[-1]
-            close_price = prev[4]
-            heartbeat = [next_ts, close_price, close_price, close_price, close_price, 0.0, 0.0, 0.0, 0.0, 0.0]
-            self._candles.append(heartbeat)
+    @staticmethod
+    def _heartbeat(timestamp: float, close: float) -> List[float]:
+        """A zero-volume candle that carries ``close`` through an interval with no trades."""
+        return [timestamp, close, close, close, close, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+    def _append_heartbeats_until(self, timestamp: float) -> None:
+        """Append a heartbeat for every interval after the newest candle and before ``timestamp``."""
+        next_ts = self._candles[-1][0] + self.interval_in_seconds
+        while next_ts < timestamp:
+            self._candles.append(self._heartbeat(next_ts, self._candles[-1][4]))
             self.logger().debug(f"Ajaib: inserted heartbeat candle at {next_ts}")
             next_ts += self.interval_in_seconds
 
+    def _fill_gaps_and_append(self, new_candle: List[float]) -> None:
+        """Insert heartbeat candles for any skipped intervals then append new_candle."""
+        if self._candles:
+            self._append_heartbeats_until(new_candle[0])
         self._candles.append(new_candle)
 
     def _ensure_heartbeats_to_current_time(self) -> None:
-        if not self._candles:
-            return
-        current_interval_ts = self._round_timestamp_to_interval_multiple(self._time())
-        next_ts = self._candles[-1][0] + self.interval_in_seconds
-        while next_ts < current_interval_ts:
-            prev_close = self._candles[-1][4]
-            heartbeat = [next_ts, prev_close, prev_close, prev_close, prev_close,
-                         0.0, 0.0, 0.0, 0.0, 0.0]
-            self._candles.append(heartbeat)
-            self.logger().debug(f"Ajaib: heartbeat candle inserted at {next_ts}")
-            next_ts += self.interval_in_seconds
+        if self._candles:
+            self._append_heartbeats_until(self._round_timestamp_to_interval_multiple(self._time()))
 
     async def _poll_and_update(self):
-        try:
-            rest_assistant = await self._api_factory.get_rest_assistant()
-            now = int(self._time())
-            data = await rest_assistant.execute_request(
-                url=self.candles_url,
-                throttler_limit_id=self._rest_throttler_limit_id,
-                params=self._get_rest_candles_params(
-                    start_time=now - self.interval_in_seconds * 10,
-                    end_time=now,
-                ),
-                method=self._rest_method,
-            )
+        if not self._candles:
+            await self._seed_candles()
+            return
 
-            candles = self._parse_rest_candles(data)
+        rest_assistant = await self._api_factory.get_rest_assistant()
+        now = int(self._time())
+        data = await rest_assistant.execute_request(
+            url=self.candles_url,
+            throttler_limit_id=self._rest_throttler_limit_id,
+            params=self._get_rest_candles_params(
+                start_time=now - self.interval_in_seconds * CONSTANTS.SEED_RECENT_INTERVALS,
+                end_time=now,
+            ),
+            method=self._rest_method,
+        )
+        if not self._candles:
+            return
 
-            if not self._candles:
-                if candles:
-                    self._candles.append(candles[-1])
-                    self._ws_candle_available.set()
-                    self._historical_fill_task = safe_ensure_future(self.fill_historical_candles())
-                return
+        for candle in self._parse_rest_candles(data):
+            last_ts = self._candles[-1][0]
+            if candle[0] > last_ts:
+                self._fill_gaps_and_append(candle)
+            elif candle[0] == last_ts:
+                self._candles[-1] = candle
 
-            for candle in candles:
-                candle_ts = candle[0]
-                last_ts = self._candles[-1][0]
-                if candle_ts > last_ts:
-                    self._fill_gaps_and_append(candle)
-                elif candle_ts == last_ts:
-                    self._candles[-1] = candle
-
-            self._ensure_heartbeats_to_current_time()
-
-        except Exception as e:
-            self.logger().error(f"Ajaib candles poll error: {e}", exc_info=True)
+        self._ensure_heartbeats_to_current_time()

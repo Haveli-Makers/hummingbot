@@ -158,8 +158,10 @@ class AjaibRateSource(RateSourceBase):
         geo-blocked, so the configured proxy URL is forwarded as well.
 
         The saved config is only readable once the CLI has decrypted it, so the
-        API server and standalone runs see no keys there. AJAIB_API_KEY /
-        AJAIB_API_SECRET / AJAIB_PROXY_URL environment variables take precedence.
+        API server and standalone runs see no keys there. AJAIB_API_KEY and
+        AJAIB_API_SECRET take precedence only when both are set: they replace the
+        saved pair together, so a key from one source is never signed with a
+        secret from the other. AJAIB_PROXY_URL takes precedence on its own.
         """
         import os
 
@@ -179,8 +181,15 @@ class AjaibRateSource(RateSourceBase):
         except Exception:
             pass
 
-        api_key = os.environ.get("AJAIB_API_KEY", "") or api_key
-        api_secret = os.environ.get("AJAIB_API_SECRET", "") or api_secret
+        env_api_key = os.environ.get("AJAIB_API_KEY", "")
+        env_api_secret = os.environ.get("AJAIB_API_SECRET", "")
+        if env_api_key and env_api_secret:
+            api_key, api_secret = env_api_key, env_api_secret
+        elif env_api_key or env_api_secret:
+            AjaibRateSource.logger().warning(
+                "Only one of AJAIB_API_KEY / AJAIB_API_SECRET is set; ignoring both and "
+                "using the saved Ajaib credentials. Set both to override them."
+            )
         proxy_url = os.environ.get("AJAIB_PROXY_URL", "") or proxy_url
 
         return AjaibExchange(

@@ -154,16 +154,18 @@ class CoinDCXAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(expected_trades_channel, second_call_args[1]["channelName"])
 
     async def test_subscribe_channels_raises_cancel_exception(self):
-        mock_ws = MagicMock()
-        mock_ws.send.side_effect = asyncio.CancelledError
+        mock_ws = AsyncMock()
+        mock_ws.emit.side_effect = asyncio.CancelledError
 
-        await self.data_source._subscribe_channels(mock_ws)
+        with self.assertRaises(asyncio.CancelledError):
+            await self.data_source._subscribe_channels(mock_ws)
 
     async def test_subscribe_channels_raises_exception_and_logs_error(self):
-        mock_ws = MagicMock()
-        mock_ws.send.side_effect = Exception("Test Error")
+        mock_ws = AsyncMock()
+        mock_ws.emit.side_effect = Exception("Test Error")
 
-        await self.data_source._subscribe_channels(mock_ws)
+        with self.assertRaises(Exception):
+            await self.data_source._subscribe_channels(mock_ws)
 
     async def test_listen_for_trades_successful(self):
         mock_queue = AsyncMock()
@@ -253,3 +255,262 @@ def test_parse_trade_and_diff_message_async():
         assert q4.empty()
 
     asyncio.run(run_test())
+
+
+class TestSocketIOMessageUnwrapping(IsolatedAsyncioWrapperTestCase):
+    """
+    Tests for the Socket.IO event handlers created in _build_client.
+    Validates JSON decoding of stringified data, channel preservation,
+    single-pair symbol injection, and queue routing for snapshots/diffs/trades.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls.trading_pair = "BTC-USDT"
+        cls.ex_symbol = "BTCUSDT"
+        cls.ex_channel_ob = "I-BTC_USDT@orderbook@20"
+        cls.ex_channel_trades = "I-BTC_USDT@trades"
+
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        self.connector = MagicMock()
+        self.data_source = CoinDCXAPIOrderBookDataSource(
+            trading_pairs=[self.trading_pair],
+            connector=self.connector,
+            api_factory=MagicMock(),
+        )
+        self.trade_queue = asyncio.Queue()
+        self.diff_queue = asyncio.Queue()
+        self.snapshot_queue = asyncio.Queue()
+
+        self._handlers = {}
+        client_stub = MagicMock()
+        client_stub.event = MagicMock(side_effect=lambda fn: fn)
+
+        def capture_on(event_type):
+            def decorator(fn):
+                self._handlers[event_type] = fn
+                return fn
+            return decorator
+
+        client_stub.on = MagicMock(side_effect=capture_on)
+        self.data_source._build_client(self.trade_queue, self.diff_queue, self.snapshot_queue)
+
+    async def _build_and_capture_handlers(self):
+        """Build a client and capture the registered Socket.IO handlers."""
+        handlers = {}
+
+        class CapturingClient:
+            def __init__(self, **kwargs):
+                pass
+
+            def event(self, fn):
+                handlers[fn.__name__] = fn
+                return fn
+
+            def on(self, event_type):
+                def decorator(fn):
+                    handlers[event_type] = fn
+                    return fn
+                return decorator
+
+        with patch("hummingbot.connector.exchange.coindcx.coindcx_api_order_book_data_source.socketio.AsyncClient",
+                   CapturingClient):
+            self.data_source._build_client(self.trade_queue, self.diff_queue, self.snapshot_queue)
+
+        return handlers
+
+    async def test_snapshot_handler_decodes_json_string_data(self):
+        handlers = await self._build_and_capture_handlers()
+        handler = handlers[CONSTANTS.SNAPSHOT_EVENT_TYPE]
+        inner = {"vs": 100, "bids": {"1.0": "10"}, "asks": {"2.0": "20"}}
+        message = {"channel": self.ex_channel_ob, "data": json.dumps(inner)}
+        await handler(message)
+        result = self.snapshot_queue.get_nowait()
+        self.assertEqual(result["bids"], {"1.0": "10"})
+        self.assertEqual(result["asks"], {"2.0": "20"})
+
+    async def test_snapshot_handler_preserves_channel(self):
+        handlers = await self._build_and_capture_handlers()
+        handler = handlers[CONSTANTS.SNAPSHOT_EVENT_TYPE]
+        inner = {"vs": 100, "bids": {"1.0": "10"}, "asks": {}}
+        message = {"channel": self.ex_channel_ob, "data": json.dumps(inner)}
+        await handler(message)
+        result = self.snapshot_queue.get_nowait()
+        self.assertEqual(result["channel"], self.ex_channel_ob)
+
+    async def test_snapshot_handler_does_not_overwrite_existing_channel(self):
+        handlers = await self._build_and_capture_handlers()
+        handler = handlers[CONSTANTS.SNAPSHOT_EVENT_TYPE]
+        inner = {"vs": 1, "bids": {"1": "1"}, "asks": {}, "channel": "original"}
+        message = {"channel": "outer-channel", "data": json.dumps(inner)}
+        await handler(message)
+        result = self.snapshot_queue.get_nowait()
+        self.assertEqual(result["channel"], "original")
+
+    async def test_snapshot_handler_injects_symbol_for_single_pair(self):
+        handlers = await self._build_and_capture_handlers()
+        handler = handlers[CONSTANTS.SNAPSHOT_EVENT_TYPE]
+        inner = {"vs": 1, "bids": {"1": "1"}, "asks": {}}
+        message = {"data": inner}
+        await handler(message)
+        result = self.snapshot_queue.get_nowait()
+        self.assertEqual(result["s"], self.ex_symbol)
+
+    async def test_snapshot_handler_skips_invalid_json_string(self):
+        handlers = await self._build_and_capture_handlers()
+        handler = handlers[CONSTANTS.SNAPSHOT_EVENT_TYPE]
+        message = {"data": "not-valid-json{{{"}
+        await handler(message)
+        self.assertTrue(self.snapshot_queue.empty())
+
+    async def test_snapshot_handler_skips_non_dict_message(self):
+        handlers = await self._build_and_capture_handlers()
+        handler = handlers[CONSTANTS.SNAPSHOT_EVENT_TYPE]
+        await handler("just a string")
+        self.assertTrue(self.snapshot_queue.empty())
+
+    async def test_snapshot_handler_skips_data_without_bids_or_asks(self):
+        handlers = await self._build_and_capture_handlers()
+        handler = handlers[CONSTANTS.SNAPSHOT_EVENT_TYPE]
+        message = {"data": {"foo": "bar"}}
+        await handler(message)
+        self.assertTrue(self.snapshot_queue.empty())
+
+    async def test_snapshot_handler_accepts_dict_data_directly(self):
+        handlers = await self._build_and_capture_handlers()
+        handler = handlers[CONSTANTS.SNAPSHOT_EVENT_TYPE]
+        inner = {"vs": 5, "bids": {"3.0": "30"}, "asks": {"4.0": "40"}}
+        message = {"channel": self.ex_channel_ob, "data": inner}
+        await handler(message)
+        result = self.snapshot_queue.get_nowait()
+        self.assertEqual(result["vs"], 5)
+        self.assertEqual(result["channel"], self.ex_channel_ob)
+
+    async def test_diff_handler_decodes_json_string_data(self):
+        handlers = await self._build_and_capture_handlers()
+        handler = handlers[CONSTANTS.DIFF_EVENT_TYPE]
+        inner = {"vs": 200, "bids": {"5.0": "50"}, "asks": {}}
+        message = {"channel": self.ex_channel_ob, "data": json.dumps(inner)}
+        await handler(message)
+        result = self.diff_queue.get_nowait()
+        self.assertEqual(result["vs"], 200)
+        self.assertEqual(result["bids"], {"5.0": "50"})
+
+    async def test_diff_handler_preserves_channel(self):
+        handlers = await self._build_and_capture_handlers()
+        handler = handlers[CONSTANTS.DIFF_EVENT_TYPE]
+        inner = {"bids": {"1": "1"}, "asks": {}}
+        message = {"channel": self.ex_channel_ob, "data": json.dumps(inner)}
+        await handler(message)
+        result = self.diff_queue.get_nowait()
+        self.assertEqual(result["channel"], self.ex_channel_ob)
+
+    async def test_diff_handler_injects_symbol_for_single_pair(self):
+        handlers = await self._build_and_capture_handlers()
+        handler = handlers[CONSTANTS.DIFF_EVENT_TYPE]
+        inner = {"bids": {}, "asks": {"1": "1"}}
+        message = {"data": inner}
+        await handler(message)
+        result = self.diff_queue.get_nowait()
+        self.assertEqual(result["s"], self.ex_symbol)
+
+    async def test_diff_handler_skips_invalid_json(self):
+        handlers = await self._build_and_capture_handlers()
+        handler = handlers[CONSTANTS.DIFF_EVENT_TYPE]
+        message = {"data": "broken json ~~~"}
+        await handler(message)
+        self.assertTrue(self.diff_queue.empty())
+
+    async def test_diff_handler_no_symbol_injected_for_multi_pair(self):
+        """When tracking multiple pairs, no symbol is injected (relies on channel)."""
+        self.data_source._trading_pairs = ["BTC-USDT", "ETH-USDT"]
+        handlers = await self._build_and_capture_handlers()
+        handler = handlers[CONSTANTS.DIFF_EVENT_TYPE]
+        inner = {"bids": {"1": "1"}, "asks": {}}
+        message = {"channel": self.ex_channel_ob, "data": inner}
+        await handler(message)
+        result = self.diff_queue.get_nowait()
+        self.assertNotIn("s", result)
+        self.assertEqual(result["channel"], self.ex_channel_ob)
+
+    # ── Trade handler tests ──
+
+    async def test_trade_handler_decodes_json_string_data(self):
+        handlers = await self._build_and_capture_handlers()
+        handler = handlers[CONSTANTS.TRADE_EVENT_TYPE]
+        inner = {"T": 999, "p": "100.5", "q": "0.5", "m": 1}
+        message = {"channel": self.ex_channel_trades, "data": json.dumps(inner)}
+        await handler(message)
+        result = self.trade_queue.get_nowait()
+        self.assertEqual(result["T"], 999)
+        self.assertEqual(result["p"], "100.5")
+
+    async def test_trade_handler_preserves_channel(self):
+        handlers = await self._build_and_capture_handlers()
+        handler = handlers[CONSTANTS.TRADE_EVENT_TYPE]
+        inner = {"T": 1, "p": "1", "q": "1", "m": 0}
+        message = {"channel": self.ex_channel_trades, "data": json.dumps(inner)}
+        await handler(message)
+        result = self.trade_queue.get_nowait()
+        self.assertEqual(result["channel"], self.ex_channel_trades)
+
+    async def test_trade_handler_injects_symbol_for_single_pair(self):
+        handlers = await self._build_and_capture_handlers()
+        handler = handlers[CONSTANTS.TRADE_EVENT_TYPE]
+        inner = {"T": 1, "p": "1", "q": "1", "m": 0}
+        message = {"data": inner}
+        await handler(message)
+        result = self.trade_queue.get_nowait()
+        self.assertEqual(result["s"], self.ex_symbol)
+
+    async def test_trade_handler_skips_data_without_price_or_quantity(self):
+        handlers = await self._build_and_capture_handlers()
+        handler = handlers[CONSTANTS.TRADE_EVENT_TYPE]
+        inner = {"T": 1, "m": 0}  # missing p and q
+        message = {"data": inner}
+        await handler(message)
+        self.assertTrue(self.trade_queue.empty())
+
+    async def test_trade_handler_skips_invalid_json(self):
+        handlers = await self._build_and_capture_handlers()
+        handler = handlers[CONSTANTS.TRADE_EVENT_TYPE]
+        message = {"data": "{invalid"}
+        await handler(message)
+        self.assertTrue(self.trade_queue.empty())
+
+    # ── End-to-end: handler → parser pipeline ──
+
+    async def test_diff_handler_to_parser_with_channel_fallback(self):
+        """Full pipeline: outer message with channel, no symbol in data → parser resolves via channel."""
+        self.connector.trading_pair_associated_to_exchange_symbol = AsyncMock(return_value=self.trading_pair)
+        handlers = await self._build_and_capture_handlers()
+        handler = handlers[CONSTANTS.DIFF_EVENT_TYPE]
+
+        inner = {"vs": 300, "bids": {"10": "100"}, "asks": {}}
+        message = {"channel": self.ex_channel_ob, "data": json.dumps(inner)}
+        await handler(message)
+
+        raw = self.diff_queue.get_nowait()
+        # Now feed into the parser (as listen_for_order_book_diffs would)
+        output = asyncio.Queue()
+        await self.data_source._parse_order_book_diff_message(raw, output)
+        parsed = output.get_nowait()
+        self.assertEqual(parsed.trading_pair, self.trading_pair)
+
+    async def test_snapshot_handler_to_parser_with_symbol(self):
+        """Full pipeline: single-pair symbol injection → parser resolves via symbol."""
+        self.connector.trading_pair_associated_to_exchange_symbol = AsyncMock(return_value=self.trading_pair)
+        handlers = await self._build_and_capture_handlers()
+        handler = handlers[CONSTANTS.SNAPSHOT_EVENT_TYPE]
+
+        inner = {"vs": 400, "bids": {"50": "500"}, "asks": {"51": "100"}}
+        message = {"data": inner}
+        await handler(message)
+
+        raw = self.snapshot_queue.get_nowait()
+        output = asyncio.Queue()
+        await self.data_source._parse_order_book_snapshot_message(raw, output)
+        parsed = output.get_nowait()
+        self.assertEqual(parsed.trading_pair, self.trading_pair)

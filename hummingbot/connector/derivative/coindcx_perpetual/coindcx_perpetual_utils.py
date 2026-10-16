@@ -36,15 +36,6 @@ def symbol_filter(symbol_info: Dict[str, Any], filter_type: str) -> Dict[str, An
                  if isinstance(f, dict) and f.get("filterType") == filter_type), {})
 
 
-def coindcx_pair_to_hb_pair(coindcx_pair: str) -> str:
-    """
-    Legacy-API pair to Hummingbot pair: "B-BTC_USDT" -> "BTC-USDT".
-    Only the legacy private code still reads legacy pairs.
-    """
-    without_ecode = coindcx_pair.split("-", 1)[1] if "-" in coindcx_pair else coindcx_pair
-    return without_ecode.replace("_", "-")
-
-
 def normalize_margin_currency(margin_currency: Any) -> str:
     """
     Validate and canonicalise the configured margin currency.
@@ -85,7 +76,7 @@ class CoinDCXPerpetualConfigMap(BaseConnectorConfigMap):
         default=CONSTANTS.DEFAULT_MARGIN_CURRENCY,
         json_schema_extra={
             "prompt": lambda cm: (
-                f"Margin currency for CoinDCX futures "
+                f"Margin currency for CoinDCX futures position exits "
                 f"({' or '.join(CONSTANTS.SUPPORTED_MARGIN_CURRENCIES)})"
             ),
             "is_secure": False,

@@ -25,10 +25,6 @@ def _symbol(**overrides):
 
 
 class CoinDCXPerpetualUtilsTests(TestCase):
-    def test_legacy_pair_conversion(self):
-        # Still used by the legacy private code to read positions.
-        self.assertEqual("BTC-USDT", utils.coindcx_pair_to_hb_pair("B-BTC_USDT"))
-
     def test_is_exchange_information_valid(self):
         self.assertTrue(utils.is_exchange_information_valid(_symbol()))
         self.assertFalse(utils.is_exchange_information_valid(_symbol(status="SETTLING")))

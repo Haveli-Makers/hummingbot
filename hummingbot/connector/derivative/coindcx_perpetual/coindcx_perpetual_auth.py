@@ -3,7 +3,6 @@ import hmac
 import json
 from typing import Any, Dict
 
-from hummingbot.connector.derivative.coindcx_perpetual import coindcx_perpetual_constants as CONSTANTS
 from hummingbot.connector.time_synchronizer import TimeSynchronizer
 from hummingbot.core.web_assistant.auth import AuthBase
 from hummingbot.core.web_assistant.connections.data_types import RESTRequest, WSRequest
@@ -11,15 +10,13 @@ from hummingbot.core.web_assistant.connections.data_types import RESTRequest, WS
 
 class CoinDCXPerpetualAuth(AuthBase):
     """
-    CoinDCX futures authentication.
+    CoinDCX FAPI authentication (guide §4).
 
-    Every private request carries a JSON body containing a millisecond
-    ``timestamp``; the body is serialised compactly and signed with
-    HMAC-SHA256, and the hex digest is sent in ``X-AUTH-SIGNATURE`` alongside
-    ``X-AUTH-APIKEY``.
-
-    Unlike the spot connector this signs **every** method, not just POST: the
-    futures wallet endpoint is a GET that still carries a signed body.
+    Every SIGNED request carries all its parameters in a JSON body that includes a
+    millisecond ``timestamp`` (within 5000 ms of server time). The body is serialised
+    compactly, signed with HMAC-SHA256 over those exact bytes, and the hex digest is
+    sent in ``X-AUTH-SIGNATURE`` alongside ``X-AUTH-APIKEY``. GET and DELETE are
+    signed the same way: for a GET with no parameters the body is ``{"timestamp":…}``.
     """
 
     def __init__(self, api_key: str, secret_key: str, time_provider: TimeSynchronizer):
@@ -46,20 +43,8 @@ class CoinDCXPerpetualAuth(AuthBase):
         return request
 
     async def ws_authenticate(self, request: WSRequest) -> WSRequest:
-        # The Socket.IO private channel is authenticated with the join payload
-        # produced by ``generate_ws_auth_payload``, not per-frame.
+        # The private stream is authorised by the listenKey in its URL.
         return request
-
-    def generate_ws_auth_payload(self) -> Dict[str, Any]:
-        """
-        Payload for ``emit("join", ...)`` on the private ``coindcx`` channel.
-        """
-        json_body = json.dumps({"channel": CONSTANTS.PRIVATE_CHANNEL}, separators=(",", ":"))
-        return {
-            "channelName": CONSTANTS.PRIVATE_CHANNEL,
-            "authSignature": self._generate_signature(json_body),
-            "apiKey": self.api_key,
-        }
 
     def header_for_authentication(self, signature: str) -> Dict[str, str]:
         return {

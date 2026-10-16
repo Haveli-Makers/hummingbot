@@ -1,20 +1,22 @@
 import asyncio
 import os
-import time
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from unittest.mock import AsyncMock, patch
-
-from bidict import bidict
 
 from hummingbot.connector.derivative.coindcx_perpetual import (
     coindcx_perpetual_constants as CONSTANTS,
     coindcx_perpetual_web_utils as web_utils,
 )
-from hummingbot.connector.derivative.coindcx_perpetual.coindcx_perpetual_derivative import CoindcxPerpetualDerivative
+from hummingbot.connector.derivative.coindcx_perpetual.coindcx_perpetual_derivative import (
+    CoindcxPerpetualDerivative,
+    error_code,
+)
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PositionSide, TradeType
 from hummingbot.core.data_type.funding_info import FundingInfo
-from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
+from hummingbot.core.data_type.in_flight_order import OrderState
+from hummingbot.core.event.event_logger import EventLogger
+from hummingbot.core.event.events import MarketEvent
 
 
 def _symbol(symbol, base, quote, status="TRADING", contract_type="PERPETUAL"):
@@ -50,9 +52,6 @@ EXCHANGE_INFO = {
     ],
 }
 
-# The private code still speaks the legacy API, which names pairs B-<BASE>_<QUOTE>.
-LEGACY_SYMBOL_MAP = {"B-BTC_USDT": "BTC-USDT"}
-
 
 class CoindcxPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
     def setUp(self):
@@ -64,24 +63,9 @@ class CoindcxPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
             trading_pairs=[self.trading_pair],
             trading_required=False,
         )
+        self._event_loggers = []
 
-    def _bootstrap(self):
-        """Legacy symbol map, for the private code that still sends legacy pairs."""
-        self.exchange._set_trading_pair_symbol_map(bidict(LEGACY_SYMBOL_MAP))
-
-    def _order(self, exchange_order_id="ex-1", trade_type=TradeType.BUY):
-        return InFlightOrder(
-            client_order_id="haveli-1",
-            trading_pair=self.trading_pair,
-            order_type=OrderType.LIMIT,
-            trade_type=trade_type,
-            amount=Decimal("0.01"),
-            price=Decimal("60000"),
-            creation_timestamp=1700000000.0,
-            exchange_order_id=exchange_order_id,
-        )
-
-    # ---- CLI wiring -----------------------------------------------------------
+    # ---- CLI wiring and market data (phase 1) -------------------------------------
 
     def test_connector_class_resolves_the_way_the_cli_loads_it(self):
         """
@@ -112,26 +96,6 @@ class CoindcxPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
             trading_pairs=[self.trading_pair])
         self.assertIsInstance(connector, CoindcxPerpetualDerivative)
         self.assertEqual("coindcx_perpetual", connector.name)
-
-    # ---- static -------------------------------------------------------------
-
-    def test_only_limit_and_market_supported(self):
-        types = self.exchange.supported_order_types()
-        self.assertIn(OrderType.LIMIT, types)
-        self.assertIn(OrderType.MARKET, types)
-        # allow_post_only is false on every CoinDCX futures instrument.
-        self.assertNotIn(OrderType.LIMIT_MAKER, types)
-
-    def test_oneway_only_and_usdt_collateral(self):
-        self.assertEqual([PositionMode.ONEWAY], self.exchange.supported_position_modes())
-        self.assertEqual("USDT", self.exchange.get_buy_collateral_token(self.trading_pair))
-        self.assertEqual("USDT", self.exchange.get_sell_collateral_token(self.trading_pair))
-
-    def test_order_type_and_side_mapping(self):
-        self.assertEqual("limit_order", CoindcxPerpetualDerivative.coindcx_order_type(OrderType.LIMIT))
-        self.assertEqual("market_order", CoindcxPerpetualDerivative.coindcx_order_type(OrderType.MARKET))
-        self.assertEqual("buy", CoindcxPerpetualDerivative.coindcx_side(TradeType.BUY))
-        self.assertEqual("sell", CoindcxPerpetualDerivative.coindcx_side(TradeType.SELL))
 
     async def test_symbol_map_comes_from_tradable_perpetuals_in_exchange_info(self):
         self.exchange._initialize_trading_pair_symbols_from_exchange_info(EXCHANGE_INFO)
@@ -183,232 +147,6 @@ class CoindcxPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
             amount=Decimal("1"), price=Decimal("60000"))
         self.assertEqual(Decimal("0.000236"), maker.percent)
         self.assertEqual(Decimal("0.00059"), taker.percent)
-
-    # ---- orders --------------------------------------------------------------
-
-    async def test_place_order_nests_body_under_order_key(self):
-        self._bootstrap()
-        captured = {}
-
-        async def fake_post(path_url, data, is_auth_required):
-            captured["path"] = path_url
-            captured["data"] = data
-            return [{"id": "uuid-1", "created_at": 1700000000000}]
-
-        self.exchange._api_post = AsyncMock(side_effect=fake_post)
-        exchange_id, ts = await self.exchange._place_order(
-            order_id="haveli-1", trading_pair=self.trading_pair, amount=Decimal("0.01"),
-            trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("60000"),
-            position_action=PositionAction.OPEN)
-
-        self.assertEqual("uuid-1", exchange_id)
-        self.assertEqual(1700000000.0, ts)
-        self.assertEqual(CONSTANTS.CREATE_ORDER_PATH_URL, captured["path"])
-        order = captured["data"]["order"]
-        self.assertEqual("B-BTC_USDT", order["pair"])
-        self.assertEqual("buy", order["side"])
-        self.assertEqual("limit_order", order["order_type"])
-        self.assertEqual("good_till_cancel", order["time_in_force"])
-        self.assertEqual(60000.0, order["price"])
-        self.assertEqual(0.01, order["total_quantity"])
-
-    async def test_place_order_sends_the_connectors_current_leverage(self):
-        """
-        The order carries ex.get_leverage(pair), which reads PerpetualTrading's
-        cache — a defaultdict returning 1. Setting leverage on the exchange alone
-        (``_set_trading_pair_leverage``) does NOT update it, so the order would go
-        out at 1x and be rejected for insufficient margin.
-        """
-        self._bootstrap()
-        captured = {}
-
-        async def fake_post(path_url, data, is_auth_required):
-            captured["data"] = data
-            return [{"id": "uuid-lev", "created_at": 1700000000000}]
-
-        self.exchange._api_post = AsyncMock(side_effect=fake_post)
-
-        # Default, before any leverage is set.
-        await self.exchange._place_order(
-            order_id="haveli-lev-default", trading_pair=self.trading_pair, amount=Decimal("0.01"),
-            trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("60000"),
-            position_action=PositionAction.OPEN)
-        self.assertEqual(1, captured["data"]["order"]["leverage"])
-
-        # After the connector's leverage is set, the order must carry it.
-        self.exchange._perpetual_trading.set_leverage(self.trading_pair, 20)
-        await self.exchange._place_order(
-            order_id="haveli-lev-20", trading_pair=self.trading_pair, amount=Decimal("0.01"),
-            trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("60000"),
-            position_action=PositionAction.OPEN)
-        self.assertEqual(20, captured["data"]["order"]["leverage"])
-
-    async def test_market_order_omits_time_in_force_and_price(self):
-        self._bootstrap()
-        captured = {}
-
-        async def fake_post(path_url, data, is_auth_required):
-            captured["data"] = data
-            return [{"id": "uuid-2", "created_at": 1700000000000}]
-
-        self.exchange._api_post = AsyncMock(side_effect=fake_post)
-        await self.exchange._place_order(
-            order_id="haveli-2", trading_pair=self.trading_pair, amount=Decimal("0.01"),
-            trade_type=TradeType.SELL, order_type=OrderType.MARKET, price=Decimal("0"),
-            position_action=PositionAction.OPEN)
-
-        order = captured["data"]["order"]
-        # CoinDCX rejects time_in_force on market orders.
-        self.assertNotIn("time_in_force", order)
-        self.assertNotIn("price", order)
-
-    async def test_place_order_raises_when_no_id_returned(self):
-        self._bootstrap()
-        self.exchange._api_post = AsyncMock(return_value={"message": "insufficient margin"})
-        with self.assertRaises(IOError):
-            await self.exchange._place_order(
-                order_id="haveli-3", trading_pair=self.trading_pair, amount=Decimal("0.01"),
-                trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("60000"),
-                position_action=PositionAction.OPEN)
-
-    async def test_place_cancel_success(self):
-        self.exchange._api_post = AsyncMock(return_value={"message": "success", "status": 200, "code": 200})
-        self.assertTrue(await self.exchange._place_cancel("haveli-1", self._order()))
-
-    async def test_place_cancel_without_exchange_id_returns_false(self):
-        # Must not raise: the framework retries once the id is assigned.
-        self.exchange._api_post = AsyncMock(side_effect=AssertionError("should not call the API"))
-        self.assertFalse(await self.exchange._place_cancel("haveli-1", self._order(exchange_order_id=None)))
-
-    async def test_request_order_status_finds_order_in_list(self):
-        self.exchange._api_post = AsyncMock(return_value=[
-            {"id": "other", "status": "open"},
-            {"id": "ex-1", "status": "partially_filled", "updated_at": 1700000001000},
-        ])
-        update = await self.exchange._request_order_status(self._order())
-        self.assertEqual(OrderState.PARTIALLY_FILLED, update.new_state)
-        self.assertEqual("ex-1", update.exchange_order_id)
-        self.assertEqual(1700000001.0, update.update_timestamp)
-
-    async def test_request_order_status_raises_when_missing(self):
-        self.exchange._api_post = AsyncMock(return_value=[])
-        with self.assertRaises(IOError):
-            await self.exchange._request_order_status(self._order())
-
-    async def test_trade_updates_parse_fills(self):
-        self.exchange._api_post = AsyncMock(return_value=[
-            {"id": "t1", "order_id": "ex-1", "price": "60000", "quantity": "0.004",
-             "fee_amount": "0.05", "timestamp": 1700000002000},
-            {"id": "t2", "order_id": "other-order", "price": "1", "quantity": "1"},
-        ])
-        updates = await self.exchange._all_trade_updates_for_order(self._order())
-        self.assertEqual(1, len(updates))
-        fill = updates[0]
-        self.assertEqual("t1", fill.trade_id)
-        self.assertEqual(Decimal("0.004"), fill.fill_base_amount)
-        self.assertEqual(Decimal("240.000"), fill.fill_quote_amount)
-        self.assertEqual(Decimal("0.05"), fill.fee.flat_fees[0].amount)
-        self.assertEqual("USDT", fill.fee.flat_fees[0].token)
-
-    # ---- balances / positions -------------------------------------------------
-
-    async def test_partial_fills_are_not_collapsed_by_a_missing_trade_id(self):
-        """
-        CoinDCX's /futures/trades payload has NO trade id field. InFlightOrder
-        drops any fill whose trade_id it has already recorded, so a constant id
-        would collapse every partial fill into the first and under-count the
-        executed amount. Fills must therefore get distinct synthesised ids.
-        """
-        order = self._order()
-        # Two genuine partial fills of the same order — real payload shape.
-        first = {"order_id": "ex-1", "timestamp": 1705645534425.8374, "price": "60000",
-                 "quantity": "0.004", "fee_amount": "0.02", "is_maker": False}
-        second = {"order_id": "ex-1", "timestamp": 1705645539871.1121, "price": "60010",
-                  "quantity": "0.006", "fee_amount": "0.03", "is_maker": False}
-
-        update_one = self.exchange._trade_update_from_fill(first, order)
-        update_two = self.exchange._trade_update_from_fill(second, order)
-        self.assertNotEqual(update_one.trade_id, update_two.trade_id)
-        self.assertTrue(update_one.trade_id, "trade_id must not be empty")
-
-        # Deterministic: re-polling the same fill yields the same id, so it dedupes.
-        self.assertEqual(update_one.trade_id, self.exchange._trade_update_from_fill(first, order).trade_id)
-
-        # Exercise the real accounting path.
-        self.assertTrue(order.update_with_trade_update(update_one))
-        self.assertTrue(order.update_with_trade_update(update_two),
-                        "second partial fill was dropped as a duplicate")
-        self.assertFalse(order.update_with_trade_update(update_one), "re-polled fill must dedupe")
-        self.assertEqual(Decimal("0.01"), order.executed_amount_base)
-
-    def test_fill_id_prefers_an_explicit_id_when_present(self):
-        self.assertEqual("abc", self.exchange._fill_id({"id": "abc", "order_id": "x"}))
-        self.assertEqual("t-1", self.exchange._fill_id({"trade_id": "t-1"}))
-
-    async def test_update_balances(self):
-        self.exchange._api_request = AsyncMock(return_value=[
-            {"currency_short_name": "USDT", "balance": "6.1693226", "locked_balance": "0.5"},
-        ])
-        await self.exchange._update_balances()
-        self.assertEqual(Decimal("6.1693226"), self.exchange._account_available_balances["USDT"])
-        self.assertEqual(Decimal("6.6693226"), self.exchange._account_balances["USDT"])
-
-    def test_long_position_derives_unrealized_pnl(self):
-        self.exchange._process_position_payload({
-            "pair": "B-BTC_USDT", "active_pos": 0.5, "avg_price": 60000.0,
-            "mark_price": 61000.0, "leverage": 10.0,
-        })
-        position = self.exchange.account_positions[self.trading_pair]
-        self.assertEqual(PositionSide.LONG, position.position_side)
-        self.assertEqual(Decimal("0.5"), position.amount)
-        # CoinDCX reports no unrealised PnL; it is derived from the mark price.
-        self.assertEqual(Decimal("500.0"), position.unrealized_pnl)
-
-    def test_short_position_has_negative_amount(self):
-        self.exchange._process_position_payload({
-            "pair": "B-BTC_USDT", "active_pos": -0.2, "avg_price": 60000.0,
-            "mark_price": 59000.0, "leverage": 5.0,
-        })
-        position = self.exchange.account_positions[self.trading_pair]
-        self.assertEqual(PositionSide.SHORT, position.position_side)
-        self.assertEqual(Decimal("-0.2"), position.amount)
-        self.assertEqual(Decimal("200.0"), position.unrealized_pnl)
-
-    def test_flat_position_is_removed(self):
-        self.exchange._process_position_payload({
-            "pair": "B-BTC_USDT", "active_pos": 0.5, "avg_price": 60000.0, "mark_price": 60000.0})
-        self.assertIn(self.trading_pair, self.exchange.account_positions)
-        self.exchange._process_position_payload({"pair": "B-BTC_USDT", "active_pos": 0})
-        self.assertNotIn(self.trading_pair, self.exchange.account_positions)
-
-    async def test_set_leverage_success(self):
-        self._bootstrap()
-        captured = {}
-
-        async def fake_post(path_url, data, is_auth_required):
-            captured.update(data)
-            return {"message": "success", "status": 200, "code": 200}
-
-        self.exchange._api_post = AsyncMock(side_effect=fake_post)
-        success, msg = await self.exchange._set_trading_pair_leverage(self.trading_pair, 10)
-        self.assertTrue(success)
-        self.assertEqual("10", captured["leverage"])
-        self.assertEqual("B-BTC_USDT", captured["pair"])
-
-    async def test_set_leverage_failure_reports_message(self):
-        self._bootstrap()
-        self.exchange._api_post = AsyncMock(return_value={"message": "leverage too high", "code": 422})
-        success, msg = await self.exchange._set_trading_pair_leverage(self.trading_pair, 500)
-        self.assertFalse(success)
-        self.assertIn("leverage too high", msg)
-
-    async def test_hedge_mode_rejected(self):
-        ok, _ = await self.exchange._trading_pair_position_mode_set(PositionMode.HEDGE, self.trading_pair)
-        self.assertFalse(ok)
-        ok, _ = await self.exchange._trading_pair_position_mode_set(PositionMode.ONEWAY, self.trading_pair)
-        self.assertTrue(ok)
-
-    # ---- funding / prices -----------------------------------------------------
 
     async def test_build_funding_info_reads_premium_index(self):
         self.exchange._initialize_trading_pair_symbols_from_exchange_info(EXCHANGE_INFO)
@@ -464,467 +202,6 @@ class CoindcxPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual([], await self.exchange.get_all_pairs_prices())
         self.assertEqual([], await self.exchange.get_all_24h_volume_tickers())
 
-    # ---- margin currency ------------------------------------------------------
-
-    async def test_usdt_margin_sent_on_every_authenticated_call(self):
-        self._bootstrap()
-        captured = []
-
-        async def fake_post(path_url, data, is_auth_required):
-            captured.append(data)
-            return []
-
-        self.exchange._api_post = AsyncMock(side_effect=fake_post)
-        await self.exchange._update_positions()
-        await self.exchange._fetch_order_by_id(self._order())
-        for data in captured:
-            self.assertEqual(["USDT"], data["margin_currency_short_name"])
-
-    async def test_trading_rules_use_usdt_collateral(self):
-        rules = await self.exchange._format_trading_rules(EXCHANGE_INFO)
-        self.assertEqual("USDT", rules[0].buy_order_collateral_token)
-        self.assertEqual("USDT", rules[0].sell_order_collateral_token)
-
-    def _inr_exchange(self):
-        ex = CoindcxPerpetualDerivative(
-            coindcx_perpetual_api_key="key",
-            coindcx_perpetual_api_secret="secret",
-            coindcx_perpetual_margin_currency="INR",
-            trading_pairs=[self.trading_pair],
-            trading_required=False,
-        )
-        ex._set_trading_pair_symbol_map(bidict(LEGACY_SYMBOL_MAP))
-        return ex
-
-    def test_margin_currency_is_configurable(self):
-        ex = self._inr_exchange()
-        self.assertEqual("INR", ex.margin_currency)
-        # Default stays USDT.
-        self.assertEqual("USDT", self.exchange.margin_currency)
-
-    def test_margin_currency_lowercase_is_normalised(self):
-        ex = CoindcxPerpetualDerivative(
-            coindcx_perpetual_api_key="k", coindcx_perpetual_api_secret="s",
-            coindcx_perpetual_margin_currency="inr",
-            trading_pairs=[self.trading_pair], trading_required=False)
-        self.assertEqual("INR", ex.margin_currency)
-
-    def test_invalid_margin_currency_rejected_at_construction(self):
-        with self.assertRaises(ValueError):
-            CoindcxPerpetualDerivative(
-                coindcx_perpetual_api_key="key",
-                coindcx_perpetual_api_secret="secret",
-                coindcx_perpetual_margin_currency="BTC",
-                trading_pairs=[self.trading_pair],
-                trading_required=False,
-            )
-
-    def test_collateral_token_is_the_quote_currency_even_under_inr_margin(self):
-        """
-        Collateral must be reported in the contract's quote currency. Reporting
-        INR makes OrderCandidate look for a "USDT-INR" market to convert with —
-        which CoinDCX futures does not list — and every v2 executor dies with
-        "No order book exists for 'USDT-INR'".
-        """
-        inr = self._inr_exchange()
-        self.assertEqual("INR", inr.margin_currency, "the wallet/API currency stays INR")
-        self.assertEqual("USDT", inr.get_buy_collateral_token(self.trading_pair))
-        self.assertEqual("USDT", inr.get_sell_collateral_token(self.trading_pair))
-
-    async def test_inr_wallet_is_reported_only_as_quote_denominated_buying_power(self):
-        """
-        The INR wallet must be CONVERTED, not listed alongside its equivalent:
-        publishing both shows the same money twice in `balance` (and the INR row
-        prices at $0 because Hummingbot has no INR rate).
-        """
-        inr = self._inr_exchange()
-        inr._api_request = AsyncMock(return_value=[
-            {"currency_short_name": "INR", "balance": "969.1044", "locked_balance": "0.0"},
-        ])
-        inr._margin_conversion_rate = AsyncMock(return_value=Decimal("100.25"))
-
-        await inr._update_balances()
-
-        self.assertNotIn("INR", inr._account_balances, "must not double-report the wallet")
-        self.assertAlmostEqual(
-            float(Decimal("969.1044") / Decimal("100.25")),
-            float(inr._account_available_balances["USDT"]), places=6)
-        self.assertEqual(1, len(inr._account_balances))
-
-    async def test_locked_margin_counts_towards_total_but_not_available(self):
-        inr = self._inr_exchange()
-        inr._api_request = AsyncMock(return_value=[
-            {"currency_short_name": "INR", "balance": "500.0", "locked_balance": "100.0"},
-        ])
-        inr._margin_conversion_rate = AsyncMock(return_value=Decimal("100.0"))
-        await inr._update_balances()
-        self.assertEqual(Decimal("5"), inr._account_available_balances["USDT"])
-        self.assertEqual(Decimal("6"), inr._account_balances["USDT"])
-
-    async def test_balances_untouched_when_the_rate_is_unavailable(self):
-        inr = self._inr_exchange()
-        inr._account_available_balances["USDT"] = Decimal("9.5")
-        inr._api_request = AsyncMock(return_value=[
-            {"currency_short_name": "INR", "balance": "969.0", "locked_balance": "0.0"}])
-        inr._margin_conversion_rate = AsyncMock(return_value=None)
-        await inr._update_balances()
-        # Better a stale figure than a wrong one.
-        self.assertEqual(Decimal("9.5"), inr._account_available_balances["USDT"])
-
-    async def test_non_margin_wallets_are_ignored(self):
-        inr = self._inr_exchange()
-        inr._api_request = AsyncMock(return_value=[
-            {"currency_short_name": "USDT", "balance": "5.0", "locked_balance": "0.0"},
-            {"currency_short_name": "INR", "balance": "1000.0", "locked_balance": "0.0"},
-        ])
-        inr._margin_conversion_rate = AsyncMock(return_value=Decimal("100.0"))
-        await inr._update_balances()
-        # Orders carry margin_currency_short_name=INR, so only the INR wallet backs them.
-        self.assertEqual(Decimal("10"), inr._account_available_balances["USDT"])
-
-    async def test_usdt_margin_balances_are_untouched(self):
-        self.exchange._api_request = AsyncMock(return_value=[
-            {"currency_short_name": "USDT", "balance": "10.0", "locked_balance": "2.0"},
-        ])
-        await self.exchange._update_balances()
-        self.assertEqual(Decimal("10.0"), self.exchange._account_available_balances["USDT"])
-        self.assertEqual(Decimal("12.0"), self.exchange._account_balances["USDT"])
-
-    async def test_conversion_rate_reads_the_spot_ticker_and_caches(self):
-        inr = self._inr_exchange()
-        calls = []
-
-        async def fake_execute(url, method, throttler_limit_id, **kwargs):
-            calls.append(url)
-            return [{"market": "BTCINR", "last_price": "6300000"},
-                    {"market": "USDTINR", "last_price": "100.25"}]
-
-        assistant = AsyncMock()
-        assistant.execute_request = AsyncMock(side_effect=fake_execute)
-        inr._web_assistants_factory.get_rest_assistant = AsyncMock(return_value=assistant)
-
-        self.assertEqual(Decimal("100.25"), await inr._margin_conversion_rate())
-        self.assertEqual(Decimal("100.25"), await inr._margin_conversion_rate())
-        self.assertEqual(1, len(calls), "rate should be cached, not re-fetched every poll")
-        self.assertEqual("https://api.coindcx.com/exchange/ticker", calls[0])
-
-    async def test_conversion_rate_is_one_for_usdt_margin(self):
-        self.assertEqual(Decimal("1"), await self.exchange._margin_conversion_rate())
-
-    async def test_inr_margin_sent_when_placing_order(self):
-        ex = self._inr_exchange()
-        captured = {}
-
-        async def fake_post(path_url, data, is_auth_required):
-            captured["data"] = data
-            return [{"id": "uuid-inr", "created_at": 1700000000000}]
-
-        ex._api_post = AsyncMock(side_effect=fake_post)
-        await ex._place_order(
-            order_id="haveli-inr", trading_pair=self.trading_pair, amount=Decimal("0.01"),
-            trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("60000"),
-            position_action=PositionAction.OPEN)
-        self.assertEqual("INR", captured["data"]["order"]["margin_currency_short_name"])
-
-    async def test_inr_margin_sent_when_fetching_positions_and_orders(self):
-        ex = self._inr_exchange()
-        captured = []
-
-        async def fake_post(path_url, data, is_auth_required):
-            captured.append((path_url, data))
-            return []
-
-        ex._api_post = AsyncMock(side_effect=fake_post)
-        await ex._update_positions()
-        await ex._fetch_order_by_id(self._order())
-        for path_url, data in captured:
-            self.assertEqual(["INR"], data["margin_currency_short_name"], f"for {path_url}")
-
-    async def test_inr_margin_sent_when_setting_leverage(self):
-        ex = self._inr_exchange()
-        captured = {}
-
-        async def fake_post(path_url, data, is_auth_required):
-            captured.update(data)
-            return {"message": "success", "code": 200}
-
-        ex._api_post = AsyncMock(side_effect=fake_post)
-        await ex._set_trading_pair_leverage(self.trading_pair, 15)
-        self.assertEqual("INR", captured["margin_currency_short_name"])
-
-    async def test_trading_rule_collateral_matches_the_collateral_token(self):
-        # Both must be the quote currency, whatever the margin wallet is.
-        for exchange in (self.exchange, self._inr_exchange()):
-            rules = await exchange._format_trading_rules(EXCHANGE_INFO)
-            self.assertEqual(exchange.get_buy_collateral_token(self.trading_pair),
-                             rules[0].buy_order_collateral_token)
-            self.assertEqual("USDT", rules[0].sell_order_collateral_token)
-
-    async def test_fees_stay_in_usdt_under_inr_margin(self):
-        # "fee_amount and ideal_margin values are in USDT for INR Futures".
-        ex = self._inr_exchange()
-        ex._api_post = AsyncMock(return_value=[
-            {"id": "t1", "order_id": "ex-1", "price": "60000", "quantity": "0.004",
-             "fee_amount": "0.05", "timestamp": 1700000002000},
-        ])
-        updates = await ex._all_trade_updates_for_order(self._order())
-        self.assertEqual("USDT", updates[0].fee.flat_fees[0].token)
-
-        fee = ex._get_fee(
-            base_currency="BTC", quote_currency="USDT", order_type=OrderType.LIMIT,
-            order_side=TradeType.BUY, position_action=PositionAction.OPEN,
-            amount=Decimal("1"), price=Decimal("60000"), is_maker=True)
-        self.assertEqual("USDT", fee.percent_token)
-
-    # ---- user-stream order updates --------------------------------------------
-
-    @staticmethod
-    def _ws_order_frame(status, updated_at, fee=0):
-        """Real df-order-update shape captured from the live private stream."""
-        return {"id": "ws-1", "pair": "B-BTC_USDT", "side": "buy", "status": status,
-                "order_type": "limit_order", "price": 64443.1, "avg_price": 64128.4,
-                "total_quantity": 0.001, "remaining_quantity": 0.0,
-                "fee_amount": fee, "trades": [], "created_at": 1785306177433,
-                "updated_at": updated_at}
-
-    async def test_ws_order_frames_drive_the_order_to_open(self):
-        """
-        Live sequence is initial -> initial -> open -> filled. process_order_update
-        schedules via safe_ensure_future, so state settles only after the loop runs.
-        """
-        self._bootstrap()
-        order = self._order(exchange_order_id="ws-1")
-        self.exchange._order_tracker.start_tracking_order(order)
-
-        for status, ts in (("initial", 1785306177433), ("open", 1785306177728)):
-            self.exchange._process_order_event(self._ws_order_frame(status, ts))
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
-
-        tracked = self.exchange._order_tracker.all_updatable_orders[order.client_order_id]
-        self.assertEqual(OrderState.OPEN, tracked.current_state)
-
-    async def test_ws_filled_frame_completes_only_once_the_fill_arrives(self):
-        """
-        A FILLED order update deliberately waits for the fills (ClientOrderTracker
-        awaits wait_until_completely_filled). CoinDCX's WS order frames always
-        carry an EMPTY 'trades' array — verified live — so the fill itself comes
-        from the REST /futures/trades poll. This pins that interplay: the order
-        only completes when both halves have landed.
-        """
-        self._bootstrap()
-        order = self._order(exchange_order_id="ws-1")
-        order.amount = Decimal("0.001")
-        self.exchange._order_tracker.start_tracking_order(order)
-
-        self.exchange._process_order_event(self._ws_order_frame("open", 1785306177728))
-        await asyncio.sleep(0)
-
-        # WS says filled, but no fill has been recorded yet.
-        self.exchange._process_order_event(
-            self._ws_order_frame("filled", 1785306178063, fee=0.037835756))
-        await asyncio.sleep(0)
-        tracked = self.exchange._order_tracker.all_updatable_orders[order.client_order_id]
-        self.assertNotEqual(OrderState.FILLED, tracked.current_state,
-                            "must not complete before the fill is known")
-
-        # Now the REST fill poll supplies the trade, using the real fill_id.
-        fill = {"fill_id": "98df7c2a-d2d4-43fe-a6c3-d001962c177b", "order_id": "ws-1",
-                "price": 64128.4, "quantity": 0.001, "fee_amount": 0.037835756,
-                "timestamp": 1785306177643.0, "is_maker": False}
-        self.exchange._order_tracker.process_trade_update(
-            self.exchange._trade_update_from_fill(fill, order))
-        for _ in range(4):
-            await asyncio.sleep(0)
-
-        completed = (self.exchange._order_tracker.all_updatable_orders.get(order.client_order_id)
-                     or self.exchange._order_tracker.all_orders.get(order.client_order_id))
-        self.assertEqual(Decimal("0.001"), completed.executed_amount_base)
-        self.assertTrue(completed.is_filled, "order should be filled once the trade landed")
-
-    def test_fill_id_uses_the_exchanges_fill_id_field(self):
-        # Confirmed live: /futures/trades returns fill_id (the docs omit it).
-        self.assertEqual(
-            "98df7c2a-d2d4-43fe-a6c3-d001962c177b",
-            self.exchange._fill_id({"fill_id": "98df7c2a-d2d4-43fe-a6c3-d001962c177b",
-                                    "order_id": "ws-1", "timestamp": 1785306177643.0}))
-
-    def test_ws_order_frame_for_an_untracked_order_is_ignored(self):
-        self._bootstrap()
-        # Must not raise when a frame arrives for an order we do not track.
-        self.exchange._process_order_event(
-            {"id": "someone-elses-order", "pair": "B-BTC_USDT", "status": "filled"})
-
-    # ---- funding payments -----------------------------------------------------
-
-    async def test_fetch_last_fee_payment_returns_the_most_recent_for_the_pair(self):
-        self._bootstrap()
-        captured = {}
-
-        async def fake_post(path_url, data, is_auth_required):
-            captured["path"] = path_url
-            captured["data"] = data
-            # Real shape from POST /positions/transactions (stage=funding).
-            return [
-                {"pair": "B-BTC_USDT", "stage": "funding", "amount": -0.12,
-                 "fee_amount": 0.0, "margin_currency_short_name": "USDT",
-                 "position_id": "pos-1", "created_at": 1728459094499},
-                {"pair": "B-BTC_USDT", "stage": "funding", "amount": 0.34,
-                 "fee_amount": 0.0, "margin_currency_short_name": "USDT",
-                 "position_id": "pos-1", "created_at": 1728462694499},
-                {"pair": "B-ETH_USDT", "stage": "funding", "amount": 9.99,
-                 "created_at": 1728462694999},
-            ]
-
-        self.exchange._api_post = AsyncMock(side_effect=fake_post)
-        self.exchange.build_funding_info = AsyncMock(return_value=FundingInfo(
-            trading_pair="BTC-USDT", index_price=Decimal("1"), mark_price=Decimal("1"),
-            next_funding_utc_timestamp=0, rate=Decimal("0.0001")))
-
-        timestamp, rate, payment = await self.exchange._fetch_last_fee_payment(self.trading_pair)
-
-        self.assertEqual(CONSTANTS.TRANSACTIONS_PATH_URL, captured["path"])
-        self.assertEqual("funding", captured["data"]["stage"])
-        self.assertEqual(["USDT"], captured["data"]["margin_currency_short_name"])
-        # Newest BTC record wins; the ETH record must not leak in.
-        self.assertEqual(Decimal("0.34"), payment)
-        self.assertEqual(1728462694.499, timestamp)
-        self.assertEqual(Decimal("0.0001"), rate)
-
-    async def test_fetch_last_fee_payment_sentinel_when_no_history(self):
-        self._bootstrap()
-        self.exchange._api_post = AsyncMock(return_value=[])
-        timestamp, rate, payment = await self.exchange._fetch_last_fee_payment(self.trading_pair)
-        # Contract from the base class: "if no payment exists, return (0, -1, -1)".
-        self.assertEqual(0, timestamp)
-        self.assertEqual(Decimal("-1"), rate)
-        self.assertEqual(Decimal("-1"), payment)
-
-    async def test_fetch_last_fee_payment_survives_a_missing_rate(self):
-        self._bootstrap()
-        self.exchange._api_post = AsyncMock(return_value=[
-            {"pair": "B-BTC_USDT", "amount": -0.5, "created_at": 1728462694499}])
-        self.exchange.build_funding_info = AsyncMock(side_effect=IOError("prices down"))
-        timestamp, rate, payment = await self.exchange._fetch_last_fee_payment(self.trading_pair)
-        self.assertEqual(Decimal("-0.5"), payment)
-        self.assertEqual(Decimal("-1"), rate)
-
-    async def test_fetch_last_fee_payment_uses_the_configured_margin_currency(self):
-        ex = self._inr_exchange()
-        captured = {}
-
-        async def fake_post(path_url, data, is_auth_required):
-            captured.update(data)
-            return []
-
-        ex._api_post = AsyncMock(side_effect=fake_post)
-        await ex._fetch_last_fee_payment(self.trading_pair)
-        self.assertEqual(["INR"], captured["margin_currency_short_name"])
-
-    # ---- pagination (list endpoints are account-wide, no pair filter) ----------
-
-    @staticmethod
-    def _pages(*pages):
-        """Serve successive pages to _api_post, keyed on the requested page."""
-        async def _post(path_url, data, is_auth_required):
-            index = int(data.get("page", 1)) - 1
-            return pages[index] if index < len(pages) else []
-        return _post
-
-    async def test_order_lookup_pages_past_the_first_page(self):
-        """A resting order beyond page 1 must not be reported as missing —
-        the caller turns 'not found' into an order failure."""
-        self._bootstrap()
-        page1 = [{"id": f"other-{i}", "status": "filled"} for i in range(CONSTANTS.PAGE_SIZE)]
-        page2 = [{"id": "ex-1", "status": "open", "updated_at": 1700000001000}]
-        self.exchange._api_post = AsyncMock(side_effect=self._pages(page1, page2))
-
-        found = await self.exchange._fetch_order_by_id(self._order())
-        self.assertIsNotNone(found, "order on page 2 was not found")
-        self.assertEqual("ex-1", found["id"])
-
-    async def test_order_lookup_stops_on_a_short_page(self):
-        self._bootstrap()
-        calls = []
-
-        async def _post(path_url, data, is_auth_required):
-            calls.append(data["page"])
-            return [{"id": "other", "status": "filled"}]  # short page -> last
-
-        self.exchange._api_post = AsyncMock(side_effect=_post)
-        self.assertIsNone(await self.exchange._fetch_order_by_id(self._order()))
-        self.assertEqual(["1"], calls, "should not keep paging past a short page")
-
-    async def test_positions_are_paged(self):
-        self._bootstrap()
-        page1 = [{"pair": f"B-X{i}_USDT", "active_pos": 0} for i in range(CONSTANTS.PAGE_SIZE)]
-        page2 = [{"pair": "B-BTC_USDT", "active_pos": 0.5, "avg_price": 60000.0,
-                  "mark_price": 61000.0, "leverage": 10.0}]
-        self.exchange._api_post = AsyncMock(side_effect=self._pages(page1, page2))
-
-        await self.exchange._update_positions()
-        self.assertIn(self.trading_pair, self.exchange.account_positions,
-                      "position on page 2 was missed")
-
-    async def test_funding_ledger_is_paged(self):
-        self._bootstrap()
-        page1 = [{"pair": "B-ETH_USDT", "amount": 1.0, "created_at": 1}
-                 for _ in range(CONSTANTS.PAGE_SIZE)]
-        page2 = [{"pair": "B-BTC_USDT", "amount": -0.25, "created_at": 1728462694499}]
-        self.exchange._api_post = AsyncMock(side_effect=self._pages(page1, page2))
-        self.exchange.build_funding_info = AsyncMock(return_value=FundingInfo(
-            trading_pair="BTC-USDT", index_price=Decimal("1"), mark_price=Decimal("1"),
-            next_funding_utc_timestamp=0, rate=Decimal("0.0001")))
-
-        timestamp, rate, payment = await self.exchange._fetch_last_fee_payment(self.trading_pair)
-        self.assertEqual(Decimal("-0.25"), payment, "funding entry on page 2 was missed")
-        self.assertEqual(1728462694.499, timestamp)
-
-    async def test_paging_is_capped(self):
-        self._bootstrap()
-        calls = []
-
-        async def _post(path_url, data, is_auth_required):
-            calls.append(data["page"])
-            return [{"id": "x"} for _ in range(CONSTANTS.PAGE_SIZE)]  # always full
-
-        self.exchange._api_post = AsyncMock(side_effect=_post)
-        await self.exchange._fetch_order_by_id(self._order())
-        self.assertEqual(CONSTANTS.MAX_PAGES, len(calls), "paging must be bounded")
-
-    # ---- error classification / cancel safety ---------------------------------
-
-    def test_generic_422_is_not_treated_as_order_gone(self):
-        """422 is a generic validation status on CoinDCX. Misreading it as
-        'already cancelled' drops a still-live order from tracking."""
-        for message in ("HTTP status is 422. Error: invalid margin_currency_short_name",
-                        "HTTP status is 422. Error: permission denied",
-                        "HTTP status is 422. Error: malformed parameter"):
-            self.assertFalse(
-                self.exchange._is_order_not_found_during_cancelation_error(IOError(message)),
-                f"must not classify as order-gone: {message}")
-
-    def test_422_with_an_order_gone_message_is_recognised(self):
-        for message in ("HTTP status is 422. Error: Order not found",
-                        "HTTP status is 422. Error: order already cancelled",
-                        "HTTP status is 404. Error: whatever"):
-            self.assertTrue(
-                self.exchange._is_order_not_found_during_cancelation_error(IOError(message)),
-                f"should classify as order-gone: {message}")
-
-    async def test_cancel_rejects_a_non_dict_response(self):
-        # A list-shaped error body must not read as a successful cancel.
-        self.exchange._api_post = AsyncMock(return_value=[{"message": "invalid request"}])
-        with self.assertRaises(IOError):
-            await self.exchange._place_cancel("haveli-1", self._order())
-
-    async def test_cancel_rejects_a_dict_without_success(self):
-        self.exchange._api_post = AsyncMock(return_value={"message": "something else", "code": 422})
-        with self.assertRaises(IOError):
-            await self.exchange._place_cancel("haveli-1", self._order())
-
-    # ---- missing price data ---------------------------------------------------
-
     async def test_missing_price_raises_instead_of_returning_zero(self):
         self.exchange._initialize_trading_pair_symbols_from_exchange_info(EXCHANGE_INFO)
         self.exchange._api_get = AsyncMock(return_value={})
@@ -946,8 +223,6 @@ class CoindcxPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
             "lastFundingRate": "0.0001", "nextFundingTime": 1780934400000})
         with self.assertRaises(ValueError):
             await self.exchange.build_funding_info(self.trading_pair)
-
-    # ---- hosts ---------------------------------------------------------------
 
     def test_unconfigured_hosts_fail_with_a_clear_message(self):
         with patch.dict(os.environ, {CONSTANTS.REST_URL_ENV_VAR: "", CONSTANTS.WSS_URL_ENV_VAR: " "}):
@@ -978,276 +253,587 @@ class CoindcxPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
             self.assertEqual(1780915597863.0, await web_utils.get_current_server_time())
         self.assertEqual("https://fapi.example/fapi/v1/time", assistant.execute_request.call_args.kwargs["url"])
 
-    # ---- websocket balance frames ---------------------------------------------
+    # ---- setup helpers ------------------------------------------------------------
 
-    def test_ws_balance_frame_is_converted_like_the_rest_poll(self):
-        """A raw write would add a bogus INR row and leave the USDT figure —
-        the one the budget checker reads — stale."""
-        inr = self._inr_exchange()
-        inr._conversion_rate = Decimal("100.0")
-        inr._process_balance_event(
-            {"currency_short_name": "INR", "balance": "500.0", "locked_balance": "100.0"})
+    async def _ready(self):
+        """Symbol map and trading rules from the guide-shaped exchangeInfo."""
+        self.exchange._initialize_trading_pair_symbols_from_exchange_info(EXCHANGE_INFO)
+        rules = await self.exchange._format_trading_rules(EXCHANGE_INFO)
+        self.exchange._trading_rules = {rule.trading_pair: rule for rule in rules}
 
-        self.assertNotIn("INR", inr._account_balances)
-        self.assertEqual(Decimal("5"), inr._account_available_balances["USDT"])
-        self.assertEqual(Decimal("6"), inr._account_balances["USDT"])
-
-    def test_ws_balance_frame_for_another_wallet_is_ignored(self):
-        inr = self._inr_exchange()
-        inr._conversion_rate = Decimal("100.0")
-        inr._process_balance_event({"currency_short_name": "USDT", "balance": "7.0"})
-        self.assertNotIn("USDT", inr._account_balances)
-
-    def test_ws_balance_frame_skipped_without_a_cached_rate(self):
-        inr = self._inr_exchange()
-        inr._account_available_balances["USDT"] = Decimal("9.5")
-        inr._conversion_rate = None
-        inr._process_balance_event({"currency_short_name": "INR", "balance": "500.0"})
-        self.assertEqual(Decimal("9.5"), inr._account_available_balances["USDT"])
-
-    def test_usdt_margin_ws_balance_frame_applies_directly(self):
-        self.exchange._process_balance_event(
-            {"currency_short_name": "USDT", "balance": "10.0", "locked_balance": "2.0"})
-        self.assertEqual(Decimal("10"), self.exchange._account_available_balances["USDT"])
-        self.assertEqual(Decimal("12"), self.exchange._account_balances["USDT"])
-
-    # ---- wire format (shapes confirmed against the live API) --------------------
-    #
-    # CoinDCX rejects the wrong type outright: a bare string for
-    # margin_currency_short_name 500s on every filter endpoint, and a list for
-    # `status` 422s. These pin the shapes so a tidy-up refactor cannot undo them.
-
-    async def _capture_post(self, coroutine, response=None):
-        """Run a coroutine and return the payloads it sent to _api_post."""
-        sent = []
-
-        async def _post(path_url, data, is_auth_required=False, **kwargs):
-            sent.append(data)
-            return response if response is not None else []
-
-        self.exchange._api_post = AsyncMock(side_effect=_post)
-        await coroutine()
-        return sent
-
-    async def test_filter_endpoints_send_margin_currency_as_a_list(self):
-        self._bootstrap()
-
-        sent = await self._capture_post(lambda: self.exchange._update_positions())
-        self.assertEqual([self.exchange.margin_currency],
-                         sent[0]["margin_currency_short_name"],
-                         "positions requires a list; a string returns HTTP 500")
-
-        sent = await self._capture_post(
-            lambda: self.exchange._fetch_order_by_id(self._order()))
-        self.assertEqual([self.exchange.margin_currency],
-                         sent[0]["margin_currency_short_name"],
-                         "list orders requires a list; a string returns HTTP 500")
-
-        sent = await self._capture_post(
-            lambda: self.exchange._fetch_last_fee_payment(self.trading_pair))
-        self.assertEqual([self.exchange.margin_currency],
-                         sent[0]["margin_currency_short_name"],
-                         "transactions requires a list; a string returns HTTP 500")
-
-    async def test_list_orders_sends_status_as_a_comma_string(self):
-        self._bootstrap()
-        sent = await self._capture_post(
-            lambda: self.exchange._fetch_order_by_id(self._order()))
-        status = sent[0]["status"]
-        self.assertIsInstance(status, str, "a list of statuses returns HTTP 422")
-        self.assertIn(",", status)
-
-    async def test_action_endpoints_send_margin_currency_as_a_string(self):
-        self._bootstrap()
-
-        sent = await self._capture_post(
-            lambda: self.exchange._set_trading_pair_leverage(self.trading_pair, 10),
-            response={"message": "success"})
-        self.assertEqual(self.exchange.margin_currency, sent[0]["margin_currency_short_name"])
-
-        sent = await self._capture_post(
-            lambda: self.exchange._place_order(
-                order_id="haveli-1", trading_pair=self.trading_pair, amount=Decimal("0.01"),
-                trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("60000"),
-                position_action=PositionAction.OPEN),
-            response=[{"id": "ex-1", "created_at": 1700000000000}])
-        self.assertEqual(self.exchange.margin_currency,
-                         sent[0]["order"]["margin_currency_short_name"])
-
-    # ---- order events racing _place_order --------------------------------------
-
-    def _track(self, client_order_id="haveli-1", exchange_order_id=None):
-        """Track an order the way _create_order does: exchange id not yet known."""
+    def _track(self, client_order_id="haveli-1", exchange_order_id=None, order_type=OrderType.LIMIT,
+               trade_type=TradeType.BUY, amount="0.01", price="60000", position_action=PositionAction.OPEN):
         self.exchange.start_tracking_order(
-            order_id=client_order_id,
-            exchange_order_id=exchange_order_id,
-            trading_pair=self.trading_pair,
-            trade_type=TradeType.BUY,
-            price=Decimal("60000"),
-            amount=Decimal("0.01"),
-            order_type=OrderType.LIMIT,
-            leverage=10,
-            position=PositionAction.OPEN,
-        )
-        return self.exchange._order_tracker.active_orders[client_order_id]
+            order_id=client_order_id, exchange_order_id=exchange_order_id, trading_pair=self.trading_pair,
+            trade_type=trade_type, price=Decimal(price), amount=Decimal(amount), order_type=order_type,
+            position_action=position_action)
+        return self.exchange._order_tracker.fetch_order(client_order_id)
 
     @staticmethod
-    def _fill_event(exchange_order_id="ex-1", status="filled"):
-        return {
-            "id": exchange_order_id,
-            "status": status,
-            "updated_at": 1700000001000,
-            "trades": [{
-                "fill_id": "f-1", "id": exchange_order_id, "pair": "B-BTC_USDT",
-                "price": "60000", "quantity": "0.01", "fee_amount": "0.35",
-                "timestamp": 1700000001000,
-            }],
-        }
+    async def _settle():
+        """The order tracker applies order updates in a scheduled task; let it run."""
+        for _ in range(5):
+            await asyncio.sleep(0)
 
-    async def test_fill_arriving_before_the_exchange_id_is_replayed(self):
-        """A market order can fill before the REST create response lands. The
-        event must be held and replayed, not dropped to the slow REST poll."""
-        self._bootstrap()
-        order = self._track()  # exchange_order_id is still None
-        self.exchange._process_order_event(self._fill_event())
+    async def _apply(self, update):
+        await self.exchange._process_order_trade_update(update)
+        await self._settle()
 
-        self.assertEqual(1, len(self.exchange._pending_order_events), "event was not deferred")
-        self.assertEqual(Decimal("0"), order.executed_amount_base)
+    def _listen(self, *events):
+        logger = EventLogger()
+        self._event_loggers.append(logger)  # listeners are held weakly
+        for event in events:
+            self.exchange.add_listener(event, logger)
+        return logger
 
-        # _place_order returns and the tracker records the id.
-        order.update_exchange_order_id("ex-1")
-        await self.exchange._replay_pending_order_events()
+    @staticmethod
+    def _capture(response):
+        """An AsyncMock that records (path_url, kwargs) and answers ``response``."""
+        calls = []
 
-        self.assertEqual(0, len(self.exchange._pending_order_events))
-        self.assertEqual(Decimal("0.01"), order.executed_amount_base,
-                         "replayed fill was not applied")
+        async def call(path_url, **kwargs):
+            calls.append((path_url, kwargs))
+            return response(path_url, kwargs) if callable(response) else response
 
-    async def test_deferred_events_replay_in_arrival_order(self):
-        self._bootstrap()
-        order = self._track()
-        self.exchange._process_order_event(
-            {"id": "ex-1", "status": "open", "updated_at": 1700000000000})
-        self.exchange._process_order_event(self._fill_event())
-        self.assertEqual(2, len(self.exchange._pending_order_events))
+        return AsyncMock(side_effect=call), calls
 
-        order.update_exchange_order_id("ex-1")
-        await self.exchange._replay_pending_order_events()
-        self.assertEqual(Decimal("0.01"), order.executed_amount_base)
+    @staticmethod
+    def _update(status, client_order_id="haveli-1", exchange_order_id="ex-1", **fields):
+        """An ORDER_TRADE_UPDATE ``o`` block in the guide's shape."""
+        return {"s": "BTCUSDT", "c": client_order_id, "S": "BUY", "o": "LIMIT", "X": status,
+                "i": exchange_order_id, "q": "0.01", "p": "60000.0", "z": "0", "V": "EXPIRE_MAKER",
+                "T": 1714003200000, **fields}
 
-    async def test_replayed_event_cannot_resurrect_a_settled_order(self):
-        """update_with_order_update assigns current_state unconditionally, so a
-        stale 'open' replayed over a finished order would reopen it."""
-        self._bootstrap()
-        order = self._track()
-        self.exchange._process_order_event(
-            {"id": "ex-1", "status": "open", "updated_at": 1700000000000})
+    # ---- static -------------------------------------------------------------------
 
-        order.update_exchange_order_id("ex-1")
-        order.current_state = OrderState.CANCELED
-        await self.exchange._replay_pending_order_events()
+    def test_order_types_include_post_only(self):
+        self.assertEqual([OrderType.LIMIT, OrderType.LIMIT_MAKER, OrderType.MARKET],
+                         self.exchange.supported_order_types())
 
-        self.assertEqual(OrderState.CANCELED, order.current_state,
-                         "a stale replayed event reopened a settled order")
+    def test_oneway_only(self):
+        self.assertEqual([PositionMode.ONEWAY], self.exchange.supported_position_modes())
 
-    def test_event_is_not_buffered_when_no_order_awaits_an_exchange_id(self):
-        """Someone else's order (or a manual trade) must not accumulate."""
-        self._bootstrap()
-        self._track(exchange_order_id="ex-known")
-        self.exchange._process_order_event(self._fill_event(exchange_order_id="ex-other"))
-        self.assertEqual(0, len(self.exchange._pending_order_events))
+    def test_cancels_are_asynchronous_and_edits_native(self):
+        self.assertFalse(self.exchange.is_cancel_request_in_exchange_synchronous)
+        self.assertTrue(self.exchange.is_edit_order_supported_by_exchange)
 
-    def test_matched_events_still_apply_directly(self):
-        self._bootstrap()
+    async def test_collateral_is_the_contracts_margin_asset(self):
+        await self._ready()
+        self.assertEqual("USDT", self.exchange.get_buy_collateral_token(self.trading_pair))
+        self.assertEqual("USDT", self.exchange.get_sell_collateral_token(self.trading_pair))
+
+    def test_margin_currency_is_validated(self):
+        self.assertEqual("USDT", self.exchange.margin_currency)
+        inr = CoindcxPerpetualDerivative(coindcx_perpetual_api_key="k", coindcx_perpetual_api_secret="s",
+                                         coindcx_perpetual_margin_currency="inr", trading_required=False)
+        self.assertEqual("INR", inr.margin_currency)
+        with self.assertRaises(ValueError):
+            CoindcxPerpetualDerivative(coindcx_perpetual_api_key="k", coindcx_perpetual_api_secret="s",
+                                       coindcx_perpetual_margin_currency="BTC", trading_required=False)
+
+    def test_decimals_are_sent_at_the_instruments_precision(self):
+        self.assertEqual("0.010", CoindcxPerpetualDerivative._decimal_string(Decimal("0.01"), Decimal("0.001")))
+        self.assertEqual("60000.0", CoindcxPerpetualDerivative._decimal_string(Decimal("60000"), Decimal("0.1")))
+        self.assertEqual("60000", CoindcxPerpetualDerivative._decimal_string(Decimal("60000"), Decimal("10")))
+        self.assertEqual("0.5", CoindcxPerpetualDerivative._decimal_string(Decimal("0.500"), None))
+
+    # ---- error classification ----------------------------------------------------------
+
+    def test_errors_are_classified_by_their_code(self):
+        def failure(code):
+            return IOError(f'Error executing request. HTTP status is 400. Error: {{"code": {code}, "message": "x"}}')
+
+        self.assertEqual(-2011, error_code(failure(-2011)))
+        self.assertIsNone(error_code(IOError("no body")))
+        self.assertTrue(self.exchange._is_request_exception_related_to_time_synchronizer(failure(-1021)))
+        self.assertFalse(self.exchange._is_request_exception_related_to_time_synchronizer(failure(-1022)))
+        self.assertTrue(self.exchange._is_order_not_found_during_status_update_error(failure(-2013)))
+        self.assertFalse(self.exchange._is_order_not_found_during_status_update_error(failure(-2011)))
+        self.assertTrue(self.exchange._is_order_not_found_during_cancelation_error(failure(-2011)))
+        self.assertTrue(self.exchange._is_order_not_found_during_cancelation_error(failure(-2013)))
+        self.assertFalse(self.exchange._is_order_not_found_during_cancelation_error(failure(-2010)))
+
+    # ---- placing orders ------------------------------------------------------------------
+
+    async def test_limit_order_body(self):
+        await self._ready()
+        self.exchange._api_post, calls = self._capture({"orderId": "ex-1", "status": "CREATE_IN_PROGRESS"})
+
+        exchange_order_id, _ = await self.exchange._place_order(
+            order_id="haveli-1", trading_pair=self.trading_pair, amount=Decimal("0.01"), trade_type=TradeType.BUY,
+            order_type=OrderType.LIMIT, price=Decimal("60000"), position_action=PositionAction.OPEN)
+
+        self.assertEqual("ex-1", exchange_order_id)
+        path_url, kwargs = calls[0]
+        self.assertEqual(CONSTANTS.ORDER_PATH_URL, path_url)
+        self.assertEqual(CONSTANTS.CREATE_ORDER_LIMIT_ID, kwargs["limit_id"])
+        self.assertTrue(kwargs["is_auth_required"])
+        self.assertEqual({"symbol": "BTCUSDT", "side": "BUY", "type": "LIMIT", "quantity": "0.010",
+                          "newClientOrderId": "haveli-1", "price": "60000.0", "timeInForce": "GTC"},
+                         kwargs["data"])
+
+    async def test_limit_maker_is_sent_post_only(self):
+        await self._ready()
+        self.exchange._api_post, calls = self._capture({"orderId": "ex-1", "status": "CREATE_IN_PROGRESS"})
+        await self.exchange._place_order(
+            order_id="haveli-1", trading_pair=self.trading_pair, amount=Decimal("0.01"), trade_type=TradeType.SELL,
+            order_type=OrderType.LIMIT_MAKER, price=Decimal("61000"))
+        body = calls[0][1]["data"]
+        self.assertEqual(("SELL", "LIMIT", "GTX"), (body["side"], body["type"], body["timeInForce"]))
+
+    async def test_market_order_has_no_price_or_time_in_force(self):
+        await self._ready()
+        self.exchange._api_post, calls = self._capture({"orderId": "ex-1", "status": "CREATE_IN_PROGRESS"})
+        await self.exchange._place_order(
+            order_id="haveli-1", trading_pair=self.trading_pair, amount=Decimal("0.01"), trade_type=TradeType.SELL,
+            order_type=OrderType.MARKET, price=Decimal("NaN"), position_action=PositionAction.CLOSE)
+        body = calls[0][1]["data"]
+        self.assertEqual("MARKET", body["type"])
+        self.assertNotIn("price", body)
+        self.assertNotIn("timeInForce", body)
+        # The guide documents no reduceOnly / positionSide, so a close is a plain opposite order.
+        self.assertNotIn("reduceOnly", body)
+
+    async def test_a_create_without_an_order_id_fails(self):
+        await self._ready()
+        self.exchange._api_post = AsyncMock(return_value={"code": -2010, "message": "rejected"})
+        with self.assertRaises(IOError):
+            await self.exchange._place_order(
+                order_id="haveli-1", trading_pair=self.trading_pair, amount=Decimal("0.01"),
+                trade_type=TradeType.BUY, order_type=OrderType.LIMIT, price=Decimal("60000"))
+
+    async def test_a_placed_order_stays_pending_until_the_venue_confirms_it(self):
+        await self._ready()
+        created = self._listen(MarketEvent.BuyOrderCreated)
+        self.exchange._api_post = AsyncMock(return_value={"orderId": "ex-1", "status": "CREATE_IN_PROGRESS"})
+
+        await self.exchange._create_order(trade_type=TradeType.BUY, order_id="haveli-1",
+                                          trading_pair=self.trading_pair, amount=Decimal("0.01"),
+                                          order_type=OrderType.LIMIT, price=Decimal("60000"),
+                                          position_action=PositionAction.OPEN)
+        await self._settle()
+
+        order = self.exchange._order_tracker.fetch_order("haveli-1")
+        self.assertEqual(OrderState.PENDING_CREATE, order.current_state)
+        self.assertEqual("ex-1", order.exchange_order_id)
+        self.assertEqual([], created.event_log, "not created until the venue says NEW")
+
+        await self._apply(self._update("NEW"))
+        self.assertEqual(OrderState.OPEN, order.current_state)
+        self.assertEqual(1, len(created.event_log))
+
+    async def test_a_rejected_create_fails_the_order(self):
+        await self._ready()
+        failures = self._listen(MarketEvent.OrderFailure)
+        self.exchange._api_post = AsyncMock(side_effect=IOError('HTTP status is 400. Error: {"code": -2010}'))
+        await self.exchange._create_order(trade_type=TradeType.BUY, order_id="haveli-1",
+                                          trading_pair=self.trading_pair, amount=Decimal("0.01"),
+                                          order_type=OrderType.LIMIT, price=Decimal("60000"),
+                                          position_action=PositionAction.OPEN)
+        await self._settle()
+        self.assertEqual(1, len(failures.event_log))
+
+    # ---- cancelling -------------------------------------------------------------------------
+
+    async def test_cancel_is_by_client_id_and_only_starts_the_cancel(self):
+        await self._ready()
         order = self._track(exchange_order_id="ex-1")
-        self.exchange._process_order_event(self._fill_event())
-        self.assertEqual(0, len(self.exchange._pending_order_events),
-                         "a matchable event must not be deferred")
+        self.exchange._api_delete, calls = self._capture({"orderId": "ex-1", "status": "CANCEL_IN_PROGRESS"})
+
+        self.assertTrue(await self.exchange._execute_order_cancel_and_process_update(order))
+        await self._settle()
+
+        path_url, kwargs = calls[0]
+        self.assertEqual(CONSTANTS.ORDER_PATH_URL, path_url)
+        self.assertEqual(CONSTANTS.CANCEL_ORDER_LIMIT_ID, kwargs["limit_id"])
+        self.assertEqual({"symbol": "BTCUSDT", "origClientOrderId": "haveli-1"}, kwargs["data"])
+        self.assertEqual(OrderState.PENDING_CANCEL, order.current_state, "a cancel is not trusted until confirmed")
+
+    async def test_an_unexpected_cancel_response_raises(self):
+        await self._ready()
+        order = self._track(exchange_order_id="ex-1")
+        self.exchange._api_delete = AsyncMock(return_value={"orderId": "ex-1", "status": "FILLED"})
+        with self.assertRaises(IOError):
+            await self.exchange._place_cancel("haveli-1", order)
+
+    async def test_the_cancel_completes_when_the_stream_says_so(self):
+        await self._ready()
+        cancelled = self._listen(MarketEvent.OrderCancelled)
+        order = self._track(exchange_order_id="ex-1")
+        await self._apply(self._update("NEW"))
+        await self._apply(self._update("CANCEL_IN_PROGRESS"))
+        self.assertEqual(OrderState.PENDING_CANCEL, order.current_state)
+        await self._apply(self._update("CANCELED"))
+        self.assertEqual(OrderState.CANCELED, order.current_state)
+        self.assertEqual(1, len(cancelled.event_log))
+
+    # ---- editing ------------------------------------------------------------------------------
+
+    async def test_native_edit_sends_quantity_and_price_by_client_id(self):
+        await self._ready()
+        self.exchange._api_put, calls = self._capture({"orderId": "ex-1", "status": "EDIT_IN_PROGRESS"})
+        result = await self.exchange._place_edit(client_order_id="haveli-1", exchange_order_id="ex-1",
+                                                 trading_pair=self.trading_pair, new_price=Decimal("60100"),
+                                                 new_amount=Decimal("0.02"))
+        self.assertEqual(("haveli-1", "ex-1"), result[:2])
+        path_url, kwargs = calls[0]
+        self.assertEqual(CONSTANTS.ORDER_PATH_URL, path_url)
+        self.assertEqual(CONSTANTS.MODIFY_ORDER_LIMIT_ID, kwargs["limit_id"])
+        self.assertEqual({"symbol": "BTCUSDT", "origClientOrderId": "haveli-1", "quantity": "0.020",
+                          "price": "60100.0"}, kwargs["data"])
+
+    async def test_edit_through_the_framework_uses_the_native_path(self):
+        await self._ready()
+        edited = self._listen(MarketEvent.OrderEdited)
+        order = self._track(exchange_order_id="ex-1")
+        await self._apply(self._update("NEW"))
+        self.exchange._api_put = AsyncMock(return_value={"orderId": "ex-1", "status": "EDIT_IN_PROGRESS"})
+
+        self.assertEqual("haveli-1", await self.exchange._execute_edit("haveli-1", self.trading_pair,
+                                                                       Decimal("60100"), Decimal("0.02")))
+        await self._settle()
+        self.assertEqual(Decimal("60100"), order.price)
+        self.assertEqual(1, len(edited.event_log))
+
+    async def test_a_failed_edit_is_reported(self):
+        await self._ready()
+        self.exchange._api_put = AsyncMock(return_value={"code": -1003, "msg": "Too many requests"})
+        with self.assertRaises(IOError):
+            await self.exchange._place_edit(client_order_id="haveli-1", exchange_order_id="ex-1",
+                                            trading_pair=self.trading_pair, new_price=Decimal("60100"),
+                                            new_amount=Decimal("0.02"))
+
+    # ---- order status -------------------------------------------------------------------------
+
+    async def test_order_status_is_queried_by_client_id(self):
+        await self._ready()
+        order = self._track(exchange_order_id="ex-1")
+        self.exchange._api_get, calls = self._capture({
+            "orderId": "ex-1", "clientOrderId": "haveli-1", "symbol": "BTCUSDT", "status": "PARTIALLY_FILLED",
+            "updateTime": 1566818724722})
+
+        update = await self.exchange._request_order_status(order)
+
+        path_url, kwargs = calls[0]
+        self.assertEqual(CONSTANTS.ORDER_PATH_URL, path_url)
+        self.assertEqual(CONSTANTS.QUERY_ORDER_LIMIT_ID, kwargs["limit_id"])
+        self.assertEqual({"symbol": "BTCUSDT", "origClientOrderId": "haveli-1"}, kwargs["data"])
+        self.assertEqual(OrderState.PARTIALLY_FILLED, update.new_state)
+        self.assertEqual("ex-1", update.exchange_order_id)
+        self.assertEqual(1566818724.722, update.update_timestamp)
+
+    async def test_an_order_whose_create_reply_was_lost_can_still_be_found(self):
+        # The client id is ours, so the query needs no exchange id.
+        await self._ready()
+        order = self._track(exchange_order_id=None)
+        self.exchange._api_get = AsyncMock(return_value={"orderId": "ex-9", "status": "NEW"})
+        update = await self.exchange._request_order_status(order)
+        self.assertEqual("ex-9", update.exchange_order_id)
+        self.assertEqual(OrderState.OPEN, update.new_state)
+
+    def test_every_documented_status_maps_to_a_state(self):
+        order = self._track(exchange_order_id="ex-1")
+        expected = {
+            "CREATE_IN_PROGRESS": OrderState.PENDING_CREATE, "PENDING_TRIGGER": OrderState.OPEN,
+            "TRIGGERED": OrderState.OPEN, "NEW": OrderState.OPEN, "PARTIALLY_FILLED": OrderState.PARTIALLY_FILLED,
+            "FILLED": OrderState.FILLED, "EDIT_IN_PROGRESS": OrderState.PENDING_EDIT,
+            "CANCEL_IN_PROGRESS": OrderState.PENDING_CANCEL, "CANCELED": OrderState.CANCELED,
+            "EXPIRED": OrderState.CANCELED, "REJECTED": OrderState.FAILED,
+        }
+        for status, state in expected.items():
+            with self.subTest(status=status):
+                self.assertEqual(state, self.exchange._order_update_from_order({"status": status}, order).new_state)
+        # An unknown status leaves the state alone rather than guessing.
+        self.assertEqual(order.current_state,
+                         self.exchange._order_update_from_order({"status": "SOMETHING_NEW"}, order).new_state)
+
+    # ---- fills --------------------------------------------------------------------------------
+
+    async def test_fills_come_from_user_trades_for_the_order(self):
+        await self._ready()
+        order = self._track(exchange_order_id="ex-1")
+        self.exchange._api_get, calls = self._capture([
+            {"id": "698759", "orderId": "ex-1", "symbol": "BTCUSDT", "side": "BUY", "price": "60000.0",
+             "qty": "0.004", "quoteQty": "240.0", "commission": "0.05", "commissionAsset": "USDT",
+             "time": 1714003200000, "maker": True, "buyer": True},
+            {"id": "1", "orderId": "someone-else", "price": "1", "qty": "1"},
+        ])
+
+        fills = await self.exchange._all_trade_updates_for_order(order)
+
+        path_url, kwargs = calls[0]
+        self.assertEqual(CONSTANTS.USER_TRADES_PATH_URL, path_url)
+        self.assertEqual({"symbol": "BTCUSDT", "orderId": "ex-1", "page": 1, "limit": CONSTANTS.PAGE_LIMIT},
+                         kwargs["data"])
+        self.assertEqual(1, len(fills))
+        fill = fills[0]
+        self.assertEqual("698759", fill.trade_id)
+        self.assertEqual(Decimal("0.004"), fill.fill_base_amount)
+        self.assertEqual(Decimal("240.0"), fill.fill_quote_amount)
+        self.assertEqual(Decimal("0.05"), fill.fee.flat_fees[0].amount)
+        self.assertEqual("USDT", fill.fee.flat_fees[0].token)
+        self.assertEqual(1714003200.0, fill.fill_timestamp)
+
+    async def test_no_fills_are_fetched_without_an_exchange_id(self):
+        self.exchange._api_get = AsyncMock(side_effect=AssertionError("must not be called"))
+        self.assertEqual([], await self.exchange._all_trade_updates_for_order(self._track(exchange_order_id=None)))
+
+    async def test_private_lists_are_read_page_by_page(self):
+        full = [{"id": str(i)} for i in range(CONSTANTS.PAGE_LIMIT)]
+        self.exchange._api_get, calls = self._capture(
+            lambda path_url, kwargs: full if kwargs["data"]["page"] == 1 else [{"id": "last"}])
+        records = await self.exchange._signed_pages(CONSTANTS.INCOME_PATH_URL, {"symbol": "BTCUSDT"})
+        self.assertEqual(CONSTANTS.PAGE_LIMIT + 1, len(records))
+        self.assertEqual([1, 2], [kwargs["data"]["page"] for _, kwargs in calls])
+
+    async def test_paging_is_capped(self):
+        full = [{"id": "x"}] * CONSTANTS.PAGE_LIMIT
+        self.exchange._api_get, calls = self._capture(full)
+        await self.exchange._signed_pages(CONSTANTS.INCOME_PATH_URL, {})
+        self.assertEqual(CONSTANTS.MAX_PAGES, len(calls))
+
+    # ---- private stream: orders --------------------------------------------------------------
+
+    async def test_stream_fills_are_applied_before_the_terminal_status(self):
+        await self._ready()
+        fills = self._listen(MarketEvent.OrderFilled)
+        completed = self._listen(MarketEvent.BuyOrderCompleted)
+        order = self._track(exchange_order_id="ex-1")
+        await self._apply(self._update("NEW"))
+
+        await self._apply(self._update(
+            "PARTIALLY_FILLED", x="TRADE", l="0.004", L="60000.0", t=11, n="0.02", N="USDT", z="0.004"))
+        self.assertEqual(Decimal("0.004"), order.executed_amount_base)
+        await self._apply(self._update(
+            "FILLED", x="TRADE", l="0.006", L="60010.0", t=12, n="0.03", N="USDT", z="0.01"))
+
+        self.assertEqual(2, len(fills.event_log))
+        self.assertEqual(1, len(completed.event_log))
+        self.assertEqual(Decimal("0.01"), completed.event_log[0].base_asset_amount)
+
+    async def test_a_fill_without_detail_is_read_over_rest_before_settling(self):
+        await self._ready()
+        completed = self._listen(MarketEvent.BuyOrderCompleted)
+        order = self._track(exchange_order_id="ex-1")
+        await self._apply(self._update("NEW"))
+        self.exchange._api_get = AsyncMock(return_value=[
+            {"id": "698759", "orderId": "ex-1", "price": "60000.0", "qty": "0.01", "commission": "0",
+             "commissionAsset": "USDT", "time": 1714003200000}])
+
+        # The guide's documented fields only: status and cumulative quantity.
+        await self._apply(self._update("FILLED", x="TRADE", z="0.01"))
+
         self.assertEqual(Decimal("0.01"), order.executed_amount_base)
+        self.assertEqual(1, len(completed.event_log))
+        self.assertEqual(Decimal("0.01"), completed.event_log[0].base_asset_amount)
 
-    async def test_deferred_events_expire_and_do_not_leak(self):
-        self._bootstrap()
-        self._track()
-        self.exchange._process_order_event(self._fill_event())
-        self.assertEqual(1, len(self.exchange._pending_order_events))
+    async def test_repeated_stream_fills_count_once(self):
+        await self._ready()
+        order = self._track(exchange_order_id="ex-1")
+        frame = self._update("PARTIALLY_FILLED", x="TRADE", l="0.004", L="60000.0", t=11, z="0.004")
+        await self._apply(frame)
+        await self._apply(frame)
+        self.assertEqual(Decimal("0.004"), order.executed_amount_base)
 
-        # Backdate past the TTL; the order never gets its id.
-        exchange_order_id, payload, _ = self.exchange._pending_order_events[0]
-        self.exchange._pending_order_events = [
-            (exchange_order_id, payload, time.time() - CONSTANTS.PENDING_ORDER_EVENT_TTL - 1)]
-        await self.exchange._replay_pending_order_events()
-        self.assertEqual(0, len(self.exchange._pending_order_events), "buffer leaked")
+    async def test_the_stream_can_beat_the_create_response(self):
+        await self._ready()
+        order = self._track(exchange_order_id=None)
+        await self._apply(self._update("NEW", exchange_order_id="ex-7"))
+        self.assertEqual("ex-7", order.exchange_order_id)
+        self.assertEqual(OrderState.OPEN, order.current_state)
 
-    def test_pending_buffer_is_bounded(self):
-        self._bootstrap()
-        self._track()
-        for index in range(CONSTANTS.MAX_PENDING_ORDER_EVENTS + 25):
-            self.exchange._process_order_event(self._fill_event(exchange_order_id=f"ex-{index}"))
-        self.assertEqual(CONSTANTS.MAX_PENDING_ORDER_EVENTS,
-                         len(self.exchange._pending_order_events))
+    async def test_updates_for_orders_we_do_not_track_are_ignored(self):
+        await self._ready()
+        self.exchange._api_get = AsyncMock(side_effect=AssertionError("must not fetch fills"))
+        await self._apply(self._update("FILLED", client_order_id="manual-1", z="1"))
 
-    async def test_stop_network_clears_the_pending_buffer(self):
-        self._bootstrap()
-        self._track()
-        self.exchange._process_order_event(self._fill_event())
-        self.assertEqual(1, len(self.exchange._pending_order_events))
+    async def test_rejected_and_expired_orders(self):
+        await self._ready()
+        failures = self._listen(MarketEvent.OrderFailure)
+        cancelled = self._listen(MarketEvent.OrderCancelled)
+        self._track(client_order_id="haveli-1", exchange_order_id="ex-1")
+        self._track(client_order_id="haveli-2", exchange_order_id="ex-2")
+        # A post-only order that would have crossed is rejected after the create was accepted.
+        await self._apply(self._update("REJECTED", "haveli-1", "ex-1"))
+        await self._apply(self._update("NEW", "haveli-2", "ex-2"))
+        # Self-trade prevention expires the resting maker order.
+        await self._apply(self._update("EXPIRED", "haveli-2", "ex-2"))
+        self.assertEqual(1, len(failures.event_log))
+        self.assertEqual(1, len(cancelled.event_log))
 
-        await asyncio.sleep(0)  # let the replay task actually start
-        await self.exchange.stop_network()
-        self.assertEqual(0, len(self.exchange._pending_order_events))
-        self.assertIsNone(self.exchange._pending_order_events_task)
+    async def test_the_listener_dispatches_each_event_type(self):
+        await self._ready()
+        order = self._track(exchange_order_id="ex-1")
+        events = [
+            {"e": "ORDER_TRADE_UPDATE", "E": 1714003200000, "o": self._update("NEW")},
+            {"e": "ACCOUNT_UPDATE", "E": 1714003200000, "a": {"B": [{"a": "USDT", "wb": "1000.50", "lb": "50.00"}]}},
+            {"e": "POSITION_UPDATE", "E": 1714003200000,
+             "P": [{"s": "BTCUSDT", "pa": "0.001", "ep": "68000.0", "up": "0.45"}]},
+            {"e": "somethingElse"},
+        ]
 
-    # ---- positions closed outside the poll -------------------------------------
+        async def queue():
+            for event in events:
+                yield event
 
-    async def test_position_absent_from_the_response_is_closed(self):
-        """CoinDCX may omit a closed position rather than return active_pos=0
-        (e.g. closed from the web UI), which would strand a ghost position."""
-        self._bootstrap()
-        self.exchange._api_post = AsyncMock(return_value=[
-            {"pair": "B-BTC_USDT", "active_pos": 0.5, "avg_price": 60000.0,
-             "mark_price": 61000.0, "leverage": 10.0}])
+        self.exchange._iter_user_event_queue = queue
+        await self.exchange._user_stream_event_listener()
+        await self._settle()
+
+        self.assertEqual(OrderState.OPEN, order.current_state)
+        self.assertEqual(Decimal("1000.50"), self.exchange.get_balance("USDT"))
+        self.assertEqual(Decimal("950.50"), self.exchange.get_available_balance("USDT"))
+        self.assertEqual(Decimal("0.001"), self.exchange.account_positions[self.trading_pair].amount)
+
+    async def test_a_bad_event_does_not_stop_the_listener(self):
+        self.exchange._sleep = AsyncMock()
+
+        async def queue():
+            yield {"e": "ACCOUNT_UPDATE", "a": {"B": [{"a": "USDT", "wb": "not-a-number"}]}}
+            yield {"e": "ACCOUNT_UPDATE", "a": {"B": [{"a": "USDT", "wb": "7"}]}}
+
+        self.exchange._iter_user_event_queue = queue
+        await self.exchange._user_stream_event_listener()
+        self.assertEqual(Decimal("7"), self.exchange.get_balance("USDT"))
+
+    # ---- balances --------------------------------------------------------------------------------
+
+    async def test_balances_come_from_the_balance_endpoint(self):
+        self.exchange._account_balances["OLD"] = Decimal("1")
+        self.exchange._account_available_balances["OLD"] = Decimal("1")
+        self.exchange._api_get, calls = self._capture([
+            {"accountAlias": "FAPI", "asset": "USDT", "balance": "10000.0", "crossWalletBalance": "10000.0",
+             "availableBalance": "9500.0", "maxWithdrawAmount": "9500.0"}])
+
+        await self.exchange._update_balances()
+
+        self.assertEqual(CONSTANTS.BALANCE_PATH_URL, calls[0][0])
+        self.assertTrue(calls[0][1]["is_auth_required"])
+        self.assertEqual(Decimal("10000.0"), self.exchange.get_balance("USDT"))
+        self.assertEqual(Decimal("9500.0"), self.exchange.get_available_balance("USDT"))
+        self.assertNotIn("OLD", self.exchange._account_balances, "assets no longer reported are dropped")
+
+    # ---- positions -------------------------------------------------------------------------------
+
+    async def test_positions_come_from_position_risk(self):
+        await self._ready()
+        self.exchange._api_get, calls = self._capture([
+            {"symbol": "BTCUSDT", "positionAmt": "0.001", "entryPrice": "64000.0", "markPrice": "65000.0",
+             "unRealizedProfit": "1.0", "leverage": "10", "marginType": "isolated"},
+            {"symbol": "ETHUSDT", "positionAmt": "-0.5", "entryPrice": "3000.0", "unRealizedProfit": "-2.0",
+             "leverage": "5"},
+        ])
+
         await self.exchange._update_positions()
-        self.assertEqual(1, len(self.exchange.account_positions))
 
-        # Position closed externally; CoinDCX now simply omits it.
-        self.exchange._api_post = AsyncMock(return_value=[])
+        self.assertEqual(CONSTANTS.POSITION_RISK_PATH_URL, calls[0][0])
+        btc = self.exchange.account_positions["BTC-USDT"]
+        self.assertEqual((PositionSide.LONG, Decimal("0.001"), Decimal("64000.0"), Decimal("1.0"), Decimal("10")),
+                         (btc.position_side, btc.amount, btc.entry_price, btc.unrealized_pnl, btc.leverage))
+        eth = self.exchange.account_positions["ETH-USDT"]
+        self.assertEqual((PositionSide.SHORT, Decimal("-0.5")), (eth.position_side, eth.amount))
+
+    async def test_flat_and_vanished_positions_are_removed(self):
+        await self._ready()
+        self.exchange._api_get = AsyncMock(return_value=[
+            {"symbol": "BTCUSDT", "positionAmt": "0.001", "entryPrice": "64000.0", "unRealizedProfit": "0"},
+            {"symbol": "ETHUSDT", "positionAmt": "0.2", "entryPrice": "3000.0", "unRealizedProfit": "0"}])
         await self.exchange._update_positions()
-        self.assertEqual(0, len(self.exchange.account_positions),
-                         "ghost position survived the poll")
 
-    async def test_explicit_zero_size_still_closes_a_position(self):
-        self._bootstrap()
-        self.exchange._api_post = AsyncMock(return_value=[
-            {"pair": "B-BTC_USDT", "active_pos": 0.5, "avg_price": 60000.0,
-             "mark_price": 61000.0, "leverage": 10.0}])
+        # BTC goes flat; ETH disappears from the report altogether (closed elsewhere).
+        self.exchange._api_get = AsyncMock(return_value=[
+            {"symbol": "BTCUSDT", "positionAmt": "0", "entryPrice": "0", "unRealizedProfit": "0"}])
         await self.exchange._update_positions()
+        self.assertEqual({}, self.exchange.account_positions)
 
-        self.exchange._api_post = AsyncMock(return_value=[
-            {"pair": "B-BTC_USDT", "active_pos": 0}])
-        await self.exchange._update_positions()
-        self.assertEqual(0, len(self.exchange.account_positions))
+    async def test_a_position_update_frame_does_not_drop_other_positions(self):
+        await self._ready()
+        await self.exchange._process_position_rows([{"s": "ETHUSDT", "pa": "0.2", "ep": "3000", "up": "0"}])
+        await self.exchange._process_position_rows([{"s": "BTCUSDT", "pa": "-0.001", "ep": "68000", "up": "0.4"}])
+        self.assertEqual({"ETH-USDT", "BTC-USDT"}, set(self.exchange.account_positions))
+        await self.exchange._process_position_rows([{"s": "XRPUSDT", "pa": "1"}])  # unknown symbol: ignored
+        await self.exchange._process_position_rows([{"s": "ETHUSDT", "pa": "0"}])
+        self.assertEqual({"BTC-USDT"}, set(self.exchange.account_positions))
 
-    async def test_other_pairs_are_not_swept_away(self):
-        self._bootstrap()
-        self.exchange._api_post = AsyncMock(return_value=[
-            {"pair": "B-BTC_USDT", "active_pos": 0.5, "avg_price": 60000.0,
-             "mark_price": 61000.0, "leverage": 10.0},
-            {"pair": "B-ETH_USDT", "active_pos": 2.0, "avg_price": 3000.0,
-             "mark_price": 3100.0, "leverage": 5.0}])
-        await self.exchange._update_positions()
-        self.assertEqual(2, len(self.exchange.account_positions))
+    async def test_leverage(self):
+        await self._ready()
+        self.exchange._api_post, calls = self._capture(
+            {"symbol": "BTCUSDT", "leverage": 20, "maxNotionalValue": "100000"})
+        self.assertEqual((True, ""), await self.exchange._set_trading_pair_leverage(self.trading_pair, 20))
+        self.assertEqual((CONSTANTS.LEVERAGE_PATH_URL, {"symbol": "BTCUSDT", "leverage": 20}),
+                         (calls[0][0], calls[0][1]["data"]))
 
-        # Only ETH closes; BTC must survive.
-        self.exchange._api_post = AsyncMock(return_value=[
-            {"pair": "B-BTC_USDT", "active_pos": 0.5, "avg_price": 60000.0,
-             "mark_price": 61000.0, "leverage": 10.0}])
-        await self.exchange._update_positions()
-        self.assertEqual(1, len(self.exchange.account_positions))
-        self.assertIn(self.trading_pair, self.exchange.account_positions)
+        self.exchange._api_post = AsyncMock(return_value={"symbol": "BTCUSDT", "leverage": 10})
+        ok, message = await self.exchange._set_trading_pair_leverage(self.trading_pair, 20)
+        self.assertFalse(ok)
+        self.assertIn("Unexpected leverage response", message)
 
-    # ---- user stream ----------------------------------------------------------
+        self.exchange._api_post = AsyncMock(side_effect=IOError("HTTP status is 400"))
+        self.assertEqual((False, "HTTP status is 400"),
+                         await self.exchange._set_trading_pair_leverage(self.trading_pair, 20))
 
-    def test_balance_event_updates_cache(self):
-        self.exchange._process_balance_event(
-            {"currency_short_name": "USDT", "balance": "10", "locked_balance": "2"})
-        self.assertEqual(Decimal("10"), self.exchange._account_available_balances["USDT"])
-        self.assertEqual(Decimal("12"), self.exchange._account_balances["USDT"])
+    async def test_only_oneway_position_mode(self):
+        self.assertEqual((True, ""), await self.exchange._trading_pair_position_mode_set(
+            PositionMode.ONEWAY, self.trading_pair))
+        ok, _ = await self.exchange._trading_pair_position_mode_set(PositionMode.HEDGE, self.trading_pair)
+        self.assertFalse(ok)
+
+    async def test_exit_position_and_close_all_use_the_margin_currency(self):
+        await self._ready()
+        self.exchange._api_post, calls = self._capture({"symbol": "BTCUSDT", "groupId": "a1b2c3"})
+        self.assertEqual("a1b2c3", await self.exchange.exit_position(self.trading_pair))
+        self.assertEqual((CONSTANTS.EXIT_POSITION_PATH_URL, {"symbol": "BTCUSDT", "marginCurrency": "USDT"}),
+                         (calls[0][0], calls[0][1]["data"]))
+
+        self.exchange._api_post, calls = self._capture({"groupId": "a1b2c3USDT"})
+        self.assertEqual("a1b2c3USDT", await self.exchange.close_all_positions())
+        self.assertEqual((CONSTANTS.CLOSE_ALL_POSITIONS_PATH_URL, {"marginCurrency": "USDT"}),
+                         (calls[0][0], calls[0][1]["data"]))
+
+    # ---- funding payments --------------------------------------------------------------------------
+
+    async def test_the_latest_funding_payment_is_reported(self):
+        await self._ready()
+        self.exchange._api_get, calls = self._capture([
+            {"symbol": "BTCUSDT", "incomeType": "FUNDING_FEE", "income": "-0.42", "asset": "USDT",
+             "time": 1714003200000, "tranId": 1},
+            {"symbol": "BTCUSDT", "incomeType": "FUNDING_FEE", "income": "0.10", "asset": "USDT",
+             "time": 1714032000000, "tranId": 2},
+        ])
+        self.exchange.build_funding_info = AsyncMock(return_value=FundingInfo(
+            trading_pair=self.trading_pair, index_price=Decimal("1"), mark_price=Decimal("1"),
+            next_funding_utc_timestamp=0, rate=Decimal("0.0001")))
+
+        self.assertEqual((1714032000.0, Decimal("0.0001"), Decimal("0.10")),
+                         await self.exchange._fetch_last_fee_payment(self.trading_pair))
+        self.assertEqual({"symbol": "BTCUSDT", "incomeType": "FUNDING_FEE", "page": 1,
+                          "limit": CONSTANTS.PAGE_LIMIT}, calls[0][1]["data"])
+
+    async def test_no_funding_history_returns_the_sentinel(self):
+        await self._ready()
+        self.exchange._api_get = AsyncMock(return_value=[])
+        self.assertEqual((0, Decimal("-1"), Decimal("-1")),
+                         await self.exchange._fetch_last_fee_payment(self.trading_pair))
+
+    async def test_a_funding_payment_survives_a_missing_rate(self):
+        await self._ready()
+        self.exchange._api_get = AsyncMock(return_value=[{"symbol": "BTCUSDT", "income": "-0.5", "time": 1}])
+        self.exchange.build_funding_info = AsyncMock(side_effect=ValueError("no mark price"))
+        timestamp, rate, payment = await self.exchange._fetch_last_fee_payment(self.trading_pair)
+        self.assertEqual((Decimal("-1"), Decimal("-0.5")), (rate, payment))
+
+    # ---- open orders ---------------------------------------------------------------------------------
+
+    async def test_open_orders_come_from_the_venue(self):
+        await self._ready()
+        self.exchange._api_get = AsyncMock(return_value=[
+            {"orderId": "ex-1", "clientOrderId": "manual-1", "symbol": "BTCUSDT", "status": "NEW", "type": "LIMIT",
+             "side": "BUY", "price": "60000", "origQty": "10", "executedQty": "2", "time": 1566818724722},
+            {"orderId": "ex-2", "symbol": "XRPUSDT", "status": "NEW"},
+        ])
+        orders = await self.exchange.get_open_orders()
+        self.assertEqual(1, len(orders), "symbols we don't map are skipped")
+        order = orders[0]
+        self.assertEqual(("manual-1", "BTC-USDT", Decimal("60000"), Decimal("10"), Decimal("2"), True, "ex-1"),
+                         (order.client_order_id, order.trading_pair, order.price, order.amount,
+                          order.executed_amount, order.is_buy, order.exchange_order_id))

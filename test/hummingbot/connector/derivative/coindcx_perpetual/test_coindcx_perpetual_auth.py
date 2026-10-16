@@ -77,8 +77,27 @@ class CoinDCXPerpetualAuthTests(TestCase):
         expected_body = json.dumps({"id": "abc", "timestamp": self.ms}, separators=(",", ":"))
         self.assertEqual(expected_body, request.data)
 
-    def test_ws_auth_payload_signs_the_channel(self):
-        payload = self.auth.generate_ws_auth_payload()
-        self.assertEqual("coindcx", payload["channelName"])
-        self.assertEqual(self.api_key, payload["apiKey"])
-        self.assertEqual(self._sign('{"channel":"coindcx"}'), payload["authSignature"])
+    def test_signing_matches_the_guides_code_sample(self):
+        # §13 "Verify balance": body {"timestamp": …}, compact JSON, HMAC-SHA256 hex, JSON content type.
+        request = RESTRequest(method=RESTMethod.GET, url="https://fapi.example/fapi/v2/balance",
+                              is_auth_required=True)
+        self.async_run_with_timeout(self.auth.rest_authenticate(request))
+        raw = json.dumps({"timestamp": self.ms}, separators=(",", ":"))
+        self.assertEqual(raw, request.data)
+        self.assertEqual({"Content-Type": "application/json", "X-AUTH-APIKEY": self.api_key,
+                          "X-AUTH-SIGNATURE": self._sign(raw)}, request.headers)
+
+    def test_delete_carries_its_parameters_in_the_signed_body(self):
+        request = RESTRequest(method=RESTMethod.DELETE, url="https://fapi.example/fapi/v1/order",
+                              data=json.dumps({"symbol": "BTCUSDT", "origClientOrderId": "haveli-1"}),
+                              is_auth_required=True)
+        self.async_run_with_timeout(self.auth.rest_authenticate(request))
+        raw = json.dumps({"symbol": "BTCUSDT", "origClientOrderId": "haveli-1", "timestamp": self.ms},
+                         separators=(",", ":"))
+        self.assertEqual(raw, request.data)
+        self.assertEqual(self._sign(raw), request.headers["X-AUTH-SIGNATURE"])
+        self.assertIsNone(request.params)
+
+    def test_websocket_requests_pass_through(self):
+        request = MagicMock()
+        self.assertIs(request, self.async_run_with_timeout(self.auth.ws_authenticate(request)))

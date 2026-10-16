@@ -11,19 +11,12 @@ DEFAULT_DOMAIN = "coindcx_perpetual"
 REST_URL_ENV_VAR = "COINDCX_FAPI_REST_URL"
 WSS_URL_ENV_VAR = "COINDCX_FAPI_WS_URL"
 
-# Contracts are USDT-quoted, but margin may be posted in USDT or INR — chosen per
-# connector instance with ``coindcx_perpetual_margin_currency``.
+# Positions are margined per currency. Orders carry no margin field, so this only
+# scopes the position-exit endpoints (``marginCurrency`` there defaults to USDT).
 DEFAULT_MARGIN_CURRENCY = "USDT"
 SUPPORTED_MARGIN_CURRENCIES = ("USDT", "INR")
 
-# Every contract is quoted in USDT, and Hummingbot sizes collateral in this
-# currency. Balances are therefore reported in it, converting the margin wallet
-# when it differs (see CONVERSION_MARKET).
-QUOTE_CURRENCY = "USDT"
-
-# Fees and every margin figure the API reports are denominated in USDT even for
-# INR-margined futures ("fee_amount and ideal_margin values are in USDT for INR
-# Futures"), so fee tokens are always USDT whatever the margin currency is.
+# Estimated-fee token; actual fills report their own ``commissionAsset``.
 FEE_CURRENCY = "USDT"
 
 HBOT_ORDER_ID_PREFIX = "haveli-"
@@ -75,100 +68,81 @@ MIN_RESYNC_INTERVAL = 5.0
 # Diffs held per pair while waiting for the snapshot they must line up with.
 MAX_BUFFERED_DIFFS = 1000
 
-# ---- Private ---------------------------------------------------------------
-LIST_ORDERS_PATH_URL = "/exchange/v1/derivatives/futures/orders"
-CREATE_ORDER_PATH_URL = "/exchange/v1/derivatives/futures/orders/create"
-CANCEL_ORDER_PATH_URL = "/exchange/v1/derivatives/futures/orders/cancel"
-POSITIONS_PATH_URL = "/exchange/v1/derivatives/futures/positions"
-UPDATE_LEVERAGE_PATH_URL = "/exchange/v1/derivatives/futures/positions/update_leverage"
-TRADES_PATH_URL = "/exchange/v1/derivatives/futures/trades"
-WALLETS_PATH_URL = "/exchange/v1/derivatives/futures/wallets"
-# Ledger of position transactions; ``stage=funding`` yields funding payments.
-TRANSACTIONS_PATH_URL = "/exchange/v1/derivatives/futures/positions/transactions"
+# ---- Private REST (FAPI, SIGNED) ---------------------------------------------
+# Every parameter goes in a signed JSON body, GET and DELETE included.
+ORDER_PATH_URL = "/fapi/v1/order"  # POST create, PUT modify, DELETE cancel, GET query
+OPEN_ORDERS_PATH_URL = "/fapi/v1/openOrders"
+USER_TRADES_PATH_URL = "/fapi/v1/userTrades"
+LEVERAGE_PATH_URL = "/fapi/v1/leverage"
+EXIT_POSITION_PATH_URL = "/fapi/v1/exitPosition"
+CLOSE_ALL_POSITIONS_PATH_URL = "/fapi/v1/closeAllPositions"
+INCOME_PATH_URL = "/fapi/v1/income"
+POSITION_RISK_PATH_URL = "/fapi/v2/positionRisk"
+BALANCE_PATH_URL = "/fapi/v2/balance"
+# The guide names a listenKey for the private stream but documents no endpoint to
+# obtain one. Binance's (POST to create, PUT to keep alive) is assumed until CoinDCX
+# says otherwise.
+LISTEN_KEY_PATH_URL = "/fapi/v1/listenKey"
+LISTEN_KEY_KEEP_ALIVE_INTERVAL = 30 * 60
 
-# Public spot ticker, used only to price the margin wallet in the quote currency
-# when margining in something other than USDT (e.g. INR). It is part of CoinDCX's
-# public spot API, not the FAPI, so it keeps its own host.
-SPOT_REST_URL = "https://api.coindcx.com"
-SPOT_TICKER_PATH_URL = "/exchange/ticker"
-# Spot market that prices one unit of the quote currency in the margin currency.
-CONVERSION_MARKET = "{quote}{margin}"
-CONVERSION_RATE_TTL = 60.0
+# Throttler ids for the four methods that share /fapi/v1/order.
+CREATE_ORDER_LIMIT_ID = "CreateOrder"
+CANCEL_ORDER_LIMIT_ID = "CancelOrder"
+MODIFY_ORDER_LIMIT_ID = "ModifyOrder"
+QUERY_ORDER_LIMIT_ID = "QueryOrder"
 
-# ``stage`` values accepted by the transactions endpoint.
-TRANSACTION_STAGE_FUNDING = "funding"
-
-# ---- WebSocket (Socket.IO) --------------------------------------------------
-PRIVATE_CHANNEL = "coindcx"
-
-WS_HEARTBEAT_TIME_INTERVAL = 25
-
-# Private events (df- prefix = derivatives futures)
-ORDER_UPDATE_EVENT_TYPE = "df-order-update"
-POSITION_UPDATE_EVENT_TYPE = "df-position-update"
-BALANCE_UPDATE_EVENT_TYPE = "balance-update"
-
-
-# ---- Order enums ------------------------------------------------------------
-SIDE_BUY = "buy"
-SIDE_SELL = "sell"
-
-ORDER_TYPE_LIMIT = "limit_order"
-ORDER_TYPE_MARKET = "market_order"
-
-TIME_IN_FORCE_GTC = "good_till_cancel"
-
-NO_NOTIFICATION = "no_notification"
-
-
-FUNDING_FEE_POLL_INTERVAL = 120
-
-ONE_MINUTE = 60
-
-ORDER_STATE = {
-    "initial": OrderState.PENDING_CREATE,
-    "init": OrderState.PENDING_CREATE,
-    "open": OrderState.OPEN,
-    "untriggered": OrderState.OPEN,
-    "partially_filled": OrderState.PARTIALLY_FILLED,
-    "filled": OrderState.FILLED,
-    "partially_cancelled": OrderState.CANCELED,
-    "cancelled": OrderState.CANCELED,
-    "canceled": OrderState.CANCELED,
-    "rejected": OrderState.FAILED,
-}
-
-# Statuses queried when listing orders. Must be a COMMA-SEPARATED STRING: sending
-# the same values as a JSON array is rejected with HTTP 422 "Invalid Request".
-ALL_ORDER_STATUSES = "open,filled,partially_filled,partially_cancelled,cancelled,rejected,untriggered"
-
-# The list endpoints (orders, positions, transactions) are account-wide and paged;
-# none of them accepts a pair filter, so callers page through until the record is
-# found or the pages run out.
-PAGE_SIZE = 100
+# Page size for the paged private lists (openOrders, userTrades, income).
+PAGE_LIMIT = 500
 MAX_PAGES = 20
 
-# Substrings that mark an error as "this order is already gone". HTTP 422 alone is
-# a generic validation status on CoinDCX (malformed params, wrong margin currency,
-# permissions), so it must be paired with one of these before an order is treated
-# as already cancelled.
-ORDER_GONE_MESSAGE_HINTS = (
-    "order not found",
-    "not found",
-    "already cancel",
-    "already filled",
-    "already executed",
-    "cannot be cancel",
-    "invalid order",
-)
+# ---- Private WebSocket (FAPI) ---------------------------------------------------
+PRIVATE_WS_PATH = "/private/ws"
+ORDER_TRADE_UPDATE_EVENT = "ORDER_TRADE_UPDATE"
+ACCOUNT_UPDATE_EVENT = "ACCOUNT_UPDATE"
+POSITION_UPDATE_EVENT = "POSITION_UPDATE"
+# Binance's name for the frame announcing an expired listenKey.
+LISTEN_KEY_EXPIRED_EVENT = "listenKeyExpired"
+PRIVATE_EVENTS = (ORDER_TRADE_UPDATE_EVENT, ACCOUNT_UPDATE_EVENT, POSITION_UPDATE_EVENT)
+PRIVATE_WS_HEARTBEAT_INTERVAL = 30
 
-# CoinDCX orders carry no client-order-id, so a websocket order event can only be
-# matched once _place_order has recorded the exchange id. A fast fill can beat the
-# REST create response, so unmatched events are held briefly and replayed instead
-# of being dropped and left to the much slower REST poll.
-PENDING_ORDER_EVENT_TTL = 15.0
-PENDING_ORDER_EVENT_RETRY_INTERVAL = 0.2
-MAX_PENDING_ORDER_EVENTS = 256
+# ---- Orders ---------------------------------------------------------------------
+SIDE_BUY = "BUY"
+SIDE_SELL = "SELL"
+ORDER_TYPE_LIMIT = "LIMIT"
+ORDER_TYPE_MARKET = "MARKET"
+TIME_IN_FORCE_GTC = "GTC"
+# Post-only: rejected rather than executed if it would match on arrival.
+TIME_IN_FORCE_GTX = "GTX"
+
+# Order statuses (guide §12) -> Hummingbot states. Creation, modification and
+# cancellation are all asynchronous: the REST call only starts them.
+ORDER_STATE = {
+    "CREATE_IN_PROGRESS": OrderState.PENDING_CREATE,
+    "PENDING_TRIGGER": OrderState.OPEN,
+    "TRIGGERED": OrderState.OPEN,
+    "NEW": OrderState.OPEN,
+    "PARTIALLY_FILLED": OrderState.PARTIALLY_FILLED,
+    "FILLED": OrderState.FILLED,
+    "EDIT_IN_PROGRESS": OrderState.PENDING_EDIT,
+    "CANCEL_IN_PROGRESS": OrderState.PENDING_CANCEL,
+    "CANCELED": OrderState.CANCELED,
+    "EXPIRED": OrderState.CANCELED,
+    "REJECTED": OrderState.FAILED,
+}
+CANCEL_ACCEPTED_STATUSES = ("CANCEL_IN_PROGRESS", "CANCELED")
+
+INCOME_TYPE_FUNDING_FEE = "FUNDING_FEE"
+FUNDING_FEE_POLL_INTERVAL = 120
+
+# ---- Error codes (guide §11) --------------------------------------------------------
+UNKNOWN_ERROR_CODE = -1000
+RATE_LIMIT_ERROR_CODE = -1003
+TIMESTAMP_ERROR_CODE = -1021
+CANCEL_REJECTED_ERROR_CODE = -2011  # "order already filled or unknown"
+ORDER_NOT_FOUND_ERROR_CODE = -2013
+
+ONE_MINUTE = 60
+TEN_SECONDS = 10
 
 # The FAPI tiers are unpublished (exchangeInfo ``rateLimits`` is empty until they
 # are), so public calls share one weight pool sized at half of Binance's 2400/min.
@@ -184,8 +158,24 @@ def _weighted(path_url: str, weight: int) -> RateLimit:
                      linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=weight)])
 
 
+# Order actions also count against an order-rate pool, sized like Binance's.
+ORDERS_10S = "ORDERS_10S"
+ORDERS_1M = "ORDERS_1M"
+ORDERS_10S_LIMIT = 300
+ORDERS_1M_LIMIT = 1200
+
+
+def _order_action(limit_id: str) -> RateLimit:
+    return RateLimit(limit_id=limit_id, limit=ORDERS_10S_LIMIT, time_interval=TEN_SECONDS,
+                     linked_limits=[LinkedLimitWeightPair(REQUEST_WEIGHT, weight=1),
+                                    LinkedLimitWeightPair(ORDERS_10S, weight=1),
+                                    LinkedLimitWeightPair(ORDERS_1M, weight=1)])
+
+
 RATE_LIMITS = [
     RateLimit(limit_id=REQUEST_WEIGHT, limit=REQUEST_WEIGHT_LIMIT, time_interval=ONE_MINUTE),
+    RateLimit(limit_id=ORDERS_10S, limit=ORDERS_10S_LIMIT, time_interval=TEN_SECONDS),
+    RateLimit(limit_id=ORDERS_1M, limit=ORDERS_1M_LIMIT, time_interval=ONE_MINUTE),
     _weighted(PING_PATH_URL, 1),
     _weighted(SERVER_TIME_PATH_URL, 1),
     _weighted(EXCHANGE_INFO_PATH_URL, 1),
@@ -194,18 +184,17 @@ RATE_LIMITS = [
     _weighted(TICKER_24HR_PATH_URL, 40),
     _weighted(TICKER_PRICE_PATH_URL, 1),
     _weighted(PREMIUM_INDEX_PATH_URL, 1),
-    RateLimit(limit_id=LIST_ORDERS_PATH_URL, limit=2000, time_interval=ONE_MINUTE),
-    RateLimit(limit_id=CREATE_ORDER_PATH_URL, limit=2000, time_interval=ONE_MINUTE),
-    RateLimit(limit_id=CANCEL_ORDER_PATH_URL, limit=2000, time_interval=ONE_MINUTE),
-    RateLimit(limit_id=POSITIONS_PATH_URL, limit=2000, time_interval=ONE_MINUTE),
-    RateLimit(limit_id=UPDATE_LEVERAGE_PATH_URL, limit=300, time_interval=ONE_MINUTE),
-    RateLimit(limit_id=TRADES_PATH_URL, limit=2000, time_interval=ONE_MINUTE),
-    RateLimit(limit_id=WALLETS_PATH_URL, limit=2000, time_interval=ONE_MINUTE),
-    RateLimit(limit_id=TRANSACTIONS_PATH_URL, limit=2000, time_interval=ONE_MINUTE),
-    RateLimit(limit_id=SPOT_TICKER_PATH_URL, limit=2000, time_interval=ONE_MINUTE),
+    _order_action(CREATE_ORDER_LIMIT_ID),
+    _order_action(CANCEL_ORDER_LIMIT_ID),
+    _order_action(MODIFY_ORDER_LIMIT_ID),
+    _weighted(QUERY_ORDER_LIMIT_ID, 1),
+    _weighted(OPEN_ORDERS_PATH_URL, 40),
+    _weighted(USER_TRADES_PATH_URL, 5),
+    _weighted(LEVERAGE_PATH_URL, 1),
+    _weighted(EXIT_POSITION_PATH_URL, 1),
+    _weighted(CLOSE_ALL_POSITIONS_PATH_URL, 1),
+    _weighted(INCOME_PATH_URL, 30),
+    _weighted(POSITION_RISK_PATH_URL, 5),
+    _weighted(BALANCE_PATH_URL, 5),
+    _weighted(LISTEN_KEY_PATH_URL, 1),
 ]
-
-ORDER_NOT_EXIST_ERROR_CODE = 404
-ORDER_NOT_EXIST_MESSAGE = "Order not found"
-# CoinDCX answers 422 when cancelling an order that is already filled/cancelled.
-INVALID_REQUEST_ERROR_CODE = 422

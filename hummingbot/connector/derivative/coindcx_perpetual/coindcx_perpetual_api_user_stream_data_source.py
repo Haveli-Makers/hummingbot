@@ -1,8 +1,6 @@
 import asyncio
-import json
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
-
-import socketio
+import time
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from hummingbot.connector.derivative.coindcx_perpetual import (
     coindcx_perpetual_constants as CONSTANTS,
@@ -10,7 +8,9 @@ from hummingbot.connector.derivative.coindcx_perpetual import (
 )
 from hummingbot.connector.derivative.coindcx_perpetual.coindcx_perpetual_auth import CoinDCXPerpetualAuth
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
+from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
+from hummingbot.core.web_assistant.ws_assistant import WSAssistant
 from hummingbot.logger import HummingbotLogger
 
 if TYPE_CHECKING:
@@ -19,166 +19,143 @@ if TYPE_CHECKING:
     )
 
 
-def unwrap_frame(message: Any) -> Optional[Dict[str, Any]]:
+def private_stream_payload(message: Any) -> Optional[Dict[str, Any]]:
     """
-    Normalise a CoinDCX Socket.IO payload into a dict.
-
-    Frames arrive double-wrapped as ``{"event": ..., "data": "<json string>"}``
-    — note ``data`` is a JSON *string*, not an object as the docs suggest — but
-    plain dicts are also accepted so callers/tests can pass either shape.
+    The event itself. The guide shows bare events; a combined-stream wrapper
+    ``{"stream": ..., "data": {...}}`` is accepted too.
     """
-    if isinstance(message, str):
-        try:
-            message = json.loads(message)
-        except (TypeError, ValueError):
-            return None
     if not isinstance(message, dict):
         return None
-
-    data = message.get("data", message)
-    if isinstance(data, str):
-        try:
-            data = json.loads(data)
-        except (TypeError, ValueError):
-            return None
-    return data if isinstance(data, dict) else None
+    data = message.get("data") if "stream" in message else None
+    return data if isinstance(data, dict) else message
 
 
 class CoinDCXPerpetualAPIUserStreamDataSource(UserStreamTrackerDataSource):
     """
-    Private account stream for CoinDCX futures.
+    Private account stream from the CoinDCX FAPI (guide §8).
 
-    Joins the authenticated ``coindcx`` Socket.IO channel and republishes the
-    ``df-order-update``, ``df-position-update`` and ``balance-update`` events
-    onto the connector's user-stream queue, tagged with their event name so the
-    connector can dispatch them.
+    Connects to ``{WS_URL}/private/ws?listenKey=…&events=…`` and forwards
+    ``ORDER_TRADE_UPDATE``, ``ACCOUNT_UPDATE`` and ``POSITION_UPDATE`` to the
+    connector. The guide does not say how a listenKey is obtained, so this follows
+    Binance: ``POST /fapi/v1/listenKey`` creates one, ``PUT`` keeps it alive, and a
+    failed keep-alive or a ``listenKeyExpired`` frame means a new key and reconnect.
     """
 
+    LISTEN_KEY_RETRY_INTERVAL = 5.0
     _logger: Optional[HummingbotLogger] = None
 
     def __init__(self,
                  auth: CoinDCXPerpetualAuth,
-                 trading_pairs: List[str],
                  connector: 'CoindcxPerpetualDerivative',
                  api_factory: WebAssistantsFactory,
                  domain: str = CONSTANTS.DEFAULT_DOMAIN):
         super().__init__()
         self._auth = auth
-        self._trading_pairs = trading_pairs
         self._connector = connector
         self._api_factory = api_factory
         self._domain = domain
-        self._client: Optional[socketio.AsyncClient] = None
-        self._last_recv_time: float = 0.0
+        self._current_listen_key: Optional[str] = None
+        self._last_listen_key_ping_ts: float = 0
+        self._listen_key_initialized_event = asyncio.Event()
+        self._manage_listen_key_task: Optional[asyncio.Task] = None
 
-    @property
-    def last_recv_time(self) -> float:
-        return self._last_recv_time
+    # ---- listenKey ----------------------------------------------------------------
 
-    async def listen_for_user_stream(self, output: asyncio.Queue):
-        while True:
-            try:
-                self._client = self._build_client(output)
-                await self._client.connect(web_utils.wss_url(domain=self._domain), transports=["websocket"])
-                await self._client.emit("join", self._auth.generate_ws_auth_payload())
-                self.logger().info("Subscribed to CoinDCX futures private account channel.")
-                self._last_recv_time = self._time()
+    async def _get_listen_key(self) -> str:
+        response = await self._connector._api_post(
+            path_url=CONSTANTS.LISTEN_KEY_PATH_URL, data={}, is_auth_required=True)
+        listen_key = response.get("listenKey") if isinstance(response, dict) else None
+        if not listen_key:
+            raise IOError(f"No listenKey in the {CONSTANTS.LISTEN_KEY_PATH_URL} response: {response}")
+        return str(listen_key)
 
-                ping_task = asyncio.create_task(self._ping_task())
-                try:
-                    await self._client.wait()
-                finally:
-                    ping_task.cancel()
-                    try:
-                        await ping_task
-                    except asyncio.CancelledError:
-                        pass
-            except asyncio.CancelledError:
-                await self._disconnect()
-                raise
-            except Exception:
-                self.logger().exception(
-                    "Unexpected error while listening to user stream. Retrying in 5 seconds...")
-                await self._disconnect()
-                await self._sleep(5.0)
-            finally:
-                await self._disconnect()
+    async def _ping_listen_key(self) -> bool:
+        try:
+            response = await self._connector._api_put(
+                path_url=CONSTANTS.LISTEN_KEY_PATH_URL, data={"listenKey": self._current_listen_key},
+                is_auth_required=True, return_err=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exception:
+            self.logger().warning(f"Failed to keep the listenKey alive: {exception}")
+            return False
+        if isinstance(response, dict) and response.get("code") not in (None, 200):
+            self.logger().warning(f"Failed to keep the listenKey alive: {response}")
+            return False
+        return True
 
-    def _build_client(self, output: asyncio.Queue) -> socketio.AsyncClient:
-        client = socketio.AsyncClient(logger=False, reconnection=False)
-
-        @client.event
-        async def connect():
-            self.logger().info("Connected to CoinDCX futures private stream.")
-
-        @client.event
-        async def disconnect():
-            self.logger().warning("CoinDCX futures private stream disconnected.")
-
-        def _handler(event_type: str):
-            async def _on_event(message):
-                self._last_recv_time = self._time()
-                # Private events deliver a LIST of records, so unwrap_frame (dict
-                # only) is tried first and _unwrap_payload covers the list case.
-                payload = unwrap_frame(message)
-                if payload is None:
-                    payload = self._unwrap_payload(message)
-                if payload is not None:
-                    output.put_nowait({"event": event_type, "data": payload})
-            return _on_event
-
-        client.on(CONSTANTS.ORDER_UPDATE_EVENT_TYPE, _handler(CONSTANTS.ORDER_UPDATE_EVENT_TYPE))
-        client.on(CONSTANTS.POSITION_UPDATE_EVENT_TYPE, _handler(CONSTANTS.POSITION_UPDATE_EVENT_TYPE))
-        client.on(CONSTANTS.BALANCE_UPDATE_EVENT_TYPE, _handler(CONSTANTS.BALANCE_UPDATE_EVENT_TYPE))
-        return client
-
-    @staticmethod
-    def _unwrap_payload(message: Any) -> Optional[Any]:
-        """
-        Private events carry a JSON-encoded LIST of records in ``data``.
-        """
-        if isinstance(message, str):
-            try:
-                message = json.loads(message)
-            except (TypeError, ValueError):
-                return None
-        if isinstance(message, list):
-            return message
-        if isinstance(message, dict):
-            data = message.get("data")
-            if isinstance(data, str):
-                try:
-                    data = json.loads(data)
-                except (TypeError, ValueError):
-                    return None
-            if isinstance(data, (list, dict)):
-                return data
-        return None
-
-    async def _disconnect(self):
-        if self._client is not None:
-            try:
-                await self._client.disconnect()
-            except Exception:
-                self.logger().debug("CoinDCX futures private stream disconnect failed", exc_info=True)
-            self._client = None
-
-    async def _ping_task(self):
+    async def _manage_listen_key_task_loop(self):
+        """Obtain a listenKey, then keep it alive until a keep-alive fails."""
         try:
             while True:
-                await self._sleep(CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL)
-                if self._client is not None and self._client.connected:
-                    try:
-                        await self._client.emit("ping", {"data": "Ping message"})
-                    except Exception as exception:
-                        self.logger().debug(f"Error sending ping: {exception}")
+                now = time.time()
+                if self._current_listen_key is None:
+                    self._current_listen_key = await self._get_listen_key()
+                    self._last_listen_key_ping_ts = now
+                    self._listen_key_initialized_event.set()
+                    self.logger().info("Obtained a CoinDCX private stream listenKey.")
+                elif now - self._last_listen_key_ping_ts >= CONSTANTS.LISTEN_KEY_KEEP_ALIVE_INTERVAL:
+                    if not await self._ping_listen_key():
+                        # A dead key means a dead stream: end it so the stream reconnects
+                        # with a fresh key.
+                        self._expire_listen_key()
+                        if self._ws_assistant is not None:
+                            await self._ws_assistant.disconnect()
+                        return
+                    self._last_listen_key_ping_ts = now
+                await self._sleep(self.LISTEN_KEY_RETRY_INTERVAL)
         except asyncio.CancelledError:
-            pass
+            raise
+        except Exception as exception:
+            self.logger().error(
+                f"Could not obtain a CoinDCX private stream listenKey from {CONSTANTS.LISTEN_KEY_PATH_URL} "
+                f"(the guide documents no listenKey endpoint; Binance's is assumed): {exception}")
+            self._expire_listen_key()
 
-    async def _connected_websocket_assistant(self):
-        """CoinDCX uses Socket.IO; the connection is managed in listen_for_user_stream."""
+    def _expire_listen_key(self):
+        self._current_listen_key = None
+        self._listen_key_initialized_event.clear()
+
+    async def _ensure_listen_key_task_running(self):
+        if self._manage_listen_key_task is None or self._manage_listen_key_task.done():
+            self._manage_listen_key_task = safe_ensure_future(self._manage_listen_key_task_loop())
+
+    # ---- WebSocket ------------------------------------------------------------------
+
+    async def _connected_websocket_assistant(self) -> WSAssistant:
+        await self._ensure_listen_key_task_running()
+        try:
+            await asyncio.wait_for(self._listen_key_initialized_event.wait(),
+                                   timeout=CONSTANTS.PRIVATE_WS_HEARTBEAT_INTERVAL)
+        except asyncio.TimeoutError:
+            raise IOError("No listenKey for the CoinDCX private stream; retrying.")
+        url = (f"{web_utils.wss_url(CONSTANTS.PRIVATE_WS_PATH, self._domain)}"
+               f"?listenKey={self._current_listen_key}&events={','.join(CONSTANTS.PRIVATE_EVENTS)}")
+        ws: WSAssistant = await self._api_factory.get_ws_assistant()
+        await ws.connect(ws_url=url, ping_timeout=CONSTANTS.PRIVATE_WS_HEARTBEAT_INTERVAL)
+        self.logger().info("Connected to the CoinDCX private stream.")
+        return ws
+
+    async def _subscribe_channels(self, websocket_assistant: WSAssistant):
+        """The events are chosen in the connection URL; nothing to send."""
         pass
 
-    async def _subscribe_channels(self, websocket_assistant):
-        """Subscription happens via the authenticated ``join`` emit."""
-        pass
+    async def _process_event_message(self, event_message: Dict[str, Any], queue: asyncio.Queue):
+        event = private_stream_payload(event_message)
+        if not event:
+            return
+        event_type = event.get("e")
+        if event_type == CONSTANTS.LISTEN_KEY_EXPIRED_EVENT:
+            self.logger().warning("The CoinDCX private stream listenKey expired; reconnecting with a new one.")
+            self._expire_listen_key()
+            raise ConnectionError("listenKey expired")
+        if event_type in CONSTANTS.PRIVATE_EVENTS:
+            queue.put_nowait(event)
+
+    async def _on_user_stream_interruption(self, websocket_assistant: Optional[WSAssistant]):
+        await super()._on_user_stream_interruption(websocket_assistant=websocket_assistant)
+        if self._manage_listen_key_task is not None and not self._manage_listen_key_task.done():
+            self._manage_listen_key_task.cancel()
+        self._manage_listen_key_task = None
+        self._expire_listen_key()
+        await self._sleep(self.LISTEN_KEY_RETRY_INTERVAL)

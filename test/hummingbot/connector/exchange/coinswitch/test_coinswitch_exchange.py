@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+import time
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from unittest.mock import patch
@@ -615,6 +616,122 @@ class CoinswitchExchangeAPITests(IsolatedAsyncioWrapperTestCase):
     async def _async_gen(items):
         for item in items:
             yield item
+
+
+class CoinswitchReviewFixTests(IsolatedAsyncioWrapperTestCase):
+    """
+    Regression cover for the PR #34 review findings on the CoinSwitch websocket
+    path. The /orderupdates frame is the ONLY fill source for this venue, so every
+    one of these is a silent accounting bug rather than a cosmetic issue.
+    """
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.trading_pair = "BTC-INR"
+        self.exchange = _make_exchange(trading_pairs=[self.trading_pair])
+        self.exchange._set_trading_pair_symbol_map(bidict({"BTC/INR": self.trading_pair}))
+
+    def _order(self, client_id="x-CS-1", exchange_id="ex-1", amount="1.0") -> InFlightOrder:
+        order = InFlightOrder(
+            client_order_id=client_id, exchange_order_id=exchange_id,
+            trading_pair=self.trading_pair, order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY, price=Decimal("100"),
+            amount=Decimal(amount), creation_timestamp=1_700_000_000.0,
+        )
+        self.exchange._order_tracker.start_tracking_order(order)
+        return order
+
+    @staticmethod
+    def _frame(order_id="ex-1", status="PARTIALLY_EXECUTED", z="0.5", v="100"):
+        return {"event": CONSTANTS.ORDER_UPDATE_EVENT_TYPE, "X": status,
+                "i": order_id, "z": z, "v": v, "O": 1_700_000_001_000}
+
+    # ── Finding 1: a frame that beats the placement response ──────────────────
+    async def test_order_frame_before_exchange_id_is_deferred_not_dropped(self):
+        # No order is tracked under ex-9 yet: the /orderupdates push beat the REST
+        # place_order response. Dropping it loses the fill forever, because
+        # CoinSwitch has no per-order trades endpoint to re-deliver it.
+        frame = self._frame(order_id="ex-9", status="EXECUTED", z="1.0")
+        self.assertFalse(self.exchange._process_order_frame(frame))
+        self.exchange._defer_order_frame("ex-9", frame)
+        self.assertIn("ex-9", self.exchange._deferred_order_frames)
+
+        # The placement response lands and the order becomes tracked; the replay
+        # then applies the fill that would otherwise have been lost.
+        order = self._order(client_id="x-CS-9", exchange_id="ex-9")
+        for pending in self.exchange._due_deferred_frames():
+            self.assertTrue(self.exchange._process_order_frame(pending))
+        self.assertEqual(Decimal("1.0"), order.executed_amount_base)
+        self.assertNotIn("ex-9", self.exchange._deferred_order_frames)
+
+    async def test_deferred_frame_expires_after_ttl(self):
+        # A frame that never matches must not be retried forever.
+        frame = self._frame(order_id="ex-gone")
+        self.exchange._defer_order_frame("ex-gone", frame)
+        self.exchange._deferred_order_frames["ex-gone"] = (time.time() - 1, frame)
+        self.assertEqual([], self.exchange._due_deferred_frames())
+        self.assertNotIn("ex-gone", self.exchange._deferred_order_frames)
+
+    # ── Finding 2: double-count against REST fills ────────────────────────────
+    async def test_ws_stops_synthesizing_once_rest_returns_real_trades(self):
+        # REST trades carry the venue's own trade_id, which can never dedup against
+        # the WS's cumulative-keyed synthetic id — emitting both records the same
+        # execution twice and over-fills the order.
+        order = self._order(exchange_id="ex-2")
+        self.exchange._rest_fill_order_ids.add("ex-2")
+        self.exchange._process_order_frame(self._frame(order_id="ex-2", z="0.5"))
+        self.assertEqual(Decimal("0"), order.executed_amount_base)
+
+    async def test_ws_synthesizes_while_rest_returns_nothing(self):
+        # The behaviour that must be preserved: REST is empty today, so the WS is
+        # the only fill source and has to keep working.
+        order = self._order(exchange_id="ex-3")
+        self.exchange._process_order_frame(self._frame(order_id="ex-3", z="0.5"))
+        self.assertEqual(Decimal("0.5"), order.executed_amount_base)
+
+    # ── Finding 5: fee is modelled, not zero ──────────────────────────────────
+    async def test_synthesized_fill_reports_a_non_zero_fee(self):
+        # A bare new_spot_fee() with no percent_token and no flat_fees reports zero,
+        # so cumulative_fee_paid stayed 0 for every order's whole lifetime and PnL
+        # silently understated costs.
+        order = self._order(exchange_id="ex-4")
+        fee = self.exchange._synthetic_fill_fee(order, Decimal("1.0"), Decimal("100"))
+        self.assertGreater(fee.percent, Decimal("0"), "fee percent not modelled")
+        self.assertEqual("INR", fee.percent_token)
+        self.assertTrue(fee.flat_fees, "no flat fee attached")
+        self.assertGreater(fee.flat_fees[0].amount, Decimal("0"))
+
+        # ...and it reaches the order through the real WS path.
+        self.exchange._process_order_frame(self._frame(order_id="ex-4", z="1.0", v="100"))
+        self.assertGreater(order.cumulative_fee_paid("INR"), Decimal("0"))
+
+    # ── Finding 6: partial balance frame must not zero the cache ──────────────
+    async def test_balance_frame_without_free_balance_leaves_cache_untouched(self):
+        # Defaulting a missing key to 0 overwrites a real balance with zero, and the
+        # bot then refuses to trade on a spurious "insufficient balance".
+        self.exchange._account_available_balances["BTC"] = Decimal("5")
+        self.exchange._account_balances["BTC"] = Decimal("5")
+        event = {"event": CONSTANTS.BALANCE_UPDATE_EVENT_TYPE,
+                 "btc": {"locked_balance": "1"}}  # no free_balance
+        with patch.object(self.exchange, "_iter_user_event_queue",
+                          side_effect=lambda: _agen([event])):
+            await self.exchange._user_stream_event_listener()
+        self.assertEqual(Decimal("5"), self.exchange._account_available_balances["BTC"])
+        self.assertEqual(Decimal("5"), self.exchange._account_balances["BTC"])
+
+    async def test_balance_frame_with_free_balance_still_updates(self):
+        event = {"event": CONSTANTS.BALANCE_UPDATE_EVENT_TYPE,
+                 "btc": {"free_balance": "2", "locked_balance": "1"}}
+        with patch.object(self.exchange, "_iter_user_event_queue",
+                          side_effect=lambda: _agen([event])):
+            await self.exchange._user_stream_event_listener()
+        self.assertEqual(Decimal("2"), self.exchange._account_available_balances["BTC"])
+        self.assertEqual(Decimal("3"), self.exchange._account_balances["BTC"])
+
+
+async def _agen(items):
+    for item in items:
+        yield item
 
 
 if __name__ == "__main__":

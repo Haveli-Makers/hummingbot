@@ -28,6 +28,7 @@ SUPPORTED_CONNECTORS = [
     "ajaib",
     "zebpay",
     "csx",
+    "coinswitch_perpetual",
     "coinex",
 ]
 
@@ -144,6 +145,10 @@ def get_rate_source(connector_name: str) -> RateSourceBase:
         from hummingbot.core.rate_oracle.sources.coinswitch_rate_source import CoinswitchRateSource
 
         return CoinswitchRateSource()
+    elif connector_name_lower == "coinswitch_perpetual":
+        from hummingbot.core.rate_oracle.sources.coinswitch_perpetual_rate_source import CoinswitchPerpetualRateSource
+
+        return CoinswitchPerpetualRateSource()
     elif connector_name_lower == "zebpay":
         from hummingbot.core.rate_oracle.sources.zebpay_rate_source import ZebpayRateSource
 

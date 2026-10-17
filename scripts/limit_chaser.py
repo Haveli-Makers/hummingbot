@@ -32,6 +32,7 @@ SUPPORTED_CONNECTORS = [
     "wazirx",
     "zebpay",
     "csx",
+    "coinswitch_perpetual",
     "coinex",
     "ajaib",
 ]

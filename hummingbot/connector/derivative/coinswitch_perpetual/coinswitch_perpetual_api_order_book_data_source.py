@@ -39,8 +39,8 @@ class CoinswitchPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource)
 
     The sockets are unauthenticated. REST is used for the initial book and the
     initial funding info; both fall back to the first socket frame when REST
-    fails (the futures REST endpoints are documented as signed, so a connector
-    without keys may be refused).
+    fails (those endpoints refuse unsigned requests, seen live 2026-10-19, so a
+    connector without keys takes the socket path).
     """
 
     def __init__(self,
@@ -200,15 +200,29 @@ class CoinswitchPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource)
     async def _on_disconnect(self, *args):
         self.logger().debug(f"CoinSwitch futures socket namespace disconnected {args}.")
 
+    def _is_ack(self, message: Any) -> bool:
+        """Consumes the subscription acknowledgement each event sends before its first data frame."""
+        if not utils.is_subscription_ack(message):
+            return False
+        if str(message.get("success")).lower() == "true":
+            self.logger().debug(f"CoinSwitch futures socket: {message.get('message')}")
+        else:
+            self.logger().warning(f"CoinSwitch futures socket refused a subscription: {message}")
+        return True
+
     async def _on_order_book(self, payload: Any):
         self._last_frame_time = self._time()
         book = utils.unwrap_data(utils.parse_socket_payload(payload))
+        if self._is_ack(book):
+            return
         if isinstance(book, dict) and ("bids" in book or "asks" in book):
             self._message_queue[self._snapshot_messages_queue_key].put_nowait(book)
 
     async def _on_trades(self, payload: Any):
         self._last_frame_time = self._time()
         trades = utils.unwrap_data(utils.parse_socket_payload(payload))
+        if self._is_ack(trades):
+            return
         for trade in trades if isinstance(trades, list) else [trades]:
             if isinstance(trade, dict):
                 self._message_queue[self._trade_messages_queue_key].put_nowait(trade)
@@ -217,6 +231,8 @@ class CoinswitchPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource)
         """The push is keyed by symbol (``{"BTCUSDT": {...}}``) so one frame can carry several symbols."""
         self._last_frame_time = self._time()
         tickers = utils.unwrap_data(utils.parse_socket_payload(payload))
+        if self._is_ack(tickers):
+            return
         if isinstance(tickers, dict):
             records = [tickers] if "s" in tickers else list(tickers.values())
         elif isinstance(tickers, list):

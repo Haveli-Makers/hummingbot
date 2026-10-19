@@ -52,11 +52,12 @@ class CoinswitchPerpetualRateSource(RateSourceBase):
             )
             return results
 
+        # One map read for all rows: a per-row lookup retries the map's initialisation
+        # for every contract whenever the map is empty.
+        mapping = await self._exchange.trading_pair_symbol_map()
         for ticker in tickers:
-            try:
-                trading_pair = await self._exchange.trading_pair_associated_to_exchange_symbol(
-                    symbol=str(ticker.get("symbol", "")).upper())
-            except KeyError:
+            trading_pair = mapping.get(str(ticker.get("symbol", "")).upper())
+            if trading_pair is None:
                 continue
             if quote_token is not None and trading_pair.split("-")[1] != quote_token:
                 continue

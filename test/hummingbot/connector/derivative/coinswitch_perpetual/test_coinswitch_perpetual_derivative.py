@@ -2,7 +2,7 @@ import asyncio
 import json
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from hummingbot.connector.derivative.coinswitch_perpetual import (
     coinswitch_perpetual_constants as CONSTANTS,
@@ -714,6 +714,19 @@ class CoinswitchPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
         with self.assertRaises(ValueError):
             await self.exchange._get_last_traded_price(self.trading_pair)
 
+    async def test_last_traded_prices_read_the_symbol_map_once(self):
+        # Live 2026-10-19: per-row lookups on an empty map re-requested instrument_info for every contract.
+        all_pairs = {"data": {"BTCUSDT": TICKER["data"]["EXCHANGE_2"], "ETHUSDT": {"last_price": "1"},
+                              "XRPUSDT": {"last_price": "2"}}}
+        self.exchange._api_get = AsyncMock(return_value=all_pairs)
+        self.exchange.trading_pair_symbol_map = AsyncMock(return_value={"BTCUSDT": "BTC-USDT"})
+        self.assertEqual({"BTC-USDT": 95136.6}, await self.exchange.get_last_traded_prices(["BTC-USDT"]))
+        self.exchange.trading_pair_symbol_map.assert_awaited_once()
+        self.assertEqual(1, self.exchange._api_get.call_count)
+
+        self.exchange.trading_pair_symbol_map = AsyncMock(return_value={})
+        self.assertEqual({}, await self.exchange.get_last_traded_prices(["BTC-USDT"]))
+
     # ---- user stream -----------------------------------------------------------------------
 
     async def test_user_stream_dispatch(self):
@@ -749,6 +762,10 @@ class CoinswitchPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
     # ---- errors ------------------------------------------------------------------------------
 
     def test_error_classification(self):
+        # Unsigned requests carry no epoch: their 401 is never a clock problem.
+        self.assertFalse(self.exchange._is_request_exception_related_to_time_synchronizer(
+            self._error(401, '{"message": "Invalid access"}')))
+        self.exchange._auth = MagicMock(has_credentials=True)
         self.assertTrue(self.exchange._is_request_exception_related_to_time_synchronizer(
             self._error(401, '{"message": "Invalid Access"}')))
         # At most once a minute, so bad keys do not double every call.

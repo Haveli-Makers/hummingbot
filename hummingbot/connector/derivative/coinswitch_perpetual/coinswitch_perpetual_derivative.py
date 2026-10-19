@@ -232,9 +232,10 @@ class CoinswitchPerpetualDerivative(PerpetualDerivativePyBase):
         """
         A 401 "Invalid Access" is also what an epoch outside the drift window
         gets. Resync and retry once, at most once a minute, so bad keys do not
-        double every failing call.
+        double every failing call. An unsigned request carries no epoch, so its
+        401 never is a clock problem.
         """
-        if self._http_status(request_exception) != 401:
+        if self._http_status(request_exception) != 401 or not self._auth.has_credentials:
             return False
         now = time.time()
         if now - self._last_forced_time_sync < CONSTANTS.ONE_MINUTE:
@@ -984,11 +985,16 @@ class CoinswitchPerpetualDerivative(PerpetualDerivativePyBase):
         return float(last)
 
     async def get_last_traded_prices(self, trading_pairs: List[str]) -> Dict[str, float]:
-        """One all-pairs ticker call instead of one call per pair."""
+        """
+        One all-pairs ticker call instead of one call per pair. The symbol map is
+        read once: a per-row lookup would retry the map's initialisation for
+        every contract whenever the map is empty.
+        """
         wanted = set(trading_pairs)
+        mapping = await self.trading_pair_symbol_map()
         results: Dict[str, float] = {}
         for ticker in await self.get_all_pairs_prices():
-            trading_pair = await self._trading_pair_for_symbol(ticker.get("symbol"))
+            trading_pair = mapping.get(str(ticker.get("symbol") or "").upper())
             if trading_pair in wanted and ticker.get("last_price") not in (None, ""):
                 results[trading_pair] = float(ticker["last_price"])
         return results

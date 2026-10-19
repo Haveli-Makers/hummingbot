@@ -26,11 +26,7 @@ class CoinswitchPerpetualRateSourceTest(IsolatedAsyncioWrapperTestCase):
     def _source(self, tickers=TICKERS):
         exchange = MagicMock()
         exchange.get_all_pairs_prices = AsyncMock(return_value=tickers)
-
-        async def _resolve(symbol):
-            return SYMBOL_MAP[symbol]
-
-        exchange.trading_pair_associated_to_exchange_symbol = AsyncMock(side_effect=_resolve)
+        exchange.trading_pair_symbol_map = AsyncMock(return_value=dict(SYMBOL_MAP))
         source = CoinswitchPerpetualRateSource()
         source._exchange = exchange
         return source
@@ -51,6 +47,16 @@ class CoinswitchPerpetualRateSourceTest(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(Decimal("95136.60"), entry["bid"])
         self.assertEqual(Decimal("95136.70"), entry["ask"])
         self.assertEqual((Decimal("0.10") / Decimal("95136.65")) * 100, entry["spread"])
+
+    async def test_symbol_map_is_read_once(self):
+        source = self._source()
+        await source.get_prices()
+        source._exchange.trading_pair_symbol_map.assert_awaited_once()
+
+    async def test_empty_symbol_map_gives_nothing(self):
+        source = self._source()
+        source._exchange.trading_pair_symbol_map = AsyncMock(return_value={})
+        self.assertEqual({}, await source.get_prices())
 
     async def test_fetch_error_returns_empty(self):
         source = self._source()

@@ -52,6 +52,15 @@ def parse_socket_payload(payload: Any) -> Any:
     return payload
 
 
+def is_subscription_ack(payload: Any) -> bool:
+    """
+    The first frame of every socket subscription is an acknowledgement, not data
+    (seen live 2026-10-19, not in the docs):
+    ``{"success": "true", "message": "Subscribed to FETCH_ORDER_BOOK_CS_PRO_EXCHANGE_2_BTCUSDT"}``.
+    """
+    return isinstance(payload, dict) and "success" in payload and "message" in payload and len(payload) <= 3
+
+
 def is_exchange_information_valid(symbol: str, instrument: Dict[str, Any]) -> bool:
     """True for a USDT perpetual that is open for trading."""
     if not symbol or not isinstance(instrument, dict):

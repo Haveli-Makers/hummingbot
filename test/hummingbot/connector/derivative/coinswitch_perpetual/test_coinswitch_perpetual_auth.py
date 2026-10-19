@@ -109,9 +109,12 @@ class CoinswitchPerpetualAuthTests(IsolatedAsyncioWrapperTestCase):
         auth = CoinswitchPerpetualAuth(api_key="", secret_key="", time_provider=self.clock)
         self.assertFalse(auth.has_credentials)
         request = RESTRequest(method=RESTMethod.GET, url="https://coinswitch.co/trade/api/v2/futures/ticker",
-                              params={"symbol": "BTCUSDT"}, is_auth_required=True)
+                              params={"symbol": "BTCUSDT"}, is_auth_required=True,
+                              headers={"Content-Type": "application/x-www-form-urlencoded", "X-Other": "kept"})
         signed = await auth.rest_authenticate(request)
-        self.assertIsNone(signed.headers)
+        # Live, CoinSwitch refuses even the open all-pairs ticker with a form-urlencoded content type.
+        self.assertEqual({"Content-Type": "application/json", "X-Other": "kept"}, signed.headers)
+        self.assertNotIn("X-AUTH-SIGNATURE", signed.headers)
         self.assertEqual({"symbol": "BTCUSDT"}, signed.params)
 
     def test_bad_secrets_are_rejected(self):

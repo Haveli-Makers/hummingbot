@@ -23,7 +23,7 @@ class CoinswitchPerpetualAuth(AuthBase):
     it verifies against the raw query or a canonical (sorted) one.
 
     A connector built without keys (rate and volume oracles, the CLI's trading-pair
-    fetcher) leaves requests unsigned.
+    fetcher) leaves requests unsigned, but still sends ``Content-Type: application/json``.
     """
 
     def __init__(self, api_key: str, secret_key: str, time_provider):
@@ -54,6 +54,10 @@ class CoinswitchPerpetualAuth(AuthBase):
 
     async def rest_authenticate(self, request: RESTRequest) -> RESTRequest:
         if not self.has_credentials:
+            # Unsigned requests still need the JSON content type: the REST assistant defaults GETs to
+            # application/x-www-form-urlencoded, and with that header CoinSwitch refuses even the open
+            # all-pairs ticker (HTTP 401 "Invalid access", live 2026-10-19).
+            request.headers = {**(request.headers or {}), "Content-Type": "application/json"}
             return request
 
         params = self._sorted_params(request.params)

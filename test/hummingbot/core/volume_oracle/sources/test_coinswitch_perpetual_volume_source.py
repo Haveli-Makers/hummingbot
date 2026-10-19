@@ -19,11 +19,7 @@ class CoinswitchPerpetualVolumeSourceTest(IsolatedAsyncioWrapperTestCase):
     def _source(self):
         exchange = MagicMock()
         exchange.get_all_pairs_prices = AsyncMock(return_value=TICKERS)
-
-        async def _resolve(symbol):
-            return SYMBOL_MAP[symbol]
-
-        exchange.trading_pair_associated_to_exchange_symbol = AsyncMock(side_effect=_resolve)
+        exchange.trading_pair_symbol_map = AsyncMock(return_value=dict(SYMBOL_MAP))
         source = CoinswitchPerpetualVolumeSource()
         source._exchange = exchange
         return source
@@ -40,6 +36,11 @@ class CoinswitchPerpetualVolumeSourceTest(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(Decimal("8970676685.2608"), btc["quote_volume"])
         self.assertEqual(Decimal("95136.60"), btc["last_price"])
         self.assertEqual(Decimal("0"), volumes["DOGE-USDT"]["base_volume"])
+
+    async def test_symbol_map_is_read_once(self):
+        source = self._source()
+        await source.get_all_24h_volumes()
+        source._exchange.trading_pair_symbol_map.assert_awaited_once()
 
     async def test_pair_filter(self):
         self.assertEqual(["BTC-USDT"], list(await self._source().get_all_24h_volumes(["BTC-USDT"])))

@@ -104,6 +104,51 @@ class CoinswitchPerpetualAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestC
         self.assertEqual(3, queues[self.data_source._funding_info_messages_queue_key].qsize())
         self.assertEqual(1732685132.0, self.data_source._last_frame_time)
 
+    async def test_live_frame_shapes(self):
+        # Exactly as received live 2026-10-19: flat book frames naming the symbol "s", one flat trade per frame.
+        book = {"timestamp": 1792399147828, "asks": [["82886.40", "0.382"], ["82886.50", "0.002"]],
+                "bids": [["82886.30", "2.975"], ["82886.20", "0.001"]], "s": "BTCUSDT"}
+        trade = {"E": 1792399147836, "p": 82886.4, "q": 0.005, "e": "EXCHANGE_2", "s": "BTCUSDT", "m": True}
+        ticker = {"BTCUSDT": {"E": 1792399147829, "s": "BTCUSDT", "h": "83155.00", "l": "80611.70", "c": "82886.40",
+                              "e": "EXCHANGE_2", "bv": "46183.4560", "qv": "3780775867.2994", "P": "1.442000",
+                              "b": "82886.30", "a": "82886.40", "T": 1792425600000, "p": 82890.56, "i": 82916.38,
+                              "r": 0.0001, "oi": "57980.86", "oiv": "4806065954.68", "bs": "2.975", "as": "0.382"}}
+        await self.data_source._on_order_book(book)
+        await self.data_source._on_trades(trade)
+        await self.data_source._on_ticker(ticker)
+        queues = self.data_source._message_queue
+        output = asyncio.Queue()
+        await self.data_source._parse_order_book_snapshot_message(
+            queues[self.data_source._snapshot_messages_queue_key].get_nowait(), output)
+        await self.data_source._parse_trade_message(queues[self.data_source._trade_messages_queue_key].get_nowait(),
+                                                    output)
+        await self.data_source._parse_funding_info_message(
+            queues[self.data_source._funding_info_messages_queue_key].get_nowait(), output)
+        snapshot, parsed_trade, funding = output.get_nowait(), output.get_nowait(), output.get_nowait()
+        self.assertEqual("BTC-USDT", snapshot.trading_pair)
+        self.assertEqual(1792399147828, snapshot.update_id)
+        self.assertEqual(82886.3, snapshot.bids[0].price)
+        self.assertEqual(82886.4, snapshot.asks[0].price)
+        self.assertEqual("BTC-USDT", parsed_trade.trading_pair)
+        self.assertEqual(0.005, parsed_trade.content["amount"])
+        self.assertEqual(Decimal("82890.56"), funding.mark_price)
+        self.assertEqual(Decimal("82916.38"), funding.index_price)
+        self.assertEqual(1792425600, funding.next_funding_utc_timestamp)
+
+    async def test_subscription_acks_are_not_data(self):
+        for event in ("FETCH_ORDER_BOOK_CS_PRO", "FETCH_TRADES_CS_PRO", "FETCH_TICKER_INFO_CS_PRO"):
+            ack = {"success": "true", "message": f"Subscribed to {event}_EXCHANGE_2_BTCUSDT"}
+            await self.data_source._on_order_book(ack)
+            await self.data_source._on_trades(ack)
+            await self.data_source._on_ticker(ack)
+        with self.assertLogs(level="WARNING") as logs:
+            await self.data_source._on_order_book({"success": "false", "message": "Invalid pair"})
+        self.assertIn("refused a subscription", logs.output[0])
+        for key in (self.data_source._snapshot_messages_queue_key, self.data_source._trade_messages_queue_key,
+                    self.data_source._funding_info_messages_queue_key):
+            self.assertTrue(self.data_source._message_queue[key].empty())
+        self.assertEqual(1732685132.0, self.data_source._last_frame_time)
+
     async def test_parsers(self):
         output = asyncio.Queue()
         await self.data_source._parse_order_book_snapshot_message(BOOK, output)

@@ -25,11 +25,10 @@ class CoinswitchPerpetualVolumeSource(VolumeSourceBase):
 
         wanted = set(trading_pairs) if trading_pairs else None
         results: Dict[str, Dict[str, Decimal]] = {}
+        mapping = await self._exchange.trading_pair_symbol_map()
         for ticker in tickers:
-            try:
-                trading_pair = await self._exchange.trading_pair_associated_to_exchange_symbol(
-                    symbol=str(ticker.get("symbol", "")).upper())
-            except KeyError:
+            trading_pair = mapping.get(str(ticker.get("symbol", "")).upper())
+            if trading_pair is None:
                 continue
             if wanted is not None and trading_pair not in wanted:
                 continue

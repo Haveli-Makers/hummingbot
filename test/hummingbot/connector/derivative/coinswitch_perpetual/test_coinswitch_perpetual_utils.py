@@ -34,6 +34,13 @@ class CoinswitchPerpetualUtilsTests(TestCase):
         self.assertIsNone(utils.parse_socket_payload("not json"))
         self.assertEqual({"a": 1}, utils.parse_socket_payload({"a": 1}))
 
+    def test_subscription_ack(self):
+        ack = {"success": "true", "message": "Subscribed to FETCH_ORDER_BOOK_CS_PRO_EXCHANGE_2_BTCUSDT"}
+        self.assertTrue(utils.is_subscription_ack(ack))
+        self.assertTrue(utils.is_subscription_ack({"success": "false", "message": "Invalid pair"}))
+        self.assertFalse(utils.is_subscription_ack({"symbol": "BTCUSDT", "bids": [], "asks": []}))
+        self.assertFalse(utils.is_subscription_ack([ack]))
+
     def test_instrument_validity(self):
         self.assertTrue(utils.is_exchange_information_valid("BTCUSDT", BTCUSDT))
         self.assertFalse(utils.is_exchange_information_valid("BTCUSDT", {**BTCUSDT, "status": "SETTLING"}))

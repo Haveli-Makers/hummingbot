@@ -2,10 +2,8 @@
 
 import argparse
 import asyncio
-import grp
 import logging
 import os
-import pwd
 import subprocess
 from pathlib import Path
 from typing import Coroutine, List
@@ -68,6 +66,9 @@ class CmdlineParser(argparse.ArgumentParser):
 
 
 def autofix_permissions(user_group_spec: str):
+    import grp  # Unix-only; imported lazily so the script still runs on Windows
+    import pwd
+
     uid, gid = [sub_str for sub_str in user_group_spec.split(':')]
 
     uid = int(uid) if uid.isnumeric() else pwd.getpwnam(uid).pw_uid
@@ -104,8 +105,8 @@ async def quick_start(args: argparse.Namespace, secrets_manager: BaseSecretsMana
     init_logging("hummingbot_logs.yml", client_config_map)
     await read_system_configs_from_yml()
 
-    # Automatically enable MQTT autostart for headless mode
-    if args.headless:
+    # Automatically enable MQTT autostart for headless mode (unless opted out with HEADLESS_MQTT=false)
+    if args.headless and os.environ.get("HEADLESS_MQTT", "").lower() != "false":
         client_config_map.mqtt_bridge.mqtt_autostart = True
 
     AllConnectorSettings.initialize_paper_trade_settings(client_config_map.paper_trade.paper_trade_exchanges)

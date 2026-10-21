@@ -13,7 +13,7 @@ from hummingbot.connector.exchange.coindcx.coindcx_exchange import CoindcxExchan
 from hummingbot.connector.test_support.exchange_connector_test import AbstractExchangeConnectorTests
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, TradeType
-from hummingbot.core.data_type.in_flight_order import InFlightOrder
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
 from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TokenAmount, TradeFeeBase
 
 
@@ -660,6 +660,114 @@ async def test_place_order_and_cancel_are_called(monkeypatch):
 
     cancelled = await ex._place_cancel(order_id="cid1", tracked_order=order)
     assert cancelled is True
+
+
+def _tracked_coindcx_order(ex: CoindcxExchange, state: OrderState) -> InFlightOrder:
+    ex.start_tracking_order(order_id="cid1", exchange_order_id="123", trading_pair="BTC-USDT",
+                            trade_type=TradeType.BUY, price=Decimal("100"), amount=Decimal("1"),
+                            order_type=OrderType.LIMIT)
+    order = ex.in_flight_orders["cid1"]
+    order.current_state = state
+    return order
+
+
+@pytest.mark.asyncio
+async def test_late_init_user_stream_update_keeps_open_order_open(monkeypatch):
+    ex = CoindcxExchange(coindcx_api_key="k", coindcx_api_secret="s", trading_pairs=["BTC-USDT"], trading_required=False, domain="")
+    _tracked_coindcx_order(ex, OrderState.OPEN)
+    updates = []
+    monkeypatch.setattr(ex._order_tracker, "process_order_update", lambda order_update: updates.append(order_update))
+
+    await ex._process_order_update({"client_order_id": "cid1", "id": "123", "status": "init", "updated_at": 1640000000000})
+
+    assert updates[0].new_state == OrderState.OPEN
+
+
+@pytest.mark.asyncio
+async def test_init_user_stream_update_keeps_pending_order_pending(monkeypatch):
+    ex = CoindcxExchange(coindcx_api_key="k", coindcx_api_secret="s", trading_pairs=["BTC-USDT"], trading_required=False, domain="")
+    _tracked_coindcx_order(ex, OrderState.PENDING_CREATE)
+    updates = []
+    monkeypatch.setattr(ex._order_tracker, "process_order_update", lambda order_update: updates.append(order_update))
+
+    await ex._process_order_update({"client_order_id": "cid1", "id": "123", "status": "init", "updated_at": 1640000000000})
+
+    assert updates[0].new_state == OrderState.PENDING_CREATE
+
+
+@pytest.mark.asyncio
+async def test_late_init_status_poll_keeps_open_order_open(monkeypatch):
+    ex = CoindcxExchange(coindcx_api_key="k", coindcx_api_secret="s", trading_pairs=["BTC-USDT"], trading_required=False, domain="")
+    order = _tracked_coindcx_order(ex, OrderState.OPEN)
+
+    async def fake_api_post(path_url=None, data=None, is_auth_required: bool = False, **kwargs):
+        return {"id": "123", "status": "init", "updated_at": 1640000000000}
+
+    monkeypatch.setattr(ex, "_api_post", fake_api_post)
+
+    update = await ex._request_order_status(order)
+
+    assert update.new_state == OrderState.OPEN
+
+
+def test_trade_history_params_ask_for_newest_trades_since_the_oldest_order():
+    orders = [InFlightOrder(client_order_id=f"c{i}", exchange_order_id=f"{i}", trading_pair="BTC-USDT",
+                            order_type=OrderType.LIMIT, trade_type=TradeType.BUY, amount=Decimal("1"),
+                            price=Decimal("100"), creation_timestamp=created)
+              for i, created in enumerate((2000, 1000))]
+    params = CoindcxExchange._trade_history_params(orders)
+    assert params == {"limit": 100, "sort": "desc", "from_timestamp": 940_000}
+    assert CoindcxExchange._trade_history_params([]) == {"limit": 100, "sort": "desc"}
+
+
+@pytest.mark.asyncio
+async def test_fill_poll_records_every_trade_of_an_order(monkeypatch):
+    ex = CoindcxExchange(coindcx_api_key="k", coindcx_api_secret="s", trading_pairs=["BTC-USDT"], trading_required=False, domain="")
+    ex._set_current_timestamp(1_640_000_000)
+    order = _tracked_coindcx_order(ex, OrderState.OPEN)
+    order.creation_timestamp = 1_639_999_000
+    requests, updates = [], []
+
+    async def fake_api_post(path_url=None, data=None, is_auth_required: bool = False, **kwargs):
+        requests.append(data)
+        return [{"id": 1, "order_id": "123", "price": 100, "quantity": 0.4, "fee_amount": 0, "timestamp": 1_639_999_100_000},
+                {"id": 2, "order_id": "123", "price": 100, "quantity": 0.6, "fee_amount": 0.1, "timestamp": 1_639_999_200_000},
+                {"id": 3, "order_id": "999", "price": 100, "quantity": 5, "fee_amount": 0, "timestamp": 1_639_999_300_000}]
+
+    monkeypatch.setattr(ex, "_api_post", fake_api_post)
+    monkeypatch.setattr(ex._order_tracker, "process_trade_update", lambda trade_update: updates.append(trade_update))
+
+    await ex._update_order_fills_from_trades()
+
+    assert requests[0]["sort"] == "desc"
+    assert requests[0]["from_timestamp"] == (1_639_999_000 - 60) * 1000
+    assert [u.trade_id for u in updates] == ["1", "2"]
+    assert sum(u.fill_base_amount for u in updates) == Decimal("1.0")
+
+
+@pytest.mark.asyncio
+async def test_all_trade_updates_for_order_asks_for_recent_trades(monkeypatch):
+    ex = CoindcxExchange(coindcx_api_key="k", coindcx_api_secret="s", trading_pairs=["BTC-USDT"], trading_required=False, domain="")
+    order = _tracked_coindcx_order(ex, OrderState.FILLED)
+    order.creation_timestamp = 1_639_999_000
+    requests = []
+
+    async def fake_symbol(trading_pair: str):
+        return "BTCUSDT"
+
+    async def fake_api_post(path_url=None, data=None, is_auth_required: bool = False, **kwargs):
+        requests.append(data)
+        return [{"id": 7, "order_id": "123", "price": 101, "quantity": 1, "fee_amount": 0.05, "timestamp": 1_639_999_100_000},
+                {"id": 8, "order_id": "456", "price": 101, "quantity": 1, "fee_amount": 0, "timestamp": 1_639_999_100_000}]
+
+    monkeypatch.setattr(ex, "exchange_symbol_associated_to_pair", fake_symbol)
+    monkeypatch.setattr(ex, "_api_post", fake_api_post)
+
+    updates = await ex._all_trade_updates_for_order(order)
+
+    assert requests[0] == {"limit": 100, "sort": "desc", "from_timestamp": (1_639_999_000 - 60) * 1000, "symbol": "BTCUSDT"}
+    assert [u.trade_id for u in updates] == ["7"]
+    assert updates[0].fee.flat_fees[0].amount == Decimal("0.05")
 
 
 def test_order_type_mappings():

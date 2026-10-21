@@ -3,11 +3,12 @@ from typing import List, Optional
 
 from pydantic import Field, field_validator
 
-from hummingbot.core.data_type.common import MarketDict, OrderType, PriceType
+from hummingbot.core.data_type.common import MarketDict, OrderType, PositionMode, PriceType
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase, ControllerConfigBase
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair
 from hummingbot.strategy_v2.executors.symmetric_grid_executor.data_types import SymmetricGridExecutorConfig
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction
+from hummingbot.strategy_v2.models.executors import CloseType
 from hummingbot.strategy_v2.models.executors_info import ExecutorInfo
 
 
@@ -16,7 +17,10 @@ class SymmetricGridConfig(ControllerConfigBase):
     Configuration for the Symmetric Grid controller.
 
     Places symmetric buy and sell orders at specified percentage distances from the fair price.
-    When any order fills, the executor automatically re-places it at the same level.
+    Once a level fills it alternates sides: after its buy fills it re-places only its sell, and
+    after its sell fills only its buy.
+
+    On perpetual connectors the grid needs one-way position mode (position_mode, set at start).
 
     Example with USDT-INR on CoinDCX:
         fair_price = mid_price (or set reference_price)
@@ -31,6 +35,7 @@ class SymmetricGridConfig(ControllerConfigBase):
     controller_name: str = "symmetric_grid"
 
     leverage: int = 1
+    position_mode: PositionMode = Field(default=PositionMode.ONEWAY)
 
     connector_name: str = Field(
         default="coindcx",
@@ -65,10 +70,16 @@ class SymmetricGridConfig(ControllerConfigBase):
     stop_loss: Optional[Decimal] = Field(default=None, json_schema_extra={"is_updatable": True})
     time_limit: Optional[int] = Field(default=None, json_schema_extra={"is_updatable": True})
     price_refresh_tolerance: Decimal = Field(
-        default=Decimal("0.0000"),
+        default=Decimal("0.0005"),
         json_schema_extra={"is_updatable": True,
                            "prompt": "Price refresh tolerance as a fraction (e.g. 0.0005 = 0.05%):"}
     )
+
+    # Sizing and pacing, passed straight to the executor
+    min_order_amount_quote: Decimal = Field(default=Decimal("0"))
+    order_frequency: int = Field(default=0)
+    max_orders_per_batch: Optional[int] = Field(default=None)
+    safe_extra_spread: Decimal = Field(default=Decimal("0.0001"))
 
     @field_validator('spreads', mode='before')
     @classmethod
@@ -103,13 +114,25 @@ class SymmetricGridConfig(ControllerConfigBase):
 class SymmetricGrid(ControllerBase):
     """
     Symmetric Grid controller that uses SymmetricGridExecutor to place symmetric buy and sell
-    orders around a fair price. Orders that fill are automatically re-placed.
+    orders around a fair price.
+
+    It keeps one executor running, except after a protective exit (stop loss, time limit, not
+    enough balance, failure): then it stays stopped until it is restarted.
     """
+    HALT_CLOSE_TYPES = {CloseType.STOP_LOSS, CloseType.TIME_LIMIT, CloseType.INSUFFICIENT_BALANCE, CloseType.FAILED}
 
     def __init__(self, config: SymmetricGridConfig, *args, **kwargs):
         super().__init__(config, *args, **kwargs)
         self.config = config
+        self._resumed_at: float = 0
+        self._halt_logged_for: Optional[str] = None
         self.initialize_rate_sources()
+
+    def start(self):
+        # Executors that stopped before this (re)start don't hold the controller back, so
+        # restarting it (manual_kill_switch true, then false) resumes trading after a protective stop.
+        self._resumed_at = self.market_data_provider.time()
+        super().start()
 
     def initialize_rate_sources(self):
         self.market_data_provider.initialize_rate_sources([
@@ -120,8 +143,24 @@ class SymmetricGrid(ControllerBase):
     def active_executors(self) -> List[ExecutorInfo]:
         return [e for e in self.executors_info if e.is_active]
 
+    def protective_stop(self) -> Optional[ExecutorInfo]:
+        """The latest executor that ended on a protective exit since the controller (re)started."""
+        stopped = [e for e in self.executors_info
+                   if e.close_type in self.HALT_CLOSE_TYPES and (e.close_timestamp or 0) >= self._resumed_at]
+        return max(stopped, key=lambda e: e.close_timestamp or 0, default=None)
+
     def determine_executor_actions(self) -> List[ExecutorAction]:
         if len(self.active_executors()) > 0:
+            return []
+
+        stopped = self.protective_stop()
+        if stopped is not None:
+            if stopped.id != self._halt_logged_for:
+                self.logger().warning(
+                    f"Executor {stopped.id} stopped with {stopped.close_type.name}; not starting a new one. "
+                    f"Restart the controller (manual_kill_switch true, then false) to trade again."
+                )
+                self._halt_logged_for = stopped.id
             return []
 
         return [CreateExecutorAction(
@@ -138,6 +177,10 @@ class SymmetricGrid(ControllerBase):
                 time_limit=self.config.time_limit,
                 leverage=self.config.leverage,
                 price_refresh_tolerance=self.config.price_refresh_tolerance,
+                min_order_amount_quote=self.config.min_order_amount_quote,
+                order_frequency=self.config.order_frequency,
+                max_orders_per_batch=self.config.max_orders_per_batch,
+                safe_extra_spread=self.config.safe_extra_spread,
             )
         )]
 
@@ -189,7 +232,13 @@ class SymmetricGrid(ControllerBase):
                 lev_line += " " * (box_width - len(lev_line) + 1) + "|"
                 status.append(lev_line)
 
-        if len(self.active_executors()) == 0:
+        stopped = self.protective_stop() if len(self.active_executors()) == 0 else None
+        if stopped is not None:
+            no_exec = (f"| Stopped: last executor ended with {stopped.close_type.name}. "
+                       f"Restart the controller to trade again")
+            no_exec += " " * (box_width - len(no_exec) + 1) + "|"
+            status.append(no_exec)
+        elif len(self.active_executors()) == 0:
             no_exec = "| No active executor - will create on next tick"
             no_exec += " " * (box_width - len(no_exec) + 1) + "|"
             status.append(no_exec)

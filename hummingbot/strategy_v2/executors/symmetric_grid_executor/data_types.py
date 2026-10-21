@@ -19,7 +19,11 @@ class SymmetricGridExecutorConfig(ExecutorConfigBase):
     Configuration for the Symmetric Grid Executor.
 
     Places symmetric buy and sell orders at specified percentage distances from a fair price.
-    When any order fills, it is automatically re-placed at the same price level.
+    Once a level fills it alternates sides: after its buy fills it re-places only its sell, and
+    after its sell fills only its buy.
+
+    min_order_amount_quote is an extra floor on top of the exchange's own minimum notional; the
+    default of 0 leaves only the exchange's minimum.
     """
     type: Literal["symmetric_grid_executor"] = "symmetric_grid_executor"
     connector_name: str
@@ -34,7 +38,7 @@ class SymmetricGridExecutorConfig(ExecutorConfigBase):
     order_frequency: int = 0
     max_orders_per_batch: Optional[int] = None
     safe_extra_spread: Decimal = Decimal("0.0001")
-    min_order_amount_quote: Decimal = Decimal("100")
+    min_order_amount_quote: Decimal = Decimal("0")
     price_refresh_tolerance: Decimal = Decimal("0.0005")
 
     stop_loss: Optional[Decimal] = None
@@ -70,8 +74,8 @@ class SymmetricGridLevel(BaseModel):
     Represents a single grid level with independent buy and sell orders.
 
     Each level is defined by a spread percentage from the fair price and an order amount.
-    When a buy fills, a sell is placed at that level (and vice versa), creating a grid
-    that alternates sides on each fill.
+    Once a level fills it alternates sides: after its buy fills it waits for its sell to fill
+    before buying again (and vice versa), so it never holds more than one order's inventory.
 
     pending_side tracks which side to place next:
       - "both" → place both buy and sell (initial state, if sufficient balance on both sides)

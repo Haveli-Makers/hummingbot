@@ -13,6 +13,7 @@ WSS_URL = None
 
 INTERVALS = bidict({
     "1m": "1m",
+    "3m": "3m",
     "5m": "5m",
     "15m": "15m",
     "30m": "30m",
@@ -26,6 +27,8 @@ INTERVALS = bidict({
     "1w": "1w",
     "1M": "1M",
 })
+
+NATIVE_INTERVALS = ["1d", "1h", "15m", "1m"]
 
 MAX_RESULTS_PER_CANDLESTICK_REST_REQUEST = 1000
 

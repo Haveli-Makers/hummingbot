@@ -1,4 +1,4 @@
-
+import asyncio
 import json
 import re
 from decimal import Decimal
@@ -13,7 +13,7 @@ from hummingbot.connector.exchange.coindcx.coindcx_exchange import CoindcxExchan
 from hummingbot.connector.test_support.exchange_connector_test import AbstractExchangeConnectorTests
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, TradeType
-from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, TradeUpdate
 from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TokenAmount, TradeFeeBase
 
 
@@ -768,6 +768,75 @@ async def test_all_trade_updates_for_order_asks_for_recent_trades(monkeypatch):
     assert requests[0] == {"limit": 100, "sort": "desc", "from_timestamp": (1_639_999_000 - 60) * 1000, "symbol": "BTCUSDT"}
     assert [u.trade_id for u in updates] == ["7"]
     assert updates[0].fee.flat_fees[0].amount == Decimal("0.05")
+
+
+def _trade(trade_id: str, amount: str) -> TradeUpdate:
+    return TradeUpdate(trade_id=trade_id, client_order_id="cid1", exchange_order_id="123", trading_pair="BTC-USDT",
+                       fill_timestamp=1_640_000_000, fill_price=Decimal("100"), fill_base_amount=Decimal(amount),
+                       fill_quote_amount=Decimal(amount) * 100, fee=DeductedFromReturnsTradeFee(flat_fees=[]))
+
+
+async def _drain():
+    for _ in range(20):
+        await asyncio.sleep(0)
+
+
+def _exchange_with_trades(monkeypatch, responses):
+    """An exchange whose order-trade lookups return each list in `responses` in turn."""
+    ex = CoindcxExchange(coindcx_api_key="k", coindcx_api_secret="s", trading_pairs=["BTC-USDT"], trading_required=False, domain="")
+    calls = []
+
+    async def fake_trades(order):
+        calls.append(order.client_order_id)
+        return responses[min(len(calls), len(responses)) - 1]
+
+    monkeypatch.setattr(ex, "_all_trade_updates_for_order", fake_trades)
+    monkeypatch.setattr(ex, "FILL_FETCH_RETRY_DELAY", 0)
+    monkeypatch.setattr(ex._order_tracker, "process_order_update", lambda order_update: None)
+    return ex, calls
+
+
+@pytest.mark.asyncio
+async def test_filled_update_fetches_the_orders_trades_at_once(monkeypatch):
+    ex, calls = _exchange_with_trades(monkeypatch, [[_trade("t1", "0.4"), _trade("t2", "0.6")]])
+    order = _tracked_coindcx_order(ex, OrderState.OPEN)
+
+    await ex._process_order_update({"client_order_id": "cid1", "id": "123", "status": "filled", "updated_at": 1640000000000})
+    await _drain()
+
+    assert calls == ["cid1"]
+    assert order.executed_amount_base == Decimal("1")
+
+
+@pytest.mark.asyncio
+async def test_filled_update_retries_until_the_trades_appear(monkeypatch):
+    ex, calls = _exchange_with_trades(monkeypatch, [[], [_trade("t1", "1")]])
+    order = _tracked_coindcx_order(ex, OrderState.OPEN)
+
+    await ex._process_order_update({"client_order_id": "cid1", "id": "123", "status": "filled", "updated_at": 1640000000000})
+    await _drain()
+
+    assert calls == ["cid1", "cid1"]
+    assert order.executed_amount_base == Decimal("1")
+
+
+@pytest.mark.asyncio
+async def test_partial_fill_and_partial_cancel_fetch_once_and_open_fetches_nothing(monkeypatch):
+    ex, calls = _exchange_with_trades(monkeypatch, [[_trade("t1", "0.3")]])
+    order = _tracked_coindcx_order(ex, OrderState.OPEN)
+
+    await ex._process_order_update({"client_order_id": "cid1", "id": "123", "status": "open", "updated_at": 1640000000000})
+    await _drain()
+    assert calls == []
+
+    await ex._process_order_update({"client_order_id": "cid1", "id": "123", "status": "partially_filled", "updated_at": 1640000001000})
+    await _drain()
+    assert calls == ["cid1"]
+    assert order.executed_amount_base == Decimal("0.3")
+
+    await ex._process_order_update({"client_order_id": "cid1", "id": "123", "status": "partially_cancelled", "updated_at": 1640000002000})
+    await _drain()
+    assert calls == ["cid1", "cid1"]
 
 
 def test_order_type_mappings():

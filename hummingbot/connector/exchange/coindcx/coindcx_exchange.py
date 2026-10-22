@@ -22,6 +22,7 @@ from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState,
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
+from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
 
@@ -32,6 +33,10 @@ class CoindcxExchange(ExchangePyBase):
     """
 
     UPDATE_ORDER_STATUS_MIN_INTERVAL = 10.0
+    # Order statuses that mean trades exist to fetch (see _fetch_order_fills)
+    FILL_STATUSES = ("partially_filled", "filled", "partially_cancelled")
+    FILL_FETCH_ATTEMPTS = 3
+    FILL_FETCH_RETRY_DELAY = 1.0
 
     web_utils = web_utils
 
@@ -627,7 +632,26 @@ class CoindcxExchange(ExchangePyBase):
                 client_order_id=client_order_id,
                 exchange_order_id=exchange_order_id,
             )
+            if status in self.FILL_STATUSES:
+                safe_ensure_future(self._fetch_order_fills(tracked_order, wait_for_full_fill=status == "filled"))
             self._order_tracker.process_order_update(order_update=order_update)
+
+    async def _fetch_order_fills(self, order: InFlightOrder, wait_for_full_fill: bool):
+        """
+        Fetch an order's trades as soon as CoinDCX reports it (partly) filled.
+
+        The user stream reports the status but its trades never arrive, and the REST trade poll only
+        runs every couple of minutes while the stream is up. The order tracker waits just a few
+        seconds for fills, and forgets a finished order 30 s later, so fetch them now. A filled order
+        is retried briefly in case the venue has not written all its trades yet.
+        """
+        for attempt in range(self.FILL_FETCH_ATTEMPTS):
+            if attempt:
+                await self._sleep(self.FILL_FETCH_RETRY_DELAY)
+            for trade_update in await self._all_trade_updates_for_order(order):
+                self._order_tracker.process_trade_update(trade_update)
+            if not wait_for_full_fill or order.executed_amount_base >= order.amount:
+                return
 
     async def _process_trade_update(self, trade_data: Dict[str, Any]):
         """

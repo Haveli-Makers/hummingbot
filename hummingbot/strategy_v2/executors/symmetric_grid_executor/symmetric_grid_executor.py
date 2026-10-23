@@ -69,7 +69,6 @@ class SymmetricGridExecutor(ExecutorBase):
         self._filled_orders: List[dict] = []
         self._failed_orders: List[str] = []
         self._canceled_orders: List[str] = []
-        self._close_order: Optional[TrackedOrder] = None
 
         self._filled_orders_processed_idx = 0
         self._buy_amount_quote_sum = Decimal("0")
@@ -91,6 +90,7 @@ class SymmetricGridExecutor(ExecutorBase):
         # amount rounded down to the step); sell what there is when it is at least this share.
         self._base_shortfall_tolerance = Decimal("0.98")
         self._last_position_mode_warning_ts: float = 0
+        self._sell_skip_logged: set = set()  # level ids whose "Skipping sell" was already logged
 
         self.total_buy_quote = Decimal("0")
         self.total_sell_quote = Decimal("0")
@@ -193,7 +193,11 @@ class SymmetricGridExecutor(ExecutorBase):
         adjusted_buy = self.adjust_order_candidates(self.config.connector_name, [buy_candidate])
         if adjusted_buy[0].amount == Decimal("0"):
             self.close_type = CloseType.INSUFFICIENT_BALANCE
-            self.logger().error("Not enough quote balance to open buy positions.")
+            quote_asset = self.config.trading_pair.split("-")[1]
+            message = (f"SymGrid {self.config.trading_pair}: not enough {quote_asset} to place the buy levels "
+                       f"(need ~{total_amount_quote} {quote_asset}). Executor stopped.")
+            self.logger().error(message)
+            self._strategy.notify_hb_app_with_timestamp(message)
             self.stop()
             return
 
@@ -612,10 +616,14 @@ class SymmetricGridExecutor(ExecutorBase):
                 if effective_available > 0 and effective_available >= amount_base * self._base_shortfall_tolerance:
                     amount_base = effective_available
                 else:
-                    self.logger().info(
-                        f"SymGrid: Skipping sell {level.id} — effective available base "
-                        f"{effective_available:.4f} < needed {amount_base:.4f} {base_asset}"
-                    )
+                    # Logged once per level until its sell goes out; this check runs every tick.
+                    if level.id not in self._sell_skip_logged:
+                        self.logger().info(
+                            f"SymGrid: Skipping sell {level.id} — effective available base "
+                            f"{effective_available:.4f} < needed {amount_base:.4f} {base_asset}. "
+                            f"Waiting for {base_asset}; not logged again until this sell is placed."
+                        )
+                        self._sell_skip_logged.add(level.id)
                     return False
 
         best_ask = self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.BestAsk)
@@ -664,6 +672,7 @@ class SymmetricGridExecutor(ExecutorBase):
         )
         level.sell_order = TrackedOrder(order_id=order_id)
         self._sell_base_pending[order_id] = order_candidate.amount
+        self._sell_skip_logged.discard(level.id)
         self.logger().info(
             f"[#{self._seq()}] SELL {level.id} | price={order_candidate.price:.4f} | "
             f"qty={order_candidate.amount:.4f} | fair={self.fair_price:.4f} | spread={float(level.spread_pct) * 100:.2f}%"
@@ -713,6 +722,11 @@ class SymmetricGridExecutor(ExecutorBase):
 
     def early_stop(self, keep_position: bool = False):
         """Stop the executor early, canceling all open orders."""
+        if self.status == RunnableStatus.TERMINATED:
+            # The kill switch stops every executor of the controller, finished ones included. Moving a
+            # finished one back to SHUTTING_DOWN leaves it stuck there (nothing runs its shutdown) and,
+            # since is_active counts SHUTTING_DOWN, the controller would never start a new executor.
+            return
         self.cancel_all_orders()
         self._status = RunnableStatus.SHUTTING_DOWN
         self.close_type = CloseType.EARLY_STOP
@@ -897,8 +911,9 @@ class SymmetricGridExecutor(ExecutorBase):
 
     async def on_start(self):
         """Start the executor, validate balance, and check barriers."""
-        await super().on_start()
-        await self.validate_sufficient_balance()
+        await super().on_start()  # runs validate_sufficient_balance()
+        if self.status == RunnableStatus.TERMINATED:
+            return  # not enough balance: stay stopped rather than flipping to SHUTTING_DOWN below
         self.update_metrics()
         if self.check_barriers():
             self.logger().error(f"SymGrid executor already expired by {self.close_type}.")
@@ -921,8 +936,6 @@ class SymmetricGridExecutor(ExecutorBase):
                     level.buy_order.order = in_flight_order
                 if level.sell_order and level.sell_order.order_id == order_id:
                     level.sell_order.order = in_flight_order
-            if self._close_order and self._close_order.order_id == order_id:
-                self._close_order.order = in_flight_order
 
     def process_order_created_event(self, _, market, event: Union[BuyOrderCreatedEvent, SellOrderCreatedEvent]):
         self.update_tracked_orders_with_order_id(event.order_id)
@@ -949,10 +962,6 @@ class SymmetricGridExecutor(ExecutorBase):
             if level.sell_order and event.order_id == level.sell_order.order_id:
                 self._release_cancelled(level, level.sell_order)
                 level.reset_sell_order()
-
-        if self._close_order and event.order_id == self._close_order.order_id:
-            self._canceled_orders.append(self._close_order.order_id)
-            self._close_order = None
 
         self._advance_refresh()
 
@@ -1056,10 +1065,6 @@ class SymmetricGridExecutor(ExecutorBase):
                         f"Will retry in {self._insufficient_funds_cooldown:.0f}s."
                     )
                 level.reset_sell_order()
-        if self._close_order and event.order_id == self._close_order.order_id:
-            self._failed_orders.append(self._close_order.order_id)
-            self._close_order = None
-
         self._advance_refresh()
 
     async def _sleep(self, delay: float):

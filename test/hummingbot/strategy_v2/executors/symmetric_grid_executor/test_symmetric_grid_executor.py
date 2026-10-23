@@ -832,7 +832,7 @@ class TestSymmetricGridExecutorConfig(IsolatedAsyncioWrapperTestCase):
 
 
 class TestSymmetricGridReviewFixes(IsolatedAsyncioWrapperTestCase):
-    """Regression tests for the PR #18 review fixes (issue numbers refer to the review)."""
+    """Regression tests for PnL, refresh, fill handling, sizing and perpetual behaviour."""
 
     RULE = TradingRule(trading_pair="ETH-USDT", min_notional_size=Decimal("1"))
 
@@ -890,7 +890,7 @@ class TestSymmetricGridReviewFixes(IsolatedAsyncioWrapperTestCase):
     def _cancel(self, executor, order_id):
         executor.process_order_canceled_event(None, MagicMock(), OrderCancelledEvent(self.now, order_id))
 
-    # #1 ── PnL counts held inventory at mid, not as a realised loss
+    # PnL counts held inventory at mid, not as a realised loss
     def test_first_buy_fill_without_price_move_is_flat_and_does_not_stop(self):
         executor = self._executor(stop_loss=Decimal("0.05"))
         executor._filled_orders = [{"trade_type": "BUY", "executed_amount_base": "5",
@@ -909,7 +909,7 @@ class TestSymmetricGridReviewFixes(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(Decimal("-50"), executor.get_net_pnl_quote())
         self.assertEqual(Decimal("-0.1"), executor.get_net_pnl_pct())
 
-    # #2 ── a refresh-cancel timeout re-sends the cancel and keeps the order tracked
+    # a refresh-cancel timeout re-sends the cancel and keeps the order tracked
     def test_refresh_timeout_keeps_unconfirmed_order_and_resends_cancel(self):
         executor = self._executor()
         executor.manage_orders()
@@ -922,7 +922,7 @@ class TestSymmetricGridReviewFixes(IsolatedAsyncioWrapperTestCase):
         self.assertGreater(self.strategy.cancel.call_count, cancels_sent)
         self.assertIn(0, executor._refresh_pending_levels)
 
-    # #2 ── a fill that arrives after a confirmed cancel is still counted, for a while
+    # a fill that arrives after a confirmed cancel is still counted, for a while
     def test_late_fill_after_confirmed_cancel_is_counted(self):
         executor = self._executor()
         executor.manage_orders()
@@ -940,7 +940,7 @@ class TestSymmetricGridReviewFixes(IsolatedAsyncioWrapperTestCase):
         executor.process_order_filled_event(None, MagicMock(), fill)
         self.assertEqual(1, len(executor._filled_orders))
 
-    # #3 ── a fill that races a refresh cancel is recorded, not overwritten
+    # a fill that races a refresh cancel is recorded, not overwritten
     def test_fill_racing_refresh_cancel_is_recorded(self):
         executor = self._executor()
         executor.manage_orders()
@@ -956,7 +956,7 @@ class TestSymmetricGridReviewFixes(IsolatedAsyncioWrapperTestCase):
         self.assertIsNone(level.buy_order)
         self.assertIsNotNone(level.sell_order)
 
-    # #4 ── the filled part of a cancelled order is recorded
+    # the filled part of a cancelled order is recorded
     def test_partial_fill_is_recorded_when_order_is_cancelled(self):
         executor = self._executor()
         executor.manage_orders()
@@ -968,7 +968,7 @@ class TestSymmetricGridReviewFixes(IsolatedAsyncioWrapperTestCase):
         executor.update_realized_pnl_metrics()
         self.assertEqual(Decimal("3"), executor.net_inventory_base)
 
-    # #6 ── a refresh completes when a pending order fills instead of cancelling
+    # a refresh completes when a pending order fills instead of cancelling
     async def test_refresh_completes_when_pending_order_fills(self):
         executor = self._executor()
         executor.manage_orders()
@@ -983,7 +983,7 @@ class TestSymmetricGridReviewFixes(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(set(), executor._refresh_pending_levels)
         self.assertIsNotNone(level.sell_order)
 
-    # #6 ── each level is re-placed as soon as its own cancels confirm
+    # each level is re-placed as soon as its own cancels confirm
     def test_refresh_replaces_each_level_as_soon_as_it_is_empty(self):
         executor = self._executor(spread_percentages=[Decimal("0.01"), Decimal("0.02")],
                                   order_amounts_quote=[Decimal("500"), Decimal("500")])
@@ -998,7 +998,7 @@ class TestSymmetricGridReviewFixes(IsolatedAsyncioWrapperTestCase):
         self.assertNotEqual(old_sell, l0.sell_order.order_id)
         self.assertEqual({1}, executor._refresh_pending_levels)
 
-    # #8 ── after a buy fills, the level waits for its sell instead of buying again
+    # after a buy fills, the level waits for its sell instead of buying again
     def test_level_does_not_buy_again_until_its_sell_fills(self):
         executor = self._executor()
         executor.manage_orders()
@@ -1011,7 +1011,7 @@ class TestSymmetricGridReviewFixes(IsolatedAsyncioWrapperTestCase):
         self.assertIsNone(level.buy_order)
         self.assertIsNotNone(level.sell_order)
 
-    # #8 ── with a fixed fair price, a level that is through the market waits instead of chasing
+    # with a fixed fair price, a level that is through the market waits instead of chasing
     def test_fixed_fair_price_does_not_chase_the_best_bid(self):
         self.price_mock.return_value = Decimal("98")  # market fell below the 99 buy level
         executor = self._executor(fair_price=Decimal("100"))
@@ -1025,7 +1025,7 @@ class TestSymmetricGridReviewFixes(IsolatedAsyncioWrapperTestCase):
         executor.manage_orders()
         self.assertIsNotNone(executor.grid_levels[0].buy_order)
 
-    # #9 ── perpetuals: sells need margin, not base; one-way mode only
+    # perpetuals: sells need margin, not base; one-way mode only
     def test_perpetual_sells_placed_without_base_balance_in_oneway_mode(self):
         self.connector.position_mode = PositionMode.ONEWAY
         with patch.object(SymmetricGridExecutor, "is_perpetual", new_callable=PropertyMock, return_value=True), \
@@ -1043,7 +1043,7 @@ class TestSymmetricGridReviewFixes(IsolatedAsyncioWrapperTestCase):
         self.assertIsNone(executor.grid_levels[0].buy_order)
         self.assertIsNone(executor.grid_levels[0].sell_order)
 
-    # #10 ── late fill data falls back to the order's own size and price
+    # late fill data falls back to the order's own size and price
     def test_fill_fallback_uses_the_orders_own_price_and_amount(self):
         executor = self._executor()
         executor.manage_orders()
@@ -1055,7 +1055,7 @@ class TestSymmetricGridReviewFixes(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(Decimal("2"), Decimal(executor._filled_orders[-1]["executed_amount_base"]))
         self.assertEqual(Decimal("190"), Decimal(executor._filled_orders[-1]["executed_amount_quote"]))
 
-    # #11 ── a refresh no longer wipes pending-sell reservations of other levels
+    # a refresh no longer wipes pending-sell reservations of other levels
     def test_refresh_keeps_other_levels_pending_sell_reservations(self):
         executor = self._executor(spread_percentages=[Decimal("0.01"), Decimal("0.02")],
                                   order_amounts_quote=[Decimal("500"), Decimal("500")])
@@ -1067,7 +1067,7 @@ class TestSymmetricGridReviewFixes(IsolatedAsyncioWrapperTestCase):
         self._cancel(executor, l0.sell_order.order_id)
         self.assertEqual(reserved, executor._sell_base_pending.get(l1.sell_order.order_id))
 
-    # #13 ── a small base shortfall after our own buy still lets the sell go out
+    # a small base shortfall after our own buy still lets the sell go out
     def test_sell_uses_available_base_when_slightly_short(self):
         received_base = Decimal("1.08") * Decimal("0.999")  # 110 INR @ ~101.2, 0.01 step, 0.1% fee in base
         with patch.object(SymmetricGridExecutor, "get_available_balance", return_value=received_base):
@@ -1083,15 +1083,82 @@ class TestSymmetricGridReviewFixes(IsolatedAsyncioWrapperTestCase):
             executor.manage_orders()
         self.assertIsNone(executor.grid_levels[0].sell_order)
 
-    # #14 ── no hidden 100-quote floor; the exchange minimum still applies
+    # no hidden 100-quote floor; the exchange minimum still applies
     def test_min_order_amount_quote_defaults_to_zero(self):
         executor = self._executor(order_amounts_quote=[Decimal("20")])
         executor.manage_orders()
         self.assertIsNotNone(executor.grid_levels[0].buy_order)
 
+    # a zero or negative fixed fair price is rejected up front
+    def test_non_positive_fair_price_is_rejected(self):
+        for value in ("0", "-1"):
+            with self.assertRaises(ValueError):
+                self._executor(fair_price=Decimal(value))
+
+    # balance validated once; a short balance keeps the executor stopped
+    async def test_on_start_validates_once_and_stays_stopped_when_balance_is_short(self):
+        executor = self._executor(time_limit=60)
+        executor._status = RunnableStatus.NOT_STARTED
+        self.now += 120  # the time limit has also passed
+
+        async def short_balance():
+            executor.close_type = CloseType.INSUFFICIENT_BALANCE
+            executor.stop()
+
+        with patch.object(SymmetricGridExecutor, "validate_sufficient_balance", side_effect=short_balance) as validate:
+            await executor.on_start()
+        self.assertEqual(1, validate.call_count)
+        self.assertEqual(RunnableStatus.TERMINATED, executor.status)
+        self.assertEqual(CloseType.INSUFFICIENT_BALANCE, executor.close_type)
+
+    # "Skipping sell" is logged once per level until that sell is placed
+    def test_skipping_sell_is_logged_once_until_the_sell_is_placed(self):
+        logger = MagicMock()
+        with patch.object(SymmetricGridExecutor, "logger", return_value=logger), \
+                patch.object(SymmetricGridExecutor, "get_available_balance", return_value=Decimal("0")) as balance:
+            executor = self._executor()
+
+            def skips():
+                return [c for c in logger.info.call_args_list if "Skipping sell" in str(c)]
+
+            for _ in range(3):
+                executor.manage_orders()
+            self.assertEqual(1, len(skips()))
+
+            balance.return_value = Decimal("10000")
+            executor.manage_orders()
+            self.assertIsNotNone(executor.grid_levels[0].sell_order)
+
+            executor.grid_levels[0].sell_order = None  # e.g. cancelled, and the balance is short again
+            balance.return_value = Decimal("0")
+            executor.manage_orders()
+            self.assertEqual(2, len(skips()))
+
+    # not enough balance to start is also shown in the bot
+    async def test_insufficient_balance_notifies_the_app(self):
+        zero = MagicMock()
+        zero.amount = Decimal("0")
+        with patch.object(SymmetricGridExecutor, "adjust_order_candidates", return_value=[zero]):
+            executor = self._executor()
+            await executor.validate_sufficient_balance()
+        self.assertEqual(CloseType.INSUFFICIENT_BALANCE, executor.close_type)
+        self.strategy.notify_hb_app_with_timestamp.assert_called_once()
+        self.assertIn("not enough USDT", self.strategy.notify_hb_app_with_timestamp.call_args[0][0])
+
+    def test_early_stop_leaves_a_finished_executor_alone(self):
+        executor = self._executor()
+        executor.close_type = CloseType.INSUFFICIENT_BALANCE
+        executor.stop()
+
+        executor.early_stop()  # what the kill switch sends to every executor of the controller
+
+        self.assertEqual(RunnableStatus.TERMINATED, executor.status)
+        self.assertEqual(CloseType.INSUFFICIENT_BALANCE, executor.close_type)
+        self.assertFalse(executor.is_active)
+
 
 class TestSymmetricGridController(IsolatedAsyncioWrapperTestCase):
-    """Controller behaviour from the PR #18 review: #5, #7, #9, #14."""
+    """Controller defaults, halting after a protective stop, config validation and status text."""
 
     def setUp(self) -> None:
         super().setUp()
@@ -1140,3 +1207,26 @@ class TestSymmetricGridController(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(3, executor_config.max_orders_per_batch)
         self.assertEqual(Decimal("0.0002"), executor_config.safe_extra_spread)
         self.assertEqual(Decimal("0.0005"), executor_config.price_refresh_tolerance)
+
+    # the controller config rejects a zero or negative reference price at load
+    def test_non_positive_reference_price_is_rejected(self):
+        for value in ("0", "-5"):
+            with self.assertRaises(ValueError):
+                SymmetricGridConfig(id="c", reference_price=Decimal(value))
+        self.assertEqual(Decimal("100"), SymmetricGridConfig(id="c", reference_price=Decimal("100")).reference_price)
+        self.assertIsNone(SymmetricGridConfig(id="c").reference_price)
+
+    # after the kill switch, status says the controller is stopped
+    def test_status_says_stopped_after_the_kill_switch(self):
+        self.mdp.get_price_by_type.return_value = Decimal("100")
+        controller = SymmetricGrid(SymmetricGridConfig(id="c3", manual_kill_switch=True),
+                                   market_data_provider=self.mdp, actions_queue=MagicMock())
+        controller.executors_info = [self._stopped(CloseType.EARLY_STOP)]
+        text = "\n".join(controller.to_format_status())
+        self.assertIn("Controller stopped (manual kill switch)", text)
+        self.assertNotIn("will create on next tick", text)
+
+    def test_status_without_kill_switch_still_says_it_will_create(self):
+        self.mdp.get_price_by_type.return_value = Decimal("100")
+        text = "\n".join(self.controller.to_format_status())
+        self.assertIn("will create on next tick", text)

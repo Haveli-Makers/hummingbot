@@ -59,6 +59,8 @@ class SymmetricGridExecutorConfig(ExecutorConfigBase):
             raise ValueError("All order_amounts_quote must be positive")
         if not self.spread_percentages:
             raise ValueError("spread_percentages must not be empty")
+        if self.fair_price is not None and self.fair_price <= 0:
+            raise ValueError("fair_price must be positive (leave it unset to follow the mid price)")
         return self
 
 

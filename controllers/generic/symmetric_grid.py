@@ -7,6 +7,7 @@ from hummingbot.core.data_type.common import MarketDict, OrderType, PositionMode
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase, ControllerConfigBase
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair
 from hummingbot.strategy_v2.executors.symmetric_grid_executor.data_types import SymmetricGridExecutorConfig
+from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction
 from hummingbot.strategy_v2.models.executors import CloseType
 from hummingbot.strategy_v2.models.executors_info import ExecutorInfo
@@ -80,6 +81,13 @@ class SymmetricGridConfig(ControllerConfigBase):
     order_frequency: int = Field(default=0)
     max_orders_per_batch: Optional[int] = Field(default=None)
     safe_extra_spread: Decimal = Field(default=Decimal("0.0001"))
+
+    @field_validator('reference_price')
+    @classmethod
+    def validate_reference_price(cls, v):
+        if v is not None and v <= 0:
+            raise ValueError("reference_price must be positive (leave it blank to follow the mid price)")
+        return v
 
     @field_validator('spreads', mode='before')
     @classmethod
@@ -233,7 +241,13 @@ class SymmetricGrid(ControllerBase):
                 status.append(lev_line)
 
         stopped = self.protective_stop() if len(self.active_executors()) == 0 else None
-        if stopped is not None:
+        if len(self.active_executors()) == 0 and (self.config.manual_kill_switch
+                                                  or self.status == RunnableStatus.TERMINATED):
+            no_exec = ("| Controller stopped (manual kill switch) - no new executor will be created. "
+                       "Set manual_kill_switch: false to restart")
+            no_exec += " " * (box_width - len(no_exec) + 1) + "|"
+            status.append(no_exec)
+        elif stopped is not None:
             no_exec = (f"| Stopped: last executor ended with {stopped.close_type.name}. "
                        f"Restart the controller to trade again")
             no_exec += " " * (box_width - len(no_exec) + 1) + "|"

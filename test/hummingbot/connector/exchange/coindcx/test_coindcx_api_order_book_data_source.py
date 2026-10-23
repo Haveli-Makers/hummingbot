@@ -518,7 +518,7 @@ class TestSocketIOMessageUnwrapping(IsolatedAsyncioWrapperTestCase):
 
 class TestMultiPairSymbolResolution(IsolatedAsyncioWrapperTestCase):
     """With several pairs there is no single-pair symbol override, so CoinDCX's pair-format symbols
-    ("I-BTC_USDT") must be normalised before the symbol-map lookup (review #12)."""
+    ("I-BTC_USDT") must be normalised before the symbol-map lookup."""
 
     async def asyncSetUp(self) -> None:
         await super().asyncSetUp()

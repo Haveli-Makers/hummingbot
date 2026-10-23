@@ -1,6 +1,5 @@
 import asyncio
 import json
-import logging
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -16,9 +15,6 @@ from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFa
 
 if TYPE_CHECKING:
     from hummingbot.connector.exchange.coindcx.coindcx_exchange import CoinDCXExchange
-
-
-logger = logging.getLogger(__name__)
 
 
 class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):

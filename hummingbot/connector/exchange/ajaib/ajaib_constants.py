@@ -60,6 +60,12 @@ BOOK_TICKER_PATH_URL = "/v1/ticker/book-ticker"
 # "Maximum symbols that can be fetched is 50." The value is a JSON array string,
 # e.g. symbols=["BTC_IDR","ETH_IDR"] (a comma-separated list also works).
 BOOK_TICKER_MAX_SYMBOLS = 50
+# The Open API has no 24h ticker, so 24h volume is summed from klines. 15m
+# candles over 24h is 96 (97 when the window straddles a boundary); the API max
+# is 1000.
+VOLUME_WINDOW_MS = 24 * 60 * 60 * 1000
+VOLUME_KLINE_INTERVAL = "15m"
+VOLUME_KLINE_LIMIT = 100
 
 # ---- Spot trading endpoints --------------------------------------------------
 CREATE_ORDER_PATH_URL = "/v1/order"

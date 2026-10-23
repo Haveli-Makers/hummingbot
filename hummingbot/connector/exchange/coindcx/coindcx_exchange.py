@@ -18,10 +18,11 @@ from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
 from hummingbot.core.data_type.common import OrderType, TradeType
-from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate, TradeUpdate
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
+from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
 
@@ -32,6 +33,10 @@ class CoindcxExchange(ExchangePyBase):
     """
 
     UPDATE_ORDER_STATUS_MIN_INTERVAL = 10.0
+    # Order statuses that mean trades exist to fetch (see _fetch_order_fills)
+    FILL_STATUSES = ("partially_filled", "filled", "partially_cancelled")
+    FILL_FETCH_ATTEMPTS = 3
+    FILL_FETCH_RETRY_DELAY = 1.0
 
     web_utils = web_utils
 
@@ -590,6 +595,21 @@ class CoindcxExchange(ExchangePyBase):
                 self.logger().error("Unexpected error in user stream listener loop.", exc_info=True)
                 await self._sleep(5.0)
 
+    @staticmethod
+    def _order_state_from_status(status: str, tracked_order: InFlightOrder) -> OrderState:
+        """
+        Maps a CoinDCX order status to an OrderState, never moving an order back to PENDING_CREATE.
+
+        The user stream can deliver an "init" update after the create request has already marked
+        the order OPEN. Accepting it puts the order back in PENDING_CREATE, and the "open" update
+        that follows fires a second order-created event (the markets recorder then fails with a
+        duplicate Order.id).
+        """
+        new_state = CONSTANTS.ORDER_STATE.get(status, tracked_order.current_state)
+        if new_state == OrderState.PENDING_CREATE and tracked_order.current_state != OrderState.PENDING_CREATE:
+            return tracked_order.current_state
+        return new_state
+
     async def _process_order_update(self, order_data: Dict[str, Any]):
         """
         Processes an order update message from the user stream.
@@ -603,7 +623,7 @@ class CoindcxExchange(ExchangePyBase):
         tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
         if tracked_order is not None:
             status = order_data.get("status", "")
-            new_state = CONSTANTS.ORDER_STATE.get(status, tracked_order.current_state)
+            new_state = self._order_state_from_status(status, tracked_order)
 
             order_update = OrderUpdate(
                 trading_pair=tracked_order.trading_pair,
@@ -612,7 +632,26 @@ class CoindcxExchange(ExchangePyBase):
                 client_order_id=client_order_id,
                 exchange_order_id=exchange_order_id,
             )
+            if status in self.FILL_STATUSES:
+                safe_ensure_future(self._fetch_order_fills(tracked_order, wait_for_full_fill=status == "filled"))
             self._order_tracker.process_order_update(order_update=order_update)
+
+    async def _fetch_order_fills(self, order: InFlightOrder, wait_for_full_fill: bool):
+        """
+        Fetch an order's trades as soon as CoinDCX reports it (partly) filled.
+
+        The user stream reports the status but its trades never arrive, and the REST trade poll only
+        runs every couple of minutes while the stream is up. The order tracker waits just a few
+        seconds for fills, and forgets a finished order 30 s later, so fetch them now. A filled order
+        is retried briefly in case the venue has not written all its trades yet.
+        """
+        for attempt in range(self.FILL_FETCH_ATTEMPTS):
+            if attempt:
+                await self._sleep(self.FILL_FETCH_RETRY_DELAY)
+            for trade_update in await self._all_trade_updates_for_order(order):
+                self._order_tracker.process_trade_update(trade_update)
+            if not wait_for_full_fill or order.executed_amount_base >= order.amount:
+                return
 
     async def _process_trade_update(self, trade_data: Dict[str, Any]):
         """
@@ -685,50 +724,63 @@ class CoindcxExchange(ExchangePyBase):
             self._last_trades_poll_coindcx_timestamp = self._time_synchronizer.time()
 
             try:
-                trade_history_params = {
-                    "limit": 100
-                }
-
+                fillable_orders = list(self._order_tracker.all_fillable_orders.values())
                 trades = await self._api_post(
                     path_url=CONSTANTS.TRADE_HISTORY_ACCOUNT_PATH_URL,
-                    data=trade_history_params,
+                    data=self._trade_history_params(fillable_orders),
                     is_auth_required=True
                 )
 
                 if trades:
-                    trades_by_order_id = {}
+                    # An order can fill in several trades; keep every one of them.
+                    trades_by_order_id: Dict[str, List[Dict[str, Any]]] = {}
                     for trade in trades:
-                        order_id = str(trade.get("order_id", ""))
-                        trades_by_order_id[order_id] = trade
+                        trades_by_order_id.setdefault(str(trade.get("order_id", "")), []).append(trade)
 
-                    for tracked_order in self._order_tracker.all_fillable_orders.values():
-                        if tracked_order.exchange_order_id in trades_by_order_id:
-                            trade = trades_by_order_id[tracked_order.exchange_order_id]
-                            fee_amount = Decimal(str(trade.get("fee_amount", 0)))
-                            trading_pair = tracked_order.trading_pair
-                            base, quote = trading_pair.split("-")
-
-                            fee = TradeFeeBase.new_spot_fee(
-                                fee_schema=self.trade_fee_schema(),
-                                trade_type=tracked_order.trade_type,
-                                flat_fees=[TokenAmount(amount=fee_amount, token=quote)]
-                            )
-
-                            trade_update = TradeUpdate(
-                                trade_id=str(trade.get("id", "")),
-                                client_order_id=tracked_order.client_order_id,
-                                exchange_order_id=tracked_order.exchange_order_id,
-                                trading_pair=trading_pair,
-                                fee=fee,
-                                fill_base_amount=Decimal(str(trade.get("quantity", 0))),
-                                fill_quote_amount=Decimal(str(trade.get("quantity", 0))) * Decimal(str(trade.get("price", 0))),
-                                fill_price=Decimal(str(trade.get("price", 0))),
-                                fill_timestamp=trade.get("timestamp", self._time_synchronizer.time() * 1000) / 1000,
-                            )
-                            self._order_tracker.process_trade_update(trade_update)
+                    for tracked_order in fillable_orders:
+                        for trade in trades_by_order_id.get(tracked_order.exchange_order_id, []):
+                            self._order_tracker.process_trade_update(
+                                self._trade_update_from_history(tracked_order, trade))
 
             except Exception as e:
                 self.logger().error(f"Error fetching trade history: {e}")
+
+    @staticmethod
+    def _trade_history_params(orders: List[InFlightOrder]) -> Dict[str, Any]:
+        """
+        Trade-history request parameters that cover the given orders' fills.
+
+        CoinDCX returns the oldest trades first unless asked otherwise, so a plain {"limit": 100}
+        on an account with any history never contains a recent fill. Ask for the newest first,
+        starting a minute before the oldest of the orders was created.
+        """
+        params: Dict[str, Any] = {"limit": 100, "sort": "desc"}
+        created = [order.creation_timestamp for order in orders if order.creation_timestamp]
+        if created:
+            params["from_timestamp"] = int((min(created) - 60) * 1000)
+        return params
+
+    def _trade_update_from_history(self, tracked_order: InFlightOrder, trade: Dict[str, Any]) -> TradeUpdate:
+        """Build a TradeUpdate from one trade-history record; CoinDCX reports fee_amount in the quote asset."""
+        quote = tracked_order.trading_pair.split("-")[1]
+        fee = TradeFeeBase.new_spot_fee(
+            fee_schema=self.trade_fee_schema(),
+            trade_type=tracked_order.trade_type,
+            flat_fees=[TokenAmount(amount=Decimal(str(trade.get("fee_amount", 0))), token=quote)]
+        )
+        quantity = Decimal(str(trade.get("quantity", 0)))
+        price = Decimal(str(trade.get("price", 0)))
+        return TradeUpdate(
+            trade_id=str(trade.get("id", "")),
+            client_order_id=tracked_order.client_order_id,
+            exchange_order_id=tracked_order.exchange_order_id,
+            trading_pair=tracked_order.trading_pair,
+            fee=fee,
+            fill_base_amount=quantity,
+            fill_quote_amount=quantity * price,
+            fill_price=price,
+            fill_timestamp=trade.get("timestamp", self._time_synchronizer.time() * 1000) / 1000,
+        )
 
     async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
         """
@@ -738,10 +790,9 @@ class CoindcxExchange(ExchangePyBase):
 
         if order.exchange_order_id is not None:
             try:
-                trade_history_params = {
-                    "symbol": await self.exchange_symbol_associated_to_pair(trading_pair=order.trading_pair),
-                    "limit": 100
-                }
+                trade_history_params = self._trade_history_params([order])
+                trade_history_params["symbol"] = await self.exchange_symbol_associated_to_pair(
+                    trading_pair=order.trading_pair)
 
                 all_fills_response = await self._api_post(
                     path_url=CONSTANTS.TRADE_HISTORY_ACCOUNT_PATH_URL,
@@ -751,28 +802,7 @@ class CoindcxExchange(ExchangePyBase):
 
                 for trade in all_fills_response:
                     if str(trade.get("order_id", "")) == order.exchange_order_id:
-                        fee_amount = Decimal(str(trade.get("fee_amount", 0)))
-                        trading_pair = order.trading_pair
-                        base, quote = trading_pair.split("-")
-
-                        fee = TradeFeeBase.new_spot_fee(
-                            fee_schema=self.trade_fee_schema(),
-                            trade_type=order.trade_type,
-                            flat_fees=[TokenAmount(amount=fee_amount, token=quote)]
-                        )
-
-                        trade_update = TradeUpdate(
-                            trade_id=str(trade.get("id", "")),
-                            client_order_id=order.client_order_id,
-                            exchange_order_id=order.exchange_order_id,
-                            trading_pair=trading_pair,
-                            fee=fee,
-                            fill_base_amount=Decimal(str(trade.get("quantity", 0))),
-                            fill_quote_amount=Decimal(str(trade.get("quantity", 0))) * Decimal(str(trade.get("price", 0))),
-                            fill_price=Decimal(str(trade.get("price", 0))),
-                            fill_timestamp=trade.get("timestamp", self._time_synchronizer.time() * 1000) / 1000,
-                        )
-                        trade_updates.append(trade_update)
+                        trade_updates.append(self._trade_update_from_history(order, trade))
 
             except Exception as e:
                 self.logger().error(f"Error fetching trades for order: {e}")
@@ -802,7 +832,7 @@ class CoindcxExchange(ExchangePyBase):
             is_auth_required=True)
 
         status = updated_order_data.get("status", "")
-        new_state = CONSTANTS.ORDER_STATE.get(status, tracked_order.current_state)
+        new_state = self._order_state_from_status(status, tracked_order)
 
         order_update = OrderUpdate(
             client_order_id=tracked_order.client_order_id,

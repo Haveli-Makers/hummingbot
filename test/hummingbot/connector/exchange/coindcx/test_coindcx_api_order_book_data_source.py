@@ -514,3 +514,41 @@ class TestSocketIOMessageUnwrapping(IsolatedAsyncioWrapperTestCase):
         await self.data_source._parse_order_book_snapshot_message(raw, output)
         parsed = output.get_nowait()
         self.assertEqual(parsed.trading_pair, self.trading_pair)
+
+
+class TestMultiPairSymbolResolution(IsolatedAsyncioWrapperTestCase):
+    """With several pairs there is no single-pair symbol override, so CoinDCX's pair-format symbols
+    ("I-BTC_USDT") must be normalised before the symbol-map lookup."""
+
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        known = {"BTCUSDT": "BTC-USDT", "ETHUSDT": "ETH-USDT"}
+
+        async def lookup(symbol):
+            return known[symbol]  # KeyError for anything else, like the real bidict map
+
+        self.connector = MagicMock()
+        self.connector.trading_pair_associated_to_exchange_symbol = AsyncMock(side_effect=lookup)
+        self.data_source = CoinDCXAPIOrderBookDataSource(trading_pairs=["BTC-USDT", "ETH-USDT"],
+                                                         connector=self.connector, api_factory=MagicMock())
+        self.output = asyncio.Queue()
+
+    async def test_diff_with_pair_format_symbol_is_routed(self):
+        await self.data_source._parse_order_book_diff_message(
+            {"s": "I-BTC_USDT", "vs": 5, "bids": {"1.0": "1"}, "asks": {}}, self.output)
+        self.assertEqual("BTC-USDT", self.output.get_nowait().content["trading_pair"])
+
+    async def test_snapshot_with_pair_format_symbol_is_routed(self):
+        await self.data_source._parse_order_book_snapshot_message(
+            {"s": "B-ETH_USDT", "vs": 5, "bids": {"1.0": "1"}, "asks": {}}, self.output)
+        self.assertEqual("ETH-USDT", self.output.get_nowait().content["trading_pair"])
+
+    async def test_diff_falls_back_to_the_channel(self):
+        await self.data_source._parse_order_book_diff_message(
+            {"channel": "I-ETH_USDT@orderbook@20", "vs": 5, "bids": {}, "asks": {"2.0": "1"}}, self.output)
+        self.assertEqual("ETH-USDT", self.output.get_nowait().content["trading_pair"])
+
+    async def test_unknown_symbol_is_dropped_without_raising(self):
+        await self.data_source._parse_order_book_diff_message(
+            {"s": "I-XRP_USDT", "vs": 5, "bids": {"1.0": "1"}, "asks": {}}, self.output)
+        self.assertTrue(self.output.empty())

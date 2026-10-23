@@ -536,6 +536,37 @@ class ZebpayExchange(ExchangePyBase):
             )
         return trade_updates
 
+    async def get_all_account_trades(self, start_time: Optional[int] = None,
+                                     end_time: Optional[int] = None,
+                                     limit: int = 100,
+                                     trading_pairs: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """
+        Fetches this account's filled/partially-filled orders from Zebpay's
+        account-wide orders list endpoint (``ORDERS_PATH_URL``).
+        """
+        params: Dict[str, Any] = {"limit": limit}
+        if start_time is not None:
+            params["startTime"] = start_time
+        if end_time is not None:
+            params["endTime"] = end_time
+
+        try:
+            result = await self._api_get(
+                path_url=CONSTANTS.ORDERS_PATH_URL,
+                params=params,
+                is_auth_required=True,
+            )
+            raise_for_status(result)
+            data = unwrap_data(result)
+            orders = data if isinstance(data, list) else (data.get("orders", []) if isinstance(data, dict) else [])
+            return [
+                o for o in orders
+                if isinstance(o, dict) and str(o.get("status", "")).upper() in ("FILLED", "PARTIALLY_FILLED")
+            ]
+        except Exception as exc:
+            self.logger().error(f"Error fetching account-wide order history: {exc}")
+            return []
+
     # ── Balance ────────────────────────────────────────────────────────────────
 
     async def _update_balances(self) -> None:

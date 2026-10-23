@@ -29,6 +29,7 @@ ORDER_PATH_URL = "/spot/order"                       # POST place order
 CANCEL_ORDER_PATH_URL = "/spot/cancel-order"         # POST cancel by order_id
 ORDER_STATUS_PATH_URL = "/spot/order-status"         # GET single order status
 ORDER_DEALS_PATH_URL = "/spot/order-deals"           # GET fills (deals) of an order
+USER_DEALS_PATH_URL = "/spot/user-deals"             # GET account-wide fills, any order origin
 PENDING_ORDERS_PATH_URL = "/spot/pending-order"      # GET open orders
 BALANCE_PATH_URL = "/assets/spot/balance"            # GET spot balances
 
@@ -86,7 +87,7 @@ MAX_REQUESTS = 6000
 _ALL_PATHS = [
     MARKETS_PATH_URL, TICKER_PATH_URL, DEPTH_PATH_URL, SERVER_TIME_PATH_URL,
     ORDER_PATH_URL, CANCEL_ORDER_PATH_URL, ORDER_STATUS_PATH_URL, ORDER_DEALS_PATH_URL,
-    PENDING_ORDERS_PATH_URL, BALANCE_PATH_URL,
+    USER_DEALS_PATH_URL, PENDING_ORDERS_PATH_URL, BALANCE_PATH_URL,
 ]
 
 RATE_LIMITS = [RateLimit(limit_id=GLOBAL_LIMIT_ID, limit=MAX_REQUESTS, time_interval=ONE_MINUTE)]

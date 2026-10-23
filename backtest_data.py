@@ -84,6 +84,16 @@ def load_books(connector: str, pair: str, start: str, end: Optional[str] = None,
     return df
 
 
+def find_gaps(df: pd.DataFrame, min_gap_sec: float = 60) -> pd.DataFrame:
+    """Periods longer than min_gap_sec with no rows, from a load_books/load_trades frame: from, to, minutes."""
+    if df.empty:
+        return pd.DataFrame(columns=["from", "to", "minutes"])
+    gap = df["ts"].diff()
+    mask = gap > min_gap_sec
+    return pd.DataFrame({"from": df["time"].shift()[mask], "to": df["time"][mask],
+                         "minutes": gap[mask] / 60}).reset_index(drop=True)
+
+
 def replay(connector: str, pair: str, start: str, end: Optional[str] = None,
            base_dir: str = DEFAULT_DIR) -> Iterator[Tuple[str, float, dict]]:
     """Merged, time-ordered stream of ("book" | "trade", ts, event). Streams from disk, so works for long ranges."""
@@ -93,11 +103,17 @@ def replay(connector: str, pair: str, start: str, end: Optional[str] = None,
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 4:
-        print("usage: python backtest_data.py <connector> <PAIR> <start YYYY-MM-DD> [end YYYY-MM-DD]")
+    args = sys.argv[1:]
+    min_gap = 60.0
+    if "--gap-sec" in args:
+        i = args.index("--gap-sec")
+        min_gap = float(args[i + 1])
+        del args[i:i + 2]
+    if len(args) < 3:
+        print("usage: python backtest_data.py <connector> <PAIR> <start YYYY-MM-DD> [end YYYY-MM-DD] [--gap-sec 60]")
         sys.exit(1)
-    connector, pair, start = sys.argv[1:4]
-    end = sys.argv[4] if len(sys.argv) > 4 else None
+    connector, pair, start = args[:3]
+    end = args[3] if len(args) > 3 else None
     t = load_trades(connector, pair, start, end)
     b = load_books(connector, pair, start, end, levels=1)
     print(f"{connector} {pair} {start}..{end or start}")
@@ -107,3 +123,15 @@ if __name__ == "__main__":
         print(f"  volume:       {t['qty'].sum():,.6f}  buy/sell: {(t['side'] == 'buy').sum()}/{(t['side'] == 'sell').sum()}")
     if len(b):
         print(f"  median spread: {b['spread'].median():.8g}")
+    # Book and trades normally stop together (recorder down, sleep, network). A gap in only one of them points at
+    # that feed. A long gap in BTC is never a quiet market - legs spanning one get made-up results.
+    for name, df in (("book", b), ("trades", t)):
+        if df.empty:
+            continue
+        gaps = find_gaps(df, min_gap)
+        span = (df["ts"].iloc[-1] - df["ts"].iloc[0]) / 3600
+        missing = gaps["minutes"].sum() / 60
+        print(f"  {name} gaps > {min_gap:g}s: {len(gaps)}   missing {missing:.1f} h of {span:.1f} h "
+              f"-> covered {span - missing:.1f} h ({(span - missing) / span:.0%})" if span else "")
+        for g in gaps.itertuples():
+            print(f"    {g._1:%Y-%m-%d %H:%M:%S} -> {g.to:%Y-%m-%d %H:%M:%S} UTC  {g.minutes:8.1f} min")

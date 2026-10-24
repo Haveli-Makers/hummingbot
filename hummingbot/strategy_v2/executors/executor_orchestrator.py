@@ -20,6 +20,7 @@ from hummingbot.strategy_v2.executors.dca_executor.dca_executor import DCAExecut
 from hummingbot.strategy_v2.executors.grid_executor.grid_executor import GridExecutor
 from hummingbot.strategy_v2.executors.order_executor.order_executor import OrderExecutor
 from hummingbot.strategy_v2.executors.position_executor.position_executor import PositionExecutor
+from hummingbot.strategy_v2.executors.simple_grid_executor.simple_grid_executor import SimpleGridExecutor
 from hummingbot.strategy_v2.executors.twap_executor.twap_executor import TWAPExecutor
 from hummingbot.strategy_v2.executors.xemm_executor.xemm_executor import XEMMExecutor
 from hummingbot.strategy_v2.models.executor_actions import (
@@ -147,6 +148,7 @@ class ExecutorOrchestrator:
         "xemm_executor": XEMMExecutor,
         "order_executor": OrderExecutor,
         "best_price_executor": BestPriceExecutor,
+        "simple_grid_executor": SimpleGridExecutor,
     }
 
     @classmethod

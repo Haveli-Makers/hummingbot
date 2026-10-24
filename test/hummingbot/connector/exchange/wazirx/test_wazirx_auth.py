@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import hmac
 from unittest import TestCase
 from unittest.mock import MagicMock
 
@@ -44,3 +46,32 @@ class WazirxAuthTests(TestCase):
 
         self.assertEqual({"X-Api-Key": self._api_key}, configured_request.headers)
         self.assertEqual(params, configured_request.params)
+
+    def test_add_auth_params_url_encodes_special_characters(self):
+        """Emails contain '+' and '@'; these must be percent-encoded so the signature the server
+        recomputes (over the decoded params) matches. Otherwise WazirX returns 'Signature is
+        incorrect' (code 2005), as seen with sub-account fund transfers."""
+        auth = WazirxAuth(api_key=self._api_key, secret_key=self._secret, time_provider=MagicMock())
+
+        async def _fixed_timestamp():
+            return 1700000000000
+
+        auth._get_timestamp = _fixed_timestamp
+
+        params = {
+            "currency": "inr",
+            "amount": "100",
+            "fromEmail": "vinayak.a@havelimakers.com",
+            "toEmail": "org+test@havelimakers.com",
+        }
+        auth_params, query_string = self.async_run_with_timeout(auth.add_auth_params(params))
+
+        # '+' -> %2B and '@' -> %40 so the server decodes the original email back.
+        self.assertIn("toEmail=org%2Btest%40havelimakers.com", query_string)
+        self.assertNotIn("org+test@havelimakers.com", query_string)
+
+        # Signature must be computed over the encoded string (everything before &signature=).
+        signed_part = query_string.split("&signature=")[0]
+        expected = hmac.new(self._secret.encode("utf-8"), signed_part.encode("utf-8"), hashlib.sha256).hexdigest()
+        self.assertEqual(expected, auth_params["signature"])
+        self.assertTrue(query_string.endswith(f"&signature={expected}"))

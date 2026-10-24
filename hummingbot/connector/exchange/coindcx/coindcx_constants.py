@@ -29,6 +29,10 @@ ACTIVE_ORDERS_PATH_URL = "/exchange/v1/orders/active_orders"
 TRADE_HISTORY_ACCOUNT_PATH_URL = "/exchange/v1/orders/trade_history"
 ORDER_EDIT_PATH_URL = "/exchange/v1/orders/edit"
 
+# Wallet transfer endpoints
+USER_INFO_PATH_URL = "/exchange/v1/users/info"
+SUB_ACCOUNT_TRANSFER_PATH_URL = "/exchange/v1/wallets/sub_account_transfer"
+
 WS_HEARTBEAT_TIME_INTERVAL = 30
 
 SIDE_BUY = "buy"
@@ -75,6 +79,8 @@ RATE_LIMITS = [
     RateLimit(limit_id=TRADE_HISTORY_ACCOUNT_PATH_URL, limit=2000, time_interval=ONE_MINUTE),
     RateLimit(limit_id=ORDER_EDIT_PATH_URL, limit=2000, time_interval=ONE_MINUTE),
     RateLimit(limit_id=TICKER_PATH_URL, limit=2000, time_interval=ONE_MINUTE),
+    RateLimit(limit_id=USER_INFO_PATH_URL, limit=2000, time_interval=ONE_MINUTE),
+    RateLimit(limit_id=SUB_ACCOUNT_TRANSFER_PATH_URL, limit=2000, time_interval=ONE_MINUTE),
 ]
 
 ORDER_NOT_EXIST_ERROR_CODE = 404

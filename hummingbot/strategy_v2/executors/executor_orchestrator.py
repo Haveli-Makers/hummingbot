@@ -20,6 +20,7 @@ from hummingbot.strategy_v2.executors.dca_executor.dca_executor import DCAExecut
 from hummingbot.strategy_v2.executors.grid_executor.grid_executor import GridExecutor
 from hummingbot.strategy_v2.executors.order_executor.order_executor import OrderExecutor
 from hummingbot.strategy_v2.executors.position_executor.position_executor import PositionExecutor
+from hummingbot.strategy_v2.executors.symmetric_grid_executor.symmetric_grid_executor import SymmetricGridExecutor
 from hummingbot.strategy_v2.executors.twap_executor.twap_executor import TWAPExecutor
 from hummingbot.strategy_v2.executors.xemm_executor.xemm_executor import XEMMExecutor
 from hummingbot.strategy_v2.models.executor_actions import (
@@ -141,6 +142,7 @@ class ExecutorOrchestrator:
     _executor_mapping = {
         "position_executor": PositionExecutor,
         "grid_executor": GridExecutor,
+        "symmetric_grid_executor": SymmetricGridExecutor,
         "dca_executor": DCAExecutor,
         "arbitrage_executor": ArbitrageExecutor,
         "twap_executor": TWAPExecutor,

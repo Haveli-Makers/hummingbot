@@ -135,6 +135,7 @@ class OrderBookTradeRecorder(ScriptStrategyBase):
         if not self._subscribed:
             self._sampler_task = safe_ensure_future(self._sample_books_loop())
             self._flusher_task = safe_ensure_future(self._flush_loop())
+            self._subscribed = True
             self.logger().info(f"Recording {self.trading_pairs} on {self.connector_name} to {self.output_dir}")
 
     async def on_stop(self):
@@ -206,7 +207,9 @@ class OrderBookTradeRecorder(ScriptStrategyBase):
 
     def _file_path(self, trading_pair: str, kind: str) -> str:
         day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        folder = os.path.join(self.output_dir, self.connector_name, trading_pair)
+        # coindcx_paper_trade streams the same public data as coindcx, so keep one folder per exchange
+        exchange = self.connector_name.removesuffix("_paper_trade")
+        folder = os.path.join(self.output_dir, exchange, trading_pair)
         os.makedirs(folder, exist_ok=True)
         return os.path.join(folder, f"{day}_{kind}.jsonl.gz")
 

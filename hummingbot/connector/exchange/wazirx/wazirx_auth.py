@@ -1,4 +1,3 @@
-import asyncio
 import hashlib
 import hmac
 import time
@@ -12,48 +11,58 @@ from hummingbot.core.web_assistant.auth import AuthBase
 from hummingbot.core.web_assistant.connections.data_types import RESTRequest, WSRequest
 
 
+class WazirxTimestampSequence:
+    """
+    Hands out strictly increasing millisecond timestamps.
+
+    WazirX rejects a request whose timestamp was already used within the recvWindow
+    (error 2006, "The tonce has already been used"), which two requests signed in the
+    same millisecond would otherwise trigger. All keys of one account share one
+    sequence, in case WazirX tracks used timestamps per account rather than per key.
+    """
+
+    def __init__(self):
+        self._last_timestamp_ms = 0
+
+    def next(self, timestamp_ms: int) -> int:
+        if timestamp_ms <= self._last_timestamp_ms:
+            timestamp_ms = self._last_timestamp_ms + 1
+        self._last_timestamp_ms = timestamp_ms
+        return timestamp_ms
+
+
 class WazirxAuth(AuthBase):
     """
     WazirX authentication handler for API requests.
 
-    Handles HMAC-SHA256 signature generation and timestamp synchronization
-    for authenticated API calls to the WazirX exchange.
+    Handles HMAC-SHA256 signature generation for authenticated API calls to the
+    WazirX exchange. Timestamps come from the connector's TimeSynchronizer, which
+    the status polling loop keeps in step with the server clock.
     """
 
     RECV_WINDOW = 60000
     AUTH_TOKEN_TIMEOUT = 900
 
-    def __init__(self, api_key: str, secret_key: str, time_provider: TimeSynchronizer):
+    def __init__(self,
+                 api_key: str,
+                 secret_key: str,
+                 time_provider: TimeSynchronizer,
+                 timestamp_sequence: Optional[WazirxTimestampSequence] = None):
         """
         Initialize the WazirX authentication handler.
         """
         self.api_key = api_key
         self.secret_key = secret_key
         self.time_provider = time_provider
-        self._nonce_counter = 0
-        self._nonce_lock = asyncio.Lock()
-        self._last_timestamp = 0
+        self._timestamp_sequence = timestamp_sequence or WazirxTimestampSequence()
         self._auth_key: Optional[str] = None
         self._auth_key_timestamp: float = 0
 
-    async def _get_timestamp(self) -> int:
-        async with self._nonce_lock:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(f"{CONSTANTS.REST_URL}{CONSTANTS.SERVER_TIME_PATH_URL}") as response:
-                        if response.status == 200:
-                            data = await response.json()
-                            current_ts = int(data.get("serverTime", int(time.time() * 1000)))
-                        else:
-                            current_ts = int(time.time() * 1000)
-            except Exception:
-                current_ts = int(time.time() * 1000)
-
-            if current_ts <= self._last_timestamp:
-                current_ts = self._last_timestamp + 1
-
-            self._last_timestamp = current_ts
-            return current_ts
+    def _get_timestamp(self) -> int:
+        # Back-dated: WazirX tolerates late timestamps but rejects early ones (see
+        # TIMESTAMP_SAFETY_MARGIN_MS).
+        timestamp = int(self.time_provider.time() * 1e3) - CONSTANTS.TIMESTAMP_SAFETY_MARGIN_MS
+        return self._timestamp_sequence.next(timestamp)
 
     def _generate_query_string(self, params: Dict[str, Any]) -> str:
         """
@@ -73,7 +82,7 @@ class WazirxAuth(AuthBase):
     async def add_auth_params(self, params: Dict[str, Any]) -> tuple[Dict[str, Any], str]:
         auth_params = dict(params)
         auth_params["recvWindow"] = self.RECV_WINDOW
-        auth_params["timestamp"] = await self._get_timestamp()
+        auth_params["timestamp"] = self._get_timestamp()
 
         query_string = self._generate_query_string(auth_params)
         signature = self.generate_signature(query_string)

@@ -1,8 +1,10 @@
 from decimal import Decimal
+from typing import List, Tuple
 
 from pydantic import ConfigDict, Field, SecretStr
 
 from hummingbot.client.config.config_data_types import BaseConnectorConfigMap
+from hummingbot.connector.exchange.wazirx.wazirx_constants import MAX_API_KEYS
 from hummingbot.core.data_type.trade_fee import TradeFeeSchema
 
 CENTRALIZED = True
@@ -64,18 +66,50 @@ def hb_pair_to_wazirx_symbol(hb_pair: str) -> str:
     return hb_pair.replace("-", "").upper()
 
 
+def parse_api_credentials(api_keys: str, api_secrets: str) -> List[Tuple[str, str]]:
+    """
+    Splits the configured API keys and secrets into (key, secret) pairs.
+
+    Both config fields take up to MAX_API_KEYS comma-separated values, matched by
+    position, so "k1,k2" with "s1,s2" gives [("k1", "s1"), ("k2", "s2")]. A single
+    value, including an empty one for public-data-only use, gives one pair.
+
+    Raises:
+        ValueError: if the counts differ, there are too many keys, an entry is
+            blank, or a key is repeated.
+    """
+    keys = [key.strip() for key in api_keys.split(",")]
+    secrets = [secret.strip() for secret in api_secrets.split(",")]
+    if len(keys) != len(secrets):
+        raise ValueError(
+            f"WazirX needs one API secret per API key, in the same order: got {len(keys)} keys "
+            f"and {len(secrets)} secrets.")
+    if len(keys) > MAX_API_KEYS:
+        raise ValueError(f"WazirX allows at most {MAX_API_KEYS} API keys per account: got {len(keys)}.")
+    if len(keys) > 1 and not all(keys + secrets):
+        raise ValueError("WazirX API keys and secrets can't have blank entries between commas.")
+    if len(set(keys)) != len(keys):
+        raise ValueError("Each WazirX API key can be entered only once.")
+    return list(zip(keys, secrets))
+
+
 class WazirxConfigMap(BaseConnectorConfigMap):
     """
     Configuration map for WazirX connector.
 
     Defines the required configuration parameters for connecting to the
-    WazirX exchange, including API credentials.
+    WazirX exchange, including API credentials. Both fields accept up to
+    MAX_API_KEYS comma-separated values from the same account; the connector
+    rotates signed requests across them (see WazirxApiKeyPool).
     """
     connector: str = "wazirx"
     wazirx_api_key: SecretStr = Field(
         default=...,
         json_schema_extra={
-            "prompt": lambda cm: "Enter your WazirX API key",
+            "prompt": lambda cm: (
+                f"Enter your WazirX API key (up to {MAX_API_KEYS} keys from the same account, "
+                "separated by commas)"
+            ),
             "is_secure": True,
             "is_connect_key": True,
             "prompt_on_new": True,
@@ -84,7 +118,7 @@ class WazirxConfigMap(BaseConnectorConfigMap):
     wazirx_api_secret: SecretStr = Field(
         default=...,
         json_schema_extra={
-            "prompt": lambda cm: "Enter your WazirX API secret",
+            "prompt": lambda cm: "Enter your WazirX API secret (one per key, separated by commas, in the same order)",
             "is_secure": True,
             "is_connect_key": True,
             "prompt_on_new": True,

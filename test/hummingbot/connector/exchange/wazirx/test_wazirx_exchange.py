@@ -1,14 +1,21 @@
 
 import asyncio
 import json
+import re
+import time
 from decimal import Decimal
+from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
+from unittest.mock import AsyncMock, patch
 
+import aiohttp
 import pytest
 from aioresponses import aioresponses
 from aioresponses.core import RequestCall
+from yarl import URL
 
 from hummingbot.connector.exchange.wazirx import wazirx_constants as CONSTANTS, wazirx_web_utils as web_utils
-from hummingbot.connector.exchange.wazirx.wazirx_exchange import WazirxExchange
+from hummingbot.connector.exchange.wazirx.wazirx_exchange import WazirxAPIError, WazirxExchange
+from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.test_support.exchange_connector_test import AbstractExchangeConnectorTests
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, TradeType
@@ -1005,3 +1012,314 @@ async def test_all_trade_updates_for_order_and_request_order_status():
     tu = updates[0]
     assert tu.trade_id == "1"
     assert float(tu.fill_price) == 123.0
+
+
+class WazirxExchangeApiKeyRotationTests(IsolatedAsyncioWrapperTestCase):
+    level = 0
+
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        self.log_records = []
+        self.responses = []
+        self.sent = []
+        self.exchange = self.create_exchange("k1,k2,k3", "s1,s2,s3")
+        self.exchange._send_signed_request = AsyncMock(side_effect=self.fake_send)
+
+    def create_exchange(self, keys: str, secrets: str, trading_required: bool = True) -> WazirxExchange:
+        exchange = WazirxExchange(keys, secrets, trading_pairs=["BTC-INR"], trading_required=trading_required)
+        exchange.logger().setLevel(1)
+        exchange.logger().addHandler(self)
+        self.addCleanup(exchange.logger().removeHandler, self)
+        return exchange
+
+    def handle(self, record):
+        self.log_records.append(record)
+
+    def is_logged(self, log_level: str, fragment: str) -> bool:
+        return any(record.levelname == log_level and fragment in record.getMessage() for record in self.log_records)
+
+    async def fake_send(self, auth, method, url, params):
+        self.sent.append((auth.api_key, method, url))
+        return self.responses.pop(0)
+
+    def fake_send_by_key(self, outcomes):
+        async def send(auth, method, url, params):
+            self.sent.append((auth.api_key, method, url))
+            outcome = outcomes.get(auth.api_key, (200, None, []))
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+        return send
+
+    async def signed_get(self, path: str = CONSTANTS.MY_TRADES_PATH_URL):
+        return await self.exchange._wazirx_request("GET", path, {"symbol": "btcinr"}, is_auth_required=True)
+
+    def keys_used(self):
+        return [api_key for api_key, _, _ in self.sent]
+
+    def test_constructor_rejects_mismatched_credentials(self):
+        with self.assertRaises(ValueError):
+            WazirxExchange("k1,k2", "s1", trading_pairs=[])
+
+    def test_constructor_creates_one_auth_per_key(self):
+        pool = self.exchange._key_pool
+        self.assertEqual(["k1", "k2", "k3"], [pool.auth(i).api_key for i in range(pool.size)])
+        self.assertEqual(["s1", "s2", "s3"], [pool.auth(i).secret_key for i in range(pool.size)])
+        self.assertIs(self.exchange._auth, pool.auth(0))
+        self.assertEqual("k1", self.exchange.api_key)
+
+    async def test_signed_requests_rotate_across_keys(self):
+        self.responses = [(200, None, []) for _ in range(4)]
+        for _ in range(4):
+            await self.signed_get()
+        self.assertEqual(["k1", "k2", "k3", "k1"], self.keys_used())
+
+    async def test_each_signed_request_logs_the_key_it_used(self):
+        self.responses = [(429, None, "Too many api request"), (200, None, [])]
+
+        await self.signed_get()
+
+        self.assertTrue(self.is_logged("DEBUG", "WazirX GET /v1/myTrades used API key 1 of 3 (k1...): HTTP 429"))
+        self.assertTrue(self.is_logged("DEBUG", "WazirX GET /v1/myTrades used API key 2 of 3 (k2...): HTTP 200"))
+
+    async def test_order_requests_log_the_order_id_with_the_key(self):
+        self.responses = [(200, None, {"id": 42}), (400, None, "Order does not exist")]
+
+        await self.exchange._wazirx_request("POST", CONSTANTS.CREATE_ORDER_PATH_URL, {"symbol": "btcinr"}, True)
+        with self.assertRaises(WazirxAPIError):
+            await self.exchange._wazirx_request("DELETE", CONSTANTS.CANCEL_ORDER_PATH_URL, {"orderId": "7"}, True)
+
+        self.assertTrue(self.is_logged("DEBUG", "WazirX POST /v1/order order 42 used API key 1 of 3 (k1...): HTTP 200"))
+        self.assertTrue(self.is_logged("DEBUG", "WazirX DELETE /v1/order order 7 used API key 1 of 3 (k1...): HTTP 400"))
+
+    async def test_order_endpoint_counts_each_method_against_its_own_limit(self):
+        self.responses = [(200, None, {}) for _ in range(3)]
+        pool = self.exchange._key_pool
+        with patch.object(pool, "acquire", wraps=pool.acquire) as acquire:
+            for method in ("POST", "get", "DELETE"):
+                await self.exchange._wazirx_request(method, CONSTANTS.CREATE_ORDER_PATH_URL, {}, is_auth_required=True)
+
+        self.assertEqual(
+            [CONSTANTS.CREATE_ORDER_LIMIT_ID, CONSTANTS.ORDER_STATUS_LIMIT_ID, CONSTANTS.CANCEL_ORDER_LIMIT_ID],
+            [call.args[0] for call in acquire.call_args_list])
+        self.assertEqual(["POST", "GET", "DELETE"], [method for _, method, _ in self.sent])
+
+    async def test_rate_limited_request_retries_once_on_another_key(self):
+        self.responses = [(429, "3", '{"code":2136,"message":"Too many api request"}'), (200, None, {"id": 1})]
+
+        result = await self.exchange._wazirx_request(
+            "POST", CONSTANTS.CREATE_ORDER_PATH_URL, {"symbol": "btcinr"}, is_auth_required=True)
+
+        self.assertEqual({"id": 1}, result)
+        self.assertEqual(["k1", "k2"], self.keys_used())
+        rest_until = self.exchange._key_pool._rest_until[(0, CONSTANTS.CREATE_ORDER_LIMIT_ID)]
+        self.assertAlmostEqual(time.monotonic() + 3, rest_until, delta=0.5)
+        self.assertTrue(self.is_logged("WARNING", "rate-limited API key 1 of 3"))
+
+    async def test_second_rate_limit_raises(self):
+        self.responses = [(429, None, "Too many api request"), (429, None, "Too many api request")]
+
+        with self.assertRaises(WazirxAPIError) as context:
+            await self.signed_get()
+
+        self.assertEqual(429, context.exception.status)
+        self.assertIn("key 2 of 3", str(context.exception))
+        self.assertEqual(["k1", "k2"], self.keys_used())
+
+    async def test_single_key_rate_limit_raises_and_rests_the_key(self):
+        exchange = self.create_exchange("k1", "s1")
+        exchange._send_signed_request = AsyncMock(return_value=(429, None, "Too many api request"))
+
+        with self.assertRaises(WazirxAPIError):
+            await exchange._wazirx_request("GET", CONSTANTS.MY_TRADES_PATH_URL, {}, is_auth_required=True)
+
+        self.assertEqual(1, exchange._send_signed_request.await_count)
+        rest_until = exchange._key_pool._rest_until[(0, CONSTANTS.MY_TRADES_PATH_URL)]
+        self.assertAlmostEqual(time.monotonic() + CONSTANTS.DEFAULT_RATE_LIMIT_COOLDOWN, rest_until, delta=0.5)
+
+    async def test_pinned_key_is_not_retried_on_another_key(self):
+        self.responses = [(429, None, "Too many api request")]
+
+        with self.assertRaises(WazirxAPIError):
+            await self.exchange._signed_request("GET", CONSTANTS.USER_BALANCES_PATH_URL, {}, key_index=1)
+
+        self.assertEqual(["k2"], self.keys_used())
+
+    async def test_ip_ban_pauses_all_signed_requests(self):
+        self.responses = [(418, "60", "IP banned")]
+
+        with self.assertRaises(WazirxAPIError) as context:
+            await self.signed_get()
+        self.assertEqual(418, context.exception.status)
+        self.assertTrue(self.is_logged("ERROR", "Signed requests are paused for 60s"))
+
+        with self.assertRaisesRegex(IOError, "paused"):
+            await self.signed_get()
+        self.assertEqual(1, len(self.sent))
+
+    async def test_recv_window_error_resyncs_the_clock_and_retries_once(self):
+        self.responses = [(400, None, '{"code":2098,"message":"Request out of receiving window."}'), (200, None, [])]
+        self.exchange._time_synchronizer.add_time_offset_ms_sample(5000)
+        self.exchange._update_time_synchronizer = AsyncMock()
+
+        result = await self.signed_get(CONSTANTS.USER_BALANCES_PATH_URL)
+
+        self.assertEqual([], result)
+        self.assertEqual(0, len(self.exchange._time_synchronizer._time_offset_ms))
+        self.exchange._update_time_synchronizer.assert_awaited_once_with(pass_on_non_cancelled_error=True)
+        self.assertEqual(2, len(self.sent))
+
+    async def test_second_recv_window_error_raises(self):
+        self.responses = [(400, None, '{"code":2098}'), (400, None, '{"code":2098}')]
+        self.exchange._update_time_synchronizer = AsyncMock()
+
+        with self.assertRaises(WazirxAPIError):
+            await self.signed_get()
+
+        self.assertEqual(2, len(self.sent))
+        self.exchange._update_time_synchronizer.assert_awaited_once()
+
+    async def test_other_errors_raise_with_the_key_named(self):
+        self.responses = [(400, None, '{"code":2004,"message":"Order does not exist"}')]
+
+        with self.assertRaises(WazirxAPIError) as context:
+            await self.exchange._wazirx_request(
+                "DELETE", CONSTANTS.CANCEL_ORDER_PATH_URL, {"orderId": "1"}, is_auth_required=True)
+
+        message = str(context.exception)
+        self.assertIn("with WazirX API key 1 of 3", message)
+        self.assertIn("HTTP status is 400", message)
+        self.assertTrue(self.exchange._is_order_not_found_during_cancelation_error(context.exception))
+        self.assertEqual(1, len(self.sent))
+
+    async def test_unsigned_requests_skip_the_key_pool(self):
+        url = f"{CONSTANTS.REST_URL}{CONSTANTS.TICKER_24HR_PATH_URL}"
+        with aioresponses() as mock_api:
+            mock_api.get(re.compile(rf"^{re.escape(url)}"), body=json.dumps({"lastPrice": "1"}))
+            mock_api.post(url, body=json.dumps({"ok": True}))
+            fetched = await self.exchange._wazirx_request("GET", CONSTANTS.TICKER_24HR_PATH_URL, {"symbol": "btcinr"})
+            posted = await self.exchange._wazirx_request("POST", CONSTANTS.TICKER_24HR_PATH_URL, {"symbol": "btcinr"})
+        with self.assertRaises(ValueError):
+            await self.exchange._wazirx_request("DELETE", CONSTANTS.TICKER_24HR_PATH_URL)
+
+        self.assertEqual({"lastPrice": "1"}, fetched)
+        self.assertEqual({"ok": True}, posted)
+        self.assertEqual([], self.sent)
+
+    def test_retry_after_seconds(self):
+        self.assertEqual(5.0, WazirxExchange._retry_after_seconds("5", 2.0))
+        self.assertEqual(2.0, WazirxExchange._retry_after_seconds(None, 2.0))
+        self.assertEqual(2.0, WazirxExchange._retry_after_seconds("soon", 2.0))
+        self.assertEqual(2.0, WazirxExchange._retry_after_seconds("0", 2.0))
+
+    async def test_send_signed_request_get_signs_the_query_string(self):
+        exchange = self.create_exchange("k1", "s1")
+        url = f"{CONSTANTS.REST_URL}{CONSTANTS.USER_BALANCES_PATH_URL}"
+        with aioresponses() as mock_api:
+            mock_api.get(re.compile(rf"^{re.escape(url)}\?"), body=json.dumps([{"asset": "inr"}]))
+            response = await exchange._send_signed_request(
+                auth=exchange._key_pool.auth(0), method="GET", url=url, params={})
+            (_, request_url), calls = next(iter(mock_api.requests.items()))
+
+        self.assertEqual((200, None, [{"asset": "inr"}]), response)
+        self.assertIn("recvWindow=60000", str(request_url))
+        self.assertIn("signature=", str(request_url))
+        self.assertEqual("k1", calls[0].kwargs["headers"]["X-Api-Key"])
+
+    async def test_send_signed_request_post_and_delete_send_a_signed_body(self):
+        exchange = self.create_exchange("k1", "s1")
+        auth = exchange._key_pool.auth(0)
+        url = f"{CONSTANTS.REST_URL}{CONSTANTS.CREATE_ORDER_PATH_URL}"
+        with aioresponses() as mock_api:
+            mock_api.post(url, body=json.dumps({"id": 7}))
+            mock_api.delete(url, status=400, body="Order does not exist", headers={"Retry-After": "1"})
+            created = await exchange._send_signed_request(auth=auth, method="POST", url=url, params={"symbol": "btcinr"})
+            canceled = await exchange._send_signed_request(auth=auth, method="DELETE", url=url, params={"orderId": "7"})
+            post_body = mock_api.requests[("POST", URL(url))][0].kwargs["data"]
+            delete_body = mock_api.requests[("DELETE", URL(url))][0].kwargs["data"]
+
+        self.assertEqual((200, None, {"id": 7}), created)
+        self.assertEqual((400, "1", "Order does not exist"), canceled)
+        self.assertTrue(post_body.startswith("symbol=btcinr&recvWindow=60000&timestamp="))
+        self.assertIn("&signature=", post_body)
+        self.assertTrue(delete_body.startswith("orderId=7&recvWindow=60000&timestamp="))
+
+    async def test_send_signed_request_rejects_unsupported_method(self):
+        exchange = self.create_exchange("k1", "s1")
+        with self.assertRaises(ValueError):
+            await exchange._send_signed_request(
+                auth=exchange._key_pool.auth(0), method="PUT", url=CONSTANTS.REST_URL, params={})
+
+    async def test_key_check_leaves_rejected_key_out_of_rotation(self):
+        self.exchange._send_signed_request = AsyncMock(side_effect=self.fake_send_by_key({
+            "k2": (400, None, '{"code":2128,"message":"IP has not been whitelisted"}'),
+        }))
+
+        await self.exchange._check_api_keys()
+
+        self.assertEqual([0, 2], self.exchange._key_pool.active_indexes)
+        self.assertEqual({"k1", "k2", "k3"}, set(self.keys_used()))
+        self.assertTrue(self.is_logged("ERROR", "rejected API key 2 of 3 at start-up"))
+        self.assertTrue(self.is_logged("INFO", "across 2 of 3 API keys"))
+
+        self.sent.clear()
+        for _ in range(3):
+            await self.signed_get()
+        self.assertEqual(["k1", "k3", "k1"], self.keys_used())
+
+    async def test_key_check_keeps_keys_whose_check_was_inconclusive(self):
+        self.exchange._send_signed_request = AsyncMock(side_effect=self.fake_send_by_key({
+            "k1": (500, None, "Internal Server Error"),
+            "k2": (429, None, "Too many api request"),
+            "k3": aiohttp.ClientConnectionError("Connection reset"),
+        }))
+
+        await self.exchange._check_api_keys()
+
+        self.assertEqual([0, 1, 2], self.exchange._key_pool.active_indexes)
+        for index in (1, 2, 3):
+            self.assertTrue(self.is_logged("WARNING", f"Could not check WazirX API key {index} of 3"))
+
+    async def test_key_check_keeps_every_key_when_all_are_rejected(self):
+        self.exchange._send_signed_request = AsyncMock(side_effect=self.fake_send_by_key(
+            {api_key: (401, None, "Unauthorized") for api_key in ("k1", "k2", "k3")}))
+
+        await self.exchange._check_api_keys()
+
+        self.assertEqual([0, 1, 2], self.exchange._key_pool.active_indexes)
+        self.assertTrue(self.is_logged("ERROR", "rejected every API key"))
+
+    async def test_key_check_timeout_keeps_every_key(self):
+        async def hang(**kwargs):
+            await asyncio.sleep(10)
+
+        self.exchange._send_signed_request = AsyncMock(side_effect=hang)
+        self.exchange._key_pool.set_active([0])
+
+        with patch.object(CONSTANTS, "API_KEY_CHECK_TIMEOUT", 0.05):
+            await self.exchange._check_api_keys()
+
+        self.assertEqual([0, 1, 2], self.exchange._key_pool.active_indexes)
+        self.assertTrue(self.is_logged("WARNING", "API key check timed out"))
+
+    async def test_key_check_brings_back_a_key_that_passes_again(self):
+        self.exchange._key_pool.set_active([0, 2])
+        self.exchange._send_signed_request = AsyncMock(side_effect=self.fake_send_by_key({}))
+
+        await self.exchange._check_api_keys()
+
+        self.assertEqual([0, 1, 2], self.exchange._key_pool.active_indexes)
+
+    async def test_start_network_checks_keys_only_when_trading_with_several_keys(self):
+        cases = [
+            (self.exchange, 1),
+            (self.create_exchange("k1", "s1"), 0),
+            (self.create_exchange("k1,k2", "s1,s2", trading_required=False), 0),
+        ]
+        with patch.object(ExchangePyBase, "start_network", new_callable=AsyncMock) as base_start_network:
+            for exchange, expected_checks in cases:
+                exchange._check_api_keys = AsyncMock()
+                await exchange.start_network()
+                self.assertEqual(expected_checks, exchange._check_api_keys.await_count)
+
+        self.assertEqual(3, base_start_network.await_count)

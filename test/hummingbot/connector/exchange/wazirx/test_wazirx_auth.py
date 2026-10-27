@@ -53,7 +53,7 @@ class WazirxAuthTests(TestCase):
         mock_time_provider.time.return_value = 1700000000.5
         auth = WazirxAuth(api_key=self._api_key, secret_key=self._secret, time_provider=mock_time_provider)
 
-        # No HTTP call: the timestamp comes from the time synchronizer
+        # no HTTP call for the timestamp
         with patch("hummingbot.connector.exchange.wazirx.wazirx_auth.aiohttp.ClientSession",
                    side_effect=AssertionError("no request expected")):
             auth_params, query_string = self.async_run_with_timeout(auth.add_auth_params({"symbol": "btcinr"}))

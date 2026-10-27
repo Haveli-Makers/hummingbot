@@ -67,17 +67,7 @@ def hb_pair_to_wazirx_symbol(hb_pair: str) -> str:
 
 
 def parse_api_credentials(api_keys: str, api_secrets: str) -> List[Tuple[str, str]]:
-    """
-    Splits the configured API keys and secrets into (key, secret) pairs.
-
-    Both config fields take up to MAX_API_KEYS comma-separated values, matched by
-    position, so "k1,k2" with "s1,s2" gives [("k1", "s1"), ("k2", "s2")]. A single
-    value, including an empty one for public-data-only use, gives one pair.
-
-    Raises:
-        ValueError: if the counts differ, there are too many keys, an entry is
-            blank, or a key is repeated.
-    """
+    """Splits comma-separated keys and secrets into (key, secret) pairs, matched by position."""
     keys = [key.strip() for key in api_keys.split(",")]
     secrets = [secret.strip() for secret in api_secrets.split(",")]
     if len(keys) != len(secrets):
@@ -98,9 +88,7 @@ class WazirxConfigMap(BaseConnectorConfigMap):
     Configuration map for WazirX connector.
 
     Defines the required configuration parameters for connecting to the
-    WazirX exchange, including API credentials. Both fields accept up to
-    MAX_API_KEYS comma-separated values from the same account; the connector
-    rotates signed requests across them (see WazirxApiKeyPool).
+    WazirX exchange, including API credentials.
     """
     connector: str = "wazirx"
     wazirx_api_key: SecretStr = Field(

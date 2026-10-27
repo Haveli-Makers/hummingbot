@@ -210,8 +210,6 @@ class WazirxExchange(ExchangePyBase):
     ) -> Dict[str, Any]:
         """
         Make an authenticated or unauthenticated request to the WazirX API.
-
-        Signed requests rotate across the configured API keys (see _signed_request).
         """
         params = params or {}
         if is_auth_required:
@@ -238,16 +236,12 @@ class WazirxExchange(ExchangePyBase):
         key_index: Optional[int] = None,
     ) -> Any:
         """
-        Signs and sends a request with the next API key that has room on this endpoint.
-
-        On HTTP 429 the key rests on the endpoint and the request is retried once with
-        another key. A 429 means WazirX did not process the request, so a retried order
-        can't be placed twice. On HTTP 418 (IP ban) all signed requests pause. On error
-        2098 the clock is resynced and the request is retried once. ``key_index`` pins
-        the request to one key, with no retry on another key.
+        Sends a signed request with the next API key that has room on this endpoint.
+        On 429 the key rests and the request is retried once on another key (WazirX did
+        not process it); on 418 signed requests pause; on error 2098 the clock is resynced
+        and the request retried once. ``key_index`` pins the request to one key.
         """
         url = f"{CONSTANTS.REST_URL}{path}"
-        # /v1/order serves create, query and cancel, and each has its own limit
         limit_id = CONSTANTS.ORDER_LIMIT_IDS.get(method, path) if path == CONSTANTS.ORDER_STATUS_PATH_URL else path
         rate_limited_keys: List[int] = []
         clock_resynced = False
@@ -294,10 +288,7 @@ class WazirxExchange(ExchangePyBase):
         url: str,
         params: Dict[str, Any],
     ) -> Tuple[int, Optional[str], Any]:
-        """
-        Sends one signed request. Returns the HTTP status, the Retry-After header, and
-        the parsed JSON body, or the raw text for an error status.
-        """
+        """Returns the HTTP status, the Retry-After header, and the JSON body (raw text on error)."""
         _, query_string = await auth.add_auth_params(params)
         headers = auth.get_headers()
         async with aiohttp.ClientSession() as session:
@@ -327,11 +318,8 @@ class WazirxExchange(ExchangePyBase):
 
     async def _check_api_keys(self):
         """
-        Sends one balance request with each API key and leaves the keys WazirX rejects
-        out of rotation, so a key without trading permission or IP whitelisting doesn't
-        fail every Nth request. A key whose check fails for another reason (timeout,
-        5xx, rate limit) stays in. If WazirX rejects every key, all of them stay in and
-        the normal error handling reports the problem.
+        Drops keys WazirX rejects at start-up (e.g. no trade permission or IP whitelist).
+        Keeps every key if the check times out or WazirX rejects all of them.
         """
         indexes = list(range(self._key_pool.size))
         try:
@@ -359,7 +347,7 @@ class WazirxExchange(ExchangePyBase):
         self.logger().info(f"Rotating signed WazirX requests across {len(active)} of {len(indexes)} API keys.")
 
     async def _check_api_key(self, index: int) -> Optional[WazirxAPIError]:
-        """Returns WazirX's error if it rejected the key, otherwise None."""
+        """Returns WazirX's error if it rejected the key, else None."""
         try:
             await self._signed_request(
                 method="GET", path=CONSTANTS.USER_BALANCES_PATH_URL, params={}, key_index=index)

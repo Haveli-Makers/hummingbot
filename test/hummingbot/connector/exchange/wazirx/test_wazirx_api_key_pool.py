@@ -51,7 +51,7 @@ class WazirxApiKeyPoolTests(IsolatedAsyncioWrapperTestCase):
 
     async def test_key_at_its_limit_is_skipped(self):
         self.assertEqual(0, await self.pool.acquire("SLOW"))
-        # key 0 is full on SLOW, so asking again with only keys 0 and 1 eligible gives key 1
+        # key 0 is full on SLOW
         self.pool.set_active([0, 1])
         self.assertEqual(1, await self.pool.acquire("SLOW"))
 
@@ -64,7 +64,7 @@ class WazirxApiKeyPoolTests(IsolatedAsyncioWrapperTestCase):
         with patch("hummingbot.connector.exchange.wazirx.wazirx_api_key_pool.asyncio.sleep", self.fake_sleep):
             index = await self.pool.acquire("SLOW")
 
-        # key 0 frees first: sent at 100.0 with a 1.5s window, asked again at 100.5
+        # key 0 frees first
         self.assertEqual(0, index)
         self.assertEqual([1.0], self.sleeps)
 

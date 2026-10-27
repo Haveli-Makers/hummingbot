@@ -12,14 +12,7 @@ from hummingbot.core.web_assistant.connections.data_types import RESTRequest, WS
 
 
 class WazirxTimestampSequence:
-    """
-    Hands out strictly increasing millisecond timestamps.
-
-    WazirX rejects a request whose timestamp was already used within the recvWindow
-    (error 2006, "The tonce has already been used"), which two requests signed in the
-    same millisecond would otherwise trigger. All keys of one account share one
-    sequence, in case WazirX tracks used timestamps per account rather than per key.
-    """
+    """Strictly increasing timestamps shared by all keys of an account (avoids WazirX error 2006)."""
 
     def __init__(self):
         self._last_timestamp_ms = 0
@@ -35,9 +28,8 @@ class WazirxAuth(AuthBase):
     """
     WazirX authentication handler for API requests.
 
-    Handles HMAC-SHA256 signature generation for authenticated API calls to the
-    WazirX exchange. Timestamps come from the connector's TimeSynchronizer, which
-    the status polling loop keeps in step with the server clock.
+    Handles HMAC-SHA256 signature generation and timestamp synchronization
+    for authenticated API calls to the WazirX exchange.
     """
 
     RECV_WINDOW = 60000

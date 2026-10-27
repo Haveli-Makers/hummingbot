@@ -9,15 +9,8 @@ from hummingbot.core.api_throttler.data_types import RateLimit
 
 class WazirxApiKeyPool:
     """
-    Spreads signed requests across the API keys of one WazirX account.
-
-    WazirX applies its rate limits per API key and per endpoint, and an account can
-    have up to 5 keys. The pool keeps a sliding-window count of requests for every
-    key and endpoint, and each request takes the next key, in turn, that has room on
-    its endpoint. With N keys a strategy gets N times one key's request budget.
-
-    A key that got HTTP 429 on an endpoint rests there until its Retry-After has
-    passed. After HTTP 418 (IP ban) no key is handed out until the ban has passed.
+    Rotates signed requests across the API keys of one WazirX account, keeping each key
+    within its per-endpoint limit. A key rests on an endpoint after a 429; all keys pause after a 418.
     """
 
     def __init__(self,
@@ -30,12 +23,9 @@ class WazirxApiKeyPool:
         self._rate_limits: Dict[str, RateLimit] = {rate_limit.limit_id: rate_limit for rate_limit in rate_limits}
         self._time = time_provider
         self._active: List[int] = list(range(len(auths)))
-        # (key index, limit id) -> send times still inside the limit's window
-        self._sent: Dict[Tuple[int, str], Deque[float]] = {}
-        # (key index, limit id) -> when the key may be used again after a 429
-        self._rest_until: Dict[Tuple[int, str], float] = {}
-        # limit id -> key index to try first on the next request
-        self._next_index: Dict[str, int] = {}
+        self._sent: Dict[Tuple[int, str], Deque[float]] = {}     # (key, limit id) -> send times in the window
+        self._rest_until: Dict[Tuple[int, str], float] = {}      # (key, limit id) -> end of its 429 rest
+        self._next_index: Dict[str, int] = {}                    # limit id -> key to try first
         self._paused_until = 0.0
 
     @property
@@ -50,35 +40,23 @@ class WazirxApiKeyPool:
         return self._auths[index]
 
     def label(self, index: int) -> str:
-        """Names a key in log and error messages by its position in the config."""
         return f"key {index + 1} of {self.size}"
 
     def set_active(self, indexes: Collection[int]):
-        """Puts only these keys in rotation, e.g. after the start-up key check."""
         if not indexes:
             raise ValueError("At least one WazirX API key must stay in rotation.")
         self._active = sorted(indexes)
 
     def rest(self, index: int, limit_id: str, seconds: float):
-        """Skips a key on one endpoint for a while, after WazirX answered HTTP 429."""
         self._rest_until[(index, limit_id)] = self._time() + seconds
 
     def pause(self, seconds: float):
-        """Stops handing out keys for a while, after WazirX banned the IP (HTTP 418)."""
         self._paused_until = max(self._paused_until, self._time() + seconds)
 
     async def acquire(self, limit_id: str, exclude: Collection[int] = (), index: Optional[int] = None) -> int:
         """
-        Returns the index of the key to sign the next request on ``limit_id`` with,
-        and counts the request against that key.
-
-        Waits while every eligible key is at its limit. ``exclude`` leaves keys out,
-        such as the key that just got a 429. ``index`` asks for one specific key,
-        whether or not it is in rotation.
-
-        Raises:
-            IOError: while requests are paused after an IP ban, or when every eligible
-                key is resting after a 429. Nothing should be sent in either case.
+        Returns the key to use for the next request on ``limit_id``, waiting while every key is at its limit.
+        Raises IOError while paused or when every eligible key is resting.
         """
         while True:
             key_index, wait = self._try_acquire(limit_id, exclude, index)
@@ -90,7 +68,6 @@ class WazirxApiKeyPool:
                      limit_id: str,
                      exclude: Collection[int],
                      index: Optional[int]) -> Tuple[Optional[int], float]:
-        """Returns (key index, 0) when a key has room, or (None, seconds until one may)."""
         now = self._time()
         if now < self._paused_until:
             raise IOError(

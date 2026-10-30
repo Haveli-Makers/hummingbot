@@ -1,3 +1,5 @@
+import asyncio
+from datetime import datetime, timezone
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from unittest.mock import AsyncMock, patch
@@ -7,7 +9,7 @@ from hummingbot.connector.derivative.delta_perpetual.delta_perpetual_derivative 
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PositionSide, TradeType
-from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, PerpetualDerivativeInFlightOrder
 
 
 def _product(symbol="BTCUSD", pid=27, base="BTC", quote="USD", settling="USD",
@@ -92,7 +94,6 @@ class DeltaPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual([PositionMode.ONEWAY], self.connector.supported_position_modes())
 
     def test_authenticator_is_cached(self):
-        # The authenticator (and its HMAC key) is built once and reused.
         self.assertIs(self.connector.authenticator, self.connector.authenticator)
 
     # ── Symbol map / trading rules ─────────────────────────────────────────────
@@ -100,7 +101,7 @@ class DeltaPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
     async def test_initialize_symbol_map(self):
         self._bootstrap_symbol_map()
         self.assertEqual(27, self.connector._product_id_by_symbol[self.symbol])
-        self.assertEqual(Decimal("0.001"), self.connector._contract_value_by_symbol[self.symbol])
+        self.assertEqual(Decimal("0.001"), self.connector._contract_value_by_pair[self.trading_pair])
         mapped = await self.connector.trading_pair_associated_to_exchange_symbol(self.symbol)
         self.assertEqual(self.trading_pair, mapped)
 
@@ -121,8 +122,6 @@ class DeltaPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual("USD", rule.sell_order_collateral_token)
 
     async def test_format_trading_rules_warns_on_missing_fields(self):
-        # Missing contract_value/tick_size must fall back to defaults WITH a warning,
-        # not silently quantize orders to a possibly-wrong increment.
         product = _product()
         product.pop("contract_value")
         product.pop("tick_size")
@@ -141,8 +140,6 @@ class DeltaPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(Decimal("0.005"), amount)
 
     def test_contract_conversion_works_before_trading_rules(self):
-        # Order-book init converts size<->amount before trading rules load; this must
-        # use the symbol-map contract value, not self._trading_rules (which KeyErrors).
         self.connector._initialize_trading_pair_symbols_from_exchange_info(
             _wrap([_product(contract_value="0.001")])
         )
@@ -231,7 +228,6 @@ class DeltaPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(27, captured["product_id"])
 
     async def test_stop_network_closes_proxy_factory(self):
-        # With a proxy configured, stop_network must close the dedicated session.
         c = DeltaPerpetualDerivative(
             delta_perpetual_api_key="k", delta_perpetual_api_secret="s",
             delta_perpetual_proxy_url="socks5://user:pass@host:1080",
@@ -243,14 +239,12 @@ class DeltaPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
         c._web_assistants_factory.close.assert_awaited_once()
 
     async def test_stop_network_without_proxy_keeps_shared_factory(self):
-        # Without a proxy the connections factory is a shared singleton — never close it.
         self.connector._web_assistants_factory.close = AsyncMock()
         await self.connector.stop_network()
         self.connector._web_assistants_factory.close.assert_not_called()
 
     async def test_place_cancel_pending_order_without_exchange_id(self):
-        # An order still pending creation has no exchange_order_id; cancelling it
-        # must not crash on int(None) — it returns False so the framework retries.
+        # Returns False so the framework retries, instead of crashing on int(None).
         self._bootstrap_symbol_map()
         order = InFlightOrder(
             client_order_id="DLTA-4b", trading_pair=self.trading_pair, order_type=OrderType.LIMIT,
@@ -264,10 +258,7 @@ class DeltaPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
         self.connector._api_delete.assert_not_called()
 
     def test_cancel_of_terminal_order_classifies_as_not_found(self):
-        # Live-confirmed: Delta returns {"error":{"code":"open_order_not_found"}}
-        # (HTTP 400) when cancelling an order that is no longer open (filled or
-        # already cancelled). That must classify as not-found so the base cancel
-        # flow settles the order rather than leaving it phantom-in-flight.
+        # Live-confirmed: cancelling a filled or cancelled order returns open_order_not_found (HTTP 400).
         err = IOError('HTTP status is 400. Error: '
                       '{"error":{"code":"open_order_not_found"},"success":false}')
         self.assertTrue(self.connector._is_order_not_found_during_cancelation_error(err))
@@ -304,8 +295,6 @@ class DeltaPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(OrderState.PARTIALLY_FILLED, update.new_state)
 
     async def test_process_order_event_unmapped_state_keeps_current(self):
-        # An unmapped WS order state must not be dropped; the order stays tracked at
-        # its current state instead of being silently ignored.
         self._bootstrap_symbol_map()
         order = InFlightOrder(
             client_order_id="DLTA-7", trading_pair=self.trading_pair, order_type=OrderType.LIMIT,
@@ -333,8 +322,6 @@ class DeltaPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(Decimal("800"), self.connector._account_available_balances["USD"])
 
     async def test_update_balances_empty_does_not_wipe(self):
-        # A degenerate empty wallet payload (success:true, result:[]) must not wipe
-        # tracked balances.
         self.connector._account_balances["USD"] = Decimal("1000")
         self.connector._account_available_balances["USD"] = Decimal("800")
         self.connector._api_get = AsyncMock(return_value=_wrap([]))
@@ -419,8 +406,6 @@ class DeltaPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
         self.assertIsNotNone(fee)
 
     def test_get_fee_respects_explicit_taker(self):
-        # An explicit is_maker=False must not be clobbered to maker just because the
-        # order type is LIMIT_MAKER.
         taker = self.connector._get_fee(
             base_currency="BTC", quote_currency="USD", order_type=OrderType.LIMIT_MAKER,
             order_side=TradeType.BUY, position_action=PositionAction.OPEN, amount=Decimal("1"),
@@ -439,3 +424,169 @@ class DeltaPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
         api_get_mock.return_value = _wrap({"symbol": self.symbol, "close": "51000"})
         price = await self.connector._get_last_traded_price(self.trading_pair)
         self.assertEqual(51000.0, price)
+
+    # ── Products, fills and stream handling ────────────────────────────────────
+
+    def _track_order(self, client_order_id="DLTA-10", exchange_order_id="1001"):
+        order = PerpetualDerivativeInFlightOrder(
+            client_order_id=client_order_id, exchange_order_id=exchange_order_id, trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT, trade_type=TradeType.BUY, amount=Decimal("0.002"), price=Decimal("50000"),
+            creation_timestamp=1700000000.0, leverage=1, position=PositionAction.OPEN,
+        )
+        self.connector._order_tracker.start_tracking_order(order)
+        return order
+
+    async def test_products_are_read_page_by_page(self):
+        self.connector._api_get = AsyncMock(side_effect=[
+            {"success": True, "result": [_product()], "meta": {"after": "cursor-1"}},
+            {"success": True, "result": [_product(symbol="ETHUSD", pid=3136, base="ETH")], "meta": {"after": None}},
+        ])
+
+        products = await self.connector._make_trading_pairs_request()
+
+        self.assertEqual(["BTCUSD", "ETHUSD"], [p["symbol"] for p in products])
+        second_params = self.connector._api_get.call_args_list[1].kwargs["params"]
+        self.assertEqual("cursor-1", second_params["after"])
+        self.assertEqual("live", second_params["states"])
+
+    async def test_fills_are_read_from_rest_with_their_commission(self):
+        self._bootstrap_symbol_map()
+        order = self._track_order()
+        self.connector._api_get = AsyncMock(return_value={"success": True, "meta": {"after": None}, "result": [
+            {"id": "f1", "order_id": "1001", "size": "1", "price": "50000", "commission": "0.025",
+             "settling_asset_symbol": "USD", "created_at": "2023-11-14T22:13:21Z"},
+            {"id": "f2", "order_id": "9999", "size": "5", "price": "50000", "commission": "1"},
+        ]})
+
+        updates = await self.connector._all_trade_updates_for_order(order)
+
+        self.assertEqual(["f1"], [u.trade_id for u in updates])
+        self.assertEqual(Decimal("0.001"), updates[0].fill_base_amount)
+        self.assertEqual(Decimal("50"), updates[0].fill_quote_amount)
+        self.assertEqual([("USD", Decimal("0.025"))], [(f.token, f.amount) for f in updates[0].fee.flat_fees])
+        self.assertEqual(1700000001.0, updates[0].fill_timestamp)
+        params = self.connector._api_get.call_args.kwargs["params"]
+        self.assertEqual("27", params["product_ids"])
+        self.assertEqual(int((1700000000.0 - 60) * 1e6), params["start_time"])
+
+    async def test_stream_fill_is_read_from_rest_until_it_is_recorded(self):
+        self._bootstrap_symbol_map()
+        order = self._track_order()
+        fill = {"id": "f1", "order_id": "1001", "size": "1", "price": "50000", "commission": "0.025"}
+        self.connector._api_get = AsyncMock(side_effect=[
+            {"success": True, "result": [], "meta": {}},  # REST has not caught up with the stream yet
+            {"success": True, "result": [fill], "meta": {}},
+        ])
+        self.connector._sleep = AsyncMock()
+
+        self.connector._process_trade_event({"type": "v2/user_trades", "sy": self.symbol, "f": "f-1", "o": 1001,
+                                             "c": "DLTA-10", "S": "buy", "s": 1, "p": "50000"})
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+        self.assertEqual(2, self.connector._api_get.await_count)
+        self.assertIn("f1", order.order_fills)
+
+    def test_stream_order_update_uses_order_id(self):
+        self._bootstrap_symbol_map()
+        self._track_order(client_order_id="DLTA-11", exchange_order_id="2002")
+        captured = {}
+        self.connector._order_tracker.process_order_update = lambda update: captured.update(update=update)
+
+        self.connector._process_order_event({"type": "orders", "action": "update", "order_id": 2002,
+                                             "client_order_id": "", "state": "cancelled", "size": 2,
+                                             "unfilled_size": 2, "timestamp": 1700000001000000})
+
+        self.assertEqual(OrderState.CANCELED, captured["update"].new_state)
+        self.assertEqual(("DLTA-11", "2002"), (captured["update"].client_order_id, captured["update"].exchange_order_id))
+
+    async def test_orders_snapshot_entries_are_processed(self):
+        processed = []
+        self.connector._process_order_event = processed.append
+
+        async def events():
+            yield {"type": "orders", "action": "snapshot", "result": [{"id": 1, "state": "open"}, {"id": 2}]}
+
+        with patch.object(self.connector, "_iter_user_event_queue", new=events):
+            await self.connector._user_stream_event_listener()
+
+        self.assertEqual([1, 2], [o["id"] for o in processed])
+
+    async def test_cancel_of_an_order_that_filled_first_is_not_reported_as_cancelled(self):
+        self._bootstrap_symbol_map()
+        order = self._track_order(exchange_order_id="555")
+        self.connector._api_delete = AsyncMock(return_value=_wrap({"id": 555, "state": "closed"}))
+
+        self.assertFalse(await self.connector._place_cancel(order.client_order_id, order))
+
+    async def test_positions_delta_no_longer_lists_are_removed(self):
+        self._bootstrap_symbol_map()
+        self.connector._api_get = AsyncMock(return_value=_wrap([{
+            "product_symbol": self.symbol, "size": 5, "entry_price": "50000", "unrealized_pnl": "12.5"}]))
+        await self.connector._update_positions()
+        self.assertEqual({"contract_types": "perpetual_futures"}, self.connector._api_get.call_args.kwargs["params"])
+        self.assertEqual(Decimal("12.5"), self.connector.account_positions[self.trading_pair].unrealized_pnl)
+
+        self.connector._api_get = AsyncMock(return_value=_wrap([]))
+        await self.connector._update_positions()
+
+        self.assertEqual({}, self.connector.account_positions)
+
+    async def test_position_stream_creates_and_deletes(self):
+        self._bootstrap_symbol_map()
+
+        await self.connector._process_position_event({"type": "positions", "action": "create", "symbol": self.symbol,
+                                                      "size": -3, "entry_price": "50000"})
+        position = self.connector.account_positions[self.trading_pair]
+        self.assertEqual((PositionSide.SHORT, Decimal("-0.003")), (position.position_side, position.amount))
+
+        await self.connector._process_position_event({"type": "positions", "action": "delete", "symbol": self.symbol,
+                                                      "size": 0})
+        self.assertEqual({}, self.connector.account_positions)
+
+    async def test_funding_payment_comes_from_wallet_transactions(self):
+        self._bootstrap_symbol_map()
+        self.connector._api_get = AsyncMock(return_value=_wrap([
+            {"transaction_type": "funding", "product_id": 27, "amount": "-0.12", "created_at": "2023-11-14T16:00:00Z"},
+            {"transaction_type": "funding", "product_id": 27, "amount": "0.05", "created_at": "2023-11-14T08:00:00Z"},
+            {"transaction_type": "funding", "product_id": 3136, "amount": "9", "created_at": "2023-11-14T16:30:00Z"},
+        ]))
+
+        timestamp, rate, amount = await self.connector._fetch_last_fee_payment(self.trading_pair)
+
+        self.assertEqual(datetime(2023, 11, 14, 16, tzinfo=timezone.utc).timestamp(), timestamp)
+        self.assertEqual(Decimal("-0.12"), amount)
+        self.assertEqual("funding", self.connector._api_get.call_args.kwargs["params"]["transaction_types"])
+
+    async def test_no_funding_payment_returns_the_sentinel(self):
+        self._bootstrap_symbol_map()
+        self.connector._api_get = AsyncMock(return_value=_wrap([]))
+
+        self.assertEqual((0, Decimal("-1"), Decimal("-1")),
+                         await self.connector._fetch_last_fee_payment(self.trading_pair))
+
+    def test_parse_delta_timestamp_iso(self):
+        self.assertEqual(1700000000.0, self.connector._parse_delta_timestamp("2023-11-14T22:13:20Z"))
+
+    def test_connector_properties(self):
+        self.assertEqual("delta_perpetual", self.connector.name)
+        self.assertEqual(CONSTANTS.DEFAULT_DOMAIN, self.connector.domain)
+        self.assertEqual(("DLTA", 32), (self.connector.client_order_id_prefix, self.connector.client_order_id_max_length))
+        self.assertEqual(CONSTANTS.PRODUCTS_PATH_URL, self.connector.trading_rules_request_path)
+        self.assertEqual(CONSTANTS.PRODUCTS_PATH_URL, self.connector.trading_pairs_request_path)
+        self.assertEqual(CONSTANTS.RATE_LIMITS, self.connector.rate_limits_rules)
+        self.assertFalse(self.connector.is_trading_required)
+
+    def test_error_classification(self):
+        self.assertTrue(self.connector._is_request_exception_related_to_time_synchronizer(
+            IOError('{"error": "SignatureExpired", "message": "your signature has expired"}')))
+        self.assertTrue(self.connector._is_order_not_found_during_status_update_error(IOError("404 not found")))
+        self.assertFalse(self.connector._is_order_not_found_during_status_update_error(IOError("insufficient_margin")))
+
+    async def test_volume_tickers_are_filtered_by_pair(self):
+        self.connector._api_get = AsyncMock(return_value=_wrap([{"symbol": "BTCUSD", "volume": 1},
+                                                                {"symbol": "ETHUSD", "volume": 2}]))
+
+        self.assertEqual(2, len(await self.connector.get_all_pairs_prices()))
+        self.assertEqual([{"symbol": "BTCUSD", "volume": 1}],
+                         await self.connector.get_all_24h_volume_tickers(["BTC-USD"]))

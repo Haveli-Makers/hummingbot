@@ -45,9 +45,7 @@ class DeltaPerpetualAuthTests(TestCase):
         self.assertEqual(CONSTANTS.BROKER_ID, request.headers["User-Agent"])
 
     def test_rest_authenticate_get_encodes_query_to_match_wire(self):
-        # The signed query string must equal exactly what aiohttp transmits, even for
-        # a value that needs escaping. aiohttp applies params via yarl's
-        # URL.extend_query, so we sign over that same encoding.
+        # Signs the same yarl encoding aiohttp sends, even for values that need escaping.
         from yarl import URL
         url = "https://api.india.delta.exchange/v2/orders"
         request = RESTRequest(
@@ -83,8 +81,7 @@ class DeltaPerpetualAuthTests(TestCase):
             is_auth_required=True,
         )
         self.async_run_with_timeout(self.auth.rest_authenticate(request))
-        # Dict body must be written back as a compact JSON string for the body to
-        # match what is signed.
+        # The body is written back as the compact JSON that was signed.
         self.assertEqual('{"product_id":27,"size":1}', request.data)
         expected = self._sign(f"POST{self.timestamp}/v2/orders{request.data}")
         self.assertEqual(expected, request.headers["signature"])
@@ -92,7 +89,7 @@ class DeltaPerpetualAuthTests(TestCase):
     def test_ws_auth_payload(self):
         payload = self.auth.ws_auth_payload()
         expected_sig = self._sign(f"GET{self.timestamp}{CONSTANTS.WS_AUTH_PREHASH_PATH}")
-        self.assertEqual("auth", payload["type"])
+        self.assertEqual("key-auth", payload["type"])
         self.assertEqual(self.api_key, payload["payload"]["api-key"])
         self.assertEqual(str(self.timestamp), payload["payload"]["timestamp"])
         self.assertEqual(expected_sig, payload["payload"]["signature"])

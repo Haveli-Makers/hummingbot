@@ -9,7 +9,7 @@ CENTRALIZED = True
 # Delta (India) perpetuals are USD-quoted/settled (e.g. BTCUSD -> BTC-USD).
 EXAMPLE_PAIR = "BTC-USD"
 
-# Delta perpetual default fees (overridden per-product from /v2/products when available).
+# Delta's standard perpetual fees.
 DEFAULT_FEES = TradeFeeSchema(
     maker_percent_fee_decimal=Decimal("0.0002"),
     taker_percent_fee_decimal=Decimal("0.0005"),

@@ -10,11 +10,19 @@ from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFa
 
 
 def public_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
-    return f"{CONSTANTS.REST_URL}{path_url}"
+    return f"{CONSTANTS.REST_URLS[domain]}{path_url}"
 
 
 def private_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
-    return f"{CONSTANTS.REST_URL}{path_url}"
+    return f"{CONSTANTS.REST_URLS[domain]}{path_url}"
+
+
+def public_wss_url(domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
+    return CONSTANTS.WSS_PUBLIC_URLS[domain]
+
+
+def private_wss_url(domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
+    return CONSTANTS.WSS_PRIVATE_URLS[domain]
 
 
 def build_api_factory(
@@ -39,22 +47,13 @@ def build_api_factory(
 
 
 def _build_connections_factory(proxy_url: Optional[str]):
-    """
-    Return a ProxyConnectionsFactory when a proxy URL is provided (routes both
-    REST and WebSocket traffic through a whitelisted IP), otherwise fall back to
-    the default singleton ConnectionsFactory. The proxy import is lazy so the
-    aiohttp_socks dependency is only loaded when a proxy is actually configured.
-    """
+    """Proxy factory (imported lazily) when a proxy URL is set, else the shared default factory."""
     if proxy_url:
         from hummingbot.core.web_assistant.connections.proxy_connections_factory import ProxyConnectionsFactory
         return ProxyConnectionsFactory(proxy_url=proxy_url)
 
     from hummingbot.core.web_assistant.connections.connections_factory import ConnectionsFactory
     return ConnectionsFactory()
-
-
-def build_api_factory_without_time_synchronizer_pre_processor(throttler: AsyncThrottler) -> WebAssistantsFactory:
-    return WebAssistantsFactory(throttler=throttler)
 
 
 def create_throttler() -> AsyncThrottler:
@@ -65,9 +64,5 @@ async def get_current_server_time(
         throttler: Optional[AsyncThrottler] = None,
         domain: str = CONSTANTS.DEFAULT_DOMAIN,
 ) -> float:
-    """
-    Delta signs with the client clock (seconds) and only accepts signatures for
-    ~5 seconds, so an accurate clock matters. Returns local time in MILLISECONDS
-    (TimeSynchronizer stores ms); DeltaPerpetualAuth then takes int(seconds).
-    """
+    """Delta has no server-time endpoint; returns the local time in ms, as TimeSynchronizer expects."""
     return _time.time() * 1000

@@ -1,6 +1,8 @@
 import asyncio
+from collections import defaultdict
+from datetime import datetime
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from bidict import bidict
 
@@ -25,18 +27,12 @@ from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState,
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
+from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
-
-if TYPE_CHECKING:
-    pass
 
 
 def _result(response: Any) -> Any:
-    """
-    Delta wraps payloads as {"success": true, "result": …, "meta": …}.
-    Raise on an explicit failure envelope; otherwise return `result` (or the
-    response itself if there is no wrapper).
-    """
+    """Unwraps Delta's {"success", "result"} envelope; raises on a failure envelope."""
     if isinstance(response, dict):
         if response.get("success") is False:
             err = response.get("error") or response.get("message") or response
@@ -62,30 +58,24 @@ class DeltaPerpetualDerivative(PerpetualDerivativePyBase):
     ):
         self.api_key = delta_perpetual_api_key
         self.secret_key = delta_perpetual_api_secret
-        # Optional proxy: route REST + WS traffic through a whitelisted IP. Empty = direct.
+        # Optional proxy for REST and WS traffic; empty means a direct connection.
         self._proxy_url = delta_perpetual_proxy_url or ""
         self._domain = domain
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
-        self._position_mode = None
-        # Delta orders reference an integer product_id and a contract size.
         self._product_id_by_symbol: Dict[str, int] = {}
-        self._contract_value_by_symbol: Dict[str, Decimal] = {}
-        # Contract value keyed by HB trading pair too, so size<->amount conversion
-        # works during order-book init (which runs before trading rules load).
+        # Keyed by pair so order books can convert contract sizes before trading rules load.
         self._contract_value_by_pair: Dict[str, Decimal] = {}
-        # Built once and cached: rebuilding hex-decodes the secret and reconstructs
-        # the HMAC key on every access otherwise.
         self._authenticator: Optional[DeltaPerpetualAuth] = None
+        # Fills announced on the private stream per order, until REST has recorded them.
+        self._ws_fill_counts: Dict[str, int] = defaultdict(int)
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     # ── Properties ─────────────────────────────────────────────────────────────
 
     @property
     def authenticator(self):
-        # Built once and cached. The base class reads this during __init__ and it
-        # may be accessed repeatedly afterwards; rebuilding each time reconstructs
-        # the HMAC signing key needlessly.
+        # Built once: the base class reads it repeatedly.
         if self._authenticator is None:
             self._authenticator = DeltaPerpetualAuth(
                 api_key=self.api_key,
@@ -146,7 +136,6 @@ class DeltaPerpetualDerivative(PerpetualDerivativePyBase):
         return [OrderType.LIMIT, OrderType.MARKET, OrderType.LIMIT_MAKER]
 
     def supported_position_modes(self) -> List[PositionMode]:
-        # Delta perpetuals operate in one-way (single) position mode.
         return [PositionMode.ONEWAY]
 
     def get_buy_collateral_token(self, trading_pair: str) -> str:
@@ -177,7 +166,6 @@ class DeltaPerpetualDerivative(PerpetualDerivativePyBase):
     def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
         return DeltaPerpetualAPIUserStreamDataSource(
             auth=self._auth,
-            trading_pairs=self._trading_pairs,
             connector=self,
             api_factory=self._web_assistants_factory,
             domain=self._domain,
@@ -185,10 +173,7 @@ class DeltaPerpetualDerivative(PerpetualDerivativePyBase):
 
     async def stop_network(self):
         await super().stop_network()
-        # When a proxy is configured, the web-assistants factory owns a dedicated,
-        # per-connector aiohttp session (ProxyConnectionsFactory). Close it on
-        # shutdown so it doesn't leak ("Unclosed client session"). The default
-        # ConnectionsFactory is a shared singleton, so it's deliberately left alone.
+        # A proxy gets its own session, so close it; the default connections factory is shared and stays open.
         if self._proxy_url:
             try:
                 await self._web_assistants_factory.close()
@@ -199,7 +184,8 @@ class DeltaPerpetualDerivative(PerpetualDerivativePyBase):
 
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception) -> bool:
         msg = str(request_exception).lower()
-        return "expired_signature" in msg or "signature expired" in msg or "timestamp" in msg
+        # Delta's error is {"error": "SignatureExpired", ...}.
+        return any(token in msg for token in ("signatureexpired", "expired_signature", "signature expired", "timestamp"))
 
     def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
         msg = str(status_update_exception).lower()
@@ -212,13 +198,7 @@ class DeltaPerpetualDerivative(PerpetualDerivativePyBase):
     # ── Contract-size helpers ──────────────────────────────────────────────────
 
     def _contract_value_for_pair(self, trading_pair: str) -> Decimal:
-        """
-        Contract value for a pair, taken from the symbol map (populated when the
-        trading-pair map loads — BEFORE trading rules). The order-book tracker
-        converts size<->amount during init, which can run before trading rules are
-        ready, so reading self._trading_rules here would KeyError. Fall back to the
-        trading rule, then to 1.
-        """
+        """Contract value from the symbol map (loaded before trading rules), else the trading rule, else 1."""
         value = self._contract_value_by_pair.get(trading_pair)
         if value is None:
             rule = self._trading_rules.get(trading_pair)
@@ -254,7 +234,6 @@ class DeltaPerpetualDerivative(PerpetualDerivativePyBase):
     def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Any):
         mapping = bidict()
         self._product_id_by_symbol = {}
-        self._contract_value_by_symbol = {}
         self._contract_value_by_pair = {}
         for product in _result(exchange_info) or []:
             try:
@@ -272,19 +251,27 @@ class DeltaPerpetualDerivative(PerpetualDerivativePyBase):
                 hb_pair = combine_to_hb_trading_pair(base=base.upper(), quote=quote.upper())
                 mapping[symbol] = hb_pair
                 self._product_id_by_symbol[symbol] = int(product.get("id"))
-                contract_value = Decimal(str(product.get("contract_value", "1")))
-                self._contract_value_by_symbol[symbol] = contract_value
-                self._contract_value_by_pair[hb_pair] = contract_value
+                self._contract_value_by_pair[hb_pair] = Decimal(str(product.get("contract_value", "1")))
             except Exception as exc:
                 self.logger().debug(f"Error parsing Delta product '{product}': {exc}")
         self._set_trading_pair_symbol_map(mapping)
 
     async def _make_trading_pairs_request(self) -> Any:
-        return await self._api_get(
-            path_url=CONSTANTS.PRODUCTS_PATH_URL,
-            params={"contract_types": CONSTANTS.PERPETUAL_CONTRACT_TYPE},
-            is_auth_required=False,
-        )
+        params = {
+            "contract_types": CONSTANTS.PERPETUAL_CONTRACT_TYPE,
+            "states": CONSTANTS.LIVE_STATE,
+            "page_size": CONSTANTS.PRODUCTS_PAGE_SIZE,
+        }
+        products: List[Dict[str, Any]] = []
+        for _ in range(CONSTANTS.MAX_PRODUCT_PAGES):
+            response = await self._api_get(path_url=CONSTANTS.PRODUCTS_PATH_URL, params=params, is_auth_required=False)
+            products.extend(_result(response) or [])
+            after = (response.get("meta") or {}).get("after") if isinstance(response, dict) else None
+            if not after:
+                return products
+            params = {**params, "after": after}
+        self.logger().warning(f"Stopped reading Delta products after {CONSTANTS.MAX_PRODUCT_PAGES} pages.")
+        return products
 
     async def _make_trading_rules_request(self) -> Any:
         return await self._make_trading_pairs_request()
@@ -306,9 +293,7 @@ class DeltaPerpetualDerivative(PerpetualDerivativePyBase):
                     continue
                 trading_pair = combine_to_hb_trading_pair(base=base.upper(), quote=quote.upper())
 
-                # Warn rather than silently quantizing to a wrong increment: Delta
-                # always publishes these, so a missing field signals an unexpected
-                # payload and orders may be rejected / mis-sized against the default.
+                # Delta always sends these; a missing one means an unexpected payload, so warn about the fallback.
                 raw_contract_value = product.get("contract_value")
                 if raw_contract_value in (None, ""):
                     contract_value = Decimal("1")
@@ -423,10 +408,7 @@ class DeltaPerpetualDerivative(PerpetualDerivativePyBase):
         return exchange_order_id, transact_time
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder) -> bool:
-        # The order may still be pending creation (no exchange id assigned yet).
-        # Delta cancels by numeric order id, so without one there is nothing to
-        # cancel server-side; report "not cancelled" so the framework retries
-        # once the creation response arrives, rather than crashing on int(None).
+        # Delta cancels by exchange id; without one yet, report "not cancelled" so the framework retries.
         if tracked_order.exchange_order_id is None:
             self.logger().warning(
                 f"Cannot cancel {order_id} yet: the exchange order id is not available "
@@ -441,10 +423,8 @@ class DeltaPerpetualDerivative(PerpetualDerivativePyBase):
             is_auth_required=True,
         )
         order = _result(response)
-        if isinstance(order, dict):
-            state = str(order.get("state", "")).lower()
-            return state in ("cancelled", "canceled") or order.get("id") is not None
-        return True
+        # Only "cancelled" confirms it; "closed" means the order filled first.
+        return isinstance(order, dict) and str(order.get("state", "")).lower() in ("cancelled", "canceled")
 
     # ── Order & trade status ───────────────────────────────────────────────────
 
@@ -465,7 +445,7 @@ class DeltaPerpetualDerivative(PerpetualDerivativePyBase):
         if new_state is None:
             raise ValueError(f"Unknown Delta order state '{state_str}' for {tracked_order.exchange_order_id}")
 
-        # A 'closed' order is fully filled only if there is no unfilled size.
+        # An open order with part of its size filled is partially filled.
         unfilled = order.get("unfilled_size")
         if new_state == OrderState.OPEN and unfilled is not None and float(unfilled) < float(order.get("size", 0)):
             new_state = OrderState.PARTIALLY_FILLED
@@ -479,10 +459,49 @@ class DeltaPerpetualDerivative(PerpetualDerivativePyBase):
         )
 
     async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
-        # Fills are delivered via the private WebSocket (v2/user_trades) and turned
-        # into TradeUpdates in the user-stream listener; the periodic poll has no
-        # dedicated per-order fills endpoint, so nothing to fetch here.
-        return []
+        """Fills with their commission, from REST. There is no order filter, so read the product's recent fills."""
+        if order.exchange_order_id is None:
+            return []
+        params: Dict[str, Any] = {
+            "product_ids": str(await self._product_id_for_pair(order.trading_pair)),
+            "page_size": CONSTANTS.FILLS_PAGE_SIZE,
+        }
+        if order.creation_timestamp > 0:
+            params["start_time"] = int((order.creation_timestamp - 60) * 1e6)
+        trade_updates = []
+        for _ in range(CONSTANTS.MAX_FILL_PAGES):
+            response = await self._api_get(path_url=CONSTANTS.FILLS_PATH_URL, params=params, is_auth_required=True)
+            for fill in _result(response) or []:
+                if str(fill.get("order_id")) == order.exchange_order_id:
+                    trade_updates.append(self._trade_update_from_fill(order, fill))
+            after = (response.get("meta") or {}).get("after") if isinstance(response, dict) else None
+            if not after:
+                break
+            params = {**params, "after": after}
+        return trade_updates
+
+    def _trade_update_from_fill(self, order: InFlightOrder, fill: Dict[str, Any]) -> TradeUpdate:
+        fill_base = abs(Decimal(str(fill.get("size", "0")))) * self._contract_value_for_pair(order.trading_pair)
+        fill_price = Decimal(str(fill.get("price", "0")))
+        fee = TradeFeeBase.new_perpetual_fee(
+            fee_schema=self.trade_fee_schema(),
+            position_action=getattr(order, "position", PositionAction.NIL),
+            flat_fees=[TokenAmount(
+                amount=Decimal(str(fill.get("commission") or "0")),
+                token=str(fill.get("settling_asset_symbol") or order.quote_asset),
+            )],
+        )
+        return TradeUpdate(
+            trade_id=str(fill.get("id")),
+            client_order_id=order.client_order_id,
+            exchange_order_id=order.exchange_order_id,
+            trading_pair=order.trading_pair,
+            fee=fee,
+            fill_base_amount=fill_base,
+            fill_quote_amount=fill_base * fill_price,
+            fill_price=fill_price,
+            fill_timestamp=self._parse_delta_timestamp(fill.get("created_at")),
+        )
 
     # ── Balance ────────────────────────────────────────────────────────────────
 
@@ -502,9 +521,7 @@ class DeltaPerpetualDerivative(PerpetualDerivativePyBase):
                 self._account_balances[asset] = total
                 self._account_available_balances[asset] = free
                 remote_assets.add(asset)
-            # A degenerate/empty wallet payload (e.g. success:true with result:[])
-            # would otherwise wipe every tracked balance via the stale-removal loop,
-            # leaving the bot believing it holds nothing. Keep last known balances.
+            # An empty payload would wipe every balance; keep the last known ones.
             if not remote_assets:
                 if local_assets:
                     self.logger().warning("Delta wallet response had no balances; keeping last known balances.")
@@ -518,43 +535,73 @@ class DeltaPerpetualDerivative(PerpetualDerivativePyBase):
     # ── Positions / leverage / funding ─────────────────────────────────────────
 
     async def _update_positions(self):
-        # /v2/positions needs a product filter; /v2/positions/margined returns all open positions.
-        response = await self._api_get(path_url=CONSTANTS.POSITIONS_MARGINED_PATH_URL, is_auth_required=True)
+        response = await self._api_get(
+            path_url=CONSTANTS.POSITIONS_MARGINED_PATH_URL,
+            params={"contract_types": CONSTANTS.PERPETUAL_CONTRACT_TYPE},
+            is_auth_required=True,
+        )
+        open_keys = set()
         for position in _result(response) or []:
             if not isinstance(position, dict):
                 continue
-            ex_symbol = position.get("product_symbol") or self._symbol_for_product_id(position.get("product_id"))
-            try:
-                hb_pair = await self.trading_pair_associated_to_exchange_symbol(ex_symbol)
-            except KeyError:
-                continue
-
+            hb_pair = await self._trading_pair_for(position)
             size = Decimal(str(position.get("size", "0")))  # signed contracts
-            position_side = PositionSide.LONG if size > 0 else PositionSide.SHORT
-            pos_key = self._perpetual_trading.position_key(hb_pair, position_side)
+            if hb_pair is None or size == 0:
+                continue
+            open_keys.add(self._set_position_from_contracts(
+                hb_pair,
+                size,
+                entry_price=Decimal(str(position.get("entry_price") or "0")),
+                unrealized_pnl=Decimal(str(position.get("unrealized_pnl") or "0")),
+                leverage=Decimal(str(position.get("leverage") or "1")),
+            ))
+        # Delta stops listing a position once it is closed.
+        for pos_key in set(self.account_positions) - open_keys:
+            self._perpetual_trading.remove_position(pos_key)
 
-            if size != 0:
-                contract_value = self._contract_value_by_symbol.get(ex_symbol, Decimal("1"))
-                amount = abs(size) * contract_value * (Decimal("1") if position_side == PositionSide.LONG else Decimal("-1"))
-                unrealized_pnl = Decimal(str(position.get("unrealized_pnl", position.get("realized_pnl", "0")) or "0"))
-                entry_price = Decimal(str(position.get("entry_price", "0") or "0"))
-                leverage = Decimal(str(position.get("leverage", "1") or "1"))
-                self._perpetual_trading.set_position(
-                    pos_key,
-                    Position(
-                        trading_pair=hb_pair,
-                        position_side=position_side,
-                        unrealized_pnl=unrealized_pnl,
-                        entry_price=entry_price,
-                        amount=amount,
-                        leverage=leverage,
-                    ),
-                )
-            else:
+    async def _process_position_event(self, event: Dict[str, Any]):
+        entries = (event.get("result") or []) if event.get("action") == "snapshot" else [event]
+        for entry in entries:
+            hb_pair = await self._trading_pair_for(entry)
+            if hb_pair is None:
+                continue
+            size = Decimal(str(entry.get("size") or "0"))
+            pos_key = self._perpetual_trading.position_key(hb_pair)
+            current = self.account_positions.get(pos_key)
+            if entry.get("action") == "delete" or size == 0:
                 self._perpetual_trading.remove_position(pos_key)
+                continue
+            # The stream has no PnL or leverage; keep the last polled values.
+            self._set_position_from_contracts(
+                hb_pair,
+                size,
+                entry_price=Decimal(str(entry.get("entry_price") or "0")),
+                unrealized_pnl=current.unrealized_pnl if current is not None else Decimal("0"),
+                leverage=current.leverage if current is not None else Decimal(self.get_leverage(hb_pair)),
+            )
+
+    def _set_position_from_contracts(self, hb_pair: str, size: Decimal, entry_price: Decimal,
+                                     unrealized_pnl: Decimal, leverage: Decimal) -> str:
+        position_side = PositionSide.LONG if size > 0 else PositionSide.SHORT
+        pos_key = self._perpetual_trading.position_key(hb_pair, position_side)
+        self._perpetual_trading.set_position(pos_key, Position(
+            trading_pair=hb_pair,
+            position_side=position_side,
+            unrealized_pnl=unrealized_pnl,
+            entry_price=entry_price,
+            amount=self._format_size_to_amount(hb_pair, size),
+            leverage=leverage,
+        ))
+        return pos_key
+
+    async def _trading_pair_for(self, entry: Dict[str, Any]) -> Optional[str]:
+        symbol = entry.get("product_symbol") or entry.get("symbol") or self._symbol_for_product_id(entry.get("product_id"))
+        try:
+            return await self.trading_pair_associated_to_exchange_symbol(symbol)
+        except KeyError:
+            return None
 
     async def _trading_pair_position_mode_set(self, mode: PositionMode, trading_pair: str) -> Tuple[bool, str]:
-        # Delta perpetuals are one-way only; accept ONEWAY, reject HEDGE.
         if mode == PositionMode.ONEWAY:
             return True, ""
         return False, "Delta perpetuals only support ONEWAY position mode."
@@ -574,11 +621,26 @@ class DeltaPerpetualDerivative(PerpetualDerivativePyBase):
             return False, str(exc)
 
     async def _fetch_last_fee_payment(self, trading_pair: str) -> Tuple[float, Decimal, Decimal]:
-        # Funding payments are not polled per-pair here; return the "no payment" sentinel.
-        return 0, Decimal("-1"), Decimal("-1")
-
-    async def _update_funding_payment(self, trading_pair: str, fire_event_on_new: bool) -> bool:
-        return True
+        # Funding payments are "funding" wallet transactions; they have no rate, so report the current one.
+        product_id = await self._product_id_for_pair(trading_pair)
+        response = await self._api_get(
+            path_url=CONSTANTS.WALLET_TRANSACTIONS_PATH_URL,
+            params={
+                "transaction_types": CONSTANTS.FUNDING_TRANSACTION_TYPE,
+                "start_time": int((self._time() - CONSTANTS.FUNDING_LOOKBACK_SECONDS) * 1e6),
+                "page_size": CONSTANTS.FILLS_PAGE_SIZE,
+            },
+            is_auth_required=True,
+        )
+        payments = [t for t in _result(response) or [] if isinstance(t, dict) and t.get("product_id") == product_id]
+        if not payments:
+            return 0, Decimal("-1"), Decimal("-1")
+        latest = max(payments, key=lambda t: self._parse_delta_timestamp(t.get("created_at")))
+        try:
+            rate = self.get_funding_info(trading_pair).rate
+        except KeyError:
+            rate = Decimal("0")
+        return self._parse_delta_timestamp(latest.get("created_at")), rate, Decimal(str(latest.get("amount") or "0"))
 
     # ── Fees ───────────────────────────────────────────────────────────────────
 
@@ -593,8 +655,7 @@ class DeltaPerpetualDerivative(PerpetualDerivativePyBase):
         price: Decimal = s_decimal_NaN,
         is_maker: Optional[bool] = None,
     ) -> TradeFeeBase:
-        # Respect an explicit is_maker=False (e.g. a LIMIT_MAKER that crossed and
-        # filled as taker); only infer from the order type when it is unspecified.
+        # Infer maker from the order type only when is_maker is not given.
         is_maker = is_maker if is_maker is not None else (order_type is OrderType.LIMIT_MAKER)
         return TradeFeeBase.new_perpetual_fee(
             fee_schema=self.trade_fee_schema(),
@@ -613,7 +674,6 @@ class DeltaPerpetualDerivative(PerpetualDerivativePyBase):
                 channel = event.get("type") or event.get("channel")
 
                 if channel == CONSTANTS.WS_WALLET_CHANNEL:
-                    # margins/wallet update
                     asset = str(event.get("asset_symbol") or "").upper()
                     if asset:
                         bal = event.get("balance")
@@ -624,14 +684,17 @@ class DeltaPerpetualDerivative(PerpetualDerivativePyBase):
                             self._account_available_balances[asset] = Decimal(str(avail))
 
                 elif channel == CONSTANTS.WS_ORDERS_CHANNEL:
-                    self._process_order_event(event)
+                    if event.get("action") == "snapshot":
+                        for order_data in event.get("result") or []:
+                            self._process_order_event(order_data)
+                    else:
+                        self._process_order_event(event)
 
                 elif channel == CONSTANTS.WS_USER_TRADES_CHANNEL:
                     self._process_trade_event(event)
 
                 elif channel == CONSTANTS.WS_POSITIONS_CHANNEL:
-                    # Positions are also refreshed by the periodic _update_positions poll.
-                    pass
+                    await self._process_position_event(event)
 
             except asyncio.CancelledError:
                 raise
@@ -639,26 +702,26 @@ class DeltaPerpetualDerivative(PerpetualDerivativePyBase):
                 self.logger().error("Unexpected error in Delta user-stream listener.", exc_info=True)
                 await self._sleep(5.0)
 
-    def _process_order_event(self, order_data: Dict[str, Any]):
-        client_order_id = order_data.get("client_order_id")
-        exchange_order_id = str(order_data.get("id", ""))
-        state_str = str(order_data.get("state", "")).lower()
-
-        tracked = None
-        if client_order_id:
-            tracked = self._order_tracker.all_updatable_orders.get(client_order_id)
+    @staticmethod
+    def _find_tracked_order(orders: Dict[str, InFlightOrder], client_order_id: Optional[str],
+                            exchange_order_id: str) -> Optional[InFlightOrder]:
+        tracked = orders.get(client_order_id) if client_order_id else None
         if tracked is None and exchange_order_id:
-            for o in self._order_tracker.all_updatable_orders.values():
-                if o.exchange_order_id == exchange_order_id:
-                    tracked = o
-                    break
+            tracked = next((o for o in orders.values() if o.exchange_order_id == exchange_order_id), None)
+        return tracked
+
+    def _process_order_event(self, order_data: Dict[str, Any]):
+        # Stream updates carry "order_id"; snapshot entries and REST responses carry "id".
+        exchange_order_id = str(order_data.get("order_id") or order_data.get("id") or "")
+        state_str = str(order_data.get("state", "")).lower()
+        tracked = self._find_tracked_order(
+            self._order_tracker.all_updatable_orders, order_data.get("client_order_id"), exchange_order_id)
         if tracked is None:
             return
 
         new_state = CONSTANTS.ORDER_STATE.get(state_str)
         if new_state is None:
-            # Unknown/unmapped state — keep the order at its current state rather
-            # than dropping the update entirely.
+            # Keep the current state for an unknown one instead of dropping the update.
             new_state = tracked.current_state
         unfilled = order_data.get("unfilled_size")
         if new_state == OrderState.OPEN and unfilled is not None and float(unfilled) < float(order_data.get("size", 0)):
@@ -666,58 +729,51 @@ class DeltaPerpetualDerivative(PerpetualDerivativePyBase):
 
         self._order_tracker.process_order_update(OrderUpdate(
             trading_pair=tracked.trading_pair,
-            update_timestamp=self._parse_delta_timestamp(order_data.get("updated_at") or order_data.get("created_at") or 0),
+            update_timestamp=self._parse_delta_timestamp(
+                order_data.get("timestamp") or order_data.get("updated_at") or order_data.get("created_at") or 0),
             new_state=new_state,
             client_order_id=tracked.client_order_id,
-            exchange_order_id=exchange_order_id,
+            exchange_order_id=exchange_order_id or tracked.exchange_order_id,
         ))
 
     def _process_trade_event(self, fill: Dict[str, Any]):
-        client_order_id = fill.get("client_order_id")
-        exchange_order_id = str(fill.get("order_id", ""))
-        tracked = None
-        if client_order_id:
-            tracked = self._order_tracker.all_fillable_orders.get(client_order_id)
-        if tracked is None and exchange_order_id:
-            for o in self._order_tracker.all_fillable_orders.values():
-                if o.exchange_order_id == exchange_order_id:
-                    tracked = o
-                    break
+        """v2/user_trades has no commission, so it only signals the fill; the fill is read from REST."""
+        tracked = self._find_tracked_order(
+            self._order_tracker.all_fillable_orders, fill.get("c"), str(fill.get("o") or ""))
         if tracked is None:
             return
+        self._ws_fill_counts[tracked.client_order_id] += 1
+        safe_ensure_future(self._fetch_fills_after_trade_event(tracked))
 
-        ex_symbol = fill.get("product_symbol")
-        contract_value = self._contract_value_by_symbol.get(ex_symbol, Decimal("1"))
-        fill_size = Decimal(str(fill.get("size", "0")))
-        fill_base = abs(fill_size) * contract_value
-        fill_price = Decimal(str(fill.get("price", "0")))
-        fee_token = str(fill.get("commission_asset") or tracked.quote_asset)
-        fee = TradeFeeBase.new_perpetual_fee(
-            fee_schema=self.trade_fee_schema(),
-            position_action=tracked.position if hasattr(tracked, "position") else PositionAction.NIL,
-            flat_fees=[TokenAmount(amount=Decimal(str(fill.get("commission", "0"))), token=fee_token)],
-        )
-        self._order_tracker.process_trade_update(TradeUpdate(
-            trade_id=str(fill.get("id", fill.get("fill_id", ""))),
-            client_order_id=tracked.client_order_id,
-            exchange_order_id=exchange_order_id,
-            trading_pair=tracked.trading_pair,
-            fee=fee,
-            fill_base_amount=fill_base,
-            fill_quote_amount=fill_base * fill_price,
-            fill_price=fill_price,
-            fill_timestamp=self._parse_delta_timestamp(fill.get("created_at") or 0),
-        ))
+    async def _fetch_fills_after_trade_event(self, order: InFlightOrder):
+        # REST can lag the stream; retry until every announced fill is recorded.
+        for delay in (0.0, 0.5, 1.0, 2.0, 4.0):
+            await self._sleep(delay)
+            try:
+                for trade_update in await self._all_trade_updates_for_order(order):
+                    self._order_tracker.process_trade_update(trade_update)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger().network(f"Error fetching the fills of {order.client_order_id}.", exc_info=True)
+                continue
+            if len(order.order_fills) >= self._ws_fill_counts[order.client_order_id]:
+                break
+        if order.is_done:
+            self._ws_fill_counts.pop(order.client_order_id, None)
 
     # ── Helpers ────────────────────────────────────────────────────────────────
 
     @staticmethod
     def _parse_delta_timestamp(raw) -> float:
-        """Delta timestamps are microseconds since epoch; normalise to seconds."""
+        """Converts Delta's microsecond (or ISO 8601) timestamps to seconds."""
         try:
             value = float(raw)
         except (TypeError, ValueError):
-            return 0.0
+            try:
+                return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                return 0.0
         if value > 1e15:        # microseconds
             return value / 1e6
         if value > 1e12:        # milliseconds

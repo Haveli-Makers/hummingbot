@@ -24,8 +24,7 @@ class DeltaPerpetualUtilsTests(TestCase):
             self.assertTrue(fields[name].json_schema_extra["is_connect_key"])
 
     def test_proxy_url_is_connect_key(self):
-        # The proxy URL MUST be a connect key, otherwise it is dropped before reaching
-        # the connector constructor and traffic goes out directly (ip_not_whitelisted).
+        # Otherwise it never reaches the connector and traffic goes out directly.
         fields = utils.DeltaPerpetualConfigMap.model_fields
         self.assertIn("delta_perpetual_proxy_url", fields)
         self.assertTrue(fields["delta_perpetual_proxy_url"].json_schema_extra["is_connect_key"])

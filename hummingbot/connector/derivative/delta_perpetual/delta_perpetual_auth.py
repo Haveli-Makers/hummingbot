@@ -13,24 +13,8 @@ from hummingbot.core.web_assistant.connections.data_types import RESTRequest, WS
 
 class DeltaPerpetualAuth(AuthBase):
     """
-    Delta Exchange authentication using HMAC-SHA256.
-
-    REST: every authenticated request carries headers
-      api-key    – public API key
-      signature  – hex HMAC-SHA256 of the prehash string
-      timestamp  – Unix time in **seconds**
-      User-Agent – required by Delta to avoid 4xx rejections
-
-    Prehash string (per the docs):
-      method + timestamp + requestPath + query_string + body
-        - requestPath includes the leading "/v2/…"
-        - query_string includes the leading "?" (empty if no params)
-        - body is the raw JSON string (empty if no body)
-
-    Signatures are only valid for 5 seconds, so requests must be sent promptly.
-
-    WebSocket: a single `auth` message is sent after connecting (see
-    `ws_auth_payload`); the signature there is HMAC of  "GET" + timestamp + "/live".
+    REST: HMAC-SHA256 of method + timestamp (seconds) + path + "?query" + body, valid for 5 seconds.
+    WebSocket: one `key-auth` message signed over "GET" + timestamp + "/live".
     """
 
     def __init__(self, api_key: str, secret_key: str, time_provider):
@@ -43,16 +27,12 @@ class DeltaPerpetualAuth(AuthBase):
             return request
 
         timestamp = str(int(self._time_provider.time()))
-        method = request.method.name if hasattr(request.method, "name") else str(request.method).upper()
+        method = request.method.value
         path = urlparse(request.url).path
 
         query_string = ""
         if request.params:
-            # Sign the EXACT query string aiohttp transmits. aiohttp serialises
-            # request.params with yarl (url.extend_query), so build the signed string
-            # the same way — otherwise a value needing escaping would diverge from the
-            # wire and Delta would reject the signature. For plain values (product_id,
-            # state, ...) this is byte-for-byte identical to the old hand-joined string.
+            # Sign the exact query string aiohttp sends, which yarl builds.
             encoded = URL(request.url).extend_query(request.params).query_string
             query_string = f"?{encoded}"
 
@@ -78,16 +58,15 @@ class DeltaPerpetualAuth(AuthBase):
         return request
 
     async def ws_authenticate(self, request: WSRequest) -> WSRequest:
-        # Delta authenticates the socket with a single `auth` message
-        # (built via ws_auth_payload), not per-request signing.
+        # The socket is authenticated once, with ws_auth_payload().
         return request
 
     def ws_auth_payload(self) -> Dict:
-        """Return the `auth` message to send right after the WebSocket connects."""
+        """Return the `key-auth` message to send right after the WebSocket connects."""
         timestamp = str(int(self._time_provider.time()))
         signature = self._sign(f"GET{timestamp}{CONSTANTS.WS_AUTH_PREHASH_PATH}")
         return {
-            "type": "auth",
+            "type": CONSTANTS.WS_AUTH_TYPE,
             "payload": {
                 "api-key": self.api_key,
                 "signature": signature,

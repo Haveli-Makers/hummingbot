@@ -1,6 +1,4 @@
 import asyncio
-import time
-from collections import defaultdict
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -22,11 +20,8 @@ if TYPE_CHECKING:
 
 class DeltaPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
     """
-    WebSocket order-book / trades / funding data source for Delta Exchange perpetuals.
-
-    Delta pushes a FULL L2 order book on the `l2_orderbook` channel (snapshots,
-    not diffs), public trades on `all_trades`, and funding/mark data on
-    `funding_rate` / `mark_price`. A REST L2 endpoint is used as a fallback.
+    Public stream: `ob_l2` (top 15 levels, full snapshots), `trades`, `ticker` (mark and index price) and
+    `funding_rate` (in percent). Sizes are in contracts.
     """
 
     def __init__(
@@ -40,10 +35,6 @@ class DeltaPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         self._connector = connector
         self._api_factory = api_factory
         self._domain = domain
-        self._message_queue: Dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
-
-    def _time(self) -> float:
-        return time.time()
 
     async def get_last_traded_prices(self, trading_pairs: List[str], domain: Optional[str] = None) -> Dict[str, float]:
         prices: Dict[str, float] = {}
@@ -60,22 +51,30 @@ class DeltaPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         ws: WSAssistant = await self._api_factory.get_ws_assistant()
-        await ws.connect(ws_url=CONSTANTS.WSS_URL, ping_timeout=CONSTANTS.PING_TIMEOUT)
+        await ws.connect(ws_url=web_utils.public_wss_url(self._domain), ping_timeout=CONSTANTS.PING_TIMEOUT)
         return ws
 
     async def _subscribe_channels(self, ws: WSAssistant):
         try:
-            symbols = [
-                await self._connector.exchange_symbol_associated_to_pair(trading_pair=tp)
-                for tp in self._trading_pairs
-            ]
+            symbols = []
+            for trading_pair in self._trading_pairs:
+                try:
+                    symbols.append(await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair))
+                except KeyError:
+                    # A delisted pair must not stop the others from subscribing.
+                    self.logger().warning(f"{trading_pair} is not listed on Delta; skipping its market data.")
+            if not symbols:
+                return
+            if len(symbols) > CONSTANTS.WS_MAX_SYMBOLS:
+                self.logger().warning(f"Delta streams order books for at most {CONSTANTS.WS_MAX_SYMBOLS} symbols per "
+                                      f"connection; {len(symbols)} were requested.")
             channels = [
-                {"name": CONSTANTS.WS_ORDERBOOK_CHANNEL, "symbols": symbols},
-                {"name": CONSTANTS.WS_TRADES_CHANNEL, "symbols": symbols},
-                {"name": CONSTANTS.WS_FUNDING_CHANNEL, "symbols": symbols},
+                {"name": name, "symbols": symbols}
+                for name in (CONSTANTS.WS_ORDERBOOK_CHANNEL, CONSTANTS.WS_TRADES_CHANNEL,
+                             CONSTANTS.WS_TICKER_CHANNEL, CONSTANTS.WS_FUNDING_CHANNEL)
             ]
             await ws.send(WSJSONRequest(payload={"type": "subscribe", "payload": {"channels": channels}}))
-            self.logger().info("Subscribed to Delta public order book / trades / funding channels.")
+            self.logger().info("Subscribed to Delta public order book / trades / ticker / funding channels.")
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -83,16 +82,20 @@ class DeltaPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
             raise
 
     def _channel_originating_message(self, event_message: Dict[str, Any]) -> str:
-        msg_type = event_message.get("type", "")
-        if msg_type in ("error",):
-            raise IOError(f"Delta WS error: {event_message}")
-        if msg_type == CONSTANTS.WS_ORDERBOOK_CHANNEL:
-            return self._snapshot_messages_queue_key
-        if msg_type == CONSTANTS.WS_TRADES_CHANNEL:
-            return self._trade_messages_queue_key
-        if msg_type in (CONSTANTS.WS_FUNDING_CHANNEL, CONSTANTS.WS_MARK_PRICE_CHANNEL):
-            return self._funding_info_messages_queue_key
-        return ""
+        return {
+            CONSTANTS.WS_ORDERBOOK_CHANNEL: self._snapshot_messages_queue_key,
+            CONSTANTS.WS_TRADES_CHANNEL: self._trade_messages_queue_key,
+            CONSTANTS.WS_TICKER_CHANNEL: self._funding_info_messages_queue_key,
+            CONSTANTS.WS_FUNDING_CHANNEL: self._funding_info_messages_queue_key,
+        }.get(event_message.get("type"), "")
+
+    async def _process_message_for_unknown_channel(self, event_message: Dict[str, Any], websocket_assistant: WSAssistant):
+        if event_message.get("type") == "subscriptions":
+            for channel in event_message.get("channels") or []:
+                if channel.get("error"):
+                    self.logger().error(f"Delta rejected the {channel.get('name')} subscription: {channel['error']}")
+        elif event_message.get("type") == "error":
+            self.logger().warning(f"Delta public WS error: {event_message}")
 
     # ── Order book ─────────────────────────────────────────────────────────────
 
@@ -100,8 +103,7 @@ class DeltaPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         out = []
         for lvl in raw_levels or []:
             if isinstance(lvl, dict):
-                price = lvl.get("limit_price", lvl.get("price", "0"))
-                size = lvl.get("size", "0")
+                price, size = lvl.get("price", "0"), lvl.get("size", "0")
             elif isinstance(lvl, (list, tuple)) and len(lvl) >= 2:
                 price, size = lvl[0], lvl[1]
             else:
@@ -111,59 +113,47 @@ class DeltaPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         return out
 
     async def _parse_order_book_snapshot_message(self, raw_message: Any, message_queue: asyncio.Queue):
-        symbol = raw_message.get("symbol")
-        if not symbol:
+        trading_pair = await self._trading_pair(raw_message.get("sy"))
+        if trading_pair is None:
             return
-        try:
-            trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol)
-        except KeyError:
-            return
-        ts = self._parse_ts(raw_message.get("timestamp")) or self._time()
+        update_id = int(raw_message.get("lts") or raw_message.get("ts") or self._time() * 1e6)
         message_queue.put_nowait(OrderBookMessage(
             message_type=OrderBookMessageType.SNAPSHOT,
             content={
                 "trading_pair": trading_pair,
-                "update_id": int(raw_message.get("last_sequence_no", ts * 1000)),
-                "bids": self._levels(trading_pair, raw_message.get("buy", raw_message.get("bids", []))),
-                "asks": self._levels(trading_pair, raw_message.get("sell", raw_message.get("asks", []))),
+                "update_id": update_id,
+                "bids": self._levels(trading_pair, raw_message.get("b")),
+                "asks": self._levels(trading_pair, raw_message.get("a")),
             },
-            timestamp=ts,
+            timestamp=update_id / 1e6,
         ))
 
     async def _parse_trade_message(self, raw_message: Any, message_queue: asyncio.Queue):
-        symbol = raw_message.get("symbol")
-        if not symbol:
+        trading_pair = await self._trading_pair(raw_message.get("sy"))
+        if trading_pair is None:
             return
-        try:
-            trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol)
-        except KeyError:
-            return
-        trades = raw_message.get("trades")
-        entries = trades if isinstance(trades, list) else [raw_message]
-        for t in entries:
-            ts = self._parse_ts(t.get("timestamp")) or self._time()
-            # Delta marks the aggressor; a 'sell' aggressor / buyer-maker is a SELL print.
-            is_sell = str(t.get("buyer_role", "")).lower() == "maker" or str(t.get("side", "")).lower() == "sell"
-            size = Decimal(str(t.get("size", "0")))
-            amount = abs(self._connector._format_size_to_amount(trading_pair, size))
-            message_queue.put_nowait(OrderBookMessage(
-                message_type=OrderBookMessageType.TRADE,
-                content={
-                    "trading_pair": trading_pair,
-                    "trade_type": float(TradeType.SELL.value) if is_sell else float(TradeType.BUY.value),
-                    "trade_id": str(t.get("trade_id", t.get("id", int(ts * 1000)))),
-                    "update_id": str(t.get("trade_id", int(ts * 1000))),
-                    "price": str(t.get("price", "0")),
-                    "amount": str(amount),
-                },
-                timestamp=ts,
-            ))
+        trade_time = int(raw_message.get("t") or raw_message.get("ts") or self._time() * 1e6)
+        # "r" is the buyer's role: a maker buyer means the seller took liquidity.
+        trade_type = TradeType.SELL if raw_message.get("r") == "m" else TradeType.BUY
+        amount = abs(self._connector._format_size_to_amount(trading_pair, Decimal(str(raw_message.get("s", "0")))))
+        message_queue.put_nowait(OrderBookMessage(
+            message_type=OrderBookMessageType.TRADE,
+            content={
+                "trading_pair": trading_pair,
+                "trade_type": float(trade_type.value),
+                "trade_id": str(trade_time),
+                "update_id": trade_time,
+                "price": str(raw_message.get("p", "0")),
+                "amount": str(amount),
+            },
+            timestamp=trade_time / 1e6,
+        ))
 
     async def _request_order_book_snapshot(self, trading_pair: str) -> Dict[str, Any]:
         symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
         rest = await self._api_factory.get_rest_assistant()
         response = await rest.execute_request(
-            url=web_utils.public_rest_url(CONSTANTS.ORDER_BOOK_PATH_URL.format(symbol=symbol)),
+            url=web_utils.public_rest_url(CONSTANTS.ORDER_BOOK_PATH_URL.format(symbol=symbol), domain=self._domain),
             method=RESTMethod.GET,
             throttler_limit_id=CONSTANTS.ORDER_BOOK_PATH_URL,
         )
@@ -171,16 +161,16 @@ class DeltaPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
 
     async def _order_book_snapshot(self, trading_pair: str) -> OrderBookMessage:
         raw = await self._request_order_book_snapshot(trading_pair)
-        ts = self._time()
+        update_id = int(raw.get("last_updated_at") or self._time() * 1e6)
         return OrderBookMessage(
             message_type=OrderBookMessageType.SNAPSHOT,
             content={
                 "trading_pair": trading_pair,
-                "update_id": int(ts * 1000),
-                "bids": self._levels(trading_pair, raw.get("buy", raw.get("bids", []))),
-                "asks": self._levels(trading_pair, raw.get("sell", raw.get("asks", []))),
+                "update_id": update_id,
+                "bids": self._levels(trading_pair, raw.get("buy")),
+                "asks": self._levels(trading_pair, raw.get("sell")),
             },
-            timestamp=ts,
+            timestamp=update_id / 1e6,
         )
 
     # ── Funding info ───────────────────────────────────────────────────────────
@@ -189,7 +179,7 @@ class DeltaPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
         rest = await self._api_factory.get_rest_assistant()
         response = await rest.execute_request(
-            url=web_utils.public_rest_url(CONSTANTS.TICKER_PATH_URL.format(symbol=symbol)),
+            url=web_utils.public_rest_url(CONSTANTS.TICKER_PATH_URL.format(symbol=symbol), domain=self._domain),
             method=RESTMethod.GET,
             throttler_limit_id=CONSTANTS.TICKER_PATH_URL,
         )
@@ -199,37 +189,50 @@ class DeltaPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         info = await self._request_complete_funding_info(trading_pair)
         mark = Decimal(str(info.get("mark_price", info.get("close", "0")) or "0"))
         index = Decimal(str(info.get("spot_price", info.get("close", "0")) or "0"))
-        rate = Decimal(str(info.get("funding_rate", "0") or "0"))
         next_ts = self._parse_ts(info.get("next_funding_realization") or info.get("funding_time")) or int(self._time())
         return FundingInfo(
             trading_pair=trading_pair,
             index_price=index,
             mark_price=mark,
             next_funding_utc_timestamp=int(next_ts),
-            rate=rate,
+            rate=self._rate_from_percent(info.get("funding_rate")) or Decimal("0"),
         )
 
     async def _parse_funding_info_message(self, raw_message: Any, message_queue: asyncio.Queue):
-        symbol = raw_message.get("symbol", "").replace("MARK:", "")
-        if not symbol:
+        if raw_message.get("type") == CONSTANTS.WS_TICKER_CHANNEL:
+            index_price = raw_message.get("sp")
+            for entry in raw_message.get("d") or []:
+                trading_pair = await self._trading_pair(entry.get("s"))
+                if trading_pair is None:
+                    continue
+                update = FundingInfoUpdate(trading_pair)
+                if entry.get("m") is not None:
+                    update.mark_price = Decimal(str(entry["m"]))
+                if index_price is not None:
+                    update.index_price = Decimal(str(index_price))
+                message_queue.put_nowait(update)
             return
-        try:
-            trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol)
-        except KeyError:
+
+        trading_pair = await self._trading_pair(raw_message.get("sy"))
+        if trading_pair is None:
             return
         update = FundingInfoUpdate(trading_pair)
-        if "mark_price" in raw_message or raw_message.get("type") == CONSTANTS.WS_MARK_PRICE_CHANNEL:
-            mp = raw_message.get("mark_price", raw_message.get("price"))
-            if mp is not None:
-                update.mark_price = Decimal(str(mp))
-        if "spot_price" in raw_message:
-            update.index_price = Decimal(str(raw_message["spot_price"]))
-        if "funding_rate" in raw_message:
-            update.rate = Decimal(str(raw_message["funding_rate"]))
-        nxt = raw_message.get("next_funding_realization") or raw_message.get("funding_time")
-        if nxt is not None:
-            update.next_funding_utc_timestamp = int(self._parse_ts(nxt))
+        update.rate = self._rate_from_percent(raw_message.get("fr"))
+        if raw_message.get("nfr") is not None:
+            update.next_funding_utc_timestamp = int(self._parse_ts(raw_message["nfr"]))
         message_queue.put_nowait(update)
+
+    async def _trading_pair(self, symbol: Optional[str]) -> Optional[str]:
+        if not symbol:
+            return None
+        try:
+            return await self._connector.trading_pair_associated_to_exchange_symbol(symbol)
+        except KeyError:
+            return None
+
+    @staticmethod
+    def _rate_from_percent(raw) -> Optional[Decimal]:
+        return None if raw is None or raw == "" else Decimal(str(raw)) / Decimal("100")
 
     @staticmethod
     def _parse_ts(raw) -> float:

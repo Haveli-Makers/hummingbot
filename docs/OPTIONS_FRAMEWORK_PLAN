@@ -1,0 +1,135 @@
+# Options Trading Framework — Implementation Plan
+
+**Venue:** Delta Exchange India · **First connector:** `delta_options` · **Revised:** 2026-10-29 (first draft June 2026)
+
+---
+
+## TL;DR
+
+- **Goal:** let our bots trade BTC and ETH options on Delta Exchange India, built the same way as our perpetuals.
+- **Why it's doable:** Delta's options use the same API, login and WebSocket as its perpetuals, and Delta sends the Greeks and implied volatility (IV) itself, so we don't need our own pricing model.
+- **What's new:** options expire (daily, weekly, monthly) and are settled in cash, without a trade. Handling that safely is most of the new work.
+- **Prerequisite:** this builds on our `delta_perpetual` connector, which is not merged yet and whose live test never fills an order. We finish it first.
+- **v1 scope:** script strategies, one expiry per run. Moving to the next expiry is a restart.
+- **Effort:** 4–6 weeks for one developer, prerequisite included.
+
+---
+
+## 1. What's different from perpetuals
+
+| | Perpetuals (built) | Options (new) |
+|---|---|---|
+| Instruments | Fixed list, never expire | ~900 live (June 2026); new ones listed and old ones expire every day at 12:00 UTC |
+| Live data | Mark price, funding rate | Mark price, IV, Greeks, sent by Delta |
+| Buyer | Posts margin | Pays the premium up front; can lose at most the premium |
+| Seller | Posts margin | Posts margin; can lose far more than the premium |
+| Fees | % of order value | % of the underlying's value, capped at 3.5% of the premium |
+| End of life | None | Cash settlement: a balance change, not a trade |
+
+Unchanged: login, networking, placing and cancelling orders, one net position per instrument, USD collateral.
+
+## 2. How it fits together
+
+```
+Strategy script    e.g. "sell a weekly strangle, hedge delta with perps"
+      │
+Options layer      new, shared, plain Python, modelled on the perpetuals layer:
+      │            option info (mark, IV, Greeks) · positions · expiry & settlement · fee & margin estimates
+      │
+delta_options      mostly reused from delta_perpetual; new: option chain, names, Greeks feed, settlement
+```
+
+File-by-file list: Appendix A.
+
+## 3. Decisions
+
+- **D1 · Instrument names.** Delta's names have four parts (`C-BTC-63800-130626` = call, BTC, strike 63,800, expiry 13 Jun 2026); our code expects `BASE-QUOTE`. → **Store as `C_BTC_63800_130626-USD`.** Our pair code only needs exactly one dash, so no core changes.
+- **D2 · Location.** → **`connector/derivative/delta_options/`.** Connector discovery, the UI and config validation pick it up unchanged.
+- **D3 · Choosing instruments.** → **At startup.** A helper reads the live option chain and picks by rule (e.g. nearest weekly expiry, strikes within ±10% of spot), plus any option the account already holds. The connector subscribes only to those.
+- **D4 · Positions.** → **One net position per instrument** (Delta's model), using the perpetuals position code. Leverage settings do nothing.
+- **D5 · Greeks.** → **Use Delta's.** Our own pricing model is optional, later.
+- **D6 · strategy_v2.** → **Not in v1.** Its executors recognise perpetuals by the word "perpetual" in the connector name, so they would treat options as spot. v1 is for script strategies.
+
+## 4. Expiry and settlement (the new part)
+
+1. **Instruments are fixed for a run.** A running connector can't add instruments (rebuilding it loses track of open orders). So each run trades what it picked at startup, and the next expiry needs a restart. Automatic rolling is v2.
+2. **Stop before expiry.** Cancel open orders and stop quoting a set time before 12:00 UTC (configurable). Delta settles any positions still open.
+3. **Let expired instruments go cleanly.** Every 30 minutes the connector reloads the instrument list, and expired names drop out. At the next reconnect, both WebSockets (market data, and our own orders and fills) fail on the missing name and stop updating **every** instrument. The options connector must skip expired names, and remove positions Delta no longer lists (today's code only removes a position reported with size 0).
+4. **Record the settlement.** Settlement is a payout, not a trade, so nothing records it today; trade history would show positions opened and never closed. The framework raises `OptionSettled` and records the payout, net of Delta's settlement fee (charged at the taker rate; options that expire worthless pay none).
+
+## 5. Fees, margin and risk
+
+- **Fee estimates need their own formula:** the lower of 0.01% of the underlying's value and 3.5% of the premium, plus 18% GST. The perpetuals formula applies the rate to the premium instead, which is tens to hundreds of times too low. Fees on real fills come from Delta's fill messages and are already correct; the estimate feeds budget checks and a strategy's profit maths.
+- **Budget checks:** buying locks the premium plus fee. Selling locks a conservative margin estimate; Delta has the final say.
+- **Limits before any live selling:** per-bot caps on short contracts and margin use, and a kill switch that cancels orders and closes positions. Selling options can lose far more than the premium collected.
+- **Hedging with perps means two connectors on one account.** `delta_options` and `delta_perpetual` share the account's margin and rate limit, and neither sees the other's pending orders. Budget the rate limit for both and expect the odd margin rejection.
+
+## 6. Phases
+
+| Phase | Work | Done when | Effort |
+|---|---|---|---|
+| 0 · Finish `delta_perpetual` | Merge to master. Recover fills missed during a disconnect (it can't today). Remove positions Delta stops listing. Record funding payments (stubbed). Replace placeholder rate limits (flat 6,000/min) with Delta's real ones. | A tiny live perp position opens and closes; fills (including one during a forced disconnect), fees and position match Delta | ~1 week |
+| 1 · Market data | Chain helper, names, order books, Greeks/IV feed, expiry-safe subscriptions | A read-only live run stays healthy through a 12:00 UTC expiry | ~1 week |
+| 2 · Trading | Orders, fills, positions, fee and margin estimates, budget checks, selling limits, kill switch | A tiny live buy and a tiny live sell of an option, each opened and closed | ~1 week |
+| 3 · Expiry and settlement | Stop-before-expiry, clean-up of expired names, settlement detection and recording | A one-contract position held through a daily expiry settles, and the payout shows in PnL | ~1 week |
+| 4 · Example script | Weekly strangle with a perp delta hedge, tiny size | Runs end to end through one expiry | 3–5 days |
+
+**Later, not v1:** strategy_v2 support; automatic rolling (needs a way to add instruments to a running connector); our own pricing model.
+
+## 7. Testing
+
+- **Unit tests** for each new piece (chain and names, Greeks feed, expiry handling, fee and margin maths, settlement), modelled on the perp connector's tests.
+- **Live checks** follow the "Done when" column: read-only first, then the smallest size.
+- **Test orders are priced from Delta's price band** for options (it's in the ticker), not a fixed % from market as in the perp test.
+
+## 8. To confirm
+
+- **Fee cap:** Delta's fee page shows both "3.5%" and "10%" of premium; confirm which applies and whether 3.5% is a promotion.
+- **Settlement messages:** what Delta sends at settlement (private WebSocket, wallet transaction, or both).
+- **Last trading time:** whether Delta stops accepting orders shortly before expiry.
+- **Margin for sold options:** Delta's formula, for the budget estimate.
+- **Instrument data:** Appendix B is a June 2026 snapshot; re-check before building.
+
+---
+
+## Appendix A — Files
+
+**New shared files**, each mirroring a perpetuals file:
+
+| New file | Mirrors | Holds |
+|---|---|---|
+| `core/data_type/option_info.py` | `funding_info.py` | `OptionInfo` (mark, IV, Greeks, open interest), `OptionInstrumentInfo` (strike, expiry, call/put) |
+| `core/data_type/option_api_order_book_data_source.py` | `perpetual_api_order_book_data_source.py` | Adds the option-info stream to the order-book source |
+| `connector/options_trading.py` | `perpetual_trading.py` | Positions, live option info, chain index |
+| `connector/option_derivative_py_base.py` | `perpetual_derivative_py_base.py` | Base connector: info listener, expiry and settlement, `get_option_chain`, `get_option_info`, `get_underlying_price` |
+| `connector/derivative/option_budget_checker.py` | `perpetual_budget_checker.py` | Premium for buys, margin estimate for sells |
+
+**Changed files**
+
+- `core/event/events.py`: add `OptionExpired` and `OptionSettled`. Plain Python, no Cython rebuild. Avoid enum numbers 213–215 (used on the wallet-transfer branch).
+- `connector/markets_recorder.py`: record `OptionSettled`, so settlements reach trade history.
+- Scripts only receive a fixed list of events, so the options layer adds a helper to subscribe to the new ones. It must keep a reference to its listener: listeners are held weakly and otherwise disappear.
+- No change to the Cython trading-rule layer: option details live in `OptionInstrumentInfo`, and the collateral fields already exist.
+
+**`delta_options` connector**, same 8-file layout as `delta_perpetual`:
+
+- Reused: signing, networking (including proxy), response unwrapping, order placement and cancellation, time sync, WebSocket plumbing.
+- New: calls/puts product filter, name mapping, Greeks/IV feed, chain helper (called from a script's `init_markets`, before the connector starts), expiry and settlement detection, fee and margin estimates.
+
+## Appendix B — Live check (June 2026, read-only)
+
+Against `https://api.india.delta.exchange`:
+
+- 924 live options (BTC 634, ETH 290), calls and puts.
+- Daily, weekly and monthly expiries, all at 12:00 UTC.
+- European-style, cash-settled in USD, same collateral as our perps.
+- The `C-BTC-63800-130626` ticker included mark price; bid, ask and mark IV; delta, gamma, theta, vega, rho; spot index; open interest; price bands.
+- Same response format, signing and integer contract sizing (`contract_value`) as `delta_perpetual`.
+
+## Changes from the June draft
+
+- Added Phase 0: the draft called `delta_perpetual` shipped, but it is unmerged and its live test never fills an order.
+- Expiry: added the reconnect failure, position clean-up and settlement recording; v1 is one expiry per run.
+- Fees don't carry over from perps; added the options formula.
+- Added selling limits and the two-connector note for hedging.
+- Effort 2–3 → 4–6 weeks, with a phase plan (the draft cited a "Phase 4" it never defined). Removed claims we can't back today (test count, undated "today" data).

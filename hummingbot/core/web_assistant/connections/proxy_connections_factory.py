@@ -62,12 +62,13 @@ class ProxyConnectionsFactory:
         return WSConnection(aiohttp_client_session=client)
 
     async def close(self) -> None:
-        if self._shared_client is not None and not self._shared_client.closed:
-            await self._shared_client.close()
-            self._shared_client = None
-        if self._ws_independent_session is not None and not self._ws_independent_session.closed:
-            await self._ws_independent_session.close()
-            self._ws_independent_session = None
+        # Detach the sessions before awaiting their close: a task that asks for a session meanwhile gets a new
+        # one that stays referenced, instead of one this method would drop unclosed.
+        sessions = (self._shared_client, self._ws_independent_session)
+        self._shared_client = self._ws_independent_session = None
+        for session in sessions:
+            if session is not None and not session.closed:
+                await session.close()
 
     async def __aenter__(self) -> "ProxyConnectionsFactory":
         return self

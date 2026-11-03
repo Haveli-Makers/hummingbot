@@ -10,11 +10,19 @@ from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFa
 
 
 def public_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
-    return f"{CONSTANTS.REST_URL}{path_url}"
+    return f"{CONSTANTS.REST_URLS[domain]}{path_url}"
 
 
 def private_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
-    return f"{CONSTANTS.REST_URL}{path_url}"
+    return f"{CONSTANTS.REST_URLS[domain]}{path_url}"
+
+
+def public_wss_url(domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
+    return CONSTANTS.WSS_PUBLIC_URLS[domain]
+
+
+def private_wss_url(domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
+    return CONSTANTS.WSS_PRIVATE_URLS[domain]
 
 
 def build_api_factory(

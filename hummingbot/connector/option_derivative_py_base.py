@@ -1,16 +1,17 @@
 import asyncio
 from abc import ABC, abstractmethod
-from decimal import Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import Dict, List, Optional, Tuple
 
 from hummingbot.connector.constants import s_decimal_NaN
+from hummingbot.connector.derivative.option_budget_checker import OptionBudgetChecker
 from hummingbot.connector.derivative.position import Position
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.options_trading import OptionsTrading
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, TradeType
 from hummingbot.core.data_type.in_flight_order import PerpetualDerivativeInFlightOrder
 from hummingbot.core.data_type.option_api_order_book_data_source import OptionAPIOrderBookDataSource
-from hummingbot.core.data_type.option_info import OptionInfo, OptionInstrumentInfo
+from hummingbot.core.data_type.option_info import OptionInfo, OptionInstrumentInfo, OptionType
 from hummingbot.core.data_type.trade_fee import TradeFeeBase
 from hummingbot.core.utils.async_utils import safe_ensure_future, safe_gather
 
@@ -19,22 +20,38 @@ class OptionDerivativePyBase(ExchangePyBase, ABC):
     """
     Base class for options connectors. Options are listed and expire continuously, so on top of the usual exchange
     state this keeps an index of the instruments, their live option info (mark price, IV, Greeks) and net positions.
+
+    Selling an option to open a short position is refused unless `allow_selling` is set, and is capped at
+    `max_short_contracts` per option, counting open sell orders as if they filled.
     """
     VALID_POSITION_ACTIONS = [PositionAction.OPEN, PositionAction.CLOSE]
+    # Conservative initial margin for a short option: max(15% - out-of-the-money share, 10%) of the underlying's value,
+    # plus the premium. Exchanges set their own; this only sizes budget checks.
+    SHORT_MARGIN_RATE = Decimal("0.15")
+    SHORT_MARGIN_FLOOR_RATE = Decimal("0.10")
 
     def __init__(self,
                  balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
-                 rate_limits_share_pct: Decimal = Decimal("100")):
+                 rate_limits_share_pct: Decimal = Decimal("100"),
+                 allow_selling: bool = False,
+                 max_short_contracts: Decimal = Decimal("0")):
         super().__init__(balance_asset_limit, rate_limits_share_pct)
+        self._allow_selling = allow_selling
+        self._max_short_contracts = Decimal(str(max_short_contracts))
         self._options_trading = OptionsTrading(self.trading_pairs)
         self._option_info_listener_task: Optional[asyncio.Task] = None
         self._orderbook_ds: OptionAPIOrderBookDataSource = self._orderbook_ds  # for type-hinting
+        self._budget_checker = OptionBudgetChecker(self)
 
     @property
     def status_dict(self) -> Dict[str, bool]:
         status_d = super().status_dict
         status_d["option_info"] = self._options_trading.is_option_info_initialized()
         return status_d
+
+    @property
+    def budget_checker(self) -> OptionBudgetChecker:
+        return self._budget_checker
 
     @property
     def position_mode(self) -> PositionMode:
@@ -102,6 +119,61 @@ class OptionDerivativePyBase(ExchangePyBase, ABC):
             except KeyError:
                 self.logger().warning(f"{trading_pair} is no longer listed on {self.name}; skipping it.")
         return symbols
+
+    def estimate_short_margin(self, trading_pair: str, amount: Decimal, price: Decimal) -> Decimal:
+        """
+        A conservative estimate of the margin needed to sell `amount` of an option to open, in the collateral token.
+        """
+        premium = price if price is not None and not price.is_nan() else Decimal("0")
+        instrument = self.get_instrument(trading_pair)
+        if instrument is None:
+            return premium * amount
+        try:
+            underlying = self.get_underlying_price(trading_pair)
+        except KeyError:
+            underlying = instrument.strike
+        if underlying <= 0:
+            return premium * amount
+        if instrument.option_type == OptionType.CALL:
+            out_of_the_money = max(instrument.strike - underlying, Decimal("0"))
+        else:
+            out_of_the_money = max(underlying - instrument.strike, Decimal("0"))
+        rate = max(self.SHORT_MARGIN_RATE - out_of_the_money / underlying, self.SHORT_MARGIN_FLOOR_RATE)
+        return (rate * underlying + premium) * amount
+
+    async def flatten(self, slippage: Decimal = Decimal("0.05")) -> List[str]:
+        """
+        Kill switch: cancels every open order, then closes every position on this connector's trading pairs with a
+        reduce-only limit order that crosses the book by `slippage` (kept inside the exchange's price band). Positions
+        on other options, or on expired ones that are settling, are left alone. Returns the client ids of the closing
+        orders.
+        """
+        await self.cancel_all(timeout_seconds=10)
+        order_ids = []
+        for position in list(self.account_positions.values()):
+            trading_pair = position.trading_pair
+            if position.amount == 0:
+                continue
+            if trading_pair not in self.trading_pairs or self.is_expired(trading_pair):
+                self.logger().warning(f"Not closing the {position.amount} {trading_pair} position: it is not one of "
+                                      f"this connector's live trading pairs.")
+                continue
+            is_buy = position.amount < 0
+            price = self._crossing_price(trading_pair, is_buy, slippage)
+            if price.is_nan():
+                self.logger().error(f"Cannot close the {position.amount} {trading_pair} position: no price to cross.")
+                continue
+            place = self.buy if is_buy else self.sell
+            order_ids.append(place(trading_pair, abs(position.amount), OrderType.LIMIT, price,
+                                   position_action=PositionAction.CLOSE))
+        return order_ids
+
+    @abstractmethod
+    def contract_size(self, trading_pair: str) -> Decimal:
+        """
+        Amount of the underlying in one contract.
+        """
+        raise NotImplementedError
 
     @abstractmethod
     def get_buy_collateral_token(self, trading_pair: str) -> str:
@@ -187,6 +259,15 @@ class OptionDerivativePyBase(ExchangePyBase, ABC):
             raise ValueError(
                 f"Invalid position action {position_action}. Must be one of {self.VALID_POSITION_ACTIONS}"
             )
+        if order_type in (OrderType.LIMIT, OrderType.LIMIT_MAKER) and price is not None:
+            # Checked as it will be sent: the base class rounds the price down to the tick.
+            price = self.quantize_order_price(trading_pair, price)
+        refusal = self._order_refusal(trading_pair, trade_type, order_type, amount, price, position_action)
+        if refusal is not None:
+            self.start_tracking_order(order_id, None, trading_pair, trade_type, price, amount, order_type, position_action)
+            self.logger().error(f"Order {order_id} for {amount} {trading_pair} refused: {refusal}.")
+            self._update_order_after_failure(order_id=order_id, trading_pair=trading_pair, exception=ValueError(refusal))
+            return
         await super()._create_order(
             trade_type,
             order_id,
@@ -226,6 +307,78 @@ class OptionDerivativePyBase(ExchangePyBase, ABC):
         is_maker: Optional[bool] = None,
     ) -> TradeFeeBase:
         raise NotImplementedError
+
+    def _order_refusal(
+        self, trading_pair: str, trade_type: TradeType, order_type: OrderType, amount: Decimal,
+        price: Optional[Decimal], position_action: PositionAction,
+    ) -> Optional[str]:
+        """
+        Why an order must not be sent, or None: an unsupported order type, the selling guard, or the exchange's price
+        band.
+        """
+        if order_type not in self.supported_order_types():
+            # Refused here: the base class would first look up a price for it, which fails on an empty book.
+            return f"{order_type.name} orders are not supported"
+        if trade_type == TradeType.SELL and position_action == PositionAction.OPEN:
+            short = self._short_after_sell(trading_pair, amount)
+            if short > 0 and not self._allow_selling:
+                return "selling options to open a short position is not enabled for this connector"
+            limit = self._max_short_contracts * self.contract_size(trading_pair)
+            if short > limit:
+                return (f"the short position could reach {short} (counting open sell orders), above the "
+                        f"{self._max_short_contracts}-contract limit ({limit})")
+        option_info = self._option_info_or_none(trading_pair)
+        if price is not None and not price.is_nan() and option_info is not None:
+            lower, upper = option_info.price_band_lower, option_info.price_band_upper
+            if (lower is not None and price < lower) or (upper is not None and price > upper):
+                return f"price {price} is outside the exchange's price band ({lower} to {upper})"
+        return None
+
+    def _short_after_sell(self, trading_pair: str, amount: Decimal) -> Decimal:
+        """
+        The worst-case short position after this sell, as if every open sell order on the option also filled.
+        """
+        position = self.get_position(trading_pair)
+        held = position.amount if position is not None else Decimal("0")
+        pending_sells = sum(
+            (order.amount - order.executed_amount_base for order in self.in_flight_orders.values()
+             if order.trading_pair == trading_pair and order.trade_type == TradeType.SELL and not order.is_done),
+            Decimal("0"),
+        )
+        return max(Decimal("0"), pending_sells + amount - held)
+
+    def _crossing_price(self, trading_pair: str, is_buy: bool, slippage: Decimal) -> Decimal:
+        option_info = self._option_info_or_none(trading_pair)
+        try:
+            reference = Decimal(str(self.get_price(trading_pair, is_buy)))
+        except Exception:
+            reference = Decimal("NaN")
+        if (reference.is_nan() or reference <= 0) and option_info is not None:
+            reference = option_info.mark_price
+        if reference is None or reference.is_nan():
+            return Decimal("NaN")
+        price = reference * (Decimal("1") + slippage if is_buy else Decimal("1") - slippage)
+        lower = option_info.price_band_lower if option_info is not None else None
+        upper = option_info.price_band_upper if option_info is not None else None
+        if upper is not None:
+            price = min(price, upper)
+        if lower is not None:
+            price = max(price, lower)
+        # Onto the tick grid: away from the book so it still crosses, but never out of the band.
+        tick = self.get_order_price_quantum(trading_pair, price)
+        steps = price / tick
+        rounded = steps.to_integral_value(rounding=ROUND_CEILING if is_buy else ROUND_FLOOR) * tick
+        if upper is not None and rounded > upper:
+            rounded = steps.to_integral_value(rounding=ROUND_FLOOR) * tick
+        if lower is not None and rounded < lower:
+            rounded = steps.to_integral_value(rounding=ROUND_CEILING) * tick
+        return rounded
+
+    def _option_info_or_none(self, trading_pair: str) -> Optional[OptionInfo]:
+        try:
+            return self.get_option_info(trading_pair)
+        except KeyError:
+            return None
 
     async def _status_polling_loop_fetch_updates(self):
         await safe_gather(

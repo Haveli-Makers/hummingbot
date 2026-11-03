@@ -190,11 +190,6 @@ class DeltaOptionsDerivativeTests(IsolatedAsyncioWrapperTestCase):
             await self.connector._update_balances()
         self.assertEqual({"INR": Decimal("5000")}, self.connector.get_all_balances())
 
-    async def test_order_placement_is_disabled(self):
-        with self.assertRaises(NotImplementedError):
-            await self.connector._place_order("id", CALL, Decimal("0.001"), TradeType.BUY, OrderType.LIMIT,
-                                              Decimal("500"), PositionAction.OPEN)
-
     def test_options_are_net_with_no_leverage(self):
         self.connector.set_leverage(CALL, 10)
         self.connector.set_position_mode(PositionMode.HEDGE)

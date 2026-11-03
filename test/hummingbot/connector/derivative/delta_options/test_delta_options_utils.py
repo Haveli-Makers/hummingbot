@@ -56,3 +56,36 @@ class DeltaOptionsUtilsTests(unittest.TestCase):
         self.assertEqual("ETH", instrument.underlying)
         self.assertEqual(OptionType.PUT, instrument.option_type)
         self.assertEqual(Decimal("3000"), instrument.strike)
+
+    def test_yes_no_answers(self):
+        self.assertEqual([True, True, False, False, True, False],
+                         [utils.as_bool(v) for v in ("Yes", "true", "no", "N", True, False)])
+
+    def test_config_defaults_keep_selling_off_and_the_switch_on(self):
+        config = utils.DeltaOptionsConfigMap(delta_options_api_key="k", delta_options_api_secret="s")
+
+        self.assertEqual((False, 1, True), (config.delta_options_allow_selling,
+                                            config.delta_options_max_short_contracts,
+                                            config.delta_options_dead_man_switch))
+
+    def test_config_rejects_unclear_answers(self):
+        with self.assertRaises(ValueError):
+            utils.DeltaOptionsConfigMap(delta_options_api_key="k", delta_options_api_secret="s",
+                                        delta_options_allow_selling="maybe")
+
+    def test_trading_settings_reach_the_connector(self):
+        fields = utils.DeltaOptionsConfigMap.model_fields
+        for name in ("delta_options_allow_selling", "delta_options_max_short_contracts", "delta_options_dead_man_switch"):
+            self.assertTrue(fields[name].json_schema_extra["is_connect_key"])
+            self.assertFalse(fields[name].json_schema_extra["is_secure"])
+
+    def test_testnet_urls(self):
+        from hummingbot.connector.derivative.delta_options import (
+            delta_options_constants as CONSTANTS,
+            delta_options_web_utils as web_utils,
+        )
+
+        self.assertEqual("https://cdn-ind.testnet.deltaex.org/v2/orders",
+                         web_utils.private_rest_url(CONSTANTS.ORDERS_PATH_URL, domain=CONSTANTS.TESTNET_DOMAIN))
+        self.assertEqual("wss://socket-ind-pub.testnet.deltaex.org", web_utils.public_wss_url(CONSTANTS.TESTNET_DOMAIN))
+        self.assertEqual("wss://socket-ind.testnet.deltaex.org", web_utils.private_wss_url(CONSTANTS.TESTNET_DOMAIN))

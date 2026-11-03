@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict
 
-from pydantic import ConfigDict, Field, SecretStr
+from pydantic import ConfigDict, Field, SecretStr, field_validator
 
 from hummingbot.client.config.config_data_types import BaseConnectorConfigMap
 from hummingbot.connector.derivative.delta_options import delta_options_constants as CONSTANTS
@@ -18,6 +18,15 @@ DEFAULT_FEES = TradeFeeSchema(
     maker_percent_fee_decimal=Decimal("0.0001"),
     taker_percent_fee_decimal=Decimal("0.0001"),
 )
+
+
+def as_bool(value: Any) -> bool:
+    """
+    Config answers can arrive as "yes"/"no" strings, where bool("no") would be True.
+    """
+    if isinstance(value, str):
+        return value.strip().lower() in ("yes", "y", "true")
+    return bool(value)
 
 
 def trading_pair_from_symbol(symbol: str, quote: str) -> str:
@@ -88,7 +97,45 @@ class DeltaOptionsConfigMap(BaseConnectorConfigMap):
             "prompt_on_new": True,
         },
     )
+    delta_options_allow_selling: bool = Field(
+        default=False,
+        json_schema_extra={
+            "prompt": lambda cm: "Allow selling options to open short positions? (Yes/No)",
+            "is_secure": False,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        },
+    )
+    delta_options_max_short_contracts: int = Field(
+        default=1,
+        gt=0,
+        json_schema_extra={
+            "prompt": lambda cm: "If selling is allowed, how many contracts of one option may the bot be short at most?",
+            "is_secure": False,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        },
+    )
+    delta_options_dead_man_switch: bool = Field(
+        default=True,
+        json_schema_extra={
+            "prompt": lambda cm: (
+                "If the bot stops responding for 30 seconds, have Delta cancel this account's open orders on the "
+                "bot's options? (Yes/No)"
+            ),
+            "is_secure": False,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        },
+    )
     model_config = ConfigDict(title="delta_options")
+
+    @field_validator("delta_options_allow_selling", "delta_options_dead_man_switch", mode="before")
+    @classmethod
+    def validate_yes_no(cls, value: Any):
+        if isinstance(value, str) and value.strip().lower() not in ("yes", "y", "true", "no", "n", "false"):
+            raise ValueError("Please answer yes or no.")
+        return value
 
 
 KEYS = DeltaOptionsConfigMap.model_construct()

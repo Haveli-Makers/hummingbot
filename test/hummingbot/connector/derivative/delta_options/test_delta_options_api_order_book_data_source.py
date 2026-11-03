@@ -212,4 +212,4 @@ class DeltaOptionsAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
 
         await self.data_source._connected_websocket_assistant()
 
-        self.assertEqual(CONSTANTS.WSS_PUBLIC_URL, ws.connect.call_args.kwargs["ws_url"])
+        self.assertEqual(CONSTANTS.WSS_PUBLIC_URLS[CONSTANTS.DEFAULT_DOMAIN], ws.connect.call_args.kwargs["ws_url"])

@@ -123,7 +123,7 @@ class DeltaOptionsAPIOrderBookDataSource(OptionAPIOrderBookDataSource):
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         ws: WSAssistant = await self._api_factory.get_ws_assistant()
-        await ws.connect(ws_url=CONSTANTS.WSS_PUBLIC_URL, ping_timeout=CONSTANTS.WS_PING_INTERVAL)
+        await ws.connect(ws_url=web_utils.public_wss_url(self._domain), ping_timeout=CONSTANTS.WS_PING_INTERVAL)
         return ws
 
     async def _subscribe_channels(self, ws: WSAssistant):

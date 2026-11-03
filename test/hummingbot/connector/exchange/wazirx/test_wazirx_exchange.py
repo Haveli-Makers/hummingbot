@@ -5,7 +5,7 @@ import re
 import time
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
 import pytest
@@ -26,6 +26,7 @@ from hummingbot.core.data_type.trade_fee import (
     TokenAmount,
     TradeFeeBase,
 )
+from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 
 
 class DummyRA:
@@ -1126,16 +1127,28 @@ class WazirxExchangeApiKeyRotationTests(IsolatedAsyncioWrapperTestCase):
         self.assertIn("key 2 of 3", str(context.exception))
         self.assertEqual(["k1", "k2"], self.keys_used())
 
-    async def test_single_key_rate_limit_raises_and_rests_the_key(self):
+    async def test_single_key_waits_out_its_rest_and_retries_once(self):
+        exchange = self.create_exchange("k1", "s1")
+        exchange._send_signed_request = AsyncMock(side_effect=[(429, None, "Too many api request"), (200, None, [])])
+
+        with patch.object(CONSTANTS, "DEFAULT_RATE_LIMIT_COOLDOWN", 0.05):
+            started = time.monotonic()
+            result = await exchange._wazirx_request("GET", CONSTANTS.MY_TRADES_PATH_URL, {}, is_auth_required=True)
+
+        self.assertEqual([], result)
+        self.assertEqual(2, exchange._send_signed_request.await_count)
+        self.assertGreaterEqual(time.monotonic() - started, 0.05)
+
+    async def test_single_key_second_rate_limit_raises(self):
         exchange = self.create_exchange("k1", "s1")
         exchange._send_signed_request = AsyncMock(return_value=(429, None, "Too many api request"))
 
-        with self.assertRaises(WazirxAPIError):
+        with patch.object(CONSTANTS, "DEFAULT_RATE_LIMIT_COOLDOWN", 0.05), self.assertRaises(WazirxAPIError):
             await exchange._wazirx_request("GET", CONSTANTS.MY_TRADES_PATH_URL, {}, is_auth_required=True)
 
-        self.assertEqual(1, exchange._send_signed_request.await_count)
+        self.assertEqual(2, exchange._send_signed_request.await_count)
         rest_until = exchange._key_pool._rest_until[(0, CONSTANTS.MY_TRADES_PATH_URL)]
-        self.assertAlmostEqual(time.monotonic() + CONSTANTS.DEFAULT_RATE_LIMIT_COOLDOWN, rest_until, delta=0.5)
+        self.assertAlmostEqual(time.monotonic() + 0.05, rest_until, delta=0.5)
 
     async def test_pinned_key_is_not_retried_on_another_key(self):
         self.responses = [(429, None, "Too many api request")]
@@ -1189,8 +1202,91 @@ class WazirxExchangeApiKeyRotationTests(IsolatedAsyncioWrapperTestCase):
         message = str(context.exception)
         self.assertIn("with WazirX API key 1 of 3", message)
         self.assertIn("HTTP status is 400", message)
+        self.assertEqual(2004, context.exception.code)
         self.assertTrue(self.exchange._is_order_not_found_during_cancelation_error(context.exception))
         self.assertEqual(1, len(self.sent))
+        self.assertEqual([0, 1, 2], self.exchange._key_pool.active_indexes)
+
+    async def test_refused_key_is_dropped_and_the_request_moves_to_another_key(self):
+        self.responses = [(400, None, '{"code":2005,"message":"Signature is incorrect."}'), (200, None, {"id": 1})]
+
+        result = await self.exchange._wazirx_request(
+            "POST", CONSTANTS.CREATE_ORDER_PATH_URL, {"symbol": "btcinr"}, is_auth_required=True)
+
+        self.assertEqual({"id": 1}, result)
+        self.assertEqual(["k1", "k2"], self.keys_used())
+        self.assertEqual([1, 2], self.exchange._key_pool.active_indexes)
+        self.assertTrue(self.is_logged("ERROR", "rejected API key 1 of 3, so it is out of rotation"))
+
+        self.sent.clear()
+        self.responses = [(200, None, []) for _ in range(3)]
+        for _ in range(3):
+            await self.signed_get()
+        self.assertNotIn("k1", self.keys_used())
+
+    async def test_the_last_key_is_never_dropped(self):
+        exchange = self.create_exchange("k1", "s1")
+        exchange._send_signed_request = AsyncMock(return_value=(401, None, "Unauthorized"))
+
+        with self.assertRaises(WazirxAPIError):
+            await exchange._wazirx_request("GET", CONSTANTS.MY_TRADES_PATH_URL, {}, is_auth_required=True)
+
+        self.assertEqual(1, exchange._send_signed_request.await_count)
+        self.assertEqual([0], exchange._key_pool.active_indexes)
+
+    async def test_a_pinned_request_does_not_drop_its_key(self):
+        self.responses = [(400, None, '{"code":2128,"message":"This IP has not been whitelisted"}')]
+
+        with self.assertRaises(WazirxAPIError):
+            await self.exchange._signed_request("GET", CONSTANTS.USER_BALANCES_PATH_URL, {}, key_index=1)
+
+        self.assertEqual(["k2"], self.keys_used())
+        self.assertEqual([0, 1, 2], self.exchange._key_pool.active_indexes)
+
+    def test_api_key_rejection_needs_a_401_or_a_key_error_code(self):
+        def error(status, body):
+            return WazirxAPIError("error", status=status, code=WazirxExchange._error_code(body))
+
+        self.assertTrue(WazirxExchange._is_api_key_rejected(error(401, "Unauthorized")))
+        for code in CONSTANTS.API_KEY_REJECTED_ERROR_CODES:
+            self.assertTrue(WazirxExchange._is_api_key_rejected(error(400, json.dumps({"code": code}))))
+        self.assertFalse(WazirxExchange._is_api_key_rejected(error(400, '{"code":2098}')))
+        self.assertFalse(WazirxExchange._is_api_key_rejected(error(403, "<html>Forbidden</html>")))
+        self.assertFalse(WazirxExchange._is_api_key_rejected(error(500, "[]")))
+
+    async def test_concurrent_recv_window_errors_resync_the_clock_once(self):
+        outcomes = [(400, None, '{"code":2098}'), (400, None, '{"code":2098}'), (200, None, []), (200, None, [])]
+
+        async def send(auth, method, url, params):
+            await asyncio.sleep(0)
+            return outcomes.pop(0)
+
+        self.exchange._send_signed_request = AsyncMock(side_effect=send)
+        self.exchange._update_time_synchronizer = AsyncMock()
+
+        results = await asyncio.gather(self.signed_get(), self.signed_get())
+
+        self.assertEqual([[], []], results)
+        self.exchange._update_time_synchronizer.assert_awaited_once_with(pass_on_non_cancelled_error=True)
+
+    def test_rate_limits_share_pct_reaches_the_key_pool(self):
+        exchange = WazirxExchange("k1,k2", "s1,s2", rate_limits_share_pct=Decimal("50"), trading_pairs=["BTC-INR"])
+
+        self.assertEqual(5, exchange._key_pool._rate_limits[CONSTANTS.CREATE_ORDER_LIMIT_ID].limit)
+        self.assertEqual(1, exchange._key_pool._rate_limits[CONSTANTS.ORDER_STATUS_LIMIT_ID].limit)
+
+    def test_constructor_requires_a_key_for_trading(self):
+        with self.assertRaisesRegex(ValueError, "can't be blank"):
+            WazirxExchange("", "", trading_pairs=["BTC-INR"], trading_required=True)
+        self.assertEqual("", WazirxExchange(None, None, trading_pairs=[], trading_required=False).api_key)
+
+    async def test_debug_line_is_skipped_when_debug_logging_is_off(self):
+        self.responses = [(200, None, [])]
+
+        with patch.object(self.exchange.logger(), "isEnabledFor", return_value=False):
+            await self.signed_get()
+
+        self.assertFalse(any("used API key" in record.getMessage() for record in self.log_records))
 
     async def test_unsigned_requests_skip_the_key_pool(self):
         url = f"{CONSTANTS.REST_URL}{CONSTANTS.TICKER_24HR_PATH_URL}"
@@ -1214,17 +1310,40 @@ class WazirxExchangeApiKeyRotationTests(IsolatedAsyncioWrapperTestCase):
 
     async def test_send_signed_request_get_signs_the_query_string(self):
         exchange = self.create_exchange("k1", "s1")
+        exchange._time_synchronizer.add_time_offset_ms_sample(0)
         url = f"{CONSTANTS.REST_URL}{CONSTANTS.USER_BALANCES_PATH_URL}"
         with aioresponses() as mock_api:
             mock_api.get(re.compile(rf"^{re.escape(url)}\?"), body=json.dumps([{"asset": "inr"}]))
             response = await exchange._send_signed_request(
                 auth=exchange._key_pool.auth(0), method="GET", url=url, params={})
-            (_, request_url), calls = next(iter(mock_api.requests.items()))
+            (request_url, calls), = [(u, c) for (_, u), c in mock_api.requests.items() if str(u).startswith(url)]
 
         self.assertEqual((200, None, [{"asset": "inr"}]), response)
         self.assertIn("recvWindow=60000", str(request_url))
         self.assertIn("signature=", str(request_url))
         self.assertEqual("k1", calls[0].kwargs["headers"]["X-Api-Key"])
+
+    async def test_send_signed_request_uses_the_shared_session_with_a_timeout(self):
+        exchange = self.create_exchange("k1", "s1")
+        response = MagicMock(status=200, headers={})
+        response.json = AsyncMock(return_value={"id": 7})
+        rest_assistant = MagicMock()
+        rest_assistant.call = AsyncMock(return_value=response)
+        exchange._web_assistants_factory.get_rest_assistant = AsyncMock(return_value=rest_assistant)
+        url = f"{CONSTANTS.REST_URL}{CONSTANTS.ORDER_STATUS_PATH_URL}"
+
+        result = await exchange._send_signed_request(
+            auth=exchange._key_pool.auth(0), method="GET", url=url, params={"orderId": "7"})
+
+        self.assertEqual((200, None, {"id": 7}), result)
+        request = rest_assistant.call.call_args.kwargs["request"]
+        self.assertEqual(CONSTANTS.SIGNED_REQUEST_TIMEOUT, rest_assistant.call.call_args.kwargs["timeout"])
+        self.assertEqual(RESTMethod.GET, request.method)
+        self.assertTrue(request.url.startswith(f"{url}?orderId=7&recvWindow=60000&timestamp="))
+        self.assertIn("&signature=", request.url)
+        self.assertIsNone(request.data)
+        self.assertFalse(request.is_auth_required)
+        self.assertEqual("k1", request.headers["X-Api-Key"])
 
     async def test_send_signed_request_post_and_delete_send_a_signed_body(self):
         exchange = self.create_exchange("k1", "s1")
@@ -1279,6 +1398,20 @@ class WazirxExchangeApiKeyRotationTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual([0, 1, 2], self.exchange._key_pool.active_indexes)
         for index in (1, 2, 3):
             self.assertTrue(self.is_logged("WARNING", f"Could not check WazirX API key {index} of 3"))
+
+    async def test_key_check_keeps_a_key_when_the_error_is_not_about_the_key(self):
+        self.exchange._update_time_synchronizer = AsyncMock()
+        self.exchange._send_signed_request = AsyncMock(side_effect=self.fake_send_by_key({
+            "k2": (400, None, '{"code":2098,"message":"Request out of receiving window."}'),
+            "k3": (403, None, "<html>Forbidden</html>"),
+        }))
+
+        await self.exchange._check_api_keys()
+
+        self.assertEqual([0, 1, 2], self.exchange._key_pool.active_indexes)
+        self.assertTrue(self.is_logged("WARNING", "Could not check WazirX API key 2 of 3"))
+        self.assertTrue(self.is_logged("WARNING", "Could not check WazirX API key 3 of 3"))
+        self.exchange._update_time_synchronizer.assert_awaited_once()
 
     async def test_key_check_keeps_every_key_when_all_are_rejected(self):
         self.exchange._send_signed_request = AsyncMock(side_effect=self.fake_send_by_key(

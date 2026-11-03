@@ -56,10 +56,19 @@ class WazirxUtilTestCases(unittest.TestCase):
             utils.parse_api_credentials(keys, secrets)
 
     def test_parse_api_credentials_rejects_blank_entries(self):
-        with self.assertRaisesRegex(ValueError, "blank entries"):
+        with self.assertRaisesRegex(ValueError, "can't be blank"):
             utils.parse_api_credentials("k1,,k3", "s1,s2,s3")
-        with self.assertRaisesRegex(ValueError, "blank entries"):
+        with self.assertRaisesRegex(ValueError, "can't be blank"):
             utils.parse_api_credentials("k1,k2", "s1, ")
+
+    def test_parse_api_credentials_treats_none_as_empty(self):
+        self.assertEqual([("", "")], utils.parse_api_credentials(None, None))
+
+    def test_parse_api_credentials_requires_a_key_and_secret_for_trading(self):
+        for key, secret in (("", ""), (" ", "s1"), ("k1", ""), (None, None)):
+            with self.assertRaisesRegex(ValueError, "can't be blank"):
+                utils.parse_api_credentials(key, secret, required=True)
+        self.assertEqual([("k1", "s1")], utils.parse_api_credentials("k1", "s1", required=True))
 
     def test_parse_api_credentials_rejects_repeated_key(self):
         with self.assertRaisesRegex(ValueError, "only once"):

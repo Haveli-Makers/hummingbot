@@ -1,6 +1,8 @@
+from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from unittest.mock import MagicMock, patch
 
+from hummingbot.connector.exchange.wazirx import wazirx_constants as CONSTANTS
 from hummingbot.connector.exchange.wazirx.wazirx_api_key_pool import WazirxApiKeyPool
 from hummingbot.connector.exchange.wazirx.wazirx_auth import WazirxAuth
 from hummingbot.core.api_throttler.data_types import RateLimit
@@ -20,8 +22,12 @@ class WazirxApiKeyPoolTests(IsolatedAsyncioWrapperTestCase):
             RateLimit(limit_id="SLOW", limit=1, time_interval=1.5),
         ])
 
-    def create_pool(self, rate_limits, auths=None) -> WazirxApiKeyPool:
-        return WazirxApiKeyPool(auths=auths or self.auths, rate_limits=rate_limits, time_provider=lambda: self.now)
+    def create_pool(self, rate_limits, auths=None, limits_share_pct=Decimal("100")) -> WazirxApiKeyPool:
+        return WazirxApiKeyPool(auths=auths or self.auths, rate_limits=rate_limits,
+                                limits_share_pct=limits_share_pct, time_provider=lambda: self.now)
+
+    def patch_sleep(self):
+        return patch("hummingbot.connector.exchange.wazirx.wazirx_api_key_pool.asyncio.sleep", self.fake_sleep)
 
     async def fake_sleep(self, seconds: float):
         self.sleeps.append(seconds)
@@ -61,7 +67,7 @@ class WazirxApiKeyPoolTests(IsolatedAsyncioWrapperTestCase):
         self.now += 0.5
         self.assertEqual(1, await self.pool.acquire("SLOW"))
 
-        with patch("hummingbot.connector.exchange.wazirx.wazirx_api_key_pool.asyncio.sleep", self.fake_sleep):
+        with self.patch_sleep():
             index = await self.pool.acquire("SLOW")
 
         # key 0 frees first
@@ -72,19 +78,14 @@ class WazirxApiKeyPoolTests(IsolatedAsyncioWrapperTestCase):
         self.pool.set_active([0])
         self.assertEqual(0, await self.pool.acquire("SLOW"))
         self.now += 1.5
-        with patch("hummingbot.connector.exchange.wazirx.wazirx_api_key_pool.asyncio.sleep", self.fake_sleep):
+        with self.patch_sleep():
             self.assertEqual(0, await self.pool.acquire("SLOW"))
         self.assertEqual([], self.sleeps)
-
-    async def test_exclude_leaves_keys_out(self):
-        self.assertEqual(1, await self.pool.acquire("FAST", exclude=[0]))
-        self.assertEqual(2, await self.pool.acquire("FAST", exclude=[0]))
-        self.assertEqual(1, await self.pool.acquire("FAST", exclude=[0]))
 
     async def test_index_pins_one_key_even_outside_rotation(self):
         self.pool.set_active([0, 1])
         self.assertEqual(2, await self.pool.acquire("FAST", index=2))
-        self.assertEqual(2, await self.pool.acquire("FAST", index=2, exclude=[2]))
+        self.assertEqual(2, await self.pool.acquire("FAST", index=2))
 
     async def test_set_active_limits_rotation(self):
         self.pool.set_active([2, 0])
@@ -94,10 +95,6 @@ class WazirxApiKeyPoolTests(IsolatedAsyncioWrapperTestCase):
     def test_set_active_needs_a_key(self):
         with self.assertRaises(ValueError):
             self.pool.set_active([])
-
-    async def test_no_key_left_to_try_raises(self):
-        with self.assertRaises(ValueError):
-            await self.pool.acquire("FAST", exclude=[0, 1, 2])
 
     async def test_rested_key_is_skipped_until_its_rest_ends(self):
         self.pool.set_active([0, 1])
@@ -111,12 +108,40 @@ class WazirxApiKeyPoolTests(IsolatedAsyncioWrapperTestCase):
         self.pool.rest(0, "FAST", 2.0)
         self.assertEqual(0, await self.pool.acquire("SLOW"))
 
-    async def test_every_key_resting_raises_without_waiting(self):
+    async def test_waits_out_a_short_rest_when_every_key_is_resting(self):
         for index in range(3):
             self.pool.rest(index, "FAST", 2.0 + index)
 
-        with self.assertRaisesRegex(IOError, "rate limited on FAST; retry in 2.0s"):
+        with self.patch_sleep():
+            self.assertEqual(0, await self.pool.acquire("FAST"))
+        self.assertEqual([2.0], self.sleeps)
+
+    async def test_waits_for_whichever_frees_first_rest_or_window(self):
+        self.pool.set_active([0, 1])
+        self.pool.rest(0, "SLOW", 0.5)
+        self.assertEqual(1, await self.pool.acquire("SLOW"))
+
+        with self.patch_sleep():
+            # key 0's rest ends before key 1's window frees
+            self.assertEqual(0, await self.pool.acquire("SLOW"))
+        self.assertEqual([0.5], self.sleeps)
+
+    async def test_every_key_resting_too_long_raises_without_waiting(self):
+        for index in range(3):
+            self.pool.rest(index, "FAST", CONSTANTS.MAX_REST_WAIT + 1 + index)
+
+        with self.patch_sleep(), self.assertRaisesRegex(IOError, "rate limited on FAST; retry in 6.0s"):
             await self.pool.acquire("FAST")
+        self.assertEqual([], self.sleeps)
+
+    def test_limits_share_pct_scales_each_limit_but_keeps_at_least_one(self):
+        pool = self.create_pool(
+            rate_limits=[RateLimit(limit_id="FAST", limit=10, time_interval=1.5),
+                         RateLimit(limit_id="SLOW", limit=1, time_interval=1.5)],
+            limits_share_pct=Decimal("50"))
+
+        self.assertEqual(5, pool._rate_limits["FAST"].limit)
+        self.assertEqual(1, pool._rate_limits["SLOW"].limit)
 
     async def test_pause_blocks_every_key_until_it_ends(self):
         self.pool.pause(120)

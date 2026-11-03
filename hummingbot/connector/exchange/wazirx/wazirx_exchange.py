@@ -1,4 +1,7 @@
 import asyncio
+import json
+import logging
+import time
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
@@ -23,16 +26,17 @@ from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState,
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
-from hummingbot.core.web_assistant.connections.data_types import RESTMethod
+from hummingbot.core.web_assistant.connections.data_types import RESTMethod, RESTRequest
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
 
 class WazirxAPIError(IOError):
-    """A signed request that WazirX answered with an HTTP error status."""
+    """A signed request that WazirX answered with an HTTP error status (and WazirX error code, if any)."""
 
-    def __init__(self, message: str, status: int):
+    def __init__(self, message: str, status: int, code: Optional[int] = None):
         super().__init__(message)
         self.status = status
+        self.code = code
 
 
 class WazirxExchange(ExchangePyBase):
@@ -62,7 +66,8 @@ class WazirxExchange(ExchangePyBase):
         ``wazirx_api_key`` and ``wazirx_api_secret`` each take one value, or up to five
         comma-separated values matched by position.
         """
-        self._api_credentials = wazirx_utils.parse_api_credentials(wazirx_api_key, wazirx_api_secret)
+        self._api_credentials = wazirx_utils.parse_api_credentials(
+            wazirx_api_key, wazirx_api_secret, required=trading_required)
         self.api_key, self.secret_key = self._api_credentials[0]
         self._timestamp_sequence = WazirxTimestampSequence()
         self._domain = domain
@@ -72,7 +77,10 @@ class WazirxExchange(ExchangePyBase):
         self._key_pool = WazirxApiKeyPool(
             auths=[self._auth] + [self._create_auth(key, secret) for key, secret in self._api_credentials[1:]],
             rate_limits=CONSTANTS.RATE_LIMITS,
+            limits_share_pct=rate_limits_share_pct,
         )
+        self._clock_resync_lock = asyncio.Lock()
+        self._clock_resynced_at = 0.0
 
         if trading_required and trading_pairs:
             for pair in trading_pairs:
@@ -237,24 +245,28 @@ class WazirxExchange(ExchangePyBase):
     ) -> Any:
         """
         Sends a signed request with the next API key that has room on this endpoint.
-        On 429 the key rests and the request is retried once on another key (WazirX did
-        not process it); on 418 signed requests pause; on error 2098 the clock is resynced
-        and the request retried once. ``key_index`` pins the request to one key.
+        On 429 the key rests and the request is retried once (WazirX did not process it); the pool
+        moves it to another key, or waits out the rest when there is only one. A key WazirX refuses
+        is taken out of rotation and the request moves on. On 418 signed requests pause; on error
+        2098 the clock is resynced and the request retried once. ``key_index`` pins one key, with no retries.
         """
         url = f"{CONSTANTS.REST_URL}{path}"
-        limit_id = CONSTANTS.ORDER_LIMIT_IDS.get(method, path) if path == CONSTANTS.ORDER_STATUS_PATH_URL else path
-        rate_limited_keys: List[int] = []
+        limit_id = CONSTANTS.ORDER_LIMIT_IDS.get((method, path), path)
+        rate_limit_retried = False
         clock_resynced = False
         while True:
-            index = await self._key_pool.acquire(limit_id, exclude=rate_limited_keys, index=key_index)
+            index = await self._key_pool.acquire(limit_id, index=key_index)
             auth = self._key_pool.auth(index)
+            sent_at = time.monotonic()
             status, retry_after, payload = await self._send_signed_request(
                 auth=auth, method=method, url=url, params=params)
             key_label = self._key_pool.label(index)
-            order_id = params.get("orderId") or (payload.get("id") if status < 400 and isinstance(payload, dict) else None)
-            order_note = f" order {order_id}" if order_id else ""
-            self.logger().debug(
-                f"WazirX {method} {path}{order_note} used API {key_label} ({auth.api_key[:4]}...): HTTP {status}")
+            if self.logger().isEnabledFor(logging.DEBUG):
+                order_id = params.get("orderId") or (
+                    payload.get("id") if status < 400 and isinstance(payload, dict) else None)
+                order_note = f" order {order_id}" if order_id else ""
+                self.logger().debug(
+                    f"WazirX {method} {path}{order_note} used API {key_label} ({auth.api_key[:4]}...): HTTP {status}")
             if status < 400:
                 return payload
 
@@ -262,22 +274,24 @@ class WazirxExchange(ExchangePyBase):
                 f"Error executing request {method} {url} with WazirX API {key_label}. "
                 f"HTTP status is {status}. Error: {payload}",
                 status=status,
+                code=self._error_code(payload),
             )
             if status == CONSTANTS.RATE_LIMITED_HTTP_STATUS:
                 self._key_pool.rest(
                     index, limit_id, self._retry_after_seconds(retry_after, CONSTANTS.DEFAULT_RATE_LIMIT_COOLDOWN))
-                rate_limited_keys.append(index)
-                if key_index is None and len(rate_limited_keys) == 1 and len(self._key_pool.active_indexes) > 1:
-                    self.logger().warning(f"WazirX rate-limited API {key_label} on {limit_id}; retrying with another key.")
+                if key_index is None and not rate_limit_retried:
+                    rate_limit_retried = True
+                    self.logger().warning(f"WazirX rate-limited API {key_label} on {limit_id}; retrying.")
                     continue
             elif status == CONSTANTS.IP_BANNED_HTTP_STATUS:
                 pause = self._retry_after_seconds(retry_after, CONSTANTS.DEFAULT_IP_BAN_COOLDOWN)
                 self._key_pool.pause(pause)
                 self.logger().error(f"WazirX banned this IP (HTTP 418). Signed requests are paused for {pause:.0f}s.")
+            elif key_index is None and self._is_api_key_rejected(error) and self._drop_key(index, error):
+                continue
             elif not clock_resynced and self._is_request_exception_related_to_time_synchronizer(error):
                 clock_resynced = True
-                self._time_synchronizer.clear_time_offset_ms_samples()
-                await self._update_time_synchronizer(pass_on_non_cancelled_error=True)
+                await self._resync_clock(sent_at)
                 continue
             raise error
 
@@ -289,19 +303,21 @@ class WazirxExchange(ExchangePyBase):
         params: Dict[str, Any],
     ) -> Tuple[int, Optional[str], Any]:
         """Returns the HTTP status, the Retry-After header, and the JSON body (raw text on error)."""
+        if method not in ("GET", "POST", "DELETE"):
+            raise ValueError(f"Unsupported HTTP method: {method}")
         _, query_string = await auth.add_auth_params(params)
-        headers = auth.get_headers()
-        async with aiohttp.ClientSession() as session:
-            if method == "GET":
-                request = session.get(f"{url}?{query_string}", headers=headers)
-            elif method in ("POST", "DELETE"):
-                request = session.request(method, url, data=query_string, headers=headers)
-            else:
-                raise ValueError(f"Unsupported HTTP method: {method}")
-            async with request as response:
-                if response.status >= 400:
-                    return response.status, response.headers.get("Retry-After"), await response.text()
-                return response.status, None, await response.json()
+        request = RESTRequest(
+            method=RESTMethod[method],
+            url=f"{url}?{query_string}" if method == "GET" else url,
+            data=None if method == "GET" else query_string,
+            headers=auth.get_headers(),
+        )
+        # Shared HTTP session, no throttling here: the key pool already paced this request.
+        rest_assistant = await self._web_assistants_factory.get_rest_assistant()
+        response = await rest_assistant.call(request=request, timeout=CONSTANTS.SIGNED_REQUEST_TIMEOUT)
+        if response.status >= 400:
+            return response.status, response.headers.get("Retry-After"), await response.text()
+        return response.status, None, await response.json()
 
     @staticmethod
     def _retry_after_seconds(retry_after: Optional[str], default: float) -> float:
@@ -311,6 +327,40 @@ class WazirxExchange(ExchangePyBase):
             return default
         return seconds if seconds > 0 else default
 
+    @staticmethod
+    def _error_code(payload: Any) -> Optional[int]:
+        try:
+            return int(json.loads(payload)["code"])
+        except (TypeError, ValueError, KeyError):
+            return None
+
+    @staticmethod
+    def _is_api_key_rejected(error: WazirxAPIError) -> bool:
+        return (error.status == CONSTANTS.UNAUTHORIZED_HTTP_STATUS
+                or error.code in CONSTANTS.API_KEY_REJECTED_ERROR_CODES)
+
+    def _drop_key(self, index: int, error: WazirxAPIError) -> bool:
+        """Takes a key WazirX refused out of rotation; returns False when it is the only key left."""
+        active = self._key_pool.active_indexes
+        remaining = [i for i in active if i != index]
+        if not remaining:
+            return False
+        if index in active:
+            self._key_pool.set_active(remaining)
+            self.logger().error(
+                f"WazirX rejected API {self._key_pool.label(index)}, so it is out of rotation until the "
+                f"connector restarts. {error}")
+        return True
+
+    async def _resync_clock(self, failed_request_sent_at: float):
+        """Resyncs the clock once for all requests that got error 2098 together."""
+        async with self._clock_resync_lock:
+            if self._clock_resynced_at > failed_request_sent_at:
+                return
+            self._time_synchronizer.clear_time_offset_ms_samples()
+            await self._update_time_synchronizer(pass_on_non_cancelled_error=True)
+            self._clock_resynced_at = time.monotonic()
+
     async def start_network(self):
         if self.is_trading_required and self._key_pool.size > 1:
             await self._check_api_keys()
@@ -318,8 +368,8 @@ class WazirxExchange(ExchangePyBase):
 
     async def _check_api_keys(self):
         """
-        Drops keys WazirX rejects at start-up (e.g. no trade permission or IP whitelist).
-        Keeps every key if the check times out or WazirX rejects all of them.
+        Drops keys WazirX refuses at start-up (bad key or secret, IP not whitelisted). Other errors
+        keep the key, and every key stays if the check times out or WazirX refuses all of them.
         """
         indexes = list(range(self._key_pool.size))
         try:
@@ -353,12 +403,9 @@ class WazirxExchange(ExchangePyBase):
                 method="GET", path=CONSTANTS.USER_BALANCES_PATH_URL, params={}, key_index=index)
         except asyncio.CancelledError:
             raise
-        except WazirxAPIError as error:
-            rate_limited = error.status in (CONSTANTS.RATE_LIMITED_HTTP_STATUS, CONSTANTS.IP_BANNED_HTTP_STATUS)
-            if error.status < 500 and not rate_limited:
-                return error
-            self.logger().warning(f"Could not check WazirX API {self._key_pool.label(index)}: {error}")
         except Exception as error:
+            if isinstance(error, WazirxAPIError) and self._is_api_key_rejected(error):
+                return error
             self.logger().warning(f"Could not check WazirX API {self._key_pool.label(index)}: {error}")
         return None
 

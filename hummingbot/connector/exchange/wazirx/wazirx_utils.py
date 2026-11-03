@@ -1,5 +1,5 @@
 from decimal import Decimal
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from pydantic import ConfigDict, Field, SecretStr
 
@@ -66,18 +66,23 @@ def hb_pair_to_wazirx_symbol(hb_pair: str) -> str:
     return hb_pair.replace("-", "").upper()
 
 
-def parse_api_credentials(api_keys: str, api_secrets: str) -> List[Tuple[str, str]]:
-    """Splits comma-separated keys and secrets into (key, secret) pairs, matched by position."""
-    keys = [key.strip() for key in api_keys.split(",")]
-    secrets = [secret.strip() for secret in api_secrets.split(",")]
+def parse_api_credentials(api_keys: Optional[str],
+                          api_secrets: Optional[str],
+                          required: bool = False) -> List[Tuple[str, str]]:
+    """
+    Splits comma-separated keys and secrets into (key, secret) pairs, matched by position.
+    A single blank key is allowed for public data unless ``required`` (trading).
+    """
+    keys = [key.strip() for key in (api_keys or "").split(",")]
+    secrets = [secret.strip() for secret in (api_secrets or "").split(",")]
     if len(keys) != len(secrets):
         raise ValueError(
             f"WazirX needs one API secret per API key, in the same order: got {len(keys)} keys "
             f"and {len(secrets)} secrets.")
     if len(keys) > MAX_API_KEYS:
         raise ValueError(f"WazirX allows at most {MAX_API_KEYS} API keys per account: got {len(keys)}.")
-    if len(keys) > 1 and not all(keys + secrets):
-        raise ValueError("WazirX API keys and secrets can't have blank entries between commas.")
+    if (required or len(keys) > 1) and not all(keys + secrets):
+        raise ValueError("WazirX API keys and secrets can't be blank.")
     if len(set(keys)) != len(keys):
         raise ValueError("Each WazirX API key can be entered only once.")
     return list(zip(keys, secrets))

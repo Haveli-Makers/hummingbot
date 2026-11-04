@@ -12,6 +12,7 @@ from hummingbot.core.event.events import (
     WalletTransferCompletedEvent,
     WalletTransferCreatedEvent,
     WalletTransferFailedEvent,
+    WalletTransferUnknownEvent,
 )
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 
@@ -30,8 +31,10 @@ class WalletTransferConfig(BaseClientModel):
             "prompt_on_new": True,
         },
     )
+    # Defaults are chosen so that accepting every prompt can never send funds OUT of the exchange:
+    # the direction defaults to an internal move, and the amount has no usable default.
     direction: str = Field(
-        default="withdraw",
+        default="sub_to_master",
         json_schema_extra={
             "prompt": lambda mi: f"Enter the operation ({' / '.join(SUPPORTED_DIRECTIONS)}): ",
             "prompt_on_new": True,
@@ -45,9 +48,9 @@ class WalletTransferConfig(BaseClientModel):
         },
     )
     amount: Decimal = Field(
-        default=Decimal("1.2"),
+        default=Decimal("0"),
         json_schema_extra={
-            "prompt": lambda mi: "Enter the amount: ",
+            "prompt": lambda mi: "Enter the amount (must be greater than 0): ",
             "prompt_on_new": True,
         },
     )
@@ -112,6 +115,13 @@ class WalletTransferConfig(BaseClientModel):
             raise ValueError(f"Operation must be one of: {', '.join(SUPPORTED_DIRECTIONS)}")
         return value
 
+    @field_validator("amount")
+    @classmethod
+    def _validate_amount(cls, value):
+        if not value.is_finite() or value <= 0:
+            raise ValueError("Amount must be a positive number.")
+        return value
+
 
 class WalletTransferExample(ScriptStrategyBase):
     """
@@ -126,8 +136,12 @@ class WalletTransferExample(ScriptStrategyBase):
     * external (``withdraw``) -> ``withdraw_to_address`` -> Created (accepted, SUBMITTED) then, after
       the connector confirms it on-chain by polling, Completed (with the tx hash) or Failed.
 
-    The transfer fires once on the first tick; the strategy keeps running so the connector can
-    confirm a withdrawal. Stop it (``stop``) once you see the terminal event.
+    Either kind can instead end in Unknown: the request was sent but its outcome could not be
+    confirmed (e.g. a timeout). The funds may have moved, so check the exchange before retrying.
+
+    The transfer fires once, on the first tick after the connector is ready; the strategy keeps
+    running so the connector can confirm a withdrawal. Stop it (``stop``) once you see the terminal
+    event.
     """
 
     @classmethod
@@ -144,17 +158,23 @@ class WalletTransferExample(ScriptStrategyBase):
         self._created_forwarder = EventForwarder(self._on_transfer_created)
         self._completed_forwarder = EventForwarder(self._on_transfer_completed)
         self._failed_forwarder = EventForwarder(self._on_transfer_failed)
+        self._unknown_forwarder = EventForwarder(self._on_transfer_unknown)
         connector = self.connectors[config.connector]
         connector.add_listener(MarketEvent.WalletTransferCreated, self._created_forwarder)
         connector.add_listener(MarketEvent.WalletTransferCompleted, self._completed_forwarder)
         connector.add_listener(MarketEvent.WalletTransferFailed, self._failed_forwarder)
+        connector.add_listener(MarketEvent.WalletTransferUnknown, self._unknown_forwarder)
 
     def on_tick(self):
         if self._transfer_started:
             return
+        connector = self.connectors[self.config.connector]
+        # ScriptStrategyBase already holds on_tick back until every connector is ready; checked here
+        # too because a money-moving call must never go out on a half-initialised connector.
+        if not connector.ready:
+            return
         self._transfer_started = True
 
-        connector = self.connectors[self.config.connector]
         try:
             if self.config.direction == "withdraw":
                 self._transfer_id = self._start_withdrawal(connector)
@@ -216,8 +236,16 @@ class WalletTransferExample(ScriptStrategyBase):
     def _on_transfer_failed(self, event: WalletTransferFailedEvent):
         self.logger().error(f"Transfer {event.transfer_id} FAILED: {event.error_message}")
 
+    def _on_transfer_unknown(self, event: WalletTransferUnknownEvent):
+        self.logger().error(
+            f"Transfer {event.transfer_id} outcome UNKNOWN ({event.amount} {event.asset}, exchange id: "
+            f"{event.exchange_transfer_id}): {event.error_message}. Funds may have moved - check "
+            f"{self.config.connector} before retrying."
+        )
+
     async def on_stop(self):
         connector = self.connectors[self.config.connector]
         connector.remove_listener(MarketEvent.WalletTransferCreated, self._created_forwarder)
         connector.remove_listener(MarketEvent.WalletTransferCompleted, self._completed_forwarder)
         connector.remove_listener(MarketEvent.WalletTransferFailed, self._failed_forwarder)
+        connector.remove_listener(MarketEvent.WalletTransferUnknown, self._unknown_forwarder)

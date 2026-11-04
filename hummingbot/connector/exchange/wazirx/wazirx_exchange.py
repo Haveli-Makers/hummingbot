@@ -1,4 +1,6 @@
 import asyncio
+import json
+import re
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
@@ -15,6 +17,8 @@ from hummingbot.connector.exchange.wazirx.wazirx_auth import WazirxAuth
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.wallet_transfer.wallet_transfer_data_types import (
+    TransferOutcomeUnknownError,
+    TransferRejectedError,
     TransferState,
     TransferType,
     TransferUpdate,
@@ -28,6 +32,18 @@ from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, Tok
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
+
+
+class WazirxAPIError(IOError):
+    """
+    A non-2xx WazirX response, carrying the HTTP status and WazirX's numeric error code (when the
+    body has one) so callers can branch on them instead of searching the message text.
+    """
+
+    def __init__(self, message: str, status: int, code: Optional[int] = None):
+        super().__init__(message)
+        self.status = status
+        self.code = code
 
 
 class WazirxExchange(WalletTransferExecutorMixin, ExchangePyBase):
@@ -166,9 +182,20 @@ class WazirxExchange(WalletTransferExecutorMixin, ExchangePyBase):
 
     @staticmethod
     def _is_rate_limited(exception: Exception) -> bool:
-        """True for WazirX's rate-limit error (HTTP 429 / code 2136 "Too many api request")."""
-        text = str(exception).lower()
-        return "2136" in text or "too many api request" in text or "429" in text
+        """
+        True for WazirX's rate-limit error (HTTP 429 / code 2136 "Too many api request").
+
+        Matches the structured status and code, not digits anywhere in the message: an order id,
+        amount or timestamp containing "429" must not be mistaken for a rate limit.
+        """
+        if isinstance(exception, WazirxAPIError):
+            return exception.status == 429 or exception.code == 2136
+        text = str(exception)
+        return bool(
+            re.search(r"HTTP status is 429\b", text)
+            or re.search(r'"code"\s*:\s*2136\b', text)
+            or "too many api request" in text.lower()
+        )
 
     def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
         return "Order does not exist" in str(status_update_exception)
@@ -269,7 +296,16 @@ class WazirxExchange(WalletTransferExecutorMixin, ExchangePyBase):
     async def _handle_response(self, response: aiohttp.ClientResponse, method: str, url: str) -> Dict[str, Any]:
         if response.status >= 400:
             error_text = await response.text()
-            raise IOError(f"Error executing request {method} {url}. HTTP status is {response.status}. Error: {error_text}")
+            try:
+                code = json.loads(error_text).get("code")
+                code = int(code) if code is not None else None
+            except (ValueError, TypeError, AttributeError):
+                code = None
+            raise WazirxAPIError(
+                f"Error executing request {method} {url}. HTTP status is {response.status}. Error: {error_text}",
+                status=response.status,
+                code=code,
+            )
         return await response.json()
 
     # ------------------------------------------------------------------
@@ -292,11 +328,10 @@ class WazirxExchange(WalletTransferExecutorMixin, ExchangePyBase):
                 "transfers. Configure wazirx_master_api_key and wazirx_master_api_secret."
             )
 
-    async def _place_internal_transfer(self, transfer: WalletTransfer, **kwargs) -> TransferUpdate:
+    async def _resolve_internal_transfer_accounts(self, transfer: WalletTransfer) -> None:
         """
-        Transfer funds between the master account and a sub-account (either direction) using the
-        master account API key. WazirX identifies accounts by email and only allows moves between
-        the master and its own sub-accounts (sub->sub is rejected).
+        WazirX identifies accounts by email. The sub-account email always comes from the caller;
+        the master side defaults to the configured ``wazirx_master_email``.
         """
         if transfer.transfer_type == TransferType.MASTER_TO_SUB:
             # The sub-account email is the destination; the master side defaults from config.
@@ -312,12 +347,20 @@ class WazirxExchange(WalletTransferExecutorMixin, ExchangePyBase):
                 f"{missing_side}) for {transfer.transfer_type.value} transfers."
             )
 
+    async def _place_internal_transfer(self, transfer: WalletTransfer, **kwargs) -> TransferUpdate:
+        """
+        Transfer funds between the master account and a sub-account (either direction) using the
+        master account API key. Only moves between the master and its own sub-accounts are allowed
+        (sub->sub is rejected). Accounts are resolved beforehand by
+        :meth:`_resolve_internal_transfer_accounts`.
+        """
         params = {
             "currency": transfer.asset.lower(),
             "amount": f"{transfer.amount:f}",
             "fromEmail": transfer.source,
             "toEmail": transfer.destination,
         }
+        transfer.request_sent = True
         resp = await self._wazirx_request(
             method="POST",
             path=CONSTANTS.SUB_ACCOUNT_FUND_TRANSFER_PATH_URL,
@@ -327,10 +370,17 @@ class WazirxExchange(WalletTransferExecutorMixin, ExchangePyBase):
             params_in_query=True,
         )
 
-        status = str(resp.get("status", "")).lower()
-        txn_id = resp.get("txnId")
+        # Require a positive confirmation: "success", or (if WazirX omits the status) a txnId. An
+        # explicit other status is a refusal; a body with neither cannot be read either way.
+        body = resp if isinstance(resp, dict) else {}
+        status = str(body.get("status", "")).strip().lower()
+        txn_id = body.get("txnId")
         if status and status != "success":
-            raise IOError(f"WazirX rejected the transfer: {resp}")
+            raise TransferRejectedError(f"WazirX rejected the transfer: {resp}")
+        if status != "success" and txn_id is None:
+            raise TransferOutcomeUnknownError(
+                f"WazirX returned neither a success status nor a txnId for the transfer: {resp}"
+            )
 
         return TransferUpdate(
             client_transfer_id=transfer.client_transfer_id,
@@ -400,29 +450,35 @@ class WazirxExchange(WalletTransferExecutorMixin, ExchangePyBase):
 
     async def _resolve_address_book_entry(self, coin: str, address_book_id: str) -> Dict[str, Any]:
         """
-        Find the Address Book entry matching ``address_book_id`` (its numeric ``id`` or its
-        ``name``) and verify it is currently withdrawable.
+        Find the Address Book entry matching ``address_book_id`` and verify it is currently
+        withdrawable.
+
+        The numeric ``id`` is unique and wins. A ``name`` is user-chosen and may be shared by
+        several entries (e.g. one per network), so a name that matches more than one entry is
+        refused rather than silently picking the first.
         """
         entries = await self.get_address_book(coin)
         if isinstance(entries, dict):
             entries = entries.get("rows") or entries.get("data") or []
+        entries = [entry for entry in entries if isinstance(entry, dict)]
+
+        def describe(entry: Dict[str, Any]) -> str:
+            return f"{entry.get('id')}:{entry.get('name')!r}[{(entry.get('networkObj') or {}).get('network')}]"
+
         wanted = str(address_book_id).strip().lower()
-        match = next(
-            (
-                entry for entry in entries
-                if isinstance(entry, dict)
-                and wanted in {str(entry.get("id", "")).lower(), str(entry.get("name", "")).strip().lower()}
-            ),
-            None,
-        )
+        matches = [entry for entry in entries if str(entry.get("id", "")).strip().lower() == wanted]
+        if not matches:
+            matches = [entry for entry in entries if str(entry.get("name", "")).strip().lower() == wanted]
+        if len(matches) > 1:
+            raise ValueError(
+                f"{len(matches)} WazirX address-book entries for {coin.upper()} are named "
+                f"{address_book_id!r}: {[describe(entry) for entry in matches]}. Pass the numeric id instead."
+            )
+        match = matches[0] if matches else None
         if match is None:
-            available = [
-                f"{e.get('id')}:{e.get('name')!r}[{(e.get('networkObj') or {}).get('network')}]"
-                for e in entries if isinstance(e, dict)
-            ]
             raise ValueError(
                 f"No WazirX address-book entry for {coin.upper()} matching {address_book_id!r}. "
-                f"Whitelist it in the WazirX app first. Available: {available or 'none'}"
+                f"Whitelist it in the WazirX app first. Available: {[describe(e) for e in entries] or 'none'}"
             )
         if match.get("disabled") is True:
             raise ValueError(
@@ -574,6 +630,7 @@ class WazirxExchange(WalletTransferExecutorMixin, ExchangePyBase):
             "extra": kwargs.get("extra", "hummingbot wallet transfer"),
             "withdrawOrderId": transfer.client_transfer_id,
         }
+        transfer.request_sent = True
         resp = await self._wazirx_request(
             method="POST",
             path=CONSTANTS.CRYPTO_WITHDRAW_PATH_URL,
@@ -582,9 +639,14 @@ class WazirxExchange(WalletTransferExecutorMixin, ExchangePyBase):
             params_in_query=True,
         )
 
+        # A 2xx without the withdrawal id cannot be read as accepted OR refused (refusals arrive as
+        # non-2xx). It may still have been queued, so report it as unknown, not failed.
         withdraw_id = resp.get("id") if isinstance(resp, dict) else None
         if withdraw_id is None:
-            raise IOError(f"WazirX rejected the withdrawal: {resp}")
+            raise TransferOutcomeUnknownError(
+                f"WazirX did not return a withdrawal id: {resp}. Check the withdraw history for "
+                f"withdrawOrderId={transfer.client_transfer_id} before retrying."
+            )
 
         return TransferUpdate(
             client_transfer_id=transfer.client_transfer_id,

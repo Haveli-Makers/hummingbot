@@ -32,6 +32,7 @@ class MarketEvent(Enum):
     WalletTransferCreated = 213
     WalletTransferCompleted = 214
     WalletTransferFailed = 215
+    WalletTransferUnknown = 216
     RangePositionLiquidityAdded = 300
     RangePositionLiquidityRemoved = 301
     RangePositionUpdate = 302
@@ -306,6 +307,22 @@ class WalletTransferFailedEvent:
     timestamp: float
     transfer_id: str
     transfer_type: str
+    error_message: Optional[str] = None
+    error_type: Optional[str] = None
+
+
+@dataclass
+class WalletTransferUnknownEvent:
+    """
+    The transfer's outcome could not be determined: it may or may not have moved funds. Reconcile
+    it against the exchange before retrying, or the funds can move twice.
+    """
+    timestamp: float
+    transfer_id: str
+    transfer_type: str
+    asset: str
+    amount: Decimal
+    exchange_transfer_id: Optional[str] = None
     error_message: Optional[str] = None
     error_type: Optional[str] = None
 

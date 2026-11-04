@@ -1,7 +1,23 @@
+import math
+import time
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum
 from typing import Any, Dict, NamedTuple, Optional
+
+
+class TransferRejectedError(IOError):
+    """
+    The exchange definitively refused the transfer (an explicit failure in its response), so no
+    funds moved and it is safe to retry once the cause is fixed. Reported as FAILED.
+    """
+
+
+class TransferOutcomeUnknownError(IOError):
+    """
+    The request reached the exchange but its answer neither confirms nor refuses the transfer, so
+    the funds may or may not have moved. Reported as UNKNOWN: reconcile before retrying.
+    """
 
 
 class TransferCategory(Enum):
@@ -48,11 +64,16 @@ class TransferState(Enum):
     Internal transfers usually go PENDING_CREATE -> COMPLETED in a single step.
     External withdrawals go PENDING_CREATE -> SUBMITTED -> COMPLETED/FAILED, where the
     transition out of SUBMITTED is confirmed asynchronously by polling the exchange.
+
+    FAILED means the funds definitely did not move. UNKNOWN means the request may have been
+    executed (e.g. it timed out after being sent, or a withdrawal was never confirmed), so the
+    transfer must be reconciled against the exchange before anyone retries it.
     """
     PENDING_CREATE = 0
     SUBMITTED = 1
     COMPLETED = 2
     FAILED = 3
+    UNKNOWN = 4
 
 
 class TransferUpdate(NamedTuple):
@@ -90,6 +111,10 @@ class WalletTransfer:
     last_update_timestamp: float = 0.0
     error_message: Optional[str] = None
     error_type: Optional[str] = None
+    # Set by the connector immediately before it sends the request that moves funds. Errors raised
+    # before that point cannot have moved anything, so they are reported as FAILED; ambiguous errors
+    # after it (timeouts, dropped connections, 5xx) are reported as UNKNOWN.
+    request_sent: bool = False
 
     @property
     def category(self) -> TransferCategory:
@@ -97,7 +122,7 @@ class WalletTransfer:
 
     @property
     def is_done(self) -> bool:
-        return self.state in {TransferState.COMPLETED, TransferState.FAILED}
+        return self.state in {TransferState.COMPLETED, TransferState.FAILED, TransferState.UNKNOWN}
 
     @property
     def is_completed(self) -> bool:
@@ -106,6 +131,10 @@ class WalletTransfer:
     @property
     def is_failure(self) -> bool:
         return self.state == TransferState.FAILED
+
+    @property
+    def is_unknown(self) -> bool:
+        return self.state == TransferState.UNKNOWN
 
     def update_with(self, transfer_update: TransferUpdate) -> bool:
         """
@@ -123,7 +152,7 @@ class WalletTransfer:
         )
 
         self.state = transfer_update.new_state
-        self.last_update_timestamp = transfer_update.update_timestamp
+        self.last_update_timestamp = safe_timestamp(transfer_update.update_timestamp)
         if transfer_update.exchange_transfer_id is not None:
             self.exchange_transfer_id = transfer_update.exchange_transfer_id
         if transfer_update.tx_hash is not None:
@@ -133,3 +162,17 @@ class WalletTransfer:
             self.error_type = transfer_update.misc_updates.get("error_type", self.error_type)
 
         return previous_state != self.state or had_new_exchange_id
+
+
+def safe_timestamp(value: Any) -> float:
+    """
+    ``value`` if it is a usable timestamp, else the current wall time. A connector's
+    ``current_timestamp`` is NaN until its clock has ticked, which would otherwise leak into
+    transfer records and events.
+    """
+    try:
+        if math.isfinite(float(value)):
+            return float(value)
+    except (TypeError, ValueError):
+        pass
+    return time.time()

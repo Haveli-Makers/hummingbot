@@ -1,3 +1,4 @@
+import math
 import unittest
 from decimal import Decimal
 
@@ -93,6 +94,42 @@ class WalletTransferTrackerTest(unittest.TestCase):
         tags = self._event_tags()
         self.assertEqual(1, tags.count(MarketEvent.WalletTransferCreated))
         self.assertEqual(1, tags.count(MarketEvent.WalletTransferCompleted))
+
+    def test_unknown_outcome_fires_unknown_event_only(self):
+        transfer = self._make_transfer("t4")
+        self.tracker.start_tracking_transfer(transfer)
+
+        self.tracker.process_transfer_update(
+            TransferUpdate(
+                client_transfer_id="t4",
+                new_state=TransferState.UNKNOWN,
+                update_timestamp=1001.0,
+                misc_updates={"error_message": "timed out after sending", "error_type": "TimeoutError"},
+            )
+        )
+
+        tags = self._event_tags()
+        self.assertEqual([MarketEvent.WalletTransferUnknown], tags)
+        event = self.connector.events[0][1]
+        self.assertEqual("t4", event.transfer_id)
+        self.assertEqual(Decimal("5"), event.amount)
+        self.assertEqual("timed out after sending", event.error_message)
+        # Terminal: no longer active, kept in the cache for later inspection.
+        self.assertNotIn("t4", self.tracker.active_transfers)
+        self.assertTrue(self.tracker.fetch_transfer("t4").is_unknown)
+
+    def test_untimed_connector_still_gets_finite_event_timestamps(self):
+        self.connector.current_timestamp = float("nan")
+        transfer = self._make_transfer("t5")
+        self.tracker.start_tracking_transfer(transfer)
+
+        self.tracker.process_transfer_update(
+            TransferUpdate(client_transfer_id="t5", new_state=TransferState.COMPLETED, update_timestamp=float("nan"))
+        )
+
+        for _, event in self.connector.events:
+            self.assertFalse(math.isnan(event.timestamp))
+        self.assertFalse(math.isnan(self.tracker.fetch_transfer("t5").last_update_timestamp))
 
     def test_update_for_unknown_transfer_is_noop(self):
         self.tracker.process_transfer_update(

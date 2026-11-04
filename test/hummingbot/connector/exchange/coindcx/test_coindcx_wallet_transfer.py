@@ -217,6 +217,66 @@ class CoindcxWalletTransferTest(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(1, len(self.failed_logger.event_log))
         self.assertEqual(TransferState.FAILED, self.exchange.get_transfer("t-rejected").state)
 
+    def _sub_to_master(self, transfer_id: str, **overrides) -> WalletTransfer:
+        fields = dict(
+            client_transfer_id=transfer_id,
+            transfer_type=TransferType.SUB_TO_MASTER,
+            asset="INR",
+            amount=Decimal("10"),
+            creation_timestamp=1000.0,
+            source="sub-456",
+        )
+        fields.update(overrides)
+        return WalletTransfer(**fields)
+
+    @aioresponses()
+    async def test_missing_coindcx_id_is_refused_before_sending(self, mock_api):
+        # Without the fix the literal string "None" was cached and sent as to_account_id.
+        mock_api.post(self._user_info_url(), body=json.dumps([{"email": "master@example.com"}]))
+
+        transfer = self._sub_to_master("t-no-id")
+        await self.exchange._create_transfer(transfer)  # the transfer endpoint is NOT mocked
+
+        tracked = self.exchange.get_transfer("t-no-id")
+        self.assertEqual(TransferState.FAILED, tracked.state)
+        self.assertIn("no coindcx_id", tracked.error_message)
+        self.assertFalse(transfer.request_sent)
+        self.assertIsNone(self.exchange._master_account_id)  # nothing bogus cached
+
+    @aioresponses()
+    async def test_empty_user_info_list_raises_a_clear_error(self, mock_api):
+        mock_api.post(self._user_info_url(), body=json.dumps([]))
+        with self.assertRaises(IOError) as ctx:
+            await self.exchange.get_user_info(use_master=True)
+        self.assertIn("no account record", str(ctx.exception))
+
+    async def test_self_transfer_is_refused_before_sending(self):
+        transfer = self._sub_to_master("t-self", source="acct-1", destination="acct-1")
+        await self.exchange._create_transfer(transfer)
+
+        self.assertEqual(TransferState.FAILED, self.exchange.get_transfer("t-self").state)
+        self.assertFalse(transfer.request_sent)
+
+    async def test_amount_a_float_would_round_is_refused_before_sending(self):
+        transfer = self._sub_to_master("t-precise", destination="master-123",
+                                       amount=Decimal("123456789.123456789"))
+        await self.exchange._create_transfer(transfer)
+
+        self.assertEqual(TransferState.FAILED, self.exchange.get_transfer("t-precise").state)
+        self.assertFalse(transfer.request_sent)
+
+    @aioresponses()
+    async def test_response_without_a_success_marker_is_unknown(self, mock_api):
+        mock_api.post(self._transfer_url(), body=json.dumps({"data": {}}))
+        unknown_logger = EventLogger()
+        self.exchange.add_listener(MarketEvent.WalletTransferUnknown, unknown_logger)
+
+        await self.exchange._create_transfer(self._sub_to_master("t-unreadable", destination="master-123"))
+
+        self.assertEqual(TransferState.UNKNOWN, self.exchange.get_transfer("t-unreadable").state)
+        self.assertEqual(1, len(unknown_logger.event_log))
+        self.assertEqual(0, len(self.completed_logger.event_log))
+
     @aioresponses()
     async def test_get_balances(self, mock_api):
         url = web_utils.private_rest_url(CONSTANTS.USER_BALANCES_PATH_URL, domain=self.exchange._domain)

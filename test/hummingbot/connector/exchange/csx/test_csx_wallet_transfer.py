@@ -1,6 +1,8 @@
+import asyncio
 import json
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
+from unittest.mock import AsyncMock
 
 from aioresponses import aioresponses
 
@@ -247,6 +249,83 @@ class CsxWalletTransferTest(IsolatedAsyncioWrapperTestCase):
         )
         with self.assertRaises(IOError):
             await self.exchange._place_withdrawal(transfer)
+
+    @aioresponses()
+    async def test_parentless_account_self_transfer_is_refused_before_sending(self, mock_api):
+        # When the configured account IS the master it has no parentID, so both omitted sides
+        # resolve to its own brokerID. That self-transfer must never be submitted.
+        mock_api.get(self._profile_url(), body=json.dumps({"data": {"brokerID": "only-me"}}))
+
+        transfer = WalletTransfer(
+            client_transfer_id="t-self", transfer_type=TransferType.SUB_TO_MASTER, asset="INR",
+            amount=Decimal("20"), creation_timestamp=1700000000.0,
+        )
+        await self.exchange._create_transfer(transfer)  # transferFunds is NOT mocked
+
+        tracked = self.exchange.get_transfer("t-self")
+        self.assertEqual(TransferState.FAILED, tracked.state)
+        self.assertIn("to itself", tracked.error_message)
+        self.assertFalse(transfer.request_sent)
+
+    @aioresponses()
+    async def test_timeout_after_the_transfer_was_sent_is_unknown(self, mock_api):
+        # CSX's 20s MASTER_REQUEST_TIMEOUT can fire after CSX already moved the funds.
+        mock_api.post(self._transfer_url(), exception=asyncio.TimeoutError())
+        unknown_logger = EventLogger()
+        self.exchange.add_listener(MarketEvent.WalletTransferUnknown, unknown_logger)
+
+        transfer = WalletTransfer(
+            client_transfer_id="t-timeout", transfer_type=TransferType.MASTER_TO_SUB, asset="INR",
+            amount=Decimal("20"), creation_timestamp=1700000000.0, source="master-123", destination="sub-456",
+        )
+        await self.exchange._create_transfer(transfer)
+
+        self.assertEqual(TransferState.UNKNOWN, self.exchange.get_transfer("t-timeout").state)
+        self.assertEqual(1, len(unknown_logger.event_log))
+        self.assertEqual(0, len(self.failed_logger.event_log))  # must not invite a retry
+
+    @aioresponses()
+    async def test_withdrawal_without_a_message_is_unknown(self, mock_api):
+        mock_api.post(self._withdraw_url(), body=json.dumps({}))
+        transfer = WalletTransfer(
+            client_transfer_id="wd-empty", transfer_type=TransferType.WITHDRAWAL, asset="USDT",
+            amount=Decimal("5"), creation_timestamp=1700000000.0, address="0xabc", network="eth",
+        )
+        await self.exchange._create_transfer(transfer)
+        self.assertEqual(TransferState.UNKNOWN, self.exchange.get_transfer("wd-empty").state)
+
+    async def test_withdrawal_amount_a_float_would_round_is_refused_before_sending(self):
+        transfer = WalletTransfer(
+            client_transfer_id="wd-precise", transfer_type=TransferType.WITHDRAWAL, asset="USDT",
+            amount=Decimal("1.00000000000000000001"), creation_timestamp=1700000000.0,
+            address="0xabc", network="eth",
+        )
+        with self.assertRaises(ValueError):
+            await self.exchange._place_withdrawal(transfer)
+        self.assertFalse(transfer.request_sent)
+
+    async def test_stop_network_closes_the_master_proxy_session_too(self):
+        # Behind a proxy, master-key calls get their own aiohttp session; it must not leak on shutdown.
+        exchange = CsxExchange(
+            csx_api_key="primary",
+            csx_api_secret=_VALID_SECRET,
+            csx_master_api_key="master",
+            csx_master_api_secret=_VALID_SECRET,
+            trading_pairs=["BTC-INR"],
+            trading_required=False,
+            domain=CONSTANTS.DEFAULT_DOMAIN,
+            csx_proxy_url="http://user:pass@127.0.0.1:3128",
+        )
+        primary_factory = exchange._web_assistants_factory
+        master_factory = exchange._master_web_factory  # created lazily, as a transfer would
+        primary_factory.close = AsyncMock()
+        master_factory.close = AsyncMock()
+
+        await exchange.stop_network()
+
+        primary_factory.close.assert_awaited_once()
+        master_factory.close.assert_awaited_once()
+        self.assertIsNone(exchange._master_web_assistants_factory)
 
     def test_withdrawal_requires_address_and_network(self):
         # Missing address -> ValueError up front (before scheduling); raw address, no whitelist.

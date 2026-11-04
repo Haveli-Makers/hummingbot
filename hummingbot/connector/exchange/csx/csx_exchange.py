@@ -17,6 +17,8 @@ from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
 from hummingbot.connector.wallet_transfer.wallet_transfer_data_types import (
+    TransferOutcomeUnknownError,
+    TransferRejectedError,
     TransferState,
     TransferType,
     TransferUpdate,
@@ -263,13 +265,18 @@ class CsxExchange(WalletTransferExecutorMixin, ExchangePyBase):
         await super().stop_network()
         # With a proxy configured, the web-assistants factory owns a dedicated,
         # per-connector aiohttp session (aiohttp-socks). Close it on shutdown so it
-        # doesn't leak ("Unclosed client session"). The default ConnectionsFactory
-        # is a shared singleton, so it is deliberately left alone.
+        # doesn't leak ("Unclosed client session"). The master-account factory used for
+        # wallet transfers gets its own proxy session the same way, so close that too.
+        # The default ConnectionsFactory is a shared singleton, so it is deliberately left alone.
         if self._proxy_url:
-            try:
-                await self._web_assistants_factory.close()
-            except Exception:
-                self.logger().debug("Error closing CSX proxy connections factory on stop_network.", exc_info=True)
+            for factory in (self._web_assistants_factory, self._master_web_assistants_factory):
+                if factory is None:
+                    continue
+                try:
+                    await factory.close()
+                except Exception:
+                    self.logger().debug("Error closing CSX proxy connections factory on stop_network.", exc_info=True)
+            self._master_web_assistants_factory = None  # rebuilt on the next master request
 
     # ── Exception classification ───────────────────────────────────────────────
 
@@ -608,13 +615,13 @@ class CsxExchange(WalletTransferExecutorMixin, ExchangePyBase):
             raise IOError("Could not determine CSX brokerID for the configured account.")
         return self._own_broker_id
 
-    async def _place_internal_transfer(self, transfer: WalletTransfer, **kwargs) -> TransferUpdate:
+    async def _resolve_internal_transfer_accounts(self, transfer: WalletTransfer) -> None:
         """
-        Move funds between the master account and a broker (sub) account using master credentials.
         CSX identifies accounts by brokerID. Either side may be omitted by the caller: the master
         side defaults to the brokerID resolved from the sub profile's ``parentID``, and the sub side
         defaults to this connector's own ``brokerID`` (the account whose primary creds are
-        configured). Explicitly provided ids always take precedence.
+        configured). Explicitly provided ids always take precedence. If the configured account is
+        itself the master, both defaults are the same id and the executor refuses the self-transfer.
         """
         if transfer.transfer_type == TransferType.MASTER_TO_SUB:
             transfer.source = transfer.source or await self._get_master_broker_id()
@@ -623,19 +630,28 @@ class CsxExchange(WalletTransferExecutorMixin, ExchangePyBase):
             transfer.source = transfer.source or await self._get_own_broker_id()
             transfer.destination = transfer.destination or await self._get_master_broker_id()
 
+    async def _place_internal_transfer(self, transfer: WalletTransfer, **kwargs) -> TransferUpdate:
+        """
+        Move funds between the master account and a broker (sub) account using master credentials.
+        Accounts are resolved beforehand by :meth:`_resolve_internal_transfer_accounts`.
+        """
         data = {
             "fromID": transfer.source,
             "toID": transfer.destination,
             "assetName": transfer.asset.upper(),
             "amount": f"{transfer.amount:f}",
         }
+        transfer.request_sent = True
         resp = await self._master_request(RESTMethod.POST, CONSTANTS.MASTER_TRANSFER_FUNDS_PATH_URL, data=data)
 
         # CSX returns HTTP 200 with {"message": "Transferred funds successfully ..."} and no status
-        # field (a non-2xx would already have raised). Treat a success-y message as completed.
-        message = str(resp.get("message", "")) if isinstance(resp, dict) else ""
+        # field (a non-2xx would already have raised). Any other message is a refusal; no message at
+        # all cannot be read either way.
+        message = str(resp.get("message", "") or "") if isinstance(resp, dict) else ""
         if "success" not in message.lower() and "transferred" not in message.lower():
-            raise IOError(f"CSX rejected the transfer: {resp}")
+            if message.strip():
+                raise TransferRejectedError(f"CSX rejected the transfer: {resp}")
+            raise TransferOutcomeUnknownError(f"CSX transfer response has no message: {resp}")
 
         return TransferUpdate(
             client_transfer_id=transfer.client_transfer_id,
@@ -675,17 +691,21 @@ class CsxExchange(WalletTransferExecutorMixin, ExchangePyBase):
         payload = {
             "assetName": transfer.asset.upper(),
             "chain": transfer.network,
-            "amount": float(transfer.amount),
+            # The withdrawal endpoint takes a JSON number; refuse amounts a float would round.
+            "amount": self._amount_as_exact_float(transfer.amount),
             "address": transfer.address,
             "subAddress": kwargs.get("sub_address", "") or "",
         }
+        transfer.request_sent = True
         resp = await self._api_post(
             path_url=CONSTANTS.WITHDRAWAL_PATH_URL, data=payload, is_auth_required=True,
         )
 
-        message = str(resp.get("message", "")) if isinstance(resp, dict) else ""
+        message = str(resp.get("message", "") or "") if isinstance(resp, dict) else ""
         if "success" not in message.lower() and "processed" not in message.lower():
-            raise IOError(f"CSX rejected the withdrawal: {resp}")
+            if message.strip():
+                raise TransferRejectedError(f"CSX rejected the withdrawal: {resp}")
+            raise TransferOutcomeUnknownError(f"CSX withdrawal response has no message: {resp}")
 
         request_id = self._extract_request_id(message)
         if request_id is None and isinstance(resp, dict):

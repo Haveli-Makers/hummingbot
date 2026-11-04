@@ -265,6 +265,48 @@ class WazirxAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         except asyncio.CancelledError:
             pass
 
+    async def test_polled_snapshots_reach_the_order_book(self):
+        """
+        Every REST poll must reach the tracker. listen_for_subscriptions queues each poll
+        internally and listen_for_order_book_snapshots hands it on through
+        _parse_order_book_snapshot_message; while that was a no-op, the bot's WazirX book stayed
+        frozen at its startup snapshot for the whole session.
+        """
+        first = {"timestamp": 1630644717528, "bids": [["100.0", "1.0"]], "asks": [["101.0", "1.0"]]}
+        second = {"timestamp": 1630644722528, "bids": [["105.0", "1.0"]], "asks": [["106.0", "1.0"]]}
+        polls = iter([first, second])
+        self.data_source._snapshot_poll_interval = 0.01
+        with patch.object(self.data_source, "_request_order_book_snapshot", new_callable=AsyncMock) as request:
+            request.side_effect = lambda *args, **kwargs: next(polls, second)
+            poller = asyncio.create_task(self.data_source.listen_for_subscriptions())
+            forwarder = asyncio.create_task(
+                self.data_source.listen_for_order_book_snapshots(self.local_event_loop, self.msg_queue))
+            try:
+                received = [await asyncio.wait_for(self.msg_queue.get(), timeout=1) for _ in range(2)]
+            finally:
+                poller.cancel()
+                forwarder.cancel()
+
+        self.assertEqual(OrderBookMessageType.SNAPSHOT, received[1].type)
+        self.assertEqual(self.trading_pair, received[1].trading_pair)
+        self.assertEqual(105.0, received[1].bids[0].price)
+
+    async def test_every_poll_gets_a_new_update_id(self):
+        """
+        A REST poll replaces the whole book, so each one must carry a new id: the id becomes the
+        book's snapshot_uid, which is how a strategy tells a live feed from a frozen one — an
+        unchanged book polled twice must still look like two fresh reads.
+        """
+        unchanged = {"timestamp": 1630644717528, "lastUpdateId": 12345,
+                     "bids": [["100.0", "1.0"]], "asks": [["101.0", "1.0"]]}
+        with patch.object(self.data_source, "_request_order_book_snapshot", new_callable=AsyncMock) as request, \
+                patch.object(self.data_source, "_time", side_effect=[1000.0, 1005.0]):
+            request.return_value = unchanged
+            first = await self.data_source._order_book_snapshot(self.trading_pair)
+            second = await self.data_source._order_book_snapshot(self.trading_pair)
+
+        self.assertLess(first.update_id, second.update_id)
+
     async def test_get_last_traded_prices(self):
         mock_prices = {
             self.trading_pair: "100.5"

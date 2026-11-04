@@ -5,12 +5,14 @@ from hummingbot.connector.wallet_transfer.wallet_transfer_data_types import (
     TransferState,
     TransferUpdate,
     WalletTransfer,
+    safe_timestamp,
 )
 from hummingbot.core.event.events import (
     MarketEvent,
     WalletTransferCompletedEvent,
     WalletTransferCreatedEvent,
     WalletTransferFailedEvent,
+    WalletTransferUnknownEvent,
 )
 from hummingbot.logger.logger import HummingbotLogger
 
@@ -74,7 +76,7 @@ class WalletTransferTracker:
                 self.stop_tracking_transfer(transfer.client_transfer_id)
 
     def _trigger_events(self, transfer: WalletTransfer, previous_state: TransferState) -> None:
-        timestamp = self._connector.current_timestamp
+        timestamp = safe_timestamp(self._connector.current_timestamp)
 
         if previous_state == TransferState.PENDING_CREATE and transfer.state in (
             TransferState.SUBMITTED,
@@ -128,6 +130,25 @@ class WalletTransferTracker:
                     timestamp=timestamp,
                     transfer_id=transfer.client_transfer_id,
                     transfer_type=transfer.transfer_type.value,
+                    error_message=transfer.error_message,
+                    error_type=transfer.error_type,
+                ),
+            )
+        elif transfer.is_unknown:
+            self.logger().error(
+                f"Outcome UNKNOWN for {transfer.transfer_type.value} of {transfer.amount} {transfer.asset} "
+                f"({transfer.client_transfer_id}, exchange id {transfer.exchange_transfer_id}): "
+                f"{transfer.error_message}. Funds may have moved: reconcile with the exchange before retrying."
+            )
+            self._connector.trigger_event(
+                MarketEvent.WalletTransferUnknown,
+                WalletTransferUnknownEvent(
+                    timestamp=timestamp,
+                    transfer_id=transfer.client_transfer_id,
+                    transfer_type=transfer.transfer_type.value,
+                    asset=transfer.asset,
+                    amount=transfer.amount,
+                    exchange_transfer_id=transfer.exchange_transfer_id,
                     error_message=transfer.error_message,
                     error_type=transfer.error_type,
                 ),

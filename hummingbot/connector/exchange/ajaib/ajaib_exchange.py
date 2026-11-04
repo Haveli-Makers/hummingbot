@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -256,6 +257,87 @@ class AjaibExchange(ExchangePyBase):
                     "askPrice": str(price),
                     "lastPrice": str(price),
                 })
+
+        return results
+
+    async def get_all_24h_volume_tickers(self, trading_pairs: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """
+        Used by the volume-oracle source. Returns a list of
+        ``{symbol, volume, quoteVolume, lastPrice}`` dicts covering the last 24h.
+
+        The Open API has no 24h ticker endpoint, so the figures are summed from
+        ``/v1/klines`` candles: one signed request per symbol. ``volume`` is in
+        the base asset (the only volume the klines carry); ``quoteVolume`` is
+        approximated as sum(volume * typical price) per candle, the usual VWAP
+        approximation. 15m candles keep the window within 15 minutes of 24h.
+        """
+        if not self._keys_configured:
+            self.logger().warning("Ajaib API keys not configured. Cannot fetch 24h volumes.")
+            return []
+
+        exchange_info = await self._make_trading_pairs_request()
+        symbols = [s["symbol"] for s in exchange_info.get("symbols", [])
+                   if ajaib_utils.is_exchange_information_valid(s)]
+
+        if trading_pairs:
+            requested = set()
+            for trading_pair in trading_pairs:
+                try:
+                    requested.add(await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair))
+                except KeyError:
+                    continue
+            symbols = [s for s in symbols if s in requested]
+
+        window_end_ms = int(time.time() * 1e3)
+        window_start_ms = window_end_ms - CONSTANTS.VOLUME_WINDOW_MS
+
+        responses = await asyncio.gather(
+            *[self._api_get(
+                path_url=CONSTANTS.KLINES_PATH_URL,
+                params={"symbol": symbol,
+                        "interval": CONSTANTS.VOLUME_KLINE_INTERVAL,
+                        "startTime": window_start_ms,
+                        "limit": CONSTANTS.VOLUME_KLINE_LIMIT},
+                is_auth_required=True)
+              for symbol in symbols],
+            return_exceptions=True)
+
+        results: List[Dict[str, Any]] = []
+        failed = []
+        for symbol, klines in zip(symbols, responses):
+            if isinstance(klines, Exception) or not isinstance(klines, list):
+                failed.append(symbol)
+                continue
+
+            base_volume = Decimal("0")
+            quote_volume = Decimal("0")
+            last_price = Decimal("0")
+            last_open_time = -1
+            for kline in klines:
+                # [openTime, open, high, low, close, volume, closeTime]
+                try:
+                    open_time, close_time = int(kline[0]), int(kline[6])
+                    high, low, close, volume = (Decimal(str(kline[i])) for i in (2, 3, 4, 5))
+                except (IndexError, TypeError, ValueError, InvalidOperation):
+                    continue
+                if close_time <= window_start_ms:
+                    continue
+                base_volume += volume
+                quote_volume += volume * (high + low + close) / Decimal("3")
+                if open_time > last_open_time:
+                    last_open_time, last_price = open_time, close
+
+            results.append({
+                "symbol": symbol,
+                "volume": str(base_volume),
+                "quoteVolume": str(quote_volume),
+                "lastPrice": str(last_price),
+            })
+
+        if failed:
+            self.logger().warning(
+                f"Failed to fetch 24h klines for {len(failed)} of {len(symbols)} Ajaib symbols: "
+                f"{', '.join(failed[:10])}{' ...' if len(failed) > 10 else ''}")
 
         return results
 

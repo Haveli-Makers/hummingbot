@@ -6,7 +6,7 @@ from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCa
 from aioresponses import aioresponses
 
 from hummingbot.connector.exchange.wazirx import wazirx_constants as CONSTANTS
-from hummingbot.connector.exchange.wazirx.wazirx_exchange import WazirxExchange
+from hummingbot.connector.exchange.wazirx.wazirx_exchange import WazirxAPIError, WazirxExchange
 from hummingbot.connector.wallet_transfer.wallet_transfer_data_types import TransferState, TransferType, WalletTransfer
 from hummingbot.core.event.event_logger import EventLogger
 from hummingbot.core.event.events import MarketEvent
@@ -107,6 +107,74 @@ class WazirxWalletTransferTest(IsolatedAsyncioWrapperTestCase):
         # The master side (source) defaults to the configured master email.
         self.assertEqual("master@example.com", completed_transfer.source)
         self.assertEqual("sub@example.com", completed_transfer.destination)
+
+    async def _run_transfer(self, transfer_id: str) -> WalletTransfer:
+        transfer = WalletTransfer(
+            client_transfer_id=transfer_id,
+            transfer_type=TransferType.SUB_TO_MASTER,
+            asset="USDT",
+            amount=Decimal("5"),
+            creation_timestamp=1000.0,
+            source="sub@example.com",
+        )
+        await self.exchange._create_transfer(transfer)
+        return self.exchange.get_transfer(transfer_id)
+
+    @aioresponses()
+    async def test_transfer_without_status_or_txn_id_is_unknown_not_completed(self, mock_api):
+        # A 2xx with no positive confirmation must not be reported as completed.
+        mock_api.get(self._server_time_url(), body=json.dumps({"serverTime": 1700000000000}), repeat=True)
+        mock_api.post(self._transfer_url_pattern(), body=json.dumps({}))
+        unknown_logger = EventLogger()
+        self.exchange.add_listener(MarketEvent.WalletTransferUnknown, unknown_logger)
+
+        transfer = await self._run_transfer("t-empty")
+
+        self.assertEqual(TransferState.UNKNOWN, transfer.state)
+        self.assertEqual(0, len(self.completed_logger.event_log))
+        self.assertEqual(1, len(unknown_logger.event_log))
+
+    @aioresponses()
+    async def test_transfer_confirmed_by_txn_id_alone_completes(self, mock_api):
+        mock_api.get(self._server_time_url(), body=json.dumps({"serverTime": 1700000000000}), repeat=True)
+        mock_api.post(self._transfer_url_pattern(), body=json.dumps({"txnId": 165}))
+
+        transfer = await self._run_transfer("t-txn-only")
+
+        self.assertEqual(TransferState.COMPLETED, transfer.state)
+        self.assertEqual("165", transfer.exchange_transfer_id)
+
+    @aioresponses()
+    async def test_transfer_with_explicit_failure_status_is_failed(self, mock_api):
+        mock_api.get(self._server_time_url(), body=json.dumps({"serverTime": 1700000000000}), repeat=True)
+        mock_api.post(self._transfer_url_pattern(), body=json.dumps({"status": "failed", "txnId": 166}))
+
+        transfer = await self._run_transfer("t-status-failed")
+
+        self.assertEqual(TransferState.FAILED, transfer.state)
+        self.assertEqual(1, len(self.failed_logger.event_log))
+
+    async def test_self_transfer_to_the_master_email_is_refused(self):
+        transfer = WalletTransfer(
+            client_transfer_id="t-self", transfer_type=TransferType.SUB_TO_MASTER, asset="USDT",
+            amount=Decimal("5"), creation_timestamp=1000.0, source="MASTER@example.com",
+        )
+        await self.exchange._create_transfer(transfer)  # no HTTP mocked: it must not send anything
+
+        self.assertEqual(TransferState.FAILED, self.exchange.get_transfer("t-self").state)
+        self.assertIn("to itself", self.exchange.get_transfer("t-self").error_message)
+
+    def test_rate_limit_is_read_from_status_and_code_not_any_digits(self):
+        self.assertTrue(WazirxExchange._is_rate_limited(WazirxAPIError("throttled", status=429)))
+        self.assertTrue(WazirxExchange._is_rate_limited(WazirxAPIError("throttled", status=400, code=2136)))
+        # "429" appearing elsewhere in the error must not be mistaken for a rate limit.
+        self.assertFalse(WazirxExchange._is_rate_limited(
+            WazirxAPIError("Order 4290 not found for amount 0.429", status=400, code=2013)))
+        self.assertFalse(WazirxExchange._is_rate_limited(IOError("withdraw 1429 failed at 14:29")))
+        # Errors that did not come through _handle_response still match on the exact fragments.
+        self.assertTrue(WazirxExchange._is_rate_limited(
+            IOError("Error executing request GET x. HTTP status is 429. Error: slow down")))
+        self.assertTrue(WazirxExchange._is_rate_limited(IOError('Error: {"code": 2136, "message": "..."}')))
 
     async def test_master_to_sub_without_master_email_or_from_account_fails(self):
         exchange = WazirxExchange(
@@ -342,6 +410,68 @@ class WazirxWalletTransferTest(IsolatedAsyncioWrapperTestCase):
         )
         with self.assertRaises(ValueError):
             await self.exchange._place_withdrawal(transfer)
+
+    @aioresponses()
+    async def test_address_book_name_shared_by_two_entries_is_refused(self, mock_api):
+        # Names are user-chosen: picking the first of two "cold wallet" entries could pay the wrong one.
+        mock_api.get(self._server_time_url(), body=json.dumps({"serverTime": 1700000000000}), repeat=True)
+        mock_api.get(self._address_book_url_pattern(), body=json.dumps([
+            self._address_book_entry(),
+            self._address_book_entry(id=981, address="0xdef0000000000000000000000000000000000000",
+                                     networkObj={"name": "Ethereum (ERC20)", "network": "eth"}),
+        ]))
+
+        transfer = WalletTransfer(
+            client_transfer_id="w-dup", transfer_type=TransferType.WITHDRAWAL, asset="USDT",
+            amount=Decimal("10"), creation_timestamp=1000.0, address_book_id="Cold Wallet",
+        )
+        with self.assertRaises(ValueError) as ctx:
+            await self.exchange._place_withdrawal(transfer)
+        self.assertIn("numeric id", str(ctx.exception))
+        self.assertFalse(transfer.request_sent)
+
+    @aioresponses()
+    async def test_address_book_id_is_matched_before_names(self, mock_api):
+        # "981" is entry B's id AND entry A's name: the unique id must win.
+        mock_api.get(self._server_time_url(), body=json.dumps({"serverTime": 1700000000000}), repeat=True)
+        mock_api.get(self._address_book_url_pattern(), body=json.dumps([
+            self._address_book_entry(id=980, name="981"),
+            self._address_book_entry(id=981, name="hot wallet"),
+        ]))
+
+        entry = await self.exchange._resolve_address_book_entry("usdt", "981")
+        self.assertEqual(981, entry["id"])
+
+    @aioresponses()
+    async def test_withdrawal_without_an_id_in_the_response_is_unknown(self, mock_api):
+        mock_api.get(self._server_time_url(), body=json.dumps({"serverTime": 1700000000000}), repeat=True)
+        mock_api.get(self._address_book_url_pattern(), body=json.dumps([self._address_book_entry()]))
+        mock_api.get(self._coins_url_pattern(), body=json.dumps(self._coins_payload()))
+        mock_api.post(self._withdraw_url_pattern(), body=json.dumps({"message": "ok"}))
+
+        transfer = WalletTransfer(
+            client_transfer_id="w-noid", transfer_type=TransferType.WITHDRAWAL, asset="USDT",
+            amount=Decimal("10"), creation_timestamp=1000.0, address_book_id="980",
+        )
+        await self.exchange._create_transfer(transfer)
+
+        tracked = self.exchange.get_transfer("w-noid")
+        self.assertEqual(TransferState.UNKNOWN, tracked.state)
+        self.assertIn("withdrawOrderId=w-noid", tracked.error_message)
+
+    @aioresponses()
+    async def test_withdrawal_status_error_containing_429_digits_is_not_swallowed(self, mock_api):
+        # A real error that merely contains "429" must surface, not be treated as a rate limit.
+        mock_api.get(self._server_time_url(), body=json.dumps({"serverTime": 1700000000000}), repeat=True)
+        mock_api.get(self._withdraws_history_url_pattern(), status=400,
+                     body=json.dumps({"code": 2013, "message": "Withdrawal 4291 does not exist"}))
+
+        transfer = WalletTransfer(
+            client_transfer_id="w-err", transfer_type=TransferType.WITHDRAWAL, asset="USDT",
+            amount=Decimal("5"), creation_timestamp=1000.0, state=TransferState.SUBMITTED,
+        )
+        with self.assertRaises(WazirxAPIError):
+            await self.exchange._request_transfer_status(transfer)
 
     @aioresponses()
     async def test_withdrawal_rejects_entry_still_in_cooldown(self, mock_api):

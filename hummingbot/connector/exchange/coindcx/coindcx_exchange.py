@@ -18,6 +18,8 @@ from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
 from hummingbot.connector.wallet_transfer.wallet_transfer_data_types import (
+    TransferOutcomeUnknownError,
+    TransferRejectedError,
     TransferState,
     TransferType,
     TransferUpdate,
@@ -353,7 +355,10 @@ class CoindcxExchange(WalletTransferExecutorMixin, ExchangePyBase):
                 data={},
                 is_auth_required=True,
             )
-        return response[0] if isinstance(response, list) else response
+        record = response[0] if isinstance(response, list) and response else response
+        if not isinstance(record, dict) or not record:
+            raise IOError(f"CoinDCX users/info returned no account record: {response!r}")
+        return record
 
     async def get_balances(self, use_master: bool = False, non_zero_only: bool = True) -> List[Dict[str, Any]]:
         """
@@ -380,27 +385,34 @@ class CoindcxExchange(WalletTransferExecutorMixin, ExchangePyBase):
             ]
         return balances
 
+    @staticmethod
+    def _coindcx_id_of(record: Dict[str, Any], whose: str) -> str:
+        """The record's coindcx_id, refusing a missing one rather than sending the string "None"."""
+        account_id = record.get("coindcx_id")
+        if account_id is None or not str(account_id).strip():
+            raise IOError(f"CoinDCX users/info for the {whose} account has no coindcx_id: {record}")
+        return str(account_id).strip()
+
     async def _get_master_account_id(self) -> str:
         """Resolve the master account's coindcx_id via users/info signed with the master creds."""
         if self._master_account_id is None:
             record = await self.get_user_info(use_master=True)
-            self._master_account_id = str(record.get("coindcx_id"))
+            self._master_account_id = self._coindcx_id_of(record, "master")
         return self._master_account_id
 
     async def _get_own_account_id(self) -> str:
         """Resolve this (primary/sub) account's coindcx_id via users/info signed with its own creds."""
         if self._own_account_id is None:
             record = await self.get_user_info(use_master=False)
-            self._own_account_id = str(record.get("coindcx_id"))
+            self._own_account_id = self._coindcx_id_of(record, "configured")
         return self._own_account_id
 
-    async def _place_internal_transfer(self, transfer: WalletTransfer, **kwargs) -> TransferUpdate:
+    async def _resolve_internal_transfer_accounts(self, transfer: WalletTransfer) -> None:
         """
-        Transfer funds between the master account and a sub-account (either direction) using
-        master credentials. CoinDCX identifies accounts by coindcx_id. Either side may be omitted:
-        the master side defaults to the id resolved from the master creds (users/info), and the sub
-        side defaults to this connector's own id resolved from its primary creds. Explicitly
-        provided ids always take precedence.
+        CoinDCX identifies accounts by coindcx_id. Either side may be omitted: the master side
+        defaults to the id resolved from the master creds (users/info), and the sub side defaults
+        to this connector's own id resolved from its primary creds. Explicitly provided ids always
+        take precedence.
         """
         if transfer.transfer_type == TransferType.MASTER_TO_SUB:
             transfer.source = transfer.source or await self._get_master_account_id()
@@ -409,26 +421,41 @@ class CoindcxExchange(WalletTransferExecutorMixin, ExchangePyBase):
             transfer.source = transfer.source or await self._get_own_account_id()
             transfer.destination = transfer.destination or await self._get_master_account_id()
 
+    async def _place_internal_transfer(self, transfer: WalletTransfer, **kwargs) -> TransferUpdate:
+        """
+        Transfer funds between the master account and a sub-account (either direction) using
+        master credentials. Accounts are resolved beforehand by
+        :meth:`_resolve_internal_transfer_accounts`.
+        """
         data = {
             "from_account_id": transfer.source,
             "to_account_id": transfer.destination,
             "currency_short_name": transfer.asset.upper(),
-            "amount": float(transfer.amount),
+            # CoinDCX takes a JSON number; refuse amounts a float would round.
+            "amount": self._amount_as_exact_float(transfer.amount),
         }
+        transfer.request_sent = True
         resp = await self._master_post(CONSTANTS.SUB_ACCOUNT_TRANSFER_PATH_URL, data=data)
 
         # The docs describe {"status": "success", "message": 200} but the live API swaps the
         # fields ({"message": "success", "status": 200}), so accept "success" in either one,
-        # or any 2xx numeric status/code.
-        if isinstance(resp, dict):
-            indicators = {str(resp.get(key, "")).strip().lower() for key in ("status", "message")}
-            numeric_codes = [
-                int(value) for value in (resp.get("status"), resp.get("code"))
-                if isinstance(value, int) or (isinstance(value, str) and value.isdigit())
-            ]
-            is_success = "success" in indicators or any(200 <= code < 300 for code in numeric_codes)
-            if not is_success:
-                raise IOError(f"CoinDCX rejected the transfer: {resp}")
+        # or any 2xx numeric status/code. An explicit error status or code is a refusal; a body
+        # with no recognisable marker at all cannot be read either way.
+        body = resp if isinstance(resp, dict) else {}
+        indicators = {str(body.get(key, "")).strip().lower() for key in ("status", "message")}
+        numeric_codes = [
+            int(value) for value in (body.get("status"), body.get("code"))
+            if isinstance(value, int) or (isinstance(value, str) and value.isdigit())
+        ]
+        if not ("success" in indicators or any(200 <= code < 300 for code in numeric_codes)):
+            status = body.get("status")
+            explicit_error = (
+                (isinstance(status, str) and status.strip() and not status.strip().isdigit())
+                or any(not 200 <= code < 300 for code in numeric_codes)
+            )
+            if explicit_error:
+                raise TransferRejectedError(f"CoinDCX rejected the transfer: {resp}")
+            raise TransferOutcomeUnknownError(f"CoinDCX transfer response has no success marker: {resp}")
 
         return TransferUpdate(
             client_transfer_id=transfer.client_transfer_id,
@@ -941,6 +968,31 @@ class CoindcxExchange(WalletTransferExecutorMixin, ExchangePyBase):
                 self.logger().error(f"Error fetching trades for order: {e}")
 
         return trade_updates
+
+    async def get_all_account_trades(self, start_time: Optional[int] = None,
+                                     end_time: Optional[int] = None,
+                                     limit: int = 100,
+                                     trading_pairs: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """
+        Fetches raw fills for this account directly from CoinDCX's account-wide
+        trade history endpoint.
+        """
+        params: Dict[str, Any] = {"limit": limit}
+        if start_time is not None:
+            params["from_timestamp"] = start_time
+        if end_time is not None:
+            params["to_timestamp"] = end_time
+
+        try:
+            trades = await self._api_post(
+                path_url=CONSTANTS.TRADE_HISTORY_ACCOUNT_PATH_URL,
+                data=params,
+                is_auth_required=True,
+            )
+            return trades if isinstance(trades, list) else []
+        except Exception as e:
+            self.logger().error(f"Error fetching account-wide trade history: {e}")
+            return []
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
         """

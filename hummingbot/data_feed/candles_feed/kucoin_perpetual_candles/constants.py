@@ -18,6 +18,7 @@ KLINE_PUSH_WEB_SOCKET_TOPIC = "/contractMarket/limitCandle"
 INTERVALS = bidict({
     "1s": "1s",  # Implemented for resampling to 1s from trades in quants-lab
     "1m": "1min",
+    "3m": "3min",
     "5m": "5min",
     "15m": "15min",
     "30m": "30min",
@@ -38,10 +39,10 @@ GRANULARITIES = bidict({
     "1h": 60,  # Up to 120 days
     "2h": 120,  # Up to 240 days
     "4h": 240,  # Up to 480 days
-    "6h": 480,  # Up to 720 days
-    "8h": 720,
-    "12h": 1440,
-    "1d": 10080,
+    "8h": 480,  # Up to 720 days
+    "12h": 720,
+    "1d": 1440,
+    "1w": 10080,
 })
 MAX_RESULTS_PER_CANDLESTICK_REST_REQUEST = 500
 REQUEST_WEIGHT = "REQUEST_WEIGHT"

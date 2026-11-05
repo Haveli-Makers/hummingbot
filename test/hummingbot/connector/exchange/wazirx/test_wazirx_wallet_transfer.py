@@ -523,7 +523,7 @@ class WazirxWalletTransferTest(IsolatedAsyncioWrapperTestCase):
         # be treated as "still pending", not raise or flip to FAILED.
         mock_api.get(self._server_time_url(), body=json.dumps({"serverTime": 1700000000000}), repeat=True)
         mock_api.get(self._withdraws_history_url_pattern(), status=429,
-                     body=json.dumps({"message": "Too many api request", "code": 2136}))
+                     body=json.dumps({"message": "Too many api request", "code": 2136}), repeat=True)
 
         transfer = WalletTransfer(
             client_transfer_id="w-429", transfer_type=TransferType.WITHDRAWAL, asset="USDT",

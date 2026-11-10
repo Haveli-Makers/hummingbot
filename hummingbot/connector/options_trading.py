@@ -60,8 +60,12 @@ class OptionsTrading:
     def initialize_option_info(self, option_info: OptionInfo):
         self._option_info[option_info.trading_pair] = option_info
 
-    def is_option_info_initialized(self) -> bool:
-        return all(trading_pair in self._option_info for trading_pair in self._trading_pairs)
+    def is_option_info_initialized(self, trading_pairs: Optional[List[str]] = None) -> bool:
+        """
+        Whether option info has arrived for every trading pair, or for the ones given (e.g. those not expired).
+        """
+        pairs = self._trading_pairs if trading_pairs is None else trading_pairs
+        return all(trading_pair in self._option_info for trading_pair in pairs)
 
     def get_option_info(self, trading_pair: str) -> OptionInfo:
         return self._option_info[trading_pair]

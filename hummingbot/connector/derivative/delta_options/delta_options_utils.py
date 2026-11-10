@@ -65,6 +65,20 @@ def instrument_from_product(product: Dict[str, Any], trading_pair: str) -> Optio
     )
 
 
+def instrument_from_trading_pair(trading_pair: str) -> OptionInstrumentInfo:
+    """
+    What the name says about an option Delta no longer lists: C_BTC_63800_130626-USD is a BTC call, strike 63,800,
+    expiring 13 Jun 2026 at 12:00 UTC.
+    """
+    symbol = trading_pair.split("-")[0].replace("_", "-")
+    kind = symbol.split("-")[0]
+    if kind not in ("C", "P"):
+        raise ValueError(f"{trading_pair} is not the name of a call or put option.")
+    return instrument_from_product(
+        {"symbol": symbol, "contract_type": CONSTANTS.CALL_OPTIONS if kind == "C" else CONSTANTS.PUT_OPTIONS},
+        trading_pair)
+
+
 class DeltaOptionsConfigMap(BaseConnectorConfigMap):
     connector: str = "delta_options"
     delta_options_api_key: SecretStr = Field(
@@ -122,6 +136,20 @@ class DeltaOptionsConfigMap(BaseConnectorConfigMap):
             "prompt": lambda cm: (
                 "If the bot stops responding for 30 seconds, have Delta cancel this account's open orders on the "
                 "bot's options? (Yes/No)"
+            ),
+            "is_secure": False,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        },
+    )
+    delta_options_stop_before_expiry_minutes: int = Field(
+        default=30,
+        ge=0,
+        json_schema_extra={
+            "prompt": lambda cm: (
+                "How many minutes before an option expires should the bot stop opening positions in it? Delta "
+                "settles on the index's average over the last 30 minutes. Closing orders are still accepted; 0 turns "
+                "this off."
             ),
             "is_secure": False,
             "is_connect_key": True,

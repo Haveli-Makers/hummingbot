@@ -29,6 +29,9 @@ class MarketEvent(Enum):
     FundingInfo = 203
     OrderEdited = 210
     OrderEditFailed = 211
+    # 213-216 are taken by the wallet transfer events.
+    OptionExpired = 220
+    OptionSettled = 221
     RangePositionLiquidityAdded = 300
     RangePositionLiquidityRemoved = 301
     RangePositionUpdate = 302
@@ -172,6 +175,30 @@ class FundingPaymentCompletedEvent:
     trading_pair: str
     amount: Decimal
     funding_rate: Decimal
+
+
+@dataclass
+class OptionExpiredEvent:
+    timestamp: float
+    market: str
+    trading_pair: str
+    expiry_timestamp: float
+
+
+@dataclass
+class OptionSettledEvent:
+    """
+    An option position closed by the exchange at expiry, without an order: like a fill that sells a long position (or
+    buys back a short one) at the option's settlement value.
+    """
+    timestamp: float
+    market: str
+    trading_pair: str
+    trade_type: TradeType
+    amount: Decimal
+    price: Decimal
+    trade_fee: TradeFeeBase
+    exchange_trade_id: str
 
 
 class OrderBookTradeEvent(NamedTuple):

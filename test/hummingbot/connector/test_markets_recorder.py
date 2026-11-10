@@ -10,14 +10,16 @@ from sqlalchemy import create_engine
 
 from hummingbot.client.config.client_config_map import ClientConfigMap, MarketDataCollectionConfigMap
 from hummingbot.client.config.config_helpers import ClientConfigAdapter
+from hummingbot.client.performance import PerformanceMetrics
 from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.core.data_type.common import OrderType, PositionAction, PriceType, TradeType
 from hummingbot.core.data_type.order_book import OrderBook
-from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee
+from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount
 from hummingbot.core.event.events import (
     BuyOrderCompletedEvent,
     BuyOrderCreatedEvent,
     MarketEvent,
+    OptionSettledEvent,
     OrderFilledEvent,
     SellOrderCreatedEvent,
 )
@@ -288,6 +290,58 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(1, len(trade_fills))
         self.assertEqual(self.config_file_path, trade_fills[0].config_file_path)
         self.assertEqual(fill_event.order_id, trade_fills[0].order_id)
+
+    def _recorder(self) -> MarketsRecorder:
+        return MarketsRecorder(
+            sql=self.manager,
+            markets=[self],
+            config_file_path=self.config_file_path,
+            strategy_name=self.strategy_name,
+            market_data_collection=MarketDataCollectionConfigMap(
+                market_data_collection_enabled=False,
+                market_data_collection_interval=60,
+                market_data_collection_depth=20,
+            ),
+        )
+
+    def _settlement(self, price: str = "120.5") -> OptionSettledEvent:
+        return OptionSettledEvent(
+            timestamp=1766664000, market=self.display_name, trading_pair=self.trading_pair, trade_type=TradeType.SELL,
+            amount=Decimal("0.001"), price=Decimal(price),
+            trade_fee=AddedToCostTradeFee(flat_fees=[TokenAmount(self.quote, Decimal("0.0091"))]),
+            exchange_trade_id="settlement-fill-1")
+
+    def test_option_settlement_is_recorded_once_as_the_closing_fill(self):
+        recorder = self._recorder()
+
+        recorder._did_settle_option(MarketEvent.OptionSettled.value, self, self._settlement())
+        recorder._did_settle_option(MarketEvent.OptionSettled.value, self, self._settlement())
+
+        with self.manager.get_new_session() as session:
+            fills = session.query(TradeFill).all()
+        self.assertEqual(1, len(fills))
+        fill = fills[0]
+        self.assertEqual(("settlement-settlement-fill-1", "SELL", "SETTLEMENT", PositionAction.CLOSE.value),
+                         (fill.order_id, fill.trade_type, fill.order_type, fill.position))
+        self.assertEqual((Decimal("120.5"), Decimal("0.001")), (Decimal(str(fill.price)), Decimal(str(fill.amount))))
+        self.assertAlmostEqual(0.0091, float(fill.trade_fee_in_quote))
+        self.assertIn((MarketEvent.OptionSettled, recorder._settle_option_forwarder), recorder._event_pairs)
+
+    async def test_option_settlement_closes_the_position_in_pnl(self):
+        recorder = self._recorder()
+        recorder._did_fill_order(MarketEvent.OrderFilled.value, self, OrderFilledEvent(
+            timestamp=1766600000, order_id="OID-OPEN", trading_pair=self.trading_pair, trade_type=TradeType.BUY,
+            order_type=OrderType.LIMIT, price=Decimal("100"), amount=Decimal("0.001"),
+            trade_fee=AddedToCostTradeFee(flat_fees=[TokenAmount(self.quote, Decimal("0"))]),
+            exchange_trade_id="T1", position=PositionAction.OPEN.value))
+        recorder._did_settle_option(MarketEvent.OptionSettled.value, self, self._settlement())
+
+        trades = recorder.get_trades_for_config(self.config_file_path)
+        metrics = await PerformanceMetrics.create(self.trading_pair, trades, {self.base: Decimal("0"),
+                                                                              self.quote: Decimal("100")})
+
+        # Bought at 100, settled at 120.5: 20.5 per unit of the underlying, on 0.001.
+        self.assertEqual(Decimal("0.0205"), metrics.trade_pnl)
 
     def test_trade_fee_in_quote_not_available(self):
         recorder = MarketsRecorder(

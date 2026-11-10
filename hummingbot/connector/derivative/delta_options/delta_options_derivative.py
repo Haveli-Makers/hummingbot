@@ -26,6 +26,7 @@ from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionSide, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
+from hummingbot.core.data_type.option_info import OptionInstrumentInfo
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
@@ -56,6 +57,7 @@ class DeltaOptionsDerivative(OptionDerivativePyBase):
         delta_options_allow_selling: bool = False,
         delta_options_max_short_contracts: int = 1,
         delta_options_dead_man_switch: bool = True,
+        delta_options_stop_before_expiry_minutes: int = 30,
         balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
         rate_limits_share_pct: Decimal = Decimal("100"),
         trading_pairs: Optional[List[str]] = None,
@@ -74,6 +76,8 @@ class DeltaOptionsDerivative(OptionDerivativePyBase):
         self._contract_values: Dict[str, Decimal] = {}
         self._product_ids: Dict[str, int] = {}
         self._fee_rates: Dict[str, Tuple[Decimal, Decimal, Decimal]] = {}
+        # Delta's symbol for each option the connector has seen listed, kept for its own options after they expire.
+        self._symbols: Dict[str, str] = {}
         # Fills announced on the private stream, per client order id, until REST has recorded them.
         self._ws_fill_counts: Dict[str, int] = defaultdict(int)
         self._heartbeat_task: Optional[asyncio.Task] = None
@@ -85,6 +89,7 @@ class DeltaOptionsDerivative(OptionDerivativePyBase):
             rate_limits_share_pct,
             allow_selling=utils.as_bool(delta_options_allow_selling),
             max_short_contracts=Decimal(str(delta_options_max_short_contracts)),
+            stop_before_expiry=float(str(delta_options_stop_before_expiry_minutes)) * 60,
         )
 
     @property
@@ -280,11 +285,42 @@ class DeltaOptionsDerivative(OptionDerivativePyBase):
             instruments.append(instrument)
             contract_values[trading_pair] = contract_value
             product_ids[trading_pair] = product_id
+        self._keep_unlisted_trading_pairs(mapping, instruments, contract_values, product_ids, fee_rates)
+        self._symbols = dict(mapping.inverse)
         self._contract_values = contract_values
         self._product_ids = product_ids
         self._fee_rates = fee_rates
         self._options_trading.set_instruments(instruments)
         self._set_trading_pair_symbol_map(mapping)
+
+    def _keep_unlisted_trading_pairs(self, mapping: bidict, instruments: List[OptionInstrumentInfo],
+                                     contract_values: Dict[str, Decimal], product_ids: Dict[str, int],
+                                     fee_rates: Dict[str, Tuple[Decimal, Decimal, Decimal]]):
+        """
+        Delta lists live options only, so the bot's own options drop out of the list once they expire. They stay
+        known: orders on them are refused, while cancels, late fills and the settlement still need their ids and sizes.
+        One the connector never saw listed (the bot started after it expired) is known from its name, which is enough
+        to tell that it has expired.
+        """
+        listed = {instrument.trading_pair for instrument in instruments}
+        for trading_pair in self._trading_pairs:
+            if trading_pair in listed:
+                continue
+            instrument = self._options_trading.get_instrument(trading_pair)
+            if instrument is None or trading_pair not in self._contract_values:
+                try:
+                    instruments.append(utils.instrument_from_trading_pair(trading_pair))
+                except Exception:
+                    self.logger().error(f"{trading_pair} is not listed on Delta, and its name doesn't describe an "
+                                        f"option.")
+                continue
+            instruments.append(instrument)
+            contract_values[trading_pair] = self._contract_values[trading_pair]
+            product_ids[trading_pair] = self._product_ids[trading_pair]
+            if trading_pair in self._fee_rates:
+                fee_rates[trading_pair] = self._fee_rates[trading_pair]
+            if trading_pair in self._symbols:
+                mapping[self._symbols[trading_pair]] = trading_pair
 
     async def _format_trading_rules(self, exchange_info_dict: List[Dict[str, Any]]) -> List[TradingRule]:
         rules = []
@@ -306,6 +342,11 @@ class DeltaOptionsDerivative(OptionDerivativePyBase):
                 ))
             except Exception:
                 self.logger().error(f"Could not read the trading rule of {product.get('symbol')}.", exc_info=True)
+        # The base class clears the old rules only after this returns: the bot's own options keep theirs once they
+        # expire and drop out of Delta's list.
+        listed = {rule.trading_pair for rule in rules}
+        rules.extend(rule for trading_pair, rule in self._trading_rules.items()
+                     if trading_pair in self._trading_pairs and trading_pair not in listed)
         return rules
 
     async def _update_trading_fees(self):

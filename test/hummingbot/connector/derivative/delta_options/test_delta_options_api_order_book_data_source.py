@@ -22,6 +22,7 @@ class DeltaOptionsAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
         self.connector.trading_pair_associated_to_exchange_symbol = AsyncMock(side_effect=self._pair)
         self.connector.exchange_symbols_for_live_pairs = AsyncMock(return_value=[self.symbol])
         self.connector.size_to_amount = lambda trading_pair, size: size * Decimal("0.001")
+        self.connector.is_expired.return_value = False
         self.rest_assistant = MagicMock()
         self.rest_assistant.execute_request = AsyncMock()
         self.api_factory = MagicMock()
@@ -205,6 +206,34 @@ class DeltaOptionsAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(10, urls[0].rsplit("/", 1)[1].count("C-BTC"))
         self.assertTrue(urls[1].endswith("/v2/tickers/C-BTC-110-251226,C-BTC-111-251226"))
         self.assertEqual({"C_BTC_100_251226-USD": 12.0, "C_BTC_111_251226-USD": 7.5}, prices)
+
+    async def test_an_expired_option_gets_an_empty_book_without_asking_delta(self):
+        self.connector.is_expired.return_value = True
+
+        book = await self.data_source.get_new_order_book(self.trading_pair)
+
+        self.assertEqual(([], []), (list(book.bid_entries()), list(book.ask_entries())))
+        self.rest_assistant.execute_request.assert_not_awaited()
+
+    async def test_hourly_snapshots_and_last_prices_skip_expired_options(self):
+        put = "P_BTC_90000_251226-USD"
+        self.data_source._trading_pairs = [self.trading_pair, put]
+        self.connector.is_expired.side_effect = lambda trading_pair: trading_pair == self.trading_pair
+        self.rest_assistant.execute_request.return_value = {"success": True, "result": {
+            "buy": [{"price": "505", "size": 10}], "sell": [], "last_updated_at": 1766664000000000,
+            "symbol": "P-BTC-90000-251226"}}
+        output = asyncio.Queue()
+
+        await self.data_source._request_order_book_snapshots(output)
+
+        self.assertEqual(put, output.get_nowait().content["trading_pair"])
+        self.assertTrue(output.empty())
+
+        self.rest_assistant.execute_request.return_value = {"success": True, "result": {
+            "symbol": "P-BTC-90000-251226", "close": "300", "mark_price": "301"}}
+        prices = await self.data_source.get_last_traded_prices([self.trading_pair, put])
+        self.assertEqual({put: 300.0}, prices)
+        self.assertNotIn("C-BTC-100000-251226", self.rest_assistant.execute_request.call_args.kwargs["url"])
 
     async def test_websocket_connects_to_the_public_endpoint(self):
         ws = AsyncMock()

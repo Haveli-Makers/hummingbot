@@ -1,7 +1,8 @@
 import asyncio
 from abc import ABC, abstractmethod
+from datetime import datetime, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from hummingbot.connector.constants import s_decimal_NaN
 from hummingbot.connector.derivative.option_budget_checker import OptionBudgetChecker
@@ -13,6 +14,7 @@ from hummingbot.core.data_type.in_flight_order import PerpetualDerivativeInFligh
 from hummingbot.core.data_type.option_api_order_book_data_source import OptionAPIOrderBookDataSource
 from hummingbot.core.data_type.option_info import OptionInfo, OptionInstrumentInfo, OptionType
 from hummingbot.core.data_type.trade_fee import TradeFeeBase
+from hummingbot.core.event.events import MarketEvent, OptionExpiredEvent
 from hummingbot.core.utils.async_utils import safe_ensure_future, safe_gather
 
 
@@ -23,30 +25,42 @@ class OptionDerivativePyBase(ExchangePyBase, ABC):
 
     Selling an option to open a short position is refused unless `allow_selling` is set, and is capped at
     `max_short_contracts` per option, counting open sell orders as if they filled.
+
+    From `stop_before_expiry` seconds before an option expires, orders that would open a position in it are refused
+    and resting ones are cancelled; closing orders are still accepted until it expires. At expiry, `OptionExpired` is
+    raised for each of the connector's options.
     """
     VALID_POSITION_ACTIONS = [PositionAction.OPEN, PositionAction.CLOSE]
     # Conservative initial margin for a short option: max(15% - out-of-the-money share, 10%) of the underlying's value,
     # plus the premium. Exchanges set their own; this only sizes budget checks.
     SHORT_MARGIN_RATE = Decimal("0.15")
     SHORT_MARGIN_FLOOR_RATE = Decimal("0.10")
+    EXPIRY_CHECK_INTERVAL = 5.0
 
     def __init__(self,
                  balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
                  rate_limits_share_pct: Decimal = Decimal("100"),
                  allow_selling: bool = False,
-                 max_short_contracts: Decimal = Decimal("0")):
+                 max_short_contracts: Decimal = Decimal("0"),
+                 stop_before_expiry: float = 0):
         super().__init__(balance_asset_limit, rate_limits_share_pct)
         self._allow_selling = allow_selling
         self._max_short_contracts = Decimal(str(max_short_contracts))
+        self._stop_before_expiry = float(stop_before_expiry)
         self._options_trading = OptionsTrading(self.trading_pairs)
         self._option_info_listener_task: Optional[asyncio.Task] = None
+        self._expiry_watch_task: Optional[asyncio.Task] = None
+        # Options whose closing window has started, and options whose expiry has been announced.
+        self._closing_only: Set[str] = set()
+        self._expiry_announced: Set[str] = set()
         self._orderbook_ds: OptionAPIOrderBookDataSource = self._orderbook_ds  # for type-hinting
         self._budget_checker = OptionBudgetChecker(self)
 
     @property
     def status_dict(self) -> Dict[str, bool]:
         status_d = super().status_dict
-        status_d["option_info"] = self._options_trading.is_option_info_initialized()
+        # An expired option has no market data any more, and the others must not wait for it.
+        status_d["option_info"] = self._options_trading.is_option_info_initialized(self._live_trading_pairs())
         return status_d
 
     @property
@@ -104,6 +118,13 @@ class OptionDerivativePyBase(ExchangePyBase, ABC):
     def is_expired(self, trading_pair: str) -> bool:
         instrument = self.get_instrument(trading_pair)
         return instrument is not None and instrument.is_expired(self._time())
+
+    def is_closing_only(self, trading_pair: str) -> bool:
+        """
+        True once the option is within `stop_before_expiry` of its expiry: only closing orders are accepted.
+        """
+        instrument = self.get_instrument(trading_pair)
+        return instrument is not None and self._time() >= instrument.expiry_timestamp - self._stop_before_expiry
 
     async def exchange_symbols_for_live_pairs(self, trading_pairs: List[str]) -> List[str]:
         """
@@ -236,12 +257,15 @@ class OptionDerivativePyBase(ExchangePyBase, ABC):
         await super().start_network()
         self._options_trading.start()
         self._option_info_listener_task = safe_ensure_future(self._listen_for_option_info())
+        if self.is_trading_required:
+            self._expiry_watch_task = safe_ensure_future(self._expiry_watch_loop())
 
     async def stop_network(self):
         self._options_trading.stop()
-        if self._option_info_listener_task is not None:
-            self._option_info_listener_task.cancel()
-            self._option_info_listener_task = None
+        for task in (self._option_info_listener_task, self._expiry_watch_task):
+            if task is not None:
+                task.cancel()
+        self._option_info_listener_task = self._expiry_watch_task = None
         await super().stop_network()
 
     async def _create_order(
@@ -313,12 +337,18 @@ class OptionDerivativePyBase(ExchangePyBase, ABC):
         price: Optional[Decimal], position_action: PositionAction,
     ) -> Optional[str]:
         """
-        Why an order must not be sent, or None: an unsupported order type, the selling guard, or the exchange's price
-        band.
+        Why an order must not be sent, or None: an unsupported order type, an expired option, an opening order too
+        close to expiry, the selling guard, or the exchange's price band.
         """
         if order_type not in self.supported_order_types():
             # Refused here: the base class would first look up a price for it, which fails on an empty book.
             return f"{order_type.name} orders are not supported"
+        instrument = self.get_instrument(trading_pair)
+        if self.is_expired(trading_pair):
+            return f"the option expired at {self._utc(instrument.expiry_timestamp)}"
+        if position_action == PositionAction.OPEN and self.is_closing_only(trading_pair):
+            return (f"the option expires at {self._utc(instrument.expiry_timestamp)}, and positions are not opened in "
+                    f"its last {self._stop_before_expiry / 60:g} minutes; closing orders are still accepted")
         if trade_type == TradeType.SELL and position_action == PositionAction.OPEN:
             short = self._short_after_sell(trading_pair, amount)
             if short > 0 and not self._allow_selling:
@@ -391,8 +421,62 @@ class OptionDerivativePyBase(ExchangePyBase, ABC):
         await self._init_option_info()
         await self._orderbook_ds.listen_for_option_info(output=self._options_trading.option_info_stream)
 
-    async def _init_option_info(self):
+    def _live_trading_pairs(self) -> List[str]:
+        return [trading_pair for trading_pair in self.trading_pairs if not self.is_expired(trading_pair)]
+
+    @staticmethod
+    def _utc(timestamp: float) -> str:
+        return f"{datetime.fromtimestamp(timestamp, tz=timezone.utc):%d %b %H:%M} UTC"
+
+    async def _expiry_watch_loop(self):
+        while True:
+            try:
+                self._check_expiries()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger().error("Unexpected error while checking option expiries.", exc_info=True)
+            await self._sleep(self.EXPIRY_CHECK_INTERVAL)
+
+    def _check_expiries(self):
+        """
+        When an option's closing window starts, cancels the resting orders that would open a position in it; when it
+        expires, raises OptionExpired and hands over the position held at that moment for settlement.
+        """
+        now = self._time()
         for trading_pair in self.trading_pairs:
+            instrument = self.get_instrument(trading_pair)
+            if instrument is None:
+                continue
+            if trading_pair not in self._closing_only and self.is_closing_only(trading_pair):
+                self._closing_only.add(trading_pair)
+                cancelled = self._cancel_opening_orders(trading_pair)
+                self.logger().info(f"{trading_pair} expires at {self._utc(instrument.expiry_timestamp)}: no new "
+                                   f"positions are opened in it from now on ({cancelled} resting opening orders "
+                                   f"cancelled); closing orders are still accepted.")
+            if trading_pair not in self._expiry_announced and instrument.is_expired(now):
+                self._expiry_announced.add(trading_pair)
+                self.trigger_event(MarketEvent.OptionExpired, OptionExpiredEvent(
+                    timestamp=now, market=self.name, trading_pair=trading_pair,
+                    expiry_timestamp=instrument.expiry_timestamp))
+                self._on_option_expired(trading_pair, self.get_position(trading_pair))
+
+    def _cancel_opening_orders(self, trading_pair: str) -> int:
+        opening = [order for order in self.in_flight_orders.values()
+                   if order.trading_pair == trading_pair and not order.is_done
+                   and getattr(order, "position", None) == PositionAction.OPEN]
+        for order in opening:
+            self.cancel(trading_pair, order.client_order_id)
+        return len(opening)
+
+    def _on_option_expired(self, trading_pair: str, position: Optional[Position]):
+        """
+        Called once when one of the connector's options expires, with the position held at that moment (or None).
+        Connectors look for the exchange's settlement record here and raise OptionSettled.
+        """
+
+    async def _init_option_info(self):
+        for trading_pair in self._live_trading_pairs():
             while True:
                 try:
                     option_info = await self._orderbook_ds.get_option_info(trading_pair)

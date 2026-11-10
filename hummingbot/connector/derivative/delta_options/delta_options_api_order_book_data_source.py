@@ -44,9 +44,14 @@ class DeltaOptionsAPIOrderBookDataSource(OptionAPIOrderBookDataSource):
         self._api_factory = api_factory
         self._domain = domain
 
+    def _is_expired(self, trading_pair: str) -> bool:
+        return self._connector.is_expired(trading_pair)
+
     async def get_last_traded_prices(self, trading_pairs: List[str], domain: Optional[str] = None) -> Dict[str, float]:
         prices = {}
-        for trading_pair, ticker in (await self._request_tickers(trading_pairs)).items():
+        # An expired option has no ticker, and asking for one could fail the batch it's in.
+        live_pairs = [trading_pair for trading_pair in trading_pairs if not self._is_expired(trading_pair)]
+        for trading_pair, ticker in (await self._request_tickers(live_pairs)).items():
             price = _decimal(ticker.get("close")) or _decimal(ticker.get("mark_price"))
             if price:
                 prices[trading_pair] = float(price)

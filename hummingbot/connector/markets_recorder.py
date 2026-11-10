@@ -23,6 +23,7 @@ from hummingbot.core.event.events import (
     FundingPaymentCompletedEvent,
     MarketEvent,
     MarketOrderFailureEvent,
+    OptionSettledEvent,
     OrderCancelledEvent,
     OrderExpiredEvent,
     OrderFilledEvent,
@@ -104,6 +105,7 @@ class MarketsRecorder:
         self._complete_order_forwarder: SourceInfoEventForwarder = SourceInfoEventForwarder(self._did_complete_order)
         self._expire_order_forwarder: SourceInfoEventForwarder = SourceInfoEventForwarder(self._did_expire_order)
         self._funding_payment_forwarder: SourceInfoEventForwarder = SourceInfoEventForwarder(self._did_complete_funding_payment)
+        self._settle_option_forwarder: SourceInfoEventForwarder = SourceInfoEventForwarder(self._did_settle_option)
         self._update_range_position_forwarder: SourceInfoEventForwarder = SourceInfoEventForwarder(self._did_update_range_position)
         self._close_range_position_forwarder: SourceInfoEventForwarder = SourceInfoEventForwarder(self._did_close_position)
 
@@ -117,6 +119,7 @@ class MarketsRecorder:
             (MarketEvent.SellOrderCompleted, self._complete_order_forwarder),
             (MarketEvent.OrderExpired, self._expire_order_forwarder),
             (MarketEvent.FundingPaymentCompleted, self._funding_payment_forwarder),
+            (MarketEvent.OptionSettled, self._settle_option_forwarder),
             (MarketEvent.RangePositionLiquidityAdded, self._update_range_position_forwarder),
             (MarketEvent.RangePositionLiquidityRemoved, self._update_range_position_forwarder),
             (MarketEvent.RangePositionFeeCollected, self._update_range_position_forwarder),
@@ -546,6 +549,58 @@ class MarketsRecorder:
                                                                             symbol=evt.trading_pair,
                                                                             amount=float(evt.amount))
                     session.add(funding_payment_record)
+
+    def _did_settle_option(self,
+                           event_tag: int,
+                           market: ConnectorBase,
+                           evt: OptionSettledEvent):
+        """
+        Records an option settlement as the fill that closes the position: no order exists for it, so trade history and
+        PnL would otherwise show the position opened and never closed.
+        """
+        if threading.current_thread() != threading.main_thread():
+            self._ev_loop.call_soon_threadsafe(self._did_settle_option, event_tag, market, evt)
+            return
+
+        base_asset, quote_asset = evt.trading_pair.split("-")
+        order_id = f"settlement-{evt.exchange_trade_id}"
+        with self._sql_manager.get_new_session() as session:
+            with session.begin():
+                recorded = session.query(TradeFill).filter(TradeFill.market == market.display_name,
+                                                           TradeFill.order_id == order_id,
+                                                           TradeFill.exchange_trade_id == evt.exchange_trade_id
+                                                           ).one_or_none()
+                if recorded is not None:
+                    return
+                try:
+                    fee_in_quote = evt.trade_fee.fee_amount_in_token(
+                        trading_pair=evt.trading_pair, price=evt.price, order_amount=evt.amount, token=quote_asset,
+                        exchange=market)
+                except Exception as e:
+                    self.logger().error(f"Error calculating fee in quote: {e}, will be stored in the DB as 0.")
+                    fee_in_quote = 0
+                session.add(TradeFill(
+                    config_file_path=self.config_file_path,
+                    strategy=self.strategy_name,
+                    market=market.display_name,
+                    symbol=evt.trading_pair,
+                    base_asset=base_asset,
+                    quote_asset=quote_asset,
+                    timestamp=int(evt.timestamp * 1e3),
+                    order_id=order_id,
+                    trade_type=evt.trade_type.name,
+                    order_type="SETTLEMENT",
+                    price=evt.price,
+                    amount=evt.amount,
+                    leverage=1,
+                    trade_fee=evt.trade_fee.to_json(),
+                    trade_fee_in_quote=fee_in_quote,
+                    exchange_trade_id=evt.exchange_trade_id,
+                    position=PositionAction.CLOSE.value,
+                ))
+        market.add_trade_fills_from_market_recorder({TradeFillOrderDetails(market.display_name,
+                                                                           evt.exchange_trade_id,
+                                                                           evt.trading_pair)})
 
     @staticmethod
     def _csv_matches_header(file_path: str, header: tuple) -> bool:

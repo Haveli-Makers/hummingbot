@@ -57,6 +57,15 @@ class DeltaOptionsUtilsTests(unittest.TestCase):
         self.assertEqual(OptionType.PUT, instrument.option_type)
         self.assertEqual(Decimal("3000"), instrument.strike)
 
+    def test_instrument_from_the_trading_pair_name(self):
+        instrument = utils.instrument_from_trading_pair("P_ETH_3000_251226-USD")
+
+        self.assertEqual(("ETH", OptionType.PUT, Decimal("3000")),
+                         (instrument.underlying, instrument.option_type, instrument.strike))
+        self.assertEqual(datetime(2026, 12, 25, 12, tzinfo=timezone.utc).timestamp(), instrument.expiry_timestamp)
+        with self.assertRaises(ValueError):
+            utils.instrument_from_trading_pair("BTC-USD")
+
     def test_yes_no_answers(self):
         self.assertEqual([True, True, False, False, True, False],
                          [utils.as_bool(v) for v in ("Yes", "true", "no", "N", True, False)])
@@ -64,9 +73,13 @@ class DeltaOptionsUtilsTests(unittest.TestCase):
     def test_config_defaults_keep_selling_off_and_the_switch_on(self):
         config = utils.DeltaOptionsConfigMap(delta_options_api_key="k", delta_options_api_secret="s")
 
-        self.assertEqual((False, 1, True), (config.delta_options_allow_selling,
-                                            config.delta_options_max_short_contracts,
-                                            config.delta_options_dead_man_switch))
+        self.assertEqual((False, 1, True, 30), (config.delta_options_allow_selling,
+                                                config.delta_options_max_short_contracts,
+                                                config.delta_options_dead_man_switch,
+                                                config.delta_options_stop_before_expiry_minutes))
+        with self.assertRaises(ValueError):
+            utils.DeltaOptionsConfigMap(delta_options_api_key="k", delta_options_api_secret="s",
+                                        delta_options_stop_before_expiry_minutes=-1)
 
     def test_config_rejects_unclear_answers(self):
         with self.assertRaises(ValueError):
@@ -75,7 +88,8 @@ class DeltaOptionsUtilsTests(unittest.TestCase):
 
     def test_trading_settings_reach_the_connector(self):
         fields = utils.DeltaOptionsConfigMap.model_fields
-        for name in ("delta_options_allow_selling", "delta_options_max_short_contracts", "delta_options_dead_man_switch"):
+        for name in ("delta_options_allow_selling", "delta_options_max_short_contracts", "delta_options_dead_man_switch",
+                     "delta_options_stop_before_expiry_minutes"):
             self.assertTrue(fields[name].json_schema_extra["is_connect_key"])
             self.assertFalse(fields[name].json_schema_extra["is_secure"])
 

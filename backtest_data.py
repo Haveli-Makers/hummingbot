@@ -28,6 +28,45 @@ import pandas as pd
 DEFAULT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "market_data")
 
 
+class NoDataError(FileNotFoundError):
+    """No recorded data exists for the requested connector/pair/date range."""
+
+
+def available_pairs(connector: str, base_dir: str = DEFAULT_DIR) -> List[str]:
+    """Pairs that have ANY recorded file under base_dir/connector/. Empty list if the connector dir is missing."""
+    d = os.path.join(base_dir, connector)
+    if not os.path.isdir(d):
+        return []
+    return sorted(name for name in os.listdir(d) if os.path.isdir(os.path.join(d, name)))
+
+
+def has_data(connector: str, pair: str, kind: str, start: str, end: Optional[str] = None,
+             base_dir: str = DEFAULT_DIR) -> bool:
+    """True if at least one data file exists for this pair/kind in [start, end]."""
+    for day in _days(start, end):
+        if os.path.exists(os.path.join(base_dir, connector, pair, f"{day}_{kind}.jsonl.gz")):
+            return True
+    return False
+
+
+def require_data(connector: str, pair: str, start: str, end: Optional[str] = None,
+                 base_dir: str = DEFAULT_DIR) -> None:
+    """Raise NoDataError with a helpful message if no book data covers the range."""
+    if has_data(connector, pair, "book", start, end, base_dir):
+        return
+    pairs = available_pairs(connector, base_dir)
+    range_str = f"{start}" if not end or end == start else f"{start}..{end}"
+    if not pairs:
+        hint = (f"No data recorded for connector '{connector}'. "
+                f"Check base_dir={base_dir!r} or record data first.")
+    elif pair not in pairs:
+        hint = f"'{pair}' is not recorded on '{connector}'. Recorded pairs: {', '.join(pairs)}"
+    else:
+        hint = (f"'{pair}' is recorded on '{connector}' but no book files cover {range_str}. "
+                f"Try a different date range.")
+    raise NoDataError(hint)
+
+
 def _days(start: str, end: Optional[str]) -> List[str]:
     d0 = date.fromisoformat(start)
     d1 = date.fromisoformat(end) if end else d0

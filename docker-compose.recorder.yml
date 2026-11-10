@@ -1,0 +1,34 @@
+# Runs orderbook_trade_recorder.py headless, 24/7, restarting after crashes and reboots.
+# Setup guide: docs/RECORDER_SERVER_SETUP.md
+#
+#   echo "CONFIG_PASSWORD=<your hummingbot password>" > .env
+#   docker compose -f docker-compose.recorder.yml up -d --build   # start
+#   docker compose -f docker-compose.recorder.yml logs -f         # watch
+#   docker compose -f docker-compose.recorder.yml down            # stop
+services:
+  recorder:
+    container_name: recorder
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hummingbot-recorder:latest
+    restart: unless-stopped
+    environment:
+      - CONFIG_PASSWORD=${CONFIG_PASSWORD:?set CONFIG_PASSWORD in .env}
+      - HEADLESS_MQTT=false  # recorder needs no remote control; avoids errors when no MQTT broker is running
+      - RECORDER_CONFIG=${RECORDER_CONFIG:-conf_orderbook_trade_recorder.yml}
+    command:
+      - /bin/bash
+      - -lc
+      - conda activate hummingbot && python bin/hummingbot_quickstart.py --headless -f orderbook_trade_recorder.py -c "$$RECORDER_CONFIG"
+    volumes:
+      - ./conf:/home/hummingbot/conf
+      - ./logs:/home/hummingbot/logs
+      - ./data:/home/hummingbot/data
+      - ./scripts:/home/hummingbot/scripts
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    network_mode: host

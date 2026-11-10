@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -33,6 +34,55 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._domain = domain
         self._api_factory = api_factory
         self._client: Optional[socketio.AsyncClient] = None
+        # HB pair -> CoinDCX market pair ("B-BTC_USDT", "I-BTC_INR", ...); the prefix differs per market.
+        self._coindcx_pairs: Dict[str, str] = {}
+        # Depth events carry "BTCUSDT" while trade events carry "B-BTC_USDT"; map both to the HB pair.
+        self._stream_symbol_to_pair: Dict[str, str] = {p.replace("-", ""): p for p in trading_pairs}
+
+    async def _coindcx_pair(self, trading_pair: str) -> str:
+        if not self._coindcx_pairs:
+            try:
+                rest_assistant = await self._api_factory.get_rest_assistant()
+                markets = await rest_assistant.execute_request(
+                    url=web_utils.public_rest_url(path_url=CONSTANTS.MARKETS_DETAILS_PATH_URL, domain=self._domain),
+                    method=RESTMethod.GET,
+                    throttler_limit_id=CONSTANTS.MARKETS_DETAILS_PATH_URL,
+                )
+                for market in markets:
+                    hb_pair = f"{market.get('target_currency_short_name')}-{market.get('base_currency_short_name')}"
+                    if market.get("pair"):
+                        self._coindcx_pairs[hb_pair] = market["pair"]
+            except Exception:
+                self.logger().warning("Could not fetch CoinDCX market pairs; guessing exchange codes", exc_info=True)
+        if trading_pair not in self._coindcx_pairs:
+            ecode = CONSTANTS.ECODE_COINDCX if trading_pair.endswith("-INR") else CONSTANTS.ECODE_BINANCE
+            self._coindcx_pairs[trading_pair] = hb_pair_to_coindcx_pair(trading_pair, ecode=ecode)
+        coindcx_pair = self._coindcx_pairs[trading_pair]
+        self._stream_symbol_to_pair[coindcx_pair] = trading_pair
+        return coindcx_pair
+
+    @staticmethod
+    def _unwrap(message: Any) -> Optional[Dict[str, Any]]:
+        """
+        Socket.IO events arrive as {"event": ..., "data": "<json string>"}; return the inner payload dict.
+        """
+        if isinstance(message, dict) and "data" in message:
+            message = message["data"]
+        if isinstance(message, str):
+            try:
+                message = json.loads(message)
+            except ValueError:
+                return None
+        return message if isinstance(message, dict) else None
+
+    async def _trading_pair_for_symbol(self, symbol: str) -> Optional[str]:
+        trading_pair = self._stream_symbol_to_pair.get(symbol)
+        if trading_pair is None and symbol:
+            try:
+                trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=symbol)
+            except KeyError:
+                return None
+        return trading_pair
 
     async def get_last_traded_prices(self,
                                      trading_pairs: List[str],
@@ -43,7 +93,7 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         return await self._connector.get_last_traded_prices(trading_pairs=trading_pairs)
 
     async def _request_order_book_snapshot(self, trading_pair: str) -> Dict[str, Any]:
-        coindcx_pair = hb_pair_to_coindcx_pair(trading_pair, ecode=CONSTANTS.ECODE_COINDCX)
+        coindcx_pair = await self._coindcx_pair(trading_pair)
 
         params = {
             "pair": coindcx_pair
@@ -67,8 +117,9 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
             try:
                 trade_queue = self._message_queue[self._trade_messages_queue_key]
                 diff_queue = self._message_queue[self._diff_messages_queue_key]
+                snapshot_queue = self._message_queue[self._snapshot_messages_queue_key]
 
-                self._client = self._build_client(trade_queue, diff_queue)
+                self._client = self._build_client(trade_queue, diff_queue, snapshot_queue)
                 await self._client.connect(CONSTANTS.WSS_URL, transports=["websocket"])
                 await self._subscribe_channels(self._client)
                 self.logger().info("Subscribed to public order book and trade channels")
@@ -92,7 +143,8 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 await self._disconnect()
                 await asyncio.sleep(1.0)
 
-    def _build_client(self, trade_queue: asyncio.Queue, diff_queue: asyncio.Queue) -> socketio.AsyncClient:
+    def _build_client(self, trade_queue: asyncio.Queue, diff_queue: asyncio.Queue,
+                      snapshot_queue: asyncio.Queue) -> socketio.AsyncClient:
         """
         Build Socket.IO client with event handlers for order book and trades.
         """
@@ -109,17 +161,24 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         async def disconnect():
             self.logger().warning("CoinDCX order book stream disconnected")
 
+        # Queue raw payloads; the base class listen_for_* loops call the _parse_* methods on them.
         @client.on(CONSTANTS.DIFF_EVENT_TYPE)
         async def on_depth_update(message):
-            self.logger().debug(f"Received depth-update: {type(message)}")
-            if isinstance(message, dict) and ("bids" in message or "asks" in message):
-                await self._parse_order_book_diff_message(message, diff_queue)
+            payload = self._unwrap(message)
+            if payload is not None and ("bids" in payload or "asks" in payload):
+                diff_queue.put_nowait(payload)
+
+        @client.on(CONSTANTS.DEPTH_SNAPSHOT_EVENT_TYPE)
+        async def on_depth_snapshot(message):
+            payload = self._unwrap(message)
+            if payload is not None and ("bids" in payload or "asks" in payload):
+                snapshot_queue.put_nowait(payload)
 
         @client.on(CONSTANTS.TRADE_EVENT_TYPE)
         async def on_new_trade(message):
-            self.logger().debug(f"Received new-trade: {type(message)}")
-            if isinstance(message, dict) and "p" in message and "q" in message:
-                await self._parse_trade_message(message, trade_queue)
+            payload = self._unwrap(message)
+            if payload is not None and "p" in payload and "q" in payload:
+                trade_queue.put_nowait(payload)
 
         return client
 
@@ -139,7 +198,7 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         Subscribe to order book and trade channels for all trading pairs.
         """
         for trading_pair in self._trading_pairs:
-            coindcx_pair = hb_pair_to_coindcx_pair(trading_pair, ecode=CONSTANTS.ECODE_COINDCX)
+            coindcx_pair = await self._coindcx_pair(trading_pair)
             orderbook_channel = f"{coindcx_pair}@orderbook@10"
             trades_channel = f"{coindcx_pair}@trades"
             await client.emit("join", {"channelName": orderbook_channel})
@@ -160,6 +219,9 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         """
         snapshot: Dict[str, Any] = await self._request_order_book_snapshot(trading_pair)
         snapshot_timestamp: float = time.time()
+        # The REST book has no "vs" sequence; the default (timestamp ms) would exceed every stream "vs" and make
+        # the tracker reject all diffs, so start from 0 and let streamed depth-snapshots take over.
+        snapshot.setdefault("vs", 0)
         snapshot_msg: OrderBookMessage = CoinDCXOrderBook.snapshot_message_from_exchange(
             snapshot,
             snapshot_timestamp,
@@ -171,10 +233,8 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         """
         Parse and enqueue a trade message from the exchange.
         """
-        self.logger().debug(f"Received trade message: {raw_message}")
-        pair_symbol = raw_message.get("s", "")
-        if pair_symbol:
-            trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=pair_symbol)
+        trading_pair = await self._trading_pair_for_symbol(raw_message.get("s", ""))
+        if trading_pair:
             trade_message = CoinDCXOrderBook.trade_message_from_exchange(
                 raw_message, {"trading_pair": trading_pair})
             message_queue.put_nowait(trade_message)
@@ -184,21 +244,27 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         Parse and enqueue an order book differential update message.
         """
         if "bids" in raw_message or "asks" in raw_message:
-            trading_pair = None
-
-            pair_symbol = raw_message.get("s") or raw_message.get("symbol") or ""
-            if pair_symbol:
-                trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=pair_symbol)
-            else:
-                channel = raw_message.get("channel", "")
-                if "@orderbook" in channel:
-                    pair_part = channel.split("@")[0]
-                    trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=pair_part)
-
+            trading_pair = await self._trading_pair_for_symbol(self._symbol_of(raw_message))
             if trading_pair:
                 order_book_message: OrderBookMessage = CoinDCXOrderBook.diff_message_from_exchange(
                     raw_message, time.time(), {"trading_pair": trading_pair})
                 message_queue.put_nowait(order_book_message)
+
+    async def _parse_order_book_snapshot_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
+        """
+        Parse and enqueue a streamed depth-snapshot (sent about once a second) to resync the local book.
+        """
+        trading_pair = await self._trading_pair_for_symbol(self._symbol_of(raw_message))
+        if trading_pair:
+            message_queue.put_nowait(CoinDCXOrderBook.snapshot_message_from_exchange(
+                raw_message, time.time(), {"trading_pair": trading_pair}))
+
+    @staticmethod
+    def _symbol_of(raw_message: Dict[str, Any]) -> str:
+        symbol = raw_message.get("s") or raw_message.get("symbol") or ""
+        if not symbol and "@orderbook" in raw_message.get("channel", ""):
+            symbol = raw_message["channel"].split("@")[0]
+        return symbol
 
     async def _ping_task(self):
         """

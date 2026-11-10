@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import time
 from collections import deque
 from typing import Deque, Dict, List, Optional, Union
@@ -222,8 +223,10 @@ class HummingbotApplication(*commands):
         try:
             self.logger().info("Starting Hummingbot in headless mode...")
 
-            # Validate MQTT is enabled for headless mode
-            if not self.client_config_map.mqtt_bridge.mqtt_autostart:
+            # Validate MQTT is enabled for headless mode (HEADLESS_MQTT=false opts out, e.g. for data recorders)
+            if os.environ.get("HEADLESS_MQTT", "").lower() == "false":
+                self.logger().info("MQTT disabled (HEADLESS_MQTT=false) - running strategy without remote control")
+            elif not self.client_config_map.mqtt_bridge.mqtt_autostart:
                 error_msg = (
                     "ERROR: MQTT must be enabled for headless mode!\n"
                     "Without MQTT, there would be no way to control the bot.\n"
@@ -232,9 +235,9 @@ class HummingbotApplication(*commands):
                 )
                 self.logger().error(error_msg)
                 raise RuntimeError("MQTT is required for headless mode")
-
-            self.logger().info("MQTT enabled - waiting for MQTT commands...")
-            self.logger().info("Bot is ready to receive commands via MQTT")
+            else:
+                self.logger().info("MQTT enabled - waiting for MQTT commands...")
+                self.logger().info("Bot is ready to receive commands via MQTT")
 
             # Keep running until shutdown
             while True:

@@ -36,6 +36,13 @@ def trading_pair_from_symbol(symbol: str, quote: str) -> str:
     return combine_to_hb_trading_pair(base=symbol.replace("-", "_"), quote=quote.upper())
 
 
+def symbol_from_trading_pair(trading_pair: str) -> str:
+    """
+    The other way round: C_BTC_63800_130626-USD is Delta's C-BTC-63800-130626.
+    """
+    return trading_pair.split("-")[0].replace("_", "-")
+
+
 def is_live_vanilla_option(product: Any) -> bool:
     return (
         isinstance(product, dict)
@@ -70,7 +77,7 @@ def instrument_from_trading_pair(trading_pair: str) -> OptionInstrumentInfo:
     What the name says about an option Delta no longer lists: C_BTC_63800_130626-USD is a BTC call, strike 63,800,
     expiring 13 Jun 2026 at 12:00 UTC.
     """
-    symbol = trading_pair.split("-")[0].replace("_", "-")
+    symbol = symbol_from_trading_pair(trading_pair)
     kind = symbol.split("-")[0]
     if kind not in ("C", "P"):
         raise ValueError(f"{trading_pair} is not the name of a call or put option.")

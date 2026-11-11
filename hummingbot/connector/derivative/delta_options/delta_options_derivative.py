@@ -1,9 +1,10 @@
 import asyncio
 import hashlib
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from bidict import bidict
 
@@ -30,6 +31,7 @@ from hummingbot.core.data_type.option_info import OptionInstrumentInfo
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
+from hummingbot.core.event.events import MarketEvent, OptionSettledEvent
 from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
@@ -44,6 +46,15 @@ def _result(response: Any) -> Any:
         if "result" in response:
             return response["result"]
     return response
+
+
+@dataclass
+class _SettlementDue:
+    """An expired option whose settlement fill is being looked for."""
+    expiry: float
+    held: bool  # a position was held at the expiry
+    until: float  # looked for until then
+    looked: bool = False  # a read of its fills has worked
 
 
 class DeltaOptionsDerivative(OptionDerivativePyBase):
@@ -82,6 +93,10 @@ class DeltaOptionsDerivative(OptionDerivativePyBase):
         self._ws_fill_counts: Dict[str, int] = defaultdict(int)
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._heartbeat_id: Optional[str] = None
+        # Expired options whose settlement fill is being looked for, and the settlement fills already raised.
+        self._settlements_due: Dict[str, _SettlementDue] = {}
+        self._settled_fill_ids: Set[str] = set()
+        self._settlement_task: Optional[asyncio.Task] = None
         self._stop_lock = asyncio.Lock()
         self._authenticator: Optional[DeltaOptionsAuth] = None
         super().__init__(
@@ -198,12 +213,17 @@ class DeltaOptionsDerivative(OptionDerivativePyBase):
         heartbeat_running = self._heartbeat_task is not None and not self._heartbeat_task.done()
         if self._trading_required and self._dead_man_switch and self._trading_pairs and not heartbeat_running:
             self._heartbeat_task = safe_ensure_future(self._heartbeat_loop())
+        # Settlements still looked for when the network stopped are looked for again.
+        self._start_settlement_watch()
 
     async def stop_network(self):
         # One stop at a time: stopping the clock starts one in the background, and a second one closing the proxy
         # session would cut off the first one's switch-off of the dead-man switch.
         async with self._stop_lock:
             await self._stop_heartbeat()
+            if self._settlement_task is not None:
+                self._settlement_task.cancel()
+                self._settlement_task = None
             await super().stop_network()
             # A proxy gets its own aiohttp session; the default connections factory is shared and stays open.
             if self._proxy_url:
@@ -475,23 +495,30 @@ class DeltaOptionsDerivative(OptionDerivativePyBase):
         """
         if order.exchange_order_id is None:
             return []
+        since = order.creation_timestamp - 60 if order.creation_timestamp > 0 else None
+        fills = await self._read_fills([self._product_ids[order.trading_pair]], since)
+        return [self._trade_update_from_fill(order, fill) for fill in fills
+                if str(fill.get("order_id")) == order.exchange_order_id]
+
+    async def _read_fills(self, product_ids: List[int], since: Optional[float]) -> List[Dict[str, Any]]:
+        """
+        The account's fills on these options (Delta takes at most 10 per request), from `since` on.
+        """
         params: Dict[str, Any] = {
-            "product_ids": str(self._product_ids[order.trading_pair]),
+            "product_ids": ",".join(str(product_id) for product_id in product_ids),
             "page_size": CONSTANTS.FILLS_PAGE_SIZE,
         }
-        if order.creation_timestamp > 0:
-            params["start_time"] = int((order.creation_timestamp - 60) * 1e6)
-        trade_updates = []
+        if since is not None:
+            params["start_time"] = int(since * 1e6)
+        fills = []
         for _ in range(CONSTANTS.MAX_FILL_PAGES):
             response = await self._api_get(path_url=CONSTANTS.FILLS_PATH_URL, params=params, is_auth_required=True)
-            for fill in _result(response) or []:
-                if str(fill.get("order_id")) == order.exchange_order_id:
-                    trade_updates.append(self._trade_update_from_fill(order, fill))
+            fills.extend(_result(response) or [])
             after = (response.get("meta") or {}).get("after") if isinstance(response, dict) else None
             if not after:
                 break
             params = {**params, "after": after}
-        return trade_updates
+        return fills
 
     def _trade_update_from_fill(self, order: InFlightOrder, fill: Dict[str, Any]) -> TradeUpdate:
         fill_base = self.size_to_amount(order.trading_pair, abs(Decimal(str(fill.get("size", "0")))))
@@ -679,6 +706,144 @@ class DeltaOptionsDerivative(OptionDerivativePyBase):
         try:
             return await self.trading_pair_associated_to_exchange_symbol(symbol)
         except KeyError:
+            return None
+
+    def _on_option_expired(self, trading_pair: str, position: Optional[Position]):
+        """
+        At expiry Delta closes every position with a fill of type "settlement": at the option's settlement value, on the
+        side that closes it, with its settlement fee as commission, within a second, worthless options included. No
+        order of the bot's carries it, so it is looked for here and raised as OptionSettled. A position held at the
+        expiry is waited for; with none known (nothing held, or a restart after the expiry) one read is enough.
+        """
+        instrument = self.get_instrument(trading_pair)
+        expiry = instrument.expiry_timestamp if instrument is not None else self._time()
+        self._settlements_due[trading_pair] = _SettlementDue(
+            expiry=expiry,
+            held=position is not None and position.amount != 0,
+            until=max(self._time(), expiry) + CONSTANTS.SETTLEMENT_WAIT,
+        )
+        self._start_settlement_watch()
+
+    def _start_settlement_watch(self):
+        running = self._settlement_task is not None and not self._settlement_task.done()
+        if self._settlements_due and not running:
+            self._settlement_task = safe_ensure_future(self._settlement_watch_loop())
+
+    async def _settlement_watch_loop(self):
+        while self._settlements_due:
+            await self._look_for_settlements()
+            self._drop_finished_settlement_watches()
+            if self._settlements_due:
+                await self._sleep(CONSTANTS.SETTLEMENT_POLL_INTERVAL)
+
+    async def _look_for_settlements(self):
+        """
+        Reads the fills of the options due, ten at a time, and raises OptionSettled for each settlement fill.
+        """
+        now = self._time()
+        products: Dict[int, str] = {}
+        for trading_pair, due in list(self._settlements_due.items()):
+            if now < due.expiry + CONSTANTS.SETTLEMENT_READ_DELAY:
+                continue
+            try:
+                products[await self._settlement_product_id(trading_pair)] = trading_pair
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger().network(f"Error looking up {trading_pair} on Delta for its settlement.", exc_info=True)
+        product_ids = list(products)
+        for start in range(0, len(product_ids), CONSTANTS.MAX_SYMBOLS_PER_REQUEST):
+            chunk = product_ids[start:start + CONSTANTS.MAX_SYMBOLS_PER_REQUEST]
+            pairs = [products[product_id] for product_id in chunk]
+            since = min(self._settlements_due[pair].expiry for pair in pairs) - CONSTANTS.SETTLEMENT_LOOKBACK
+            try:
+                fills = await self._read_fills(chunk, since)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger().network(f"Error reading the settlement fills of {', '.join(pairs)} from Delta.",
+                                      exc_info=True)
+                continue
+            for pair in pairs:
+                self._settlements_due[pair].looked = True
+            for fill in fills:
+                trading_pair = products.get(self._int_or_none(fill.get("product_id")))
+                if trading_pair is not None and fill.get("fill_type") == CONSTANTS.FILL_TYPE_SETTLEMENT:
+                    self._settlements_due.pop(trading_pair, None)
+                    self._record_settlement(trading_pair, fill)
+
+    def _drop_finished_settlement_watches(self):
+        """
+        Stops looking once a read found no settlement where nothing was held, or when the wait is over; a position held
+        at the expiry and still without a settlement record by then is reported.
+        """
+        now = self._time()
+        minutes = f"{CONSTANTS.SETTLEMENT_WAIT / 60:g}"
+        for trading_pair, due in list(self._settlements_due.items()):
+            if not due.held and due.looked:
+                del self._settlements_due[trading_pair]
+            elif now >= due.until:
+                del self._settlements_due[trading_pair]
+                if due.looked:
+                    self.logger().warning(f"Delta lists no settlement for {trading_pair} {minutes} minutes after it "
+                                          f"expired. If the bot still held it then, its trade records show that "
+                                          f"position open.")
+                else:
+                    self.logger().warning(f"Could not read Delta's records for {trading_pair} in the {minutes} minutes "
+                                          f"after it expired, so a settlement of it is not recorded.")
+
+    async def _settlement_product_id(self, trading_pair: str) -> int:
+        """
+        The option's Delta id. One the connector never saw listed (it expired before the bot started) is read by its
+        symbol, which Delta still serves after the expiry, together with its contract size.
+        """
+        if trading_pair in self._product_ids and trading_pair in self._contract_values:
+            return self._product_ids[trading_pair]
+        symbol = self._symbols.get(trading_pair) or utils.symbol_from_trading_pair(trading_pair)
+        product = _result(await self._api_get(path_url=f"{CONSTANTS.PRODUCTS_PATH_URL}/{symbol}",
+                                              limit_id=CONSTANTS.PRODUCTS_PATH_URL))
+        if not isinstance(product, dict) or product.get("id") is None:
+            raise IOError(f"Delta returned no product for {symbol}: {product}")
+        self._product_ids[trading_pair] = int(product["id"])
+        self._contract_values[trading_pair] = Decimal(str(product["contract_value"]))
+        self._symbols[trading_pair] = symbol
+        return self._product_ids[trading_pair]
+
+    def _record_settlement(self, trading_pair: str, fill: Dict[str, Any]):
+        fill_id = str(fill.get("id"))
+        if fill_id in self._settled_fill_ids:
+            return
+        self._settled_fill_ids.add(fill_id)
+        amount = self.size_to_amount(trading_pair, abs(Decimal(str(fill.get("size") or "0"))))
+        price = Decimal(str(fill.get("price") or "0"))
+        commission = Decimal(str(fill.get("commission") or "0"))
+        token = str(fill.get("settling_asset_symbol") or trading_pair.split("-")[-1])
+        trade_type = TradeType.BUY if str(fill.get("side")).lower() == CONSTANTS.SIDE_BUY else TradeType.SELL
+        fee = TradeFeeBase.new_perpetual_fee(
+            fee_schema=self.trade_fee_schema(),
+            position_action=PositionAction.CLOSE,
+            flat_fees=[TokenAmount(amount=commission, token=token)],
+        )
+        self.logger().info(f"{trading_pair} settled: Delta closed {amount} with a {trade_type.name.lower()} at the "
+                           f"settlement price {price}, fee {commission} {token}.")
+        self.trigger_event(MarketEvent.OptionSettled, OptionSettledEvent(
+            timestamp=self._parse_timestamp(fill.get("created_at")) or self._time(),
+            market=self.name,
+            trading_pair=trading_pair,
+            trade_type=trade_type,
+            amount=amount,
+            price=price,
+            trade_fee=fee,
+            exchange_trade_id=fill_id,
+        ))
+        # Delta has closed the position and paid it out: positions and balances are read again at once.
+        self._poll_notifier.set()
+
+    @staticmethod
+    def _int_or_none(value: Any) -> Optional[int]:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
             return None
 
     async def _heartbeat_loop(self):

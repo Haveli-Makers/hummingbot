@@ -82,6 +82,14 @@ HEARTBEAT_TTL_MS = 30000
 HEARTBEAT_INTERVAL = 10.0
 HEARTBEAT_STOP_TIMEOUT = 5.0
 
+# Settlement: at expiry Delta closes every position with a fill of this type, at the option's settlement value. Live on
+# 10 Nov 2026 it wrote them within a second of the expiry, for worthless options too.
+FILL_TYPE_SETTLEMENT = "settlement"
+SETTLEMENT_READ_DELAY = 5.0  # seconds after the expiry before the first read
+SETTLEMENT_POLL_INTERVAL = 10.0
+SETTLEMENT_WAIT = 15 * 60  # how long a position held at the expiry waits for its settlement fill
+SETTLEMENT_LOOKBACK = 60  # fills are read from this many seconds before the expiry
+
 # Options fees: a rate on the underlying's value, capped at a share of the premium, plus GST.
 # Each product carries its own cap; this conservative fallback is used only if it is missing.
 DEFAULT_PREMIUM_CAP_RATE = Decimal("0.1")

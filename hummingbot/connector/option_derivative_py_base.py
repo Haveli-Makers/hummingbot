@@ -28,7 +28,8 @@ class OptionDerivativePyBase(ExchangePyBase, ABC):
 
     From `stop_before_expiry` seconds before an option expires, orders that would open a position in it are refused
     and resting ones are cancelled; closing orders are still accepted until it expires. At expiry, `OptionExpired` is
-    raised for each of the connector's options.
+    raised for each of the connector's options, and connectors raise the exchange's settlement of a position held then
+    as `OptionSettled` (see `_on_option_expired`).
     """
     VALID_POSITION_ACTIONS = [PositionAction.OPEN, PositionAction.CLOSE]
     # Conservative initial margin for a short option: max(15% - out-of-the-money share, 10%) of the underlying's value,
@@ -53,6 +54,8 @@ class OptionDerivativePyBase(ExchangePyBase, ABC):
         # Options whose closing window has started, and options whose expiry has been announced.
         self._closing_only: Set[str] = set()
         self._expiry_announced: Set[str] = set()
+        # The position on each option as last seen before its expiry: the exchange may close it the moment it expires.
+        self._positions_before_expiry: Dict[str, Position] = {}
         self._orderbook_ds: OptionAPIOrderBookDataSource = self._orderbook_ds  # for type-hinting
         self._budget_checker = OptionBudgetChecker(self)
 
@@ -441,7 +444,7 @@ class OptionDerivativePyBase(ExchangePyBase, ABC):
     def _check_expiries(self):
         """
         When an option's closing window starts, cancels the resting orders that would open a position in it; when it
-        expires, raises OptionExpired and hands over the position held at that moment for settlement.
+        expires, raises OptionExpired and hands over the position held at the expiry for settlement.
         """
         now = self._time()
         for trading_pair in self.trading_pairs:
@@ -454,12 +457,20 @@ class OptionDerivativePyBase(ExchangePyBase, ABC):
                 self.logger().info(f"{trading_pair} expires at {self._utc(instrument.expiry_timestamp)}: no new "
                                    f"positions are opened in it from now on ({cancelled} resting opening orders "
                                    f"cancelled); closing orders are still accepted.")
-            if trading_pair not in self._expiry_announced and instrument.is_expired(now):
+            position = self.get_position(trading_pair)
+            if not instrument.is_expired(now):
+                if position is not None:
+                    self._positions_before_expiry[trading_pair] = position
+                else:
+                    self._positions_before_expiry.pop(trading_pair, None)
+            elif trading_pair not in self._expiry_announced:
                 self._expiry_announced.add(trading_pair)
                 self.trigger_event(MarketEvent.OptionExpired, OptionExpiredEvent(
                     timestamp=now, market=self.name, trading_pair=trading_pair,
                     expiry_timestamp=instrument.expiry_timestamp))
-                self._on_option_expired(trading_pair, self.get_position(trading_pair))
+                # The exchange settles within a second of the expiry, so its stream may have removed the position already.
+                last_seen = self._positions_before_expiry.pop(trading_pair, None)
+                self._on_option_expired(trading_pair, position if position is not None else last_seen)
 
     def _cancel_opening_orders(self, trading_pair: str) -> int:
         opening = [order for order in self.in_flight_orders.values()
@@ -471,8 +482,9 @@ class OptionDerivativePyBase(ExchangePyBase, ABC):
 
     def _on_option_expired(self, trading_pair: str, position: Optional[Position]):
         """
-        Called once when one of the connector's options expires, with the position held at that moment (or None).
-        Connectors look for the exchange's settlement record here and raise OptionSettled.
+        Called once when one of the connector's options expires, with the position held at its expiry (the last one
+        seen before it, since the exchange may close it at that moment), or None. Connectors look for the exchange's
+        settlement record here and raise OptionSettled.
         """
 
     async def _init_option_info(self):

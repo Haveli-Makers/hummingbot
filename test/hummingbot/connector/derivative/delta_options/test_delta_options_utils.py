@@ -66,6 +66,9 @@ class DeltaOptionsUtilsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             utils.instrument_from_trading_pair("BTC-USD")
 
+    def test_symbol_from_the_trading_pair_name(self):
+        self.assertEqual("C-BTC-63800-130626", utils.symbol_from_trading_pair("C_BTC_63800_130626-USD"))
+
     def test_yes_no_answers(self):
         self.assertEqual([True, True, False, False, True, False],
                          [utils.as_bool(v) for v in ("Yes", "true", "no", "N", True, False)])

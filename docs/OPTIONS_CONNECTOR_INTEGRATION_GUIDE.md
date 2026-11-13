@@ -686,18 +686,24 @@ class OptionsSketch(ScriptStrategyBase):
 - **Size budget checks with `PerpetualOrderCandidate`** (leverage 1), and
   pass `position_close=True` for closing orders, which lock nothing.
 - **Kill switch:** `safe_ensure_future(connector.flatten())`.
-- **Pick the options before the start.** A connector without keys can read
-  the chain; this is how our verification scripts choose options:
+- **Pick the options before the start.** Hummingbot calls a script's
+  `init_markets` synchronously, before any connector runs, so
+  `delta_options_chain` reads the chain over plain HTTP, without keys:
 
 ```python
-scout = DeltaOptionsDerivative("", "", trading_pairs=[], trading_required=False)
-await scout.trading_pair_symbol_map()        # reads every live option; no keys needed
-chain = scout.get_option_chain("BTC")        # sorted by expiry, type and strike
-await scout.stop_network()
+from hummingbot.connector.derivative.delta_options.delta_options_chain import fetch_option_chain, pick_strangle
+
+@classmethod
+def init_markets(cls, config):
+    chain, spot = fetch_option_chain("BTC")      # every live BTC option, and BTC's spot price
+    call, put = pick_strangle(chain, spot, otm=Decimal("0.02"), min_hours_to_expiry=Decimal("1"))
+    cls.markets = {"delta_options": {call.trading_pair, put.trading_pair}}
 ```
 
-A helper that does this from a script's `init_markets` is in the plan
-(decision D3) but not built yet.
+The complete example is `scripts/options_strangle_example.py`. It buys a
+strangle on a daily expiry, hedges its delta with `delta_perpetual`, holds it
+to settlement, then closes the hedge and reports the result. Stopping it before
+expiry closes everything.
 
 ---
 
@@ -866,7 +872,9 @@ The Delta scripts are outside the repo, in `temp/connectors/delta_options/`:
 | `delta_options_api_order_book_data_source.py` | `ob_l2`/`trades`/`ticker` parsing, sizes in contracts, the option-info feed, live-only subscriptions |
 | `delta_options_api_user_stream_data_source.py` | Key-auth login, category subscriptions, re-sync after a drop |
 | `delta_options_derivative.py` | Keeping expired options known, orders and cancels, fills over REST, positions, the fee formula, the dead-man switch, settlement (`_on_option_expired` and the methods after it) |
+| `delta_options_chain.py` | Picking options before the start: the chain over plain HTTP, and a strangle picker |
 | `connector/option_derivative_py_base.py` | Order refusals, selling guard, `flatten()`, margin estimate, the expiry watch |
+| `scripts/options_strangle_example.py` | A complete strategy: buy, hedge with the perpetual, hold to settlement |
 
 **Start from `delta_options`.** Copy it, rename everything, then change the
 exchange-specific parts. Read the tests next to each file: they show the

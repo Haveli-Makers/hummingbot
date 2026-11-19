@@ -699,6 +699,41 @@ class WazirxExchange(ExchangePyBase):
 
         return trades
 
+    async def get_all_open_orders(self, trading_pairs: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """
+        Fetches every open order on the exchange for this account, including orders placed
+        outside Hummingbot (e.g. on the WazirX website).
+        """
+        open_orders: List[Dict[str, Any]] = []
+        for trading_pair in trading_pairs or []:
+            symbol = trading_pair.replace("-", "").lower()
+            try:
+                resp = await self._wazirx_request(
+                    method="GET",
+                    path=CONSTANTS.OPEN_ORDERS_PATH_URL,
+                    params={"symbol": symbol},
+                    is_auth_required=True,
+                )
+                orders = resp if isinstance(resp, list) else (resp or {}).get("orders", [])
+                for order in orders:
+                    if not isinstance(order, dict):
+                        continue
+                    open_orders.append({
+                        "exchange_order_id": str(order.get("id", order.get("orderId", ""))),
+                        "client_order_id": order.get("clientOrderId") or None,
+                        "trading_pair": trading_pair,
+                        "trade_type": str(order.get("side", "")).upper(),
+                        "order_type": str(order.get("type", "")).upper(),
+                        "price": float(order.get("price") or 0),
+                        "amount": float(order.get("origQty") or 0),
+                        "filled_amount": float(order.get("executedQty") or 0),
+                        "status": str(order.get("status", "wait")).upper(),
+                        "created_at": order.get("createdTime") or order.get("time"),
+                    })
+            except Exception as e:
+                self.logger().error(f"Error fetching open orders for {symbol}: {e}")
+        return open_orders
+
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
         if tracked_order.current_state in [OrderState.FAILED, OrderState.CANCELED]:
             return OrderUpdate(

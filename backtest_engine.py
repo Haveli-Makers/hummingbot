@@ -1,24 +1,4 @@
-"""
-Event-driven backtester for data recorded by scripts/orderbook_trade_recorder.py.
 
-Replays book changes and public trades in time order, lets a strategy place/cancel limit orders, and simulates fills:
-  - Resting (maker) orders fill against recorded trades on the opposite side that trade THROUGH the order price
-    (or AT the price too, with fill_at_touch=True - optimistic, ignores queue position). Fill size is capped by the
-    trade size. A resting order is also filled if a later book shows the opposite side crossing it.
-  - An order priced through the current book when it becomes active fills immediately as taker, walking the levels.
-  - Placing and cancelling both take `latency_ms` to reach the exchange; an order can still fill while its cancel
-    is in flight.
-
-Write a strategy by subclassing Strategy (see SimpleMarketMaker below), then:
-
-    python backtest_engine.py coindcx BTC-USDT 2026-10-21 [2026-10-27] --spread-bps 2 --size 0.001 --out results
-
-or from Python:
-
-    from backtest_engine import Backtest, SimpleMarketMaker
-    result = Backtest("coindcx", "BTC-USDT", "2026-10-21", maker_fee=0.001).run(SimpleMarketMaker(spread_bps=2))
-    print(result.summary()); result.fills  # DataFrame
-"""
 import argparse
 import itertools
 import math
@@ -34,15 +14,15 @@ from backtest_data import DEFAULT_DIR, replay
 @dataclass
 class Order:
     id: int
-    side: str            # "buy" | "sell"
+    side: str           
     price: float
     qty: float
     placed_ts: float
-    active_ts: float     # when it reaches the exchange (placed_ts + latency)
-    post_only: bool = False            # LIMIT_MAKER: rejected on arrival instead of crossing the book
+    active_ts: float     
+    post_only: bool = False            
     filled: float = 0.0
-    arrived: bool = False             # reached the exchange (took any crossing liquidity, now resting)
-    cancel_ts: Optional[float] = None  # when the cancel takes effect
+    arrived: bool = False             
+    cancel_ts: Optional[float] = None 
 
     @property
     def remaining(self) -> float:

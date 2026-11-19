@@ -1,5 +1,5 @@
 """
-Load data recorded by scripts/orderbook_trade_recorder.py for backtesting.
+Load data recorded by standalone_recorder.py for backtesting.
 
     from backtest_data import load_trades, load_books, replay
 
@@ -86,10 +86,81 @@ def _iter_file(path: str) -> Iterator[dict]:
         return
 
 
-def iter_rows(connector: str, pair: str, kind: str, start: str, end: Optional[str] = None,
-              base_dir: str = DEFAULT_DIR) -> Iterator[dict]:
+def iter_raw_rows(connector: str, pair: str, kind: str, start: str, end: Optional[str] = None,
+                  base_dir: str = DEFAULT_DIR) -> Iterator[dict]:
+    """Rows exactly as stored on disk."""
     for day in _days(start, end):
         yield from _iter_file(os.path.join(base_dir, connector, pair, f"{day}_{kind}.jsonl.gz"))
+
+
+def _apply_book_row(book: Tuple[dict, dict], row: dict) -> None:
+    """Apply a stored snapshot (replaces the book) or difference (qty 0 removes the level) row."""
+    is_diff = row.get("t") == "d"
+    for side, levels in zip(book, (row["b"], row["a"])):
+        if not is_diff:
+            side.clear()
+        for px, qty in levels:
+            if qty > 0:
+                side[px] = qty
+            else:
+                side.pop(px, None)
+
+
+def _book_levels(book: Tuple[dict, dict]) -> Tuple[list, list]:
+    return ([[px, qty] for px, qty in sorted(book[0].items(), reverse=True)],
+            [[px, qty] for px, qty in sorted(book[1].items())])
+
+
+def iter_rows(connector: str, pair: str, kind: str, start: str, end: Optional[str] = None,
+              base_dir: str = DEFAULT_DIR) -> Iterator[dict]:
+    """
+    Stored rows; for kind "book" every row is the full recorded book {"ts", "uid", "b", "a"} at that moment.
+    """
+    if kind != "book":
+        yield from iter_raw_rows(connector, pair, kind, start, end, base_dir)
+        return
+    book: Tuple[dict, dict] = ({}, {})
+    have_snapshot = False
+    last_levels = None
+    for row in iter_raw_rows(connector, pair, kind, start, end, base_dir):
+        if "t" not in row:
+            yield row
+            continue
+        if row["t"] == "d" and not have_snapshot:
+            continue        # nothing to apply a difference to
+        have_snapshot = True
+        _apply_book_row(book, row)
+        levels = _book_levels(book)
+        if row["t"] == "s" and levels == last_levels:
+            continue        # a checkpoint (midnight / passed verification) of the book we already yielded
+        last_levels = levels
+        yield {"ts": row["ts"], "uid": row["uid"], "b": levels[0], "a": levels[1]}
+
+
+def verify_books(connector: str, pair: str, start: str, end: Optional[str] = None,
+                 base_dir: str = DEFAULT_DIR) -> pd.DataFrame:
+    """
+    Re-check every verification snapshot against the book rebuilt from the rows stored before it.
+    """
+    book: Tuple[dict, dict] = ({}, {})
+    have_snapshot = False
+    records = []
+    for row in iter_raw_rows(connector, pair, "book", start, end, base_dir):
+        if "t" not in row:
+            continue
+        if row["t"] == "s" and row.get("src") == "verify" and have_snapshot:
+            bids, asks = _book_levels(book)
+            rebuilt_matches = bids == [list(x) for x in row["b"]] and asks == [list(x) for x in row["a"]]
+            records.append({"ts": row["ts"], "live_ok": bool(row.get("ok")), "bad": row.get("bad", 0),
+                            "stored_ok": rebuilt_matches if row.get("ok") else True})
+        if row["t"] == "s":
+            have_snapshot = True
+        if have_snapshot:
+            _apply_book_row(book, row)
+    df = pd.DataFrame(records, columns=["ts", "live_ok", "bad", "stored_ok"])
+    if not df.empty:
+        df.insert(0, "time", pd.to_datetime(df["ts"], unit="s", utc=True))
+    return df
 
 
 def load_trades(connector: str, pair: str, start: str, end: Optional[str] = None,
@@ -162,6 +233,14 @@ if __name__ == "__main__":
         print(f"  volume:       {t['qty'].sum():,.6f}  buy/sell: {(t['side'] == 'buy').sum()}/{(t['side'] == 'sell').sum()}")
     if len(b):
         print(f"  median spread: {b['spread'].median():.8g}")
+    v = verify_books(connector, pair, start, end)
+    if len(v):
+        print(f"  verifications: {len(v)}   matched exchange: {int(v['live_ok'].sum())}   "
+              f"failed (book resynced): {int((~v['live_ok']).sum())}   "
+              f"stored rows damaged: {int((~v['stored_ok']).sum())}")
+        for r in v[~(v["live_ok"] & v["stored_ok"])].itertuples():
+            reason = "stored rows do not rebuild to this snapshot" if not r.stored_ok else f"{r.bad} level(s) differed"
+            print(f"    {r.time:%Y-%m-%d %H:%M:%S} UTC  {reason}")
     # Book and trades normally stop together (recorder down, sleep, network). A gap in only one of them points at
     # that feed. A long gap in BTC is never a quiet market - legs spanning one get made-up results.
     for name, df in (("book", b), ("trades", t)):

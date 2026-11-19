@@ -60,9 +60,9 @@ class CandlesBase(NetworkBase):
         if interval in self.intervals.keys():
             self.interval = interval
         else:
-            self.logger().exception(
-                f"Interval {interval} is not supported. Available Intervals: {self.intervals.keys()}")
-            raise
+            error_message = f"Interval {interval} is not supported. Available Intervals: {list(self.intervals.keys())}"
+            self.logger().error(error_message)
+            raise ValueError(error_message)
 
     async def start_network(self):
         """
@@ -173,6 +173,8 @@ class CandlesBase(NetworkBase):
                                                    end_time=current_end_time,
                                                    limit=missing_records)
                 if len(candles) <= 1 or missing_records == 0:
+                    if candles.size == 0:
+                        candles = candles.reshape(0, len(self.columns))
                     fetched_candles_df = pd.DataFrame(candles, columns=self.columns)
                     candles_df = pd.concat([fetched_candles_df, candles_df])
                     break

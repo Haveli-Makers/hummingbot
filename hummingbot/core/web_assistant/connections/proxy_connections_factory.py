@@ -25,15 +25,27 @@ class ProxyConnectionsFactory:
     connector can have its own independently configured session.
     """
 
-    def __init__(self, proxy_url: str):
+    def __init__(self, proxy_url: str, verify_ssl: bool = True):
+        """
+        :param verify_ssl: set False ONLY to reach a sandbox/testnet whose TLS
+            certificate is invalid. Traffic stays encrypted, but the server's
+            identity is no longer checked, so anyone able to intercept the
+            connection could read the API key and alter orders in flight. Never
+            use it against a production host or with credentials that control
+            real funds. Callers are expected to gate this on the environment.
+        """
         if not proxy_url:
             raise ValueError("proxy_url must not be empty")
         self._proxy_url = proxy_url
+        self._verify_ssl = verify_ssl
         self._shared_client: Optional[aiohttp.ClientSession] = None
         self._ws_independent_session: Optional[aiohttp.ClientSession] = None
 
     def _make_session(self) -> aiohttp.ClientSession:
-        connector = ProxyConnector.from_url(self._proxy_url, rdns=True)
+        kwargs = {"rdns": True}
+        if not self._verify_ssl:
+            kwargs["ssl"] = False
+        connector = ProxyConnector.from_url(self._proxy_url, **kwargs)
         return aiohttp.ClientSession(connector=connector)
 
     async def _get_shared_client(self) -> aiohttp.ClientSession:

@@ -117,8 +117,18 @@ class CoinDCXAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         with self.assertRaises(IOError):
             await self.data_source.get_new_order_book(self.trading_pair)
 
+    def _mock_markets_details(self, mock_api, status=200):
+        url = web_utils.public_rest_url(path_url=CONSTANTS.MARKETS_DETAILS_PATH_URL, domain=self.domain)
+        regex_url = re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
+        markets = [{"target_currency_short_name": self.base_asset, "base_currency_short_name": self.quote_asset,
+                    "pair": self.ex_trading_pair_channel}]
+        mock_api.get(regex_url, status=status, body=json.dumps(markets))
+
+    @aioresponses()
     @patch("hummingbot.connector.exchange.coindcx.coindcx_api_order_book_data_source.socketio.AsyncClient")
-    async def test_listen_for_subscriptions_subscribes_to_trades_and_order_diffs(self, mock_client_class):
+    async def test_listen_for_subscriptions_subscribes_to_trades_and_order_diffs(self, mock_api, mock_client_class):
+        # The market's pair code ("I-..." here) comes from /exchange/v1/markets_details, not from a guess
+        self._mock_markets_details(mock_api)
         mock_client = MagicMock()
         mock_client.connect = AsyncMock()
         mock_client.emit = AsyncMock()
@@ -154,16 +164,48 @@ class CoinDCXAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(expected_trades_channel, second_call_args[1]["channelName"])
 
     async def test_subscribe_channels_raises_cancel_exception(self):
-        mock_ws = MagicMock()
-        mock_ws.send.side_effect = asyncio.CancelledError
+        self.data_source._coindcx_pairs = {self.trading_pair: self.ex_trading_pair_channel}
+        mock_client = MagicMock()
+        mock_client.emit = AsyncMock(side_effect=asyncio.CancelledError)
 
-        await self.data_source._subscribe_channels(mock_ws)
+        with self.assertRaises(asyncio.CancelledError):
+            await self.data_source._subscribe_channels(mock_client)
 
-    async def test_subscribe_channels_raises_exception_and_logs_error(self):
-        mock_ws = MagicMock()
-        mock_ws.send.side_effect = Exception("Test Error")
+    async def test_subscribe_channels_raises_exception_to_caller(self):
+        # listen_for_subscriptions catches it, logs it and reconnects
+        self.data_source._coindcx_pairs = {self.trading_pair: self.ex_trading_pair_channel}
+        mock_client = MagicMock()
+        mock_client.emit = AsyncMock(side_effect=Exception("Test Error"))
 
-        await self.data_source._subscribe_channels(mock_ws)
+        with self.assertRaises(Exception):
+            await self.data_source._subscribe_channels(mock_client)
+
+    @aioresponses()
+    async def test_pair_code_is_guessed_from_quote_when_markets_request_fails(self, mock_api):
+        self._mock_markets_details(mock_api, status=500)
+        mock_client = MagicMock()
+        mock_client.emit = AsyncMock()
+        self.data_source._trading_pairs = ["BTC-INR", "BTC-USDT"]
+
+        await self.data_source._subscribe_channels(mock_client)
+
+        channels = [c[0][1]["channelName"] for c in mock_client.emit.call_args_list]
+        self.assertEqual(["I-BTC_INR@orderbook@20", "I-BTC_INR@trades",
+                          "B-BTC_USDT@orderbook@20", "B-BTC_USDT@trades"], channels)
+        self.assertTrue(self._is_logged("WARNING", "Could not fetch CoinDCX market pairs; guessing exchange codes"))
+
+    async def test_streamed_depth_snapshot_is_parsed_as_snapshot(self):
+        msg_queue: asyncio.Queue = asyncio.Queue()
+        raw = {"vs": 160, "ts": 123456789, "s": self.ex_trading_pair_symbol,
+               "bids": {"0.0024": "10"}, "asks": {"0.0026": "100"}}
+
+        await self.data_source._parse_order_book_snapshot_message(raw, msg_queue)
+
+        msg: OrderBookMessage = msg_queue.get_nowait()
+        self.assertEqual(self.trading_pair, msg.trading_pair)
+        self.assertEqual(160, msg.update_id)
+        self.assertEqual(0.0024, msg.bids[0].price)
+        self.assertEqual(0.0026, msg.asks[0].price)
 
     async def test_listen_for_trades_successful(self):
         mock_queue = AsyncMock()
@@ -211,14 +253,31 @@ class CoinDCXAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(1027024, msg.update_id)
 
 
-def test_channel_originating_message_trade_and_diff():
-    ds = CoinDCXAPIOrderBookDataSource(trading_pairs=[], connector=None, api_factory=None)
+def test_socketio_events_are_routed_to_their_queues():
+    """Each Socket.IO event goes straight to its queue; payloads arrive as {"event", "data": "<json string>"}."""
+    async def run_test():
+        ds = CoinDCXAPIOrderBookDataSource(trading_pairs=[], connector=None, api_factory=None)
+        trade_q, diff_q, snapshot_q = asyncio.Queue(), asyncio.Queue(), asyncio.Queue()
+        handlers = ds._build_client(trade_q, diff_q, snapshot_q).handlers["/"]
 
-    trade_event = {"p": 1, "q": 2, "T": 123}
-    diff_event = {"bids": [], "asks": []}
+        update = {"vs": 2, "s": "BTCUSDT", "bids": {"1": "0"}, "asks": {}}
+        snapshot = {"vs": 3, "s": "BTCUSDT", "bids": {"1": "2"}, "asks": {"3": "4"}}
+        trade = {"T": 123, "p": "1", "q": "2", "m": 1, "s": "B-BTC_USDT"}
+        await handlers[CONSTANTS.DIFF_EVENT_TYPE]({"event": "depth-update", "data": json.dumps(update)})
+        await handlers[CONSTANTS.DEPTH_SNAPSHOT_EVENT_TYPE]({"event": "depth-snapshot", "data": json.dumps(snapshot)})
+        await handlers[CONSTANTS.TRADE_EVENT_TYPE](trade)          # an already-unwrapped payload works too
 
-    assert ds._channel_originating_message(trade_event) == ds._trade_messages_queue_key
-    assert ds._channel_originating_message(diff_event) == ds._diff_messages_queue_key
+        assert diff_q.get_nowait() == update
+        assert snapshot_q.get_nowait() == snapshot
+        assert trade_q.get_nowait() == trade
+
+        # Malformed or unrelated payloads are dropped
+        await handlers[CONSTANTS.DIFF_EVENT_TYPE]({"event": "depth-update", "data": "not json"})
+        await handlers[CONSTANTS.DEPTH_SNAPSHOT_EVENT_TYPE]({"event": "depth-snapshot", "data": json.dumps({"x": 1})})
+        await handlers[CONSTANTS.TRADE_EVENT_TYPE]({"T": 123})
+        assert diff_q.empty() and snapshot_q.empty() and trade_q.empty()
+
+    asyncio.run(run_test())
 
 
 def test_parse_trade_and_diff_message_async():

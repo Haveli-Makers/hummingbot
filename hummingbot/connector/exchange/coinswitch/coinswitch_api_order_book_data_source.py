@@ -168,7 +168,7 @@ class CoinswitchAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 await self._client.connect(
                     CONSTANTS.WS_URL,
                     namespaces=[self._namespace],
-                    socketio_path=CONSTANTS.WS_SPOT_SOCKETIO_PATH,
+                    socketio_path=CONSTANTS.WS_SPOT_SOCKETIO_PATH.format(exchange=self._exchange),
                     transports=["websocket"],
                 )
                 await self._subscribe_channels(self._client)

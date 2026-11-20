@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from bidict import bidict
 
+from hummingbot.connector.exchange.zebpay import zebpay_constants as CONSTANTS
 from hummingbot.connector.exchange.zebpay.zebpay_api_order_book_data_source import ZebpayAPIOrderBookDataSource
 from hummingbot.connector.exchange.zebpay.zebpay_exchange import ZebpayExchange
 from hummingbot.core.data_type.order_book_message import OrderBookMessageType
@@ -65,6 +66,32 @@ class ZebpayOrderBookDataSourceTests(unittest.IsolatedAsyncioTestCase):
             {"_trading_pair": "BTC-INR", "price": "3000000", "amount": "0.001",
              "id": "t1", "isBuyerMaker": False, "timestamp": 1_700_000_000_000}, q)
         self.assertEqual(OrderBookMessageType.TRADE, q.get_nowait().type)
+
+    async def test_trades_seen_in_earlier_poll_are_not_queued_again(self):
+        first = {"data": [
+            {"id": 3, "price": "3", "amount": "1", "timestamp": 1_700_000_003_000},
+            {"id": 2, "price": "2", "amount": "1", "timestamp": 1_700_000_002_000},
+        ]}
+        second = {"data": [
+            {"id": 4, "price": "4", "amount": "1", "timestamp": 1_700_000_004_000},
+            {"id": 3, "price": "3", "amount": "1", "timestamp": 1_700_000_003_000},
+            {"id": 2, "price": "2", "amount": "1", "timestamp": 1_700_000_002_000},
+        ]}
+        queue = self.source._message_queue[self.source._trade_messages_queue_key]
+        with patch.object(self.connector, "_api_get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = first
+            await self.source._fetch_public_trades()
+            mock_get.return_value = second
+            await self.source._fetch_public_trades()
+
+        queued = [queue.get_nowait()["id"] for _ in range(queue.qsize())]
+        # Each trade once, oldest first within a poll.
+        self.assertEqual([2, 3, 4], queued)
+
+    def test_seen_trade_ids_are_bounded(self):
+        with patch.object(CONSTANTS, "MAX_SEEN_TRADE_IDS", 3):
+            self.source._new_trades("BTC-INR", [{"id": i, "timestamp": i} for i in range(5)])
+            self.assertEqual(3, len(self.source._seen_trade_ids["BTC-INR"]))
 
     async def test_connected_websocket_raises(self):
         with self.assertRaises(NotImplementedError):

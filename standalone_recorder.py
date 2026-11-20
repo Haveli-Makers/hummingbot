@@ -1,31 +1,11 @@
 """
 Standalone order book + public trades recorder for every exchange hummingbot has a connector for.
 
-It does not run the hummingbot app. It builds the exchange's connector the same way paper trading does and
-listens to its public order book feed directly, so a new exchange needs no code here.
-
 Usage:
     python standalone_recorder.py --connector coindcx --pairs BTC-USDT,ETH-USDT
     python standalone_recorder.py --connector binance --pairs BTC-USDT --depth 50 --verify-sec 900
     python standalone_recorder.py --list                      # connectors hummingbot knows
     python standalone_recorder.py --connector coinswitch --list-keys   # API key settings a connector takes
-
-API keys (only for exchanges that serve market data to signed requests only, e.g. coinswitch):
-    Most exchanges need none. When one does, pass them on the command line:
-      python standalone_recorder.py --connector coinswitch --pairs BTC-INR --api-key <key> --api-secret <secret>
-    --passphrase is there for exchanges that also take one (e.g. kucoin). Any other key setting the connector
-    takes (see --list-keys) can be set with --key NAME=VALUE. Environment variables named after the setting in
-    capitals (e.g. COINSWITCH_API_KEY) also work; command-line values win over them.
-    The recorder only reads market data with them; it never places orders or reads balances.
-
-Output (read it back with backtest_data.py, which rebuilds the full book for the backtester):
-
-    <output_dir>/<connector>/<PAIR>/<YYYY-MM-DD>_book.jsonl.gz
-        snapshot    {"t":"s","ts":..,"uid":..,"b":[[px,qty],..],"a":[[px,qty],..],"src":"start"|"rotate"|"verify"}
-                    verify snapshots also carry "ok": true|false and, when false, "bad": <levels that differed>
-        difference  {"t":"d","ts":..,"uid":..,"b":[[px,qty],..],"a":[[px,qty],..]}   qty 0 = level removed
-    <output_dir>/<connector>/<PAIR>/<YYYY-MM-DD>_trades.jsonl.gz
-        {"ts":..,"ets":<exchange ts>,"id":..,"px":..,"qty":..,"side":"buy"|"sell" (taker),"bb":..,"ba":..}
 
 How the book is stored:
     Whatever the exchange sends (differences, full snapshots, or both) is applied to a local book exactly as

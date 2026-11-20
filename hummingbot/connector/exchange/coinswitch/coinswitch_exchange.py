@@ -664,7 +664,7 @@ class CoinswitchExchange(ExchangePyBase):
         Fetches this account's filled orders (including partly filled, then cancelled ones)
         from CoinSwitch's account-wide closed-orders endpoint, one entry per order.
         """
-        params: Dict[str, Any] = {"count": limit, "open": "false"}  
+        params: Dict[str, Any] = {"count": limit, "open": "false"}
         if start_time is not None:
             params["from_time"] = start_time
         if end_time is not None:

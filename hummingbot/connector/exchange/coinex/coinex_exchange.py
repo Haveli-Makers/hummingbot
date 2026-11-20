@@ -456,7 +456,7 @@ class CoinexExchange(ExchangePyBase):
         Fetches every open order on the exchange for this account, including orders placed
         outside Hummingbot (e.g. on the CoinEx website).
         """
-        requests: List[Tuple[str, str]] = []  
+        requests: List[Tuple[str, str]] = []
         for trading_pair in trading_pairs or []:
             try:
                 requests.append((await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair), trading_pair))

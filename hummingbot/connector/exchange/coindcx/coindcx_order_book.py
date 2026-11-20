@@ -101,7 +101,8 @@ class CoinDCXOrderBook(OrderBook):
 
         content = {
             "trading_pair": metadata.get("trading_pair"),
-            "trade_type": float(TradeType.BUY.value) if msg.get("m", 0) else float(TradeType.SELL.value),
+            # "m" = buyer is maker, so the taker (aggressor) sold
+            "trade_type": float(TradeType.SELL.value) if msg.get("m", 0) else float(TradeType.BUY.value),
             "trade_id": msg.get("T"),
             "update_id": msg.get("T"),
             "price": float(msg.get("p", 0)),

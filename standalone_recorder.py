@@ -12,14 +12,21 @@ How the book is stored:
     hummingbot's own order book tracker does. A row is written only when the top `depth` levels really changed,
     and it holds just the levels that changed. So a repeated snapshot, or an update that changes nothing we
     record, writes nothing. A full snapshot row is written at start, at UTC midnight (every daily file stands on
-    its own) and at every verification.
+    its own) and at every verification. When the live feed itself carries fewer levels than --depth (Ajaib sends
+    12, CoinDCX's 10-level channel 10), that many are recorded and verified, and a warning says so.
+
+Trades:
+    Polled trade endpoints (Zebpay, CSX) return the last N trades on every poll, so trades that happened before
+    recording started, and trades seen again 2 s or more later, are dropped. Identical real trades that arrive
+    within that time (CoinDCX's same-second, same-price, same-size fills) are kept.
 
 Verification (every --verify-sec, default one hour):
     A fresh order book is requested from the exchange and compared with the book rebuilt from the stored
     snapshot + differences. Live updates keep arriving while the request is in flight, so both books keep
     receiving them for --verify-grace-sec; if they agree at any moment in that window the stored data is good
-    ("ok": true). If they never agree, the local book is replaced by the exchange's ("ok": false, "bad": n) so an
-    error cannot outlive one verification interval.
+    ("ok": true). A feed that sends full books at intervals skips states in between, so a fresh book is tried up
+    to 3 times ("tries": n). If none agrees, the local book is replaced by the exchange's ("ok": false, "bad": n)
+    so an error cannot outlive one verification interval.
 """
 
 import argparse
@@ -43,6 +50,19 @@ Book = Tuple[Dict[float, float], Dict[float, float]]   # ({bid px: qty}, {ask px
 logger = logging.getLogger("recorder")
 
 PAST_DIFF_WINDOW_SIZE = 32
+# Live full books (snapshot feeds) remembered to learn how many levels the feed really carries.
+FEED_DEPTH_WINDOW = 50
+# A trade identical to one already recorded is a re-delivery when it arrives this many seconds or more after the
+# first copy: a polled endpoint returning the same recent trades on its next poll (Zebpay and CSX poll every 3 s)
+# or a stream replaying its last trades after a reconnect. Identical real trades are kept: CoinDCX stamps INR trades
+# to the whole second, and small orders with the same second, price, quantity and side are common there (14 in one
+# 500-trade history). They arrive within about a second of each other; 0.5 s here dropped ~1.5% of BTC-INR trades.
+TRADE_REDELIVERY_SEC = 2.0
+RECENT_TRADE_KEYS = 5000
+# Trades that happened this long before recording started are a backlog from a polled endpoint, not live trades.
+TRADE_BACKLOG_SEC = 2.0
+# Fresh exchange books tried per verification before it counts as failed (see _verify_pair).
+VERIFY_ATTEMPTS = 3
 
 
 def top_levels(book: Book, depth: int) -> View:
@@ -157,7 +177,12 @@ class PairState:
         self.pending: List = []                   
         self.shadow: Optional[Tuple[Book, int]] = None
         self.verify_ok: bool = False
-        self.counts = {"snapshots": 0, "diffs": 0, "trades": 0, "skipped": 0, "verify_ok": 0, "verify_bad": 0}
+        # Levels per side in the live feed's recent full books; empty for difference feeds (whose book is deeper)
+        self.feed_levels: Deque[int] = deque(maxlen=FEED_DEPTH_WINDOW)
+        self.depth_warned: bool = False
+        self.recent_trades: Dict[tuple, float] = {}   # trade key -> local time first recorded (insertion ordered)
+        self.counts = {"snapshots": 0, "diffs": 0, "trades": 0, "skipped": 0, "verify_ok": 0, "verify_bad": 0,
+                       "trades_dropped": 0}
 
 
 class StandaloneRecorder:
@@ -175,6 +200,7 @@ class StandaloneRecorder:
         self._states: Dict[str, PairState] = {p: PairState() for p in self.pairs}
         self._buffers: Dict[Tuple[str, str, str], List[str]] = {}    # (pair, day, kind) -> rows
         self._data_source = None
+        self._started = time.time()
 
     # ---- persistence -----------------------------------------------------------------------------------------
 
@@ -202,11 +228,30 @@ class StandaloneRecorder:
     def _snapshot_row(self, ts: float, uid: int, view: View, src: str, **extra) -> dict:
         return {"t": "s", "ts": round(ts, 6), "uid": uid, "b": view[0], "a": view[1], "src": src, **extra}
 
+    def _depth(self, pair: str) -> int:
+        """Levels per side to record and verify: --depth, or fewer when the live feed itself carries fewer.
+
+        A feed that sends the top N levels as full books (Ajaib's depth20 sends 12, CoinDCX's orderbook@10 sends
+        10) cannot tell us anything below level N. Recording deeper would store whatever the start snapshot had
+        there and never update it, and verification would compare those levels with the exchange's REST book and
+        fail every time (or, before this check, pass without looking at them)."""
+        state = self._states[pair]
+        if not state.feed_levels:
+            return self.depth
+        feed = max(state.feed_levels)
+        if self.depth and feed >= self.depth:
+            return self.depth
+        if not state.depth_warned:
+            state.depth_warned = True
+            logger.warning(f"{pair}: the live feed carries only {feed} levels per side, so {feed} are recorded and "
+                           f"verified instead of {self.depth or 'the whole book'}")
+        return feed
+
     def _record_book(self, pair: str, uid: int, snapshot_src: Optional[str] = None, **extra):
         """Write what changed in the recorded levels since the last row (or a full snapshot if snapshot_src)."""
         state = self._states[pair]
         now = time.time()
-        view = top_levels(state.book, self.depth)
+        view = top_levels(state.book, self._depth(pair))
         day = self._day(now)
         if snapshot_src is None and day != state.day and state.day:
             self._buffer(pair, "book", self._snapshot_row(now, uid, state.view, "rotate"))
@@ -244,19 +289,21 @@ class StandaloneRecorder:
             return
         if is_snapshot:
             state.book = self._restore(message, state.past_diffs)
-            if state.shadow is not None:
-                state.shadow = (self._restore(message, state.past_diffs), state.shadow[1])
+            state.feed_levels.append(max(len(message.bids), len(message.asks)))
+            # The shadow (the exchange's fresh REST book under verification) is deliberately NOT replaced by a
+            # live full book: that would compare the live feed with itself and always pass. It stays as fetched,
+            # and verification passes only if the recorded book equals it at some moment in the grace window.
         else:
             apply_rows(state.book, message.bids, message.asks)
             state.past_diffs.append(message)
             if state.shadow is not None:
                 apply_rows(state.shadow[0], message.bids, message.asks)
         self._record_book(pair, message.update_id)
-        self._check_shadow(state)
+        self._check_shadow(state, pair)
 
-    def _check_shadow(self, state: PairState):
+    def _check_shadow(self, state: PairState, pair: str):
         if state.shadow is not None and not state.verify_ok:
-            state.verify_ok = top_levels(state.shadow[0], self.depth) == state.view
+            state.verify_ok = top_levels(state.shadow[0], self._depth(pair)) == state.view
 
     async def _fetch_book(self, pair: str):
         """A fresh order book straight from the exchange, as a snapshot message."""
@@ -296,26 +343,45 @@ class StandaloneRecorder:
         state = self._states[pair]
         if state.book is None:
             return
-        snapshot = await self._fetch_book(pair)
-        state.shadow = (self._restore(snapshot, state.past_diffs), snapshot.update_id)
-        state.verify_ok = False
-        self._check_shadow(state)
-        deadline = time.time() + self.verify_grace_sec
-        while not state.verify_ok and time.time() < deadline:
-            await asyncio.sleep(0.05)      # live updates feed both books meanwhile (see _on_book_message)
-        shadow, uid = state.shadow
-        state.shadow = None
+        # Feeds that send full books at intervals (Ajaib: one 12-level book every 500 ms) skip the states in
+        # between, so a REST book taken at such a moment never appears in the stream and cannot be matched, however
+        # correct the recording is. Measured on Ajaib, about half of REST books are such states. A fresh book is
+        # therefore tried up to VERIFY_ATTEMPTS times: a real error fails every one, an unlucky moment does not.
+        shadow = uid = None
+        for attempt in range(1, VERIFY_ATTEMPTS + 1):
+            try:
+                snapshot = await self._fetch_book(pair)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:      # e.g. HTTP 429: WazirX allows 1-2 depth requests per second
+                if attempt == VERIFY_ATTEMPTS and shadow is None:
+                    raise
+                logger.info(f"{pair}: verification try {attempt} could not fetch the exchange book ({e}); "
+                            f"trying again in 2s")
+                await asyncio.sleep(2)
+                continue
+            state.shadow = (self._restore(snapshot, state.past_diffs), snapshot.update_id)
+            state.verify_ok = False
+            self._check_shadow(state, pair)
+            deadline = time.time() + self.verify_grace_sec
+            while not state.verify_ok and time.time() < deadline:
+                await asyncio.sleep(0.05)      # live updates feed both books meanwhile (see _on_book_message)
+            shadow, uid = state.shadow
+            state.shadow = None
+            if state.verify_ok:
+                break
         if state.verify_ok:
             state.counts["verify_ok"] += 1
-            self._record_book(pair, uid, snapshot_src="verify", ok=True)
-            logger.info(f"{pair}: verification OK - stored snapshot + differences match the exchange book")
+            self._record_book(pair, uid, snapshot_src="verify", ok=True, tries=attempt)
+            logger.info(f"{pair}: verification OK - stored snapshot + differences match the exchange book"
+                        + (f" (on try {attempt} of {VERIFY_ATTEMPTS})" if attempt > 1 else ""))
         else:
-            bad = levels_differing(top_levels(shadow, self.depth), state.view)
+            bad = levels_differing(top_levels(shadow, self._depth(pair)), state.view)
             state.counts["verify_bad"] += 1
             state.book = shadow
-            self._record_book(pair, uid, snapshot_src="verify", ok=False, bad=bad)
-            logger.warning(f"{pair}: verification FAILED - {bad} level(s) differed from the exchange book; "
-                           f"local book replaced with the exchange's")
+            self._record_book(pair, uid, snapshot_src="verify", ok=False, bad=bad, tries=attempt)
+            logger.warning(f"{pair}: verification FAILED on all {VERIFY_ATTEMPTS} tries - {bad} level(s) differed "
+                           f"from the exchange book; local book replaced with the exchange's")
 
     async def _verify_loop(self):
         while True:
@@ -337,17 +403,33 @@ class StandaloneRecorder:
         if state is None:
             return
         content = message.content
-        bids, asks = state.view
-        self._buffer(pair, "trades", {
-            "ts": round(time.time(), 6),
+        now = time.time()
+        row = {
+            "ts": round(now, 6),
             "ets": message.timestamp,
             "id": str(content.get("trade_id", "")),
             "px": float(content["price"]),
             "qty": float(content["amount"]),
             "side": "sell" if int(float(content.get("trade_type", 1))) == 2 else "buy",   # TradeType.SELL == 2
-            "bb": bids[0][0] if bids else None,
-            "ba": asks[0][0] if asks else None,
-        })
+        }
+        # Polled trade endpoints (Zebpay, CSX) return the last N trades on every poll: the first poll is a backlog
+        # from before recording started (hours old on a quiet pair), and later polls repeat trades already stored.
+        if message.timestamp and float(message.timestamp) < self._started - TRADE_BACKLOG_SEC:
+            state.counts["trades_dropped"] += 1
+            return
+        key = (row["id"], row["ets"], row["px"], row["qty"], row["side"])
+        first_seen = state.recent_trades.get(key)
+        if first_seen is not None and now - first_seen >= TRADE_REDELIVERY_SEC:
+            state.counts["trades_dropped"] += 1
+            return
+        if first_seen is None:
+            state.recent_trades[key] = now
+            if len(state.recent_trades) > RECENT_TRADE_KEYS:
+                del state.recent_trades[next(iter(state.recent_trades))]
+        bids, asks = state.view
+        row["bb"] = bids[0][0] if bids else None
+        row["ba"] = asks[0][0] if asks else None
+        self._buffer(pair, "trades", row)
         state.counts["trades"] += 1
 
     # ---- loops -----------------------------------------------------------------------------------------------
@@ -373,7 +455,8 @@ class StandaloneRecorder:
                 bids, asks = state.view
                 top = f"{bids[0][0] if bids else '-'} / {asks[0][0] if asks else '-'}"
                 logger.info(f"{pair}: snapshots={c['snapshots']} differences={c['diffs']} unchanged-skipped={c['skipped']} "
-                            f"trades={c['trades']} verify ok/failed={c['verify_ok']}/{c['verify_bad']}  bid/ask={top}")
+                            f"trades={c['trades']} (dropped as backlog/repeat: {c['trades_dropped']}) "
+                            f"verify ok/failed={c['verify_ok']}/{c['verify_bad']}  bid/ask={top}")
 
     async def run(self):
         settings = connector_settings(self.connector_name)

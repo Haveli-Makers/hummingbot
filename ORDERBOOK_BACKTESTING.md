@@ -87,7 +87,7 @@ final position, a reconciliation report, the tick size and the candles used.
 ### How it starts
 
 ```
-python standalone_recorder.py --connector coindcx --pairs BTC-USDT,ETH-USDT --depth 10 --verify-sec 3600
+python standalone_recorder.py --connector coindcx --pairs BTC-USDT,ETH-USDT --depth 20 --verify-sec 3600
 ```
 
 | Option | Meaning | Default |
@@ -430,7 +430,6 @@ Git already ignores everything in the right-hand column, so a `git clone` on the
 
 | Item | Effect | What would fix it |
 |---|---|---|
-| CoinDCX records only 10 levels | The hummingbot connector subscribes to the 10-level channel. Use `--depth 10` | Change the connector to the 20-level channel. This also changes what live CoinDCX trading sees, so it is an open decision |
 | CoinDCX book is wrong for the first few seconds after a start | Its REST order book lags the stream, so the first rows can be crossed until the first pushed snapshot arrives 2–3 s later | Hold back writing until the book is no longer crossed |
 | WazirX public trades are not recorded | The hummingbot connector has no trade stream | Add a trade stream to the WazirX connector |
 | Recordings from 2–12 Nov 2026 for CoinDCX are corrupt | An older recorder stored differences as whole books. About 60% of rows are wrong | Do not backtest on those days; re-record |

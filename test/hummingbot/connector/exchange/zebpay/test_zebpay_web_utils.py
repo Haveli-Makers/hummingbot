@@ -21,13 +21,6 @@ class ZebpayWebUtilsTests(unittest.IsolatedAsyncioTestCase):
         from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
         self.assertIsInstance(web_utils.build_api_factory(), WebAssistantsFactory)
 
-    async def test_pre_processor_sets_user_agent(self):
-        from hummingbot.core.web_assistant.connections.data_types import RESTMethod, RESTRequest
-        request = RESTRequest(method=RESTMethod.GET, url="https://example.com", headers={"X-Other": "1"})
-        request = await web_utils.ZebpayRESTPreProcessor().pre_process(request)
-        self.assertEqual(CONSTANTS.USER_AGENT, request.headers["User-Agent"])
-        self.assertEqual("1", request.headers["X-Other"])
-
     async def test_server_time_is_milliseconds(self):
         t = await web_utils.get_current_server_time()
         # Milliseconds since epoch are ~1.7e12; seconds would be ~1.7e9.

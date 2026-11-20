@@ -36,7 +36,6 @@ class ZebpayAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._connector = connector
         self._api_factory = api_factory
         self._domain = domain
-        self._seen_trade_ids: Dict[str, Dict[str, None]] = {}
 
     def _time(self) -> float:
         return time.time()
@@ -169,31 +168,12 @@ class ZebpayAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     raise trades_resp
                 trades = unwrap_data(trades_resp)
                 trades = trades if isinstance(trades, list) else []
-                for trade in self._new_trades(trading_pair, trades):
-                    trade["_trading_pair"] = trading_pair
-                    trade_queue.put_nowait(trade)
+                for trade in trades:
+                    if isinstance(trade, dict):
+                        trade["_trading_pair"] = trading_pair
+                        trade_queue.put_nowait(trade)
             except Exception as exc:
                 self.logger().warning(f"Error fetching Zebpay trades for {trading_pair}: {exc}")
-
-    def _new_trades(self, trading_pair: str, trades: List[Any]) -> List[Dict[str, Any]]:
-        """
-        Returns the trades not queued by an earlier poll, oldest first.
-        Each poll returns the most recent trades, so without this every trade would be queued once per poll.
-        """
-        seen = self._seen_trade_ids.setdefault(trading_pair, {})
-        new_trades = []
-        for trade in trades:
-            if not isinstance(trade, dict):
-                continue
-            trade_id = str(trade.get("id", trade.get("tradeId", "")))
-            if trade_id == "" or trade_id in seen:
-                continue
-            seen[trade_id] = None
-            new_trades.append(trade)
-        while len(seen) > CONSTANTS.MAX_SEEN_TRADE_IDS:
-            del seen[next(iter(seen))]
-        new_trades.sort(key=lambda t: float(t.get("timestamp", t.get("createdAt", 0)) or 0))
-        return new_trades
 
     async def _request_public_trades(self, trading_pair: str):
         """GET the recent public trades for one pair. Raises on failure (caller isolates)."""

@@ -6,21 +6,7 @@ from hummingbot.connector.time_synchronizer import TimeSynchronizer
 from hummingbot.connector.utils import TimeSynchronizerRESTPreProcessor
 from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
 from hummingbot.core.web_assistant.auth import AuthBase
-from hummingbot.core.web_assistant.connections.data_types import RESTRequest
-from hummingbot.core.web_assistant.rest_pre_processors import RESTPreProcessorBase
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
-
-
-class ZebpayRESTPreProcessor(RESTPreProcessorBase):
-    """
-    Sets a User-Agent on every request; Zebpay's Cloudflare front blocks aiohttp's default one.
-    """
-
-    async def pre_process(self, request: RESTRequest) -> RESTRequest:
-        headers = request.headers or {}
-        headers["User-Agent"] = CONSTANTS.USER_AGENT
-        request.headers = headers
-        return request
 
 
 def public_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
@@ -56,13 +42,12 @@ def build_api_factory(
                 synchronizer=time_synchronizer,
                 time_provider=effective_time_provider,
             ),
-            ZebpayRESTPreProcessor(),
         ],
     )
 
 
 def build_api_factory_without_time_synchronizer_pre_processor(throttler: AsyncThrottler) -> WebAssistantsFactory:
-    return WebAssistantsFactory(throttler=throttler, rest_pre_processors=[ZebpayRESTPreProcessor()])
+    return WebAssistantsFactory(throttler=throttler)
 
 
 def create_throttler() -> AsyncThrottler:

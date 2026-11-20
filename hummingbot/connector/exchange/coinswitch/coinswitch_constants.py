@@ -35,7 +35,7 @@ TRADING_FEE_PATH_URL = "/trade/api/v2/tradingFee"
 
 WS_HEARTBEAT_TIME_INTERVAL = 30
 
-WS_SPOT_SOCKETIO_PATH = "/pro/realtime-rates-socket/spot/{exchange}"
+WS_SPOT_SOCKETIO_PATH = "pro/realtime-rates-socket/spot"
 WS_ORDER_UPDATES_SOCKETIO_PATH = "pro/realtime-rates-socket/spot/order-updates"
 WS_BALANCE_UPDATES_SOCKETIO_PATH = "pro/realtime-rates-socket/spot/balance-updates"
 

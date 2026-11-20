@@ -11,10 +11,6 @@ MAX_ORDER_ID_LEN = 32
 # Spot API base URL (REST only — Zebpay spot exposes no WebSocket feed).
 REST_URL = "https://sapi.zebpay.com"
 
-USER_AGENT = "hummingbot"
-
-MAX_SEEN_TRADE_IDS = 1000
-
 # ── Public endpoints (no auth required) ───────────────────────────────────────
 EXCHANGE_INFO_PATH_URL = "/api/v2/ex/exchangeInfo"
 CURRENCIES_PATH_URL = "/api/v2/ex/currencies"

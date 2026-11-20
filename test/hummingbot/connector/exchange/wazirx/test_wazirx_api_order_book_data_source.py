@@ -5,15 +5,10 @@ from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCa
 from typing import Dict
 from unittest.mock import AsyncMock, patch
 
-from bidict import bidict
-
-from hummingbot.connector.exchange.wazirx import wazirx_constants as CONSTANTS
 from hummingbot.connector.exchange.wazirx.wazirx_api_order_book_data_source import WazirxAPIOrderBookDataSource
 from hummingbot.connector.exchange.wazirx.wazirx_exchange import WazirxExchange
 from hummingbot.connector.test_support.network_mocking_assistant import NetworkMockingAssistant
-from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.order_book_message import OrderBookMessage, OrderBookMessageType
-from hummingbot.core.web_assistant.connections.data_types import WSResponse
 
 
 class WazirxAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
@@ -269,118 +264,6 @@ class WazirxAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
             await task
         except asyncio.CancelledError:
             pass
-
-    # ---- websocket streams ----------------------------------------------------------------------------------------
-
-    def _set_symbol_map(self):
-        self.connector._set_trading_pair_symbol_map(bidict({self.ex_trading_pair.lower(): self.trading_pair}))
-
-    def _ws_depth_event(self, symbol=None) -> Dict:
-        symbol = symbol or self.ex_trading_pair.lower()
-        return {"data": {"E": 1631682370, "s": symbol,
-                         "b": [["100.0", "1.0"], ["99.0", "2.0"]],
-                         "a": [["101.0", "1.5"], ["102.0", "0.5"]]},
-                "stream": f"{symbol}@depth20@100ms"}
-
-    def _ws_trades_event(self) -> Dict:
-        symbol = self.ex_trading_pair.lower()
-        return {"data": {"trades": [
-            {"E": 1631681323000, "S": "buy", "a": 1, "b": 2, "m": True, "p": "100.5", "q": "0.1", "s": symbol, "t": 17},
-            {"E": 1631681323500, "S": "buy", "a": 3, "b": 4, "m": False, "p": "100.6", "q": "0.2", "s": symbol, "t": 18},
-        ]}, "stream": f"{symbol}@trades"}
-
-    async def test_subscribe_channels_sends_one_message_with_depth_and_trade_streams(self):
-        self._set_symbol_map()
-        ws = AsyncMock()
-        await self.data_source._subscribe_channels(ws)
-        ws.send.assert_awaited_once()
-        payload = ws.send.call_args.args[0].payload
-        symbol = self.ex_trading_pair.lower()
-        self.assertEqual({"event": "subscribe", "streams": [f"{symbol}@depth20@100ms", f"{symbol}@trades"]}, payload)
-
-    def test_channel_routing(self):
-        self.assertEqual(self.data_source._snapshot_messages_queue_key,
-                         self.data_source._channel_originating_message(self._ws_depth_event()))
-        self.assertEqual(self.data_source._trade_messages_queue_key,
-                         self.data_source._channel_originating_message(self._ws_trades_event()))
-        for control in ({"event": "pong", "data": {"timeout_duration": 1800}}, {"event": "subscribed"}, {}):
-            self.assertEqual("", self.data_source._channel_originating_message(control))
-
-    async def test_depth_event_becomes_full_snapshot(self):
-        self._set_symbol_map()
-        with patch.object(self.data_source, "_time", return_value=1700000000.5):
-            await self.data_source._parse_order_book_snapshot_message(self._ws_depth_event(), self.msg_queue)
-        message: OrderBookMessage = self.msg_queue.get_nowait()
-        self.assertEqual(OrderBookMessageType.SNAPSHOT, message.type)
-        self.assertEqual(self.trading_pair, message.trading_pair)
-        self.assertEqual([100.0, 99.0], [row.price for row in message.bids])
-        self.assertEqual([101.0, 102.0], [row.price for row in message.asks])
-        self.assertEqual(1700000000.5, message.timestamp)
-        self.assertEqual(1700000000500, message.update_id)
-
-    async def test_depth_event_for_unknown_symbol_is_ignored(self):
-        self._set_symbol_map()
-        await self.data_source._parse_order_book_snapshot_message(self._ws_depth_event("unknownpair"), self.msg_queue)
-        self.assertTrue(self.msg_queue.empty())
-
-    async def test_trades_event_yields_one_message_per_trade(self):
-        self._set_symbol_map()
-        await self.data_source._parse_trade_message(self._ws_trades_event(), self.msg_queue)
-        first, second = self.msg_queue.get_nowait(), self.msg_queue.get_nowait()
-        self.assertTrue(self.msg_queue.empty())
-        self.assertEqual(OrderBookMessageType.TRADE, first.type)
-        self.assertEqual(float(TradeType.SELL.value), first.content["trade_type"])    # buyer was maker -> taker sold
-        self.assertEqual(float(TradeType.BUY.value), second.content["trade_type"])
-        self.assertEqual([17, 18], [first.trade_id, second.trade_id])
-        self.assertEqual(1631681323.0, first.timestamp)                               # trade "E" is in milliseconds
-
-    async def test_failed_rest_snapshot_raises_instead_of_returning_empty_book(self):
-        self._set_symbol_map()
-        for bad in ({}, {"message": "Too many api request", "code": 2136}):
-            with patch.object(self.data_source, "_request_order_book_snapshot", new_callable=AsyncMock, return_value=bad):
-                with self.assertRaises(IOError):
-                    await self.data_source._order_book_snapshot(self.trading_pair)
-
-    async def test_rest_snapshot_parsed(self):
-        self._set_symbol_map()
-        with patch.object(self.data_source, "_request_order_book_snapshot", new_callable=AsyncMock,
-                          return_value=self.get_order_book_data_mock()):
-            message = await self.data_source._order_book_snapshot(self.trading_pair)
-        self.assertEqual(OrderBookMessageType.SNAPSHOT, message.type)
-        self.assertEqual(2, len(message.bids))
-        self.assertEqual(2, len(message.asks))
-
-    async def test_open_but_silent_market_streams_trigger_reconnect(self):
-        ws = AsyncMock()
-        disconnected = asyncio.Event()
-
-        async def only_pongs():
-            while not disconnected.is_set():
-                await asyncio.sleep(0.01)
-                yield WSResponse(data={"event": "pong", "data": {"timeout_duration": 1800}})
-
-        async def disconnect():
-            disconnected.set()
-
-        ws.iter_messages = only_pongs
-        ws.disconnect.side_effect = disconnect
-        with patch.object(CONSTANTS, "WS_DATA_STALL_TIMEOUT", 0.1), patch.object(CONSTANTS, "WS_WATCHDOG_INTERVAL", 0.02):
-            with self.assertRaises(ConnectionError):
-                await asyncio.wait_for(self.data_source._process_websocket_messages(ws), 2)
-        ws.disconnect.assert_awaited()
-
-    async def test_websocket_messages_are_queued_by_channel(self):
-        ws = AsyncMock()
-        events = [self._ws_depth_event(), self._ws_trades_event(), {"event": "pong", "data": {"timeout_duration": 1800}}]
-
-        async def messages():
-            for event in events:
-                yield WSResponse(data=event)
-
-        ws.iter_messages = messages
-        await self.data_source._process_websocket_messages(ws)
-        self.assertEqual(1, self.data_source._message_queue[self.data_source._snapshot_messages_queue_key].qsize())
-        self.assertEqual(1, self.data_source._message_queue[self.data_source._trade_messages_queue_key].qsize())
 
     async def test_get_last_traded_prices(self):
         mock_prices = {

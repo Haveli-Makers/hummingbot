@@ -26,8 +26,6 @@ MY_TRADES_PATH_URL = "/v1/myTrades"
 CREATE_AUTH_TOKEN_PATH_URL = "/v1/create_auth_token"
 
 WS_HEARTBEAT_TIME_INTERVAL = 30
-WS_DATA_STALL_TIMEOUT = 60
-WS_WATCHDOG_INTERVAL = 5
 
 SIDE_BUY = "BUY"
 SIDE_SELL = "SELL"
@@ -43,9 +41,6 @@ ORDER_STATE = {
     "done": OrderState.FILLED,
     "cancel": OrderState.CANCELED,
 }
-
-DEPTH_EVENT_TYPE = "depth20@100ms"
-TRADE_EVENT_TYPE = "trades"
 
 # WazirX rate-limits each API key separately; an account can have up to 5 keys.
 MAX_API_KEYS = 5
@@ -83,7 +78,7 @@ RATE_LIMITS = [
     RateLimit(limit_id=EXCHANGE_INFO_PATH_URL, limit=1, time_interval=ONE_SECOND),
     RateLimit(limit_id=TICKERS_PATH_URL, limit=1, time_interval=ONE_SECOND),
     RateLimit(limit_id=TICKER_24HR_PATH_URL, limit=1, time_interval=ONE_SECOND),
-    RateLimit(limit_id=DEPTH_PATH_URL, limit=1, time_interval=ONE_SECOND),
+    RateLimit(limit_id=DEPTH_PATH_URL, limit=2, time_interval=ONE_SECOND),
     RateLimit(limit_id=TRADE_HISTORY_PATH_URL, limit=1, time_interval=ONE_SECOND),
     RateLimit(limit_id=USER_BALANCES_PATH_URL, limit=1, time_interval=SIGNED_RATE_LIMIT_WINDOW),
     RateLimit(limit_id=CREATE_ORDER_LIMIT_ID, limit=10, time_interval=SIGNED_RATE_LIMIT_WINDOW),

@@ -61,8 +61,10 @@ class Strategy:
 class Backtest:
     def __init__(self, connector: str, pair: str, start: str, end: Optional[str] = None,
                  maker_fee: float = 0.001, taker_fee: float = 0.001, latency_ms: float = 100,
-                 fill_at_touch: bool = False, base_dir: str = DEFAULT_DIR):
+                 fill_at_touch: bool = False, base_dir: str = DEFAULT_DIR,
+                 start_ts: Optional[float] = None, end_ts: Optional[float] = None):
         self.connector, self.pair, self.start, self.end = connector, pair, start, end
+        self.start_ts, self.end_ts = start_ts, end_ts
         self.maker_fee, self.taker_fee = maker_fee, taker_fee
         self.latency = latency_ms / 1000
         self.fill_at_touch = fill_at_touch
@@ -188,7 +190,8 @@ class Backtest:
 
     def run(self, strategy: Strategy) -> "BacktestResult":
         started = False
-        for kind, ts, event in replay(self.connector, self.pair, self.start, self.end, self.base_dir):
+        for kind, ts, event in replay(self.connector, self.pair, self.start, self.end, self.base_dir,
+                                      start_ts=self.start_ts, end_ts=self.end_ts):
             self.now = ts
             self._process_order_lifecycle(strategy, ts)
             if kind == "book":

@@ -205,11 +205,24 @@ def find_gaps(df: pd.DataFrame, min_gap_sec: float = 60) -> pd.DataFrame:
 
 
 def replay(connector: str, pair: str, start: str, end: Optional[str] = None,
-           base_dir: str = DEFAULT_DIR) -> Iterator[Tuple[str, float, dict]]:
-    """Merged, time-ordered stream of ("book" | "trade", ts, event). Streams from disk, so works for long ranges."""
+           base_dir: str = DEFAULT_DIR, start_ts: Optional[float] = None,
+           end_ts: Optional[float] = None) -> Iterator[Tuple[str, float, dict]]:
+    """
+    Merged, time-ordered stream of ("book" | "trade", ts, event). Streams from disk, so works for long ranges.
+
+    ``start`` / ``end`` pick the day files; ``start_ts`` / ``end_ts`` (unix seconds, end exclusive) then trim
+    the stream to an exact window. The trim happens after the book is rebuilt, so the first book yielded
+    inside the window is the full book at that moment, not a partial one built from mid-day differences.
+    """
     books = (("book", r["ts"], r) for r in iter_rows(connector, pair, "book", start, end, base_dir))
     trades = (("trade", r["ts"], r) for r in iter_rows(connector, pair, "trades", start, end, base_dir))
-    yield from heapq.merge(books, trades, key=lambda e: e[1])
+    for event in heapq.merge(books, trades, key=lambda e: e[1]):
+        ts = event[1]
+        if start_ts is not None and ts < start_ts:
+            continue
+        if end_ts is not None and ts >= end_ts:
+            break
+        yield event
 
 
 if __name__ == "__main__":

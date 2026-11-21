@@ -5,7 +5,7 @@ import logging
 import math
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Type
@@ -22,7 +22,8 @@ from hummingbot.strategy_v2.executors.dca_executor.data_types import DCAExecutor
 from hummingbot.strategy_v2.executors.grid_executor.data_types import GridExecutorConfig
 from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy, OrderExecutorConfig
 from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig
-from hummingbot.strategy_v2.executors.simple_grid_executor.data_types import SimpleGridExecutorConfig
+# TEMP: simple_grid_executor lands in a separate PR. Restore this import (and the check in _build_plan) once merged.
+# from hummingbot.strategy_v2.executors.simple_grid_executor.data_types import SimpleGridExecutorConfig
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, StopExecutorAction
 from hummingbot.strategy_v2.models.executors import CloseType
@@ -1616,7 +1617,8 @@ class OrderbookBacktestingEngine:
                 f"requested is {pair}. They must match.")
 
     async def load_candles(self, controller_config: ControllerConfigBase, connector: str, pair: str,
-                           start: str, end: Optional[str] = None, base_dir: Optional[str] = None) -> None:
+                           start: str, end: Optional[str] = None, base_dir: Optional[str] = None,
+                           start_ts: Optional[float] = None, end_ts: Optional[float] = None) -> None:
         self._require_replayable(controller_config, pair)
         config = self._with_validated_defaults(controller_config)
         controller = self._get_controller_class(config)(
@@ -1625,6 +1627,13 @@ class OrderbookBacktestingEngine:
         if not candles_configs:
             return
         span = _recording_span(connector, pair, start, end, base_dir)
+        if span is not None:
+            first, last = span
+            if start_ts is not None:
+                first = max(first, int(start_ts))
+            if end_ts is not None:
+                last = min(last, int(math.ceil(end_ts)))
+            span = (first, last) if first < last else None
         if span is not None:
             await self.backtesting_data_provider.load_candles(candles_configs, *span)
 
@@ -1646,9 +1655,14 @@ class OrderbookBacktestingEngine:
         post_only_entries: bool = False,
         strict_errors: bool = True,
         base_dir: Optional[str] = None,
+        start_ts: Optional[float] = None,
+        end_ts: Optional[float] = None,
     ) -> Dict:
         """
         Replay ``connector``/``pair`` over ``[start, end]`` and run the controller against it.
+
+        ``start`` / ``end`` are UTC dates that select the recorded day files. ``start_ts`` / ``end_ts``
+        (unix seconds, end exclusive) optionally trim the replay to an exact window inside them.
         """
         from backtest_data import DEFAULT_DIR, NoDataError, require_data
         from backtest_engine import Backtest, Order, Strategy
@@ -1664,9 +1678,11 @@ class OrderbookBacktestingEngine:
             import uuid
             controller_config.id = str(uuid.uuid4())[:8]
 
-        await self.load_candles(controller_config, connector, pair, start, end, base_dir)
+        await self.load_candles(controller_config, connector, pair, start, end, base_dir,
+                                start_ts=start_ts, end_ts=end_ts)
 
-        bt = Backtest(connector, pair, start, end, maker_fee, taker_fee, latency_ms, fill_at_touch, base_dir)
+        bt = Backtest(connector, pair, start, end, maker_fee, taker_fee, latency_ms, fill_at_touch, base_dir,
+                      start_ts=start_ts, end_ts=end_ts)
 
         resolved_tick = tick_size if tick_size and tick_size > 0 else _infer_tick_size(
             connector, pair, start, end, base_dir=base_dir)
@@ -1758,6 +1774,8 @@ class OrderbookBacktestingEngine:
 
         if state["books"] == 0:
             range_str = f"{start}" if not end or end == start else f"{start}..{end}"
+            if start_ts is not None or end_ts is not None:
+                range_str = f"{_fmt_ts(start_ts)} .. {_fmt_ts(end_ts)} UTC"
             raise NoDataError(
                 f"Found files for {connector} {pair} but no book updates were replayed over "
                 f"{range_str}. The files may be empty or outside this range.")
@@ -2012,8 +2030,6 @@ def _simulator_class(config) -> Type[_ExecutorSim]:
 
 def _build_plan(config, market: _Market, post_only: bool = False) -> Optional[_Plan]:
     """Translate an executor config into the behaviour the simulated executor should follow."""
-    if isinstance(config, SimpleGridExecutorConfig):
-        return _simple_grid_plan(config, post_only)
     if isinstance(config, GridExecutorConfig):
         return _grid_plan(config)
     if isinstance(config, PositionExecutorConfig):
@@ -2131,6 +2147,12 @@ def _jsonable(value, _depth: int = 0):
     if isinstance(value, (list, tuple, set)):
         return [_jsonable(item, _depth + 1) for item in value]
     return str(value)
+
+
+def _fmt_ts(ts: Optional[float]) -> str:
+    if ts is None:
+        return "open"
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _recording_span(connector: str, pair: str, start: str, end: Optional[str],

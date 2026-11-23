@@ -278,7 +278,9 @@ class WazirxExchange(WalletTransferExecutorMixin, ExchangePyBase):
             "Signature is incorrect" (code 2005).
         """
         params = params or {}
-        if is_auth_required:
+        if is_auth_required and auth is None and not params_in_query:
+            # Everything signed with the trading keys goes through the key pool. Wallet transfers
+            # sign with the master account, or need the params in the query string, below.
             return await self._signed_request(method=method.upper(), path=path, params=params)
 
         url = f"{CONSTANTS.REST_URL}{path}"

@@ -1,0 +1,486 @@
+"""
+Cross-arb controller: the decision to trade, and every reason not to.
+
+The executor is tested separately; here the question is only whether the controller reads the two
+books correctly, sizes an order both venues would accept, and refuses in every case where trading
+would be unsafe — each refusal named, because "why is it not trading?" is the question an operator
+asks first.
+"""
+import asyncio
+from datetime import datetime, timedelta
+from decimal import Decimal
+from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+from controllers.generic.cross_arb import IST, CrossArbConfig, CrossArbController, TriggerOn
+from hummingbot.connector.trading_rule import TradingRule
+from hummingbot.core.data_type.order_book_row import OrderBookRow
+from hummingbot.data_feed.market_data_provider import MarketDataProvider
+from hummingbot.strategy_v2.models.executors import CloseType
+
+D = Decimal
+START_TS = 1_790_000_000
+PAIR = "USDT-INR"
+
+
+class FakeBook:
+    """Only what the controller reads: the top of each side, and whether the venue is still talking."""
+
+    def __init__(self, bid, bid_qty, ask, ask_qty, uid=1):
+        self.bid, self.bid_qty, self.ask, self.ask_qty = D(bid), D(bid_qty), D(ask), D(ask_qty)
+        self.snapshot_uid = uid
+
+    def bid_entries(self):
+        yield OrderBookRow(float(self.bid), float(self.bid_qty), self.snapshot_uid)
+
+    def ask_entries(self):
+        yield OrderBookRow(float(self.ask), float(self.ask_qty), self.snapshot_uid)
+
+
+class CrossArbControllerTests(IsolatedAsyncioWrapperTestCase):
+    """
+    Default market: CSX sells at 99.00, WazirX buys at 100.00 — a 1.01% gap, buy CSX / sell WazirX.
+    Fees are the measured ones: CSX 0.05% taker, WazirX 0%, 1% TDS on the sell.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.now = START_TS
+        self.books = {
+            ("csx", PAIR): FakeBook("98.90", "500", "99.00", "500"),
+            ("wazirx", PAIR): FakeBook("100.00", "500", "100.10", "500"),
+        }
+        self.balances = {("csx", "INR"): D("100000"), ("csx", "USDT"): D("1000"),
+                         ("wazirx", "INR"): D("100000"), ("wazirx", "USDT"): D("1000")}
+        self.steps = {"csx": D("0.01"), "wazirx": D("0.01")}
+        self.rules = {"csx": TradingRule(PAIR, min_order_size=D("0.01"), min_notional_size=D("60")),
+                      "wazirx": TradingRule(PAIR, min_order_size=D("0.01"), min_notional_size=D("50"))}
+
+        provider = MagicMock(spec=MarketDataProvider)
+        provider.time.side_effect = lambda: self.now
+        provider.get_order_book.side_effect = lambda ex, pair: self.books[(ex, pair)]
+        provider.get_trading_rules.side_effect = lambda ex, pair: self.rules[ex]
+        provider.quantize_order_amount.side_effect = self._quantize
+        provider.get_connector.side_effect = self._connector
+        self.provider = provider
+
+    def _quantize(self, exchange, pair, amount):
+        step = self.steps[exchange]
+        return (D(str(amount)) // step) * step
+
+    def _connector(self, exchange):
+        connector = MagicMock()
+        connector.get_available_balance.side_effect = lambda asset: self.balances.get((exchange, asset), D("0"))
+        return connector
+
+    def controller(self, **overrides) -> CrossArbController:
+        params = dict(id="arb-1", exchange_a="csx", exchange_b="wazirx", trading_pairs=[PAIR],
+                      min_profitability=D("0.01"), order_amount_quote=D("10000"),
+                      min_order_amount_quote=D("100"),
+                      taker_fee_pct={"csx": D("0.05"), "wazirx": D("0")}, gst_pct=D("18"), tds_pct=D("1"))
+        params.update(overrides)
+        return CrossArbController(CrossArbConfig(**params), self.provider, asyncio.Queue())
+
+    def executor(self, active=True, pair=PAIR, close_type=None, pnl=D("0"), executor_id="e1",
+                 amount=D("10"), price=D("99"), sell_price=D("100"), custom_info=None):
+        return SimpleNamespace(
+            id=executor_id, is_active=active, close_type=close_type, net_pnl_quote=pnl,
+            custom_info=custom_info or {},
+            config=SimpleNamespace(buying_market=SimpleNamespace(connector_name="csx", trading_pair=pair),
+                                   selling_market=SimpleNamespace(connector_name="wazirx", trading_pair=pair),
+                                   order_amount=amount, buy_price_cap=price, sell_price_floor=sell_price))
+
+    def made_today(self, controller, pnl):
+        """Today's cash so far: one finished attempt that made ``pnl``."""
+        controller.executors_info.append(self.executor(active=False, close_type=CloseType.COMPLETED, pnl=D(pnl),
+                                                       executor_id=f"done-{len(controller.executors_info)}"))
+        controller.account_for_finished_executors()
+
+    def relaxed(self, **overrides) -> CrossArbController:
+        """The team lead's TDS rule: 1.25% always, 0.8% on cash already made, floor 100. The default
+        market's 1.01% gap sits between the two; one 10,000 trade there is 101.01 USDT and, at its
+        price limits, takes 101.01 * (100 * 0.99 - 99 * 1.00059) = -5.90 from today's cash."""
+        params = dict(min_profitability=D("0.0125"), relaxed_min_profitability=D("0.008"),
+                      cash_floor_quote=D("100"))
+        params.update(overrides)
+        return self.controller(**params)
+
+    async def opportunities(self, controller):
+        await controller.update_processed_data()
+        return {(o.buy_exchange, o.sell_exchange): o for o in controller.processed_data["opportunities"]}
+
+    # ── reading the market ───────────────────────────────────────────────────
+
+    async def test_both_directions_are_priced(self):
+        controller = self.controller()
+        found = await self.opportunities(controller)
+        good = found[("csx", "wazirx")]
+        self.assertAlmostEqual(float(good.gross_pct), 1.0101, places=3)
+        # net = [100 * (1 - 0 - 0.01)] - [99 * (1 + 0.0005 * 1.18)] = 99.0 - 99.05841, over 99.
+        # A 1% gap does not survive 1% TDS: that is the whole economics of this strategy.
+        self.assertAlmostEqual(float(good.net_pct), -0.059, places=3)
+        self.assertIsNone(good.blocked_by)
+        self.assertEqual(found[("wazirx", "csx")].blocked_by, "gap below threshold")
+
+    async def test_trigger_can_use_the_net_number_instead(self):
+        controller = self.controller(trigger_on=TriggerOn.NET, min_profitability=D("0.005"))
+        found = await self.opportunities(controller)
+        # gross is 1.01% but net is negative, so on NET it must not trade
+        self.assertEqual(found[("csx", "wazirx")].blocked_by, "gap below threshold")
+
+    async def test_a_book_that_stops_updating_is_refused(self):
+        controller = self.controller()
+        await controller.update_processed_data()          # first look: remembers the snapshot id
+        self.now += 11                                    # max_book_age is 10s, id unchanged
+        found = await self.opportunities(controller)
+        self.assertEqual(found[("csx", "wazirx")].blocked_by, "no fresh book: csx, wazirx")
+        self.assertGreater(controller.processed_data["skips"]["no fresh book"], 0)
+
+    async def test_a_stale_row_names_the_silent_venue_and_shows_no_fake_price(self):
+        """B3 live: every row read 'no fresh book' with ask 0 / bid 0, and nothing said which feed."""
+        controller = self.controller()
+        await controller.update_processed_data()
+        self.now += 11
+        self.books[("csx", PAIR)].snapshot_uid += 1       # CSX still talking, WazirX silent
+        found = await self.opportunities(controller)
+        row = found[("csx", "wazirx")]
+        self.assertEqual(row.blocked_by, "no fresh book: wazirx")
+        shown = row.as_row()
+        self.assertEqual(shown["ask"], "99.0")            # CSX's price is real and still shown
+        self.assertEqual((shown["bid"], shown["gross %"], shown["size quote"]), ("-", "-", "-"))
+
+    async def test_a_quiet_but_live_book_is_fine(self):
+        """Prices repeating is normal here; a new snapshot id is what proves the venue is talking."""
+        controller = self.controller()
+        await controller.update_processed_data()
+        self.now += 30
+        for book in self.books.values():
+            book.snapshot_uid += 1                        # same prices, fresh snapshot
+        found = await self.opportunities(controller)
+        self.assertIsNone(found[("csx", "wazirx")].blocked_by)
+
+    # ── sizing ───────────────────────────────────────────────────────────────
+
+    async def test_size_is_capped_by_the_thinner_side(self):
+        self.books[("wazirx", PAIR)] = FakeBook("100.00", "3", "100.10", "500")   # only 3 on the bid
+        controller = self.controller()
+        found = await self.opportunities(controller)
+        self.assertEqual(found[("csx", "wazirx")].amount, D("3"))
+
+    async def test_size_is_capped_by_the_operator_and_by_balances(self):
+        controller = self.controller(order_amount_quote=D("990"))
+        found = await self.opportunities(controller)
+        self.assertEqual(found[("csx", "wazirx")].amount, D("10"))                 # 990 / 99
+
+        self.balances[("wazirx", "USDT")] = D("2")                                 # nothing to deliver
+        found = await self.opportunities(controller)
+        self.assertEqual(found[("csx", "wazirx")].amount, D("2"))
+
+    async def test_size_must_be_valid_on_both_venues(self):
+        """A coarser step on one venue decides the amount, or the two legs would not match."""
+        self.steps["wazirx"] = D("0.1")
+        controller = self.controller(order_amount_quote=D("1000"))
+        found = await self.opportunities(controller)
+        self.assertEqual(found[("csx", "wazirx")].amount, D("10.1"))               # 10.10 not 10.101
+
+    async def test_below_the_operator_minimum_is_refused(self):
+        self.books[("wazirx", PAIR)] = FakeBook("100.00", "0.5", "100.10", "500")  # 50 INR of depth
+        controller = self.controller(min_order_amount_quote=D("100"))
+        found = await self.opportunities(controller)
+        self.assertEqual(found[("csx", "wazirx")].blocked_by, "below min order value (100)")
+
+    async def test_below_a_venue_minimum_is_refused(self):
+        self.books[("wazirx", PAIR)] = FakeBook("100.00", "0.61", "100.10", "500")  # 60 INR
+        controller = self.controller(min_order_amount_quote=D("10"))
+        found = await self.opportunities(controller)
+        # CSX needs 60 INR of notional at its own price (0.61 * 99 = 60.39 clears it), WazirX 50 -
+        # so raise CSX's floor to show the check bites
+        self.rules["csx"] = TradingRule(PAIR, min_order_size=D("0.01"), min_notional_size=D("100"))
+        found = await self.opportunities(controller)
+        self.assertEqual(found[("csx", "wazirx")].blocked_by, "below a venue minimum")
+
+    async def test_no_balance_is_named(self):
+        self.balances[("wazirx", "USDT")] = D("0")
+        controller = self.controller()
+        found = await self.opportunities(controller)
+        self.assertEqual(found[("csx", "wazirx")].blocked_by, "not enough USDT on wazirx")
+
+    async def test_a_balance_too_small_for_one_step_is_named_not_called_rounding(self):
+        """The replay: WazirX ran out of INR and the status said 'rounds to zero' 467 times."""
+        self.balances[("csx", "INR")] = D("0.5")          # less than one 0.01 step at 99
+        controller = self.controller()
+        found = await self.opportunities(controller)
+        self.assertEqual(found[("csx", "wazirx")].blocked_by, "not enough INR on csx")
+
+    async def test_a_balance_below_the_minimum_is_named_too(self):
+        self.balances[("csx", "INR")] = D("50")           # 0.5 USDT, under the 100 minimum
+        controller = self.controller()
+        found = await self.opportunities(controller)
+        self.assertEqual(found[("csx", "wazirx")].blocked_by, "not enough INR on csx")
+
+    # ── the total budget ─────────────────────────────────────────────────────
+
+    async def test_the_total_budget_caps_an_attempt(self):
+        controller = self.controller(order_amount_quote=D("10000"), total_amount_quote=D("500"))
+        found = await self.opportunities(controller)
+        self.assertEqual(found[("csx", "wazirx")].amount, D("5.05"))              # 500 / 99, stepped
+
+    async def test_live_attempts_use_up_the_budget(self):
+        controller = self.controller(total_amount_quote=D("1000"))
+        controller.executors_info = [self.executor(active=True, pair="SOL-INR", amount=D("10"), price=D("99"))]
+        found = await self.opportunities(controller)                              # 990 already in play
+        self.assertEqual(found[("csx", "wazirx")].blocked_by, "total budget in use")
+
+    async def test_attempts_started_together_share_the_budget(self):
+        second = "SOL-INR"
+        self.books[("csx", second)] = FakeBook("98.90", "500", "99.00", "500")
+        self.books[("wazirx", second)] = FakeBook("100.00", "500", "100.10", "500")
+        self.balances.update({("csx", "SOL"): D("1000"), ("wazirx", "SOL"): D("1000")})
+        controller = self.controller(trading_pairs=[PAIR, second], order_amount_quote=D("990"),
+                                     total_amount_quote=D("1500"))
+        await controller.update_processed_data()
+        actions = controller.determine_executor_actions()
+        self.assertEqual(len(actions), 1)                  # 990 + 990 would exceed 1500
+        self.assertEqual(controller.processed_data["skips"].get("total budget in use", 0) +
+                         controller._skips["total budget in use"], 1)
+
+    # ── deciding ─────────────────────────────────────────────────────────────
+
+    async def test_action_carries_the_whole_plan(self):
+        controller = self.controller(order_amount_quote=D("990"), fill_timeout=12.0, tds_pct=D("1"))
+        await controller.update_processed_data()
+        actions = controller.determine_executor_actions()
+        self.assertEqual(len(actions), 1)
+        config = actions[0].executor_config
+        self.assertEqual(config.buying_market.connector_name, "csx")
+        self.assertEqual(config.selling_market.connector_name, "wazirx")
+        self.assertEqual((config.buy_price_cap, config.sell_price_floor), (D("99.00"), D("100.00")))
+        self.assertEqual(config.order_amount, D("10"))
+        self.assertEqual(config.fill_timeout, 12.0)
+        self.assertEqual(config.tds_pct, D("1"))
+        self.assertEqual(config.controller_id, "arb-1")
+
+    async def test_the_better_direction_wins(self):
+        self.books[("csx", PAIR)] = FakeBook("103.00", "500", "103.10", "500")   # CSX now the dear one
+        controller = self.controller()
+        await controller.update_processed_data()
+        config = controller.determine_executor_actions()[0].executor_config
+        self.assertEqual(config.buying_market.connector_name, "wazirx")
+        self.assertEqual(config.selling_market.connector_name, "csx")
+
+    async def test_one_attempt_per_pair_at_a_time(self):
+        controller = self.controller()
+        controller.executors_info = [self.executor(active=True)]
+        await controller.update_processed_data()
+        self.assertEqual(controller.determine_executor_actions(), [])
+        self.assertEqual(controller.processed_data["skips"].get("executor already running", 0) +
+                         controller._skips["executor already running"], 1)
+
+    async def test_cooldown_between_attempts(self):
+        controller = self.controller(cooldown=30)
+        await controller.update_processed_data()
+        self.assertEqual(len(controller.determine_executor_actions()), 1)
+        await controller.update_processed_data()
+        self.assertEqual(controller.determine_executor_actions(), [])      # still inside the cooldown
+        self.now += 31
+        for book in self.books.values():
+            book.snapshot_uid += 1      # 31s later the venues must have sent something, or it is stale
+        await controller.update_processed_data()
+        self.assertEqual(len(controller.determine_executor_actions()), 1)
+
+    # ── the brakes ───────────────────────────────────────────────────────────
+
+    async def test_kill_switch(self):
+        controller = self.controller(manual_kill_switch=True)
+        await controller.update_processed_data()
+        self.assertEqual(controller.determine_executor_actions(), [])
+        self.assertEqual(controller.halt_reason(), "kill switch on")
+
+    async def test_daily_loss_limit(self):
+        controller = self.controller(max_loss_quote=D("50"))
+        controller.executors_info = [self.executor(active=False, close_type=CloseType.COMPLETED,
+                                                   pnl=D("-60"), executor_id="e-loss")]
+        await controller.update_processed_data()
+        self.assertEqual(controller.determine_executor_actions(), [])
+        self.assertIn("daily loss limit", controller.halt_reason())
+
+    async def test_failures_in_a_row_stop_it_and_a_win_clears_them(self):
+        controller = self.controller(max_consecutive_failures=2)
+        controller.executors_info = [
+            self.executor(active=False, close_type=CloseType.FAILED, executor_id="f1"),
+            self.executor(active=False, close_type=CloseType.INSUFFICIENT_BALANCE, executor_id="f2")]
+        await controller.update_processed_data()
+        self.assertEqual(controller.determine_executor_actions(), [])
+        self.assertIn("failed attempts in a row", controller.halt_reason())
+
+        controller.executors_info.append(
+            self.executor(active=False, close_type=CloseType.COMPLETED, pnl=D("5"), executor_id="w1"))
+        controller.account_for_finished_executors()
+        self.assertIsNone(controller.halt_reason())
+
+    async def test_an_attempt_that_needed_an_unwind_counts_as_a_failure(self):
+        """Dry-run 'reject': WazirX refused every sell, each attempt ended COMPLETED after selling
+        back on CSX at -59.94, and 'failures in a row' stayed at 0 — the brake never fired."""
+        controller = self.controller(max_consecutive_failures=2)
+        unwound = {"flatten_orders": 1}
+        controller.executors_info = [
+            self.executor(active=False, close_type=CloseType.COMPLETED, pnl=D("-6"), executor_id="u1",
+                          custom_info=unwound),
+            self.executor(active=False, close_type=CloseType.COMPLETED, pnl=D("-6"), executor_id="u2",
+                          custom_info=unwound)]
+        await controller.update_processed_data()
+        self.assertEqual(controller.determine_executor_actions(), [])
+        self.assertEqual(controller.halt_reason(), "2 failed attempts in a row")
+
+    async def test_a_clean_attempt_still_clears_the_count(self):
+        controller = self.controller(max_consecutive_failures=2)
+        controller.executors_info = [
+            self.executor(active=False, close_type=CloseType.COMPLETED, pnl=D("-6"), executor_id="u1",
+                          custom_info={"flatten_orders": 1}),
+            self.executor(active=False, close_type=CloseType.COMPLETED, pnl=D("5"), executor_id="w1",
+                          custom_info={"flatten_orders": 0})]
+        controller.account_for_finished_executors()
+        self.assertEqual(controller._consecutive_failures, 0)
+
+    async def test_trades_per_hour(self):
+        controller = self.controller(max_trades_per_hour=1, cooldown=0)
+        await controller.update_processed_data()
+        self.assertEqual(len(controller.determine_executor_actions()), 1)
+        await controller.update_processed_data()
+        self.assertEqual(controller.determine_executor_actions(), [])
+        self.assertEqual(controller.halt_reason(), "trades per hour reached")
+        self.now += 3601
+        self.assertIsNone(controller.halt_reason())
+
+    async def test_a_held_mismatch_pauses_the_pair(self):
+        """mismatch_policy: hold — the design says the controller pauses that pair; now it does."""
+        controller = self.controller()
+        controller.executors_info = [self.executor(
+            active=False, close_type=CloseType.POSITION_HOLD, pnl=D("0.29"), executor_id="held-1",
+            custom_info={"imbalance_base": D("0.7")})]
+        await controller.update_processed_data()          # priced before the held attempt is counted
+        self.assertEqual(controller.determine_executor_actions(), [])
+        await controller.update_processed_data()          # and from now on it shows in the table
+        found = {(o.buy_exchange, o.sell_exchange): o for o in controller.processed_data["opportunities"]}
+        self.assertEqual(found[("csx", "wazirx")].blocked_by, "paused: holding a mismatch")
+        self.assertEqual(controller.determine_executor_actions(), [])
+        self.assertIn("PAUSED USDT-INR", "\n".join(controller.to_format_status()))
+        self.assertEqual(controller._realized_pnl, D("0.29"))   # the kept coin is not counted as a loss
+
+    async def test_finished_attempts_are_counted_once(self):
+        controller = self.controller()
+        controller.executors_info = [self.executor(active=False, close_type=CloseType.COMPLETED,
+                                                   pnl=D("7"), executor_id="e-done")]
+        controller.account_for_finished_executors()
+        controller.account_for_finished_executors()
+        self.assertEqual(controller._realized_pnl, D("7"))
+
+    # ── TDS: the cash floor ──────────────────────────────────────────────────
+
+    async def test_between_the_triggers_it_waits_for_cash_already_made(self):
+        controller = self.relaxed()
+        found = await self.opportunities(controller)
+        self.assertEqual(found[("csx", "wazirx")].blocked_by, "cash floor: needs 1.25%")
+        self.assertTrue(found[("csx", "wazirx")].relaxed)
+
+    async def test_the_trade_must_leave_cash_at_or_above_the_floor(self):
+        """Doubt 2, decided: not 'cash above X', but 'cash still at or above X after this trade'."""
+        controller = self.relaxed()
+        self.made_today(controller, "105")                # 105 - 5.90 = 99.10: below the floor
+        found = await self.opportunities(controller)
+        self.assertEqual(found[("csx", "wazirx")].blocked_by, "cash floor: needs 1.25%")
+
+        self.made_today(controller, "1")                  # 106 - 5.90 = 100.10: clears it
+        found = await self.opportunities(controller)
+        opportunity = found[("csx", "wazirx")]
+        self.assertIsNone(opportunity.blocked_by)
+        self.assertAlmostEqual(float(opportunity.worst_cash), -5.90, places=2)
+        self.assertEqual(len(controller.determine_executor_actions()), 1)
+
+    async def test_a_gap_at_the_main_trigger_never_waits_for_the_floor(self):
+        controller = self.relaxed(min_profitability=D("0.01"))     # the 1.01% gap is now above it
+        await controller.update_processed_data()
+        self.assertEqual(len(controller.determine_executor_actions()), 1)
+
+    async def test_below_the_relaxed_trigger_is_below_threshold(self):
+        controller = self.relaxed(min_profitability=D("0.02"), relaxed_min_profitability=D("0.0105"))
+        self.made_today(controller, "1000")
+        found = await self.opportunities(controller)
+        self.assertEqual(found[("csx", "wazirx")].blocked_by, "gap below threshold")
+
+    async def test_live_attempts_count_against_the_room(self):
+        """A live attempt's possible loss is reserved; its possible gain is not counted yet."""
+        controller = self.relaxed(total_amount_quote=D("100000"))
+        self.made_today(controller, "110")                # room 10
+        controller.executors_info.append(self.executor(active=True, pair="SOL-INR", amount=D("101.01")))
+        found = await self.opportunities(controller)      # 10 - 5.90 live - 5.90 this one < 0
+        self.assertEqual(found[("csx", "wazirx")].blocked_by, "cash floor: needs 1.25%")
+
+    async def test_attempts_started_together_share_the_room(self):
+        second = "SOL-INR"
+        self.books[("csx", second)] = FakeBook("98.90", "500", "99.00", "500")
+        self.books[("wazirx", second)] = FakeBook("100.00", "500", "100.10", "500")
+        self.balances.update({("csx", "SOL"): D("1000"), ("wazirx", "SOL"): D("1000")})
+        controller = self.relaxed(trading_pairs=[PAIR, second], total_amount_quote=D("100000"))
+        self.made_today(controller, "110")                # room 10: one -5.90 trade fits, not two
+        await controller.update_processed_data()
+        self.assertEqual(len(controller.determine_executor_actions()), 1)
+        self.assertEqual(controller._skips["cash floor: needs 1.25%"], 1)
+
+    async def test_slippage_counts_in_the_worst_case(self):
+        for exchange in ("csx", "wazirx"):
+            self.rules[exchange] = TradingRule(PAIR, min_order_size=D("0.01"), min_notional_size=D("50"),
+                                               min_price_increment=D("0.01"))
+        plain = (await self.opportunities(self.relaxed()))[("csx", "wazirx")]
+        slipped = (await self.opportunities(self.relaxed(slippage_ticks=2)))[("csx", "wazirx")]
+        # buy 0.02 higher with its fee, sell 0.02 lower after fee and TDS: 101.01 * 0.0398 = 4.02 worse
+        self.assertAlmostEqual(float(plain.worst_cash - slipped.worst_cash), 4.02, places=2)
+
+    async def test_off_when_not_set_or_not_lower(self):
+        for relaxed in (None, D("0.0125"), D("0.02")):
+            controller = self.relaxed(relaxed_min_profitability=relaxed)
+            self.made_today(controller, "1000")
+            found = await self.opportunities(controller)
+            self.assertEqual(found[("csx", "wazirx")].blocked_by, "gap below threshold")
+            self.assertNotIn("relaxed", "\n".join(controller.to_format_status()))
+
+    async def test_the_day_starts_again_at_midnight_in_india(self):
+        controller = self.relaxed()
+        self.made_today(controller, "106")
+        today = datetime.fromtimestamp(self.now, IST).date()
+        midnight_ist = datetime.combine(today + timedelta(days=1), datetime.min.time(), IST).timestamp()
+        self.now = midnight_ist - 1
+        controller.account_for_finished_executors()
+        self.assertEqual(controller._realized_pnl, D("106"))
+        self.now = midnight_ist                           # 18:30 UTC: a UTC clock would not reset yet
+        controller.account_for_finished_executors()
+        self.assertEqual(controller._realized_pnl, D("0"))
+
+    async def test_status_shows_both_triggers_and_the_room(self):
+        controller = self.relaxed()
+        self.made_today(controller, "130.5")
+        await controller.update_processed_data()
+        text = "\n".join(controller.to_format_status())
+        self.assertIn("trigger 1.25% on gross (0.80% while today's cash stays >= 100)", text)
+        self.assertIn("realised today (IST): 130.50", text)
+        self.assertIn("room for relaxed trades: 30.50", text)
+
+    # ── inventory and status ─────────────────────────────────────────────────
+
+    async def test_running_low_raises_a_rebalance_note(self):
+        self.balances[("wazirx", "USDT")] = D("1")        # about 100 INR of coin left to sell
+        controller = self.controller(rebalance_below_quote=D("500"))
+        await controller.update_processed_data()
+        needs = controller.processed_data["rebalance_needs"]
+        self.assertIn("wazirx:USDT", needs)
+        self.assertIn("cannot sell", needs["wazirx:USDT"])
+
+    async def test_status_shows_the_numbers_and_the_reasons(self):
+        controller = self.controller()
+        await controller.update_processed_data()
+        text = "\n".join(controller.to_format_status())
+        self.assertIn("Cross-exchange arbitrage", text)
+        self.assertIn("csx", text)
+        self.assertIn("gross %", text)
+        self.assertIn("not trading because", text)       # the other direction was below threshold

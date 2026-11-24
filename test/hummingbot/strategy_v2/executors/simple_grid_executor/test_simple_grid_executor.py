@@ -1,7 +1,7 @@
 import asyncio
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
-from unittest.mock import MagicMock, PropertyMock, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 from hummingbot.connector.derivative.position import Position
 from hummingbot.connector.exchange_py_base import ExchangePyBase
@@ -797,6 +797,109 @@ class TestSimpleGridExecutor(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(executor.close_type, CloseType.POSITION_HOLD)
         self.assertEqual(executor._status, RunnableStatus.SHUTTING_DOWN)
         self.strategy.sell.assert_not_called()
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    async def test_a_held_position_is_handed_on_and_never_closed(self, mock_price, rules_mock):
+        """
+        The shutdown loop used to reach control_close_order and flatten the position it had
+        been asked to keep, and held_position_orders stayed empty.
+        """
+        mock_price.side_effect = self.price_feed()
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(self.config())
+        self.open_long(executor)
+        take_profit = self.track(executor, "_take_profit_order", "OID-SELL-1", TradeType.SELL, price="105")
+        executor._sleep = AsyncMock()
+
+        executor.early_stop(keep_position=True)
+        self.assertEqual(self.strategy.cancel.call_args.kwargs["order_id"], "OID-SELL-1")
+        take_profit.order.current_state = OrderState.CANCELED
+        executor.process_order_canceled_event(None, MagicMock(), self.cancel_event("OID-SELL-1"))
+        await executor.control_shutdown_process()
+
+        self.strategy.sell.assert_not_called()
+        self.assertEqual(executor.close_type, CloseType.POSITION_HOLD)
+        self.assertEqual(executor.status, RunnableStatus.TERMINATED)
+        self.assertEqual([order["client_order_id"] for order in executor._held_position_orders], ["OID-BUY-1"])
+        self.assertEqual(executor.get_custom_info()["held_amount"], Decimal("1"))
+        self.assertEqual(executor.trade_pnl_quote, Decimal("0"), "nothing was realised")
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    async def test_a_hold_with_nothing_to_hold_is_reported_as_an_early_stop(self, mock_price, rules_mock):
+        mock_price.side_effect = self.price_feed()
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(self.config())
+        entry = self.track(executor, "entry", "OID-BUY-1", TradeType.BUY, price="95")
+        executor._sleep = AsyncMock()
+
+        executor.early_stop(keep_position=True)
+        entry.order.current_state = OrderState.CANCELED
+        executor.process_order_canceled_event(None, MagicMock(), self.cancel_event("OID-BUY-1"))
+        await executor.control_shutdown_process()
+
+        self.assertEqual(executor.close_type, CloseType.EARLY_STOP)
+        self.assertEqual(executor._held_position_orders, [])
+        self.assertEqual(executor.status, RunnableStatus.TERMINATED)
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_a_hold_request_does_not_relabel_a_leg_already_closing(self, mock_price, rules_mock):
+        """A take profit that has filled is a win; calling it a hold would lose it from the tally."""
+        mock_price.side_effect = self.price_feed()
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(self.config())
+        self.open_long(executor)
+        executor.close_type = CloseType.TAKE_PROFIT
+        executor._status = RunnableStatus.SHUTTING_DOWN
+
+        executor.early_stop(keep_position=True)
+
+        self.assertEqual(executor.close_type, CloseType.TAKE_PROFIT)
+
+    def adopt(self, executor, order_id="OID-BUY-2", amount="2", filled="1",
+              state=OrderState.PARTIALLY_FILLED) -> TrackedOrder:
+        """An entry that filled after the venue confirmed its cancel, adopted by the executor."""
+        order = self.register(self.in_flight(order_id, TradeType.BUY, amount=amount, state=state))
+        self.fill(order, filled, "100", trade_id=f"{order_id}-1")
+        tracked = TrackedOrder(order_id=order_id)
+        tracked.order = order
+        executor._adopted_entries.append((TradeType.BUY, tracked))
+        return tracked
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_an_adopted_entry_still_open_is_cancelled_and_waited_for(self, mock_price, rules_mock):
+        """Stopping with its remainder in the book leaves a later fill that nothing watches."""
+        mock_price.side_effect = self.price_feed()
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(self.config())
+        self.open_long(executor)
+        adopted = self.adopt(executor)
+
+        self.assertFalse(executor.all_orders_completed())
+        executor.cancel_open_orders()
+        self.assertIn("OID-BUY-2", [call.kwargs["order_id"] for call in self.strategy.cancel.call_args_list])
+
+        # Once it is no longer open it does not hold anything up.
+        adopted.order.current_state = OrderState.CANCELED
+        self.assertTrue(executor.all_orders_completed())
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_an_adopted_entry_s_fees_are_counted(self, mock_price, rules_mock):
+        """Leaving them out overstated net PnL, which the controller's loss limit is built on."""
+        mock_price.side_effect = self.price_feed()
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(self.config())
+        self.open_long(executor)
+        one_fill = executor.get_cum_fees_quote()
+        self.assertGreater(one_fill, Decimal("0"))
+
+        self.adopt(executor, amount="1", filled="1", state=OrderState.CANCELED)
+
+        self.assertEqual(executor.get_cum_fees_quote(), one_fill * 2)
 
     @patch.object(SimpleGridExecutor, "get_trading_rules")
     @patch.object(SimpleGridExecutor, "get_price")
@@ -2134,6 +2237,119 @@ class TestSimpleGridExecutor(IsolatedAsyncioWrapperTestCase):
 
         self.assertTrue(executor._entry_triggered)
         self.assertIsNone(executor._entry_trigger_pending)
+        self.assertEqual(self.order_args(self.strategy.buy.call_args)["price"], Decimal("102.30"))
+
+    def _trigger_with_resting_buy(self, mock_price, rules_mock, **config):
+        """A long leg whose resting BUY at 95 is being cancelled because the trigger (102) hit."""
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(self.config(**config))
+        mock_price.side_effect = self.price_feed(best_bid="99", best_ask="101", mid="100")
+        executor.control_entry_orders()
+        resting = self.track(executor, "entry", "OID-BUY-1", TradeType.BUY, price="95")
+        self.strategy.buy.reset_mock()
+        mock_price.side_effect = self.price_feed(best_bid="101.9", best_ask="102.1", mid="102")
+        executor.control_entry_orders()
+        return executor, resting
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_the_resting_order_stays_tracked_until_its_cancel_is_confirmed(self, mock_price, rules_mock):
+        """
+        Letting go of it on the cancel REQUEST meant the confirmation matched nothing: the
+        order was never put under watch, so a late fill on it would open a position nobody was
+        watching.
+        """
+        executor, resting = self._trigger_with_resting_buy(mock_price, rules_mock)
+
+        self.assertIs(executor._entry_orders[TradeType.BUY], resting)
+
+        resting.order.current_state = OrderState.CANCELED
+        executor.process_order_canceled_event(None, MagicMock(), self.cancel_event("OID-BUY-1"))
+
+        self.assertIsNone(executor._entry_orders[TradeType.BUY])
+        self.assertEqual([order for _, order, _ in executor._cancelled_entries], [resting])
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_a_fill_racing_the_trigger_s_cancel_is_the_entry(self, mock_price, rules_mock):
+        """The resting order filled before the cancel landed: that IS the position, so no trigger."""
+        executor, resting = self._trigger_with_resting_buy(mock_price, rules_mock)
+
+        self.fill(resting.order, "1", "95")
+        executor.process_order_filled_event(None, MagicMock(), MagicMock(order_id="OID-BUY-1"))
+        type(self.strategy).current_timestamp = PropertyMock(return_value=START_TS + 10)
+        mock_price.side_effect = self.price_feed(best_bid="101.9", best_ask="102.1", mid="102")
+        executor._detect_entry_fill()
+
+        self.assertEqual(executor._filled_side, TradeType.BUY)
+        self.assertIsNone(executor._entry_trigger_pending)
+        self.assertEqual(executor.entry_price, Decimal("95"))
+        self.strategy.buy.assert_not_called()
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_an_unconfirmed_cancel_is_asked_again_and_holds_the_trigger(self, mock_price, rules_mock):
+        """A cancel lost in transit produces no event; the trigger must not go out over a live order."""
+        executor, resting = self._trigger_with_resting_buy(mock_price, rules_mock)
+        self.assertEqual(self.strategy.cancel.call_count, 1)
+
+        type(self.strategy).current_timestamp = PropertyMock(return_value=START_TS + 1)
+        executor.control_entry_orders()
+        self.assertEqual(self.strategy.cancel.call_count, 1, "not re-sent every tick")
+
+        type(self.strategy).current_timestamp = PropertyMock(return_value=START_TS + 5)
+        executor.control_entry_orders()
+
+        self.assertEqual(self.strategy.cancel.call_count, 2)
+        self.assertEqual(self.strategy.cancel.call_args.kwargs["order_id"], "OID-BUY-1")
+        self.strategy.buy.assert_not_called()
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_a_resting_order_not_yet_acknowledged_is_cancelled_not_replaced(self, mock_price, rules_mock):
+        """
+        Before its created event the order has no in-flight state. Replacing it with the
+        trigger would leave it resting on the venue with nothing tracking it.
+        """
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(self.config())
+        mock_price.side_effect = self.price_feed(best_bid="99", best_ask="101", mid="100")
+        executor.control_entry_orders()
+        unacknowledged = executor._entry_orders[TradeType.BUY]
+        self.assertIsNone(unacknowledged.order)
+        self.strategy.buy.reset_mock()
+
+        mock_price.side_effect = self.price_feed(best_bid="101.9", best_ask="102.1", mid="102")
+        executor.control_entry_orders()
+
+        self.assertEqual(self.strategy.cancel.call_args.kwargs["order_id"], unacknowledged.order_id)
+        self.assertIs(executor._entry_orders[TradeType.BUY], unacknowledged)
+        self.strategy.buy.assert_not_called()
+
+    @patch.object(SimpleGridExecutor, "get_trading_rules")
+    @patch.object(SimpleGridExecutor, "get_price")
+    def test_a_both_oco_trigger_does_not_wait_on_the_other_side(self, mock_price, rules_mock):
+        """
+        Only the order cancelled for this trigger is in the way. Waiting on the other side's
+        resting order held the trigger until the entry timed out.
+        """
+        rules_mock.return_value = self.trading_rules()
+        executor = self.running_executor(self.config(entry_mode=SimpleGridEntryMode.BOTH_OCO))
+        mock_price.side_effect = self.price_feed(best_bid="99", best_ask="101", mid="100")
+        executor.control_entry_orders()
+        buy = self.track(executor, "entry", "OID-BUY-1", TradeType.BUY, price="95")
+        self.track(executor, "entry", "OID-SELL-1", TradeType.SELL, price="105")
+        self.strategy.buy.reset_mock()
+
+        mock_price.side_effect = self.price_feed(best_bid="101.9", best_ask="102.1", mid="102")
+        executor.control_entry_orders()
+        buy.order.current_state = OrderState.CANCELED
+        executor.process_order_canceled_event(None, MagicMock(), self.cancel_event("OID-BUY-1"))
+        type(self.strategy).current_timestamp = PropertyMock(return_value=START_TS + 1)
+        mock_price.side_effect = self.price_feed(best_bid="101.9", best_ask="102.1", mid="102")
+        executor.control_entry_orders()
+
+        self.assertTrue(executor._entry_triggered)
         self.assertEqual(self.order_args(self.strategy.buy.call_args)["price"], Decimal("102.30"))
 
     @patch.object(SimpleGridExecutor, "get_trading_rules")

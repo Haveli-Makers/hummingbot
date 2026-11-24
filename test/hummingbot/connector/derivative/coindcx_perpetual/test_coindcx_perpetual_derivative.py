@@ -290,6 +290,24 @@ class CoindcxPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
         self.exchange._sleep.assert_awaited_once_with(
             CONSTANTS.BALANCE_REFRESH_AFTER_CANCEL_DELAY)
 
+    async def test_a_delayed_refresh_is_not_swallowed_by_one_already_running(self):
+        """
+        The OCO path: the fill starts an immediate read, then cancelling the other side asks
+        for one 1.5s later, after the venue releases that order's margin. Dropping the second
+        request left the freed margin invisible until the 120s poll.
+        """
+        self.exchange._trading_required = True
+        self.exchange._update_balances = AsyncMock()
+        self.exchange._sleep = AsyncMock()
+
+        self.exchange._refresh_balances_soon()            # the fill
+        self.exchange._refresh_balances_soon(delay=CONSTANTS.BALANCE_REFRESH_AFTER_CANCEL_DELAY)
+        await self.exchange._balance_refresh_task
+
+        self.assertEqual(2, self.exchange._update_balances.await_count)
+        self.exchange._sleep.assert_awaited_once_with(CONSTANTS.BALANCE_REFRESH_AFTER_CANCEL_DELAY)
+        self.assertIsNone(self.exchange._balance_refresh_again_after)
+
     async def test_a_refused_cancel_does_not_re_read_the_wallet(self):
         """Nothing was released, so there is nothing new to read."""
         self.exchange._trading_required = True
@@ -1273,6 +1291,50 @@ class CoindcxPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
             (exchange_order_id, payload, time.time() - CONSTANTS.PENDING_ORDER_EVENT_TTL - 1)]
         await self.exchange._replay_pending_order_events()
         self.assertEqual(0, len(self.exchange._pending_order_events), "buffer leaked")
+
+    async def test_a_deferred_frame_that_expired_does_not_block_its_resend(self):
+        """
+        The signature used to be recorded when a frame was deferred. If that copy expired
+        unmatched, the venue's resend of the same frame was dropped as a repeat and the fill
+        waited for the REST poll.
+        """
+        self._bootstrap()
+        order = self._track()
+        self.exchange._process_order_event(self._fill_event())
+        exchange_order_id, payload, _ = self.exchange._pending_order_events[0]
+        self.exchange._pending_order_events = [
+            (exchange_order_id, payload, time.time() - CONSTANTS.PENDING_ORDER_EVENT_TTL - 1)]
+        await self.exchange._replay_pending_order_events()
+
+        order.update_exchange_order_id("ex-1")
+        self.exchange._process_order_event(self._fill_event())
+
+        self.assertEqual(Decimal("0.01"), order.executed_amount_base, "the resend was dropped")
+
+    async def test_two_buffered_copies_of_a_frame_are_applied_once(self):
+        self._bootstrap()
+        order = self._track()
+        self.exchange._process_order_event(self._fill_event())
+        self.exchange._process_order_event(self._fill_event())
+        self.assertEqual(2, len(self.exchange._pending_order_events))
+
+        order.update_exchange_order_id("ex-1")
+        with patch.object(self.exchange, "_apply_order_event",
+                          wraps=self.exchange._apply_order_event) as apply:
+            await self.exchange._replay_pending_order_events()
+
+        self.assertEqual(1, apply.call_count)
+        self.assertEqual(1, len(self.exchange._applied_order_events))
+
+    def test_the_repeat_memory_is_bounded_and_forgets_the_oldest(self):
+        self._bootstrap()
+        for index in range(CONSTANTS.MAX_APPLIED_ORDER_EVENTS + 5):
+            self.exchange._remember(self.exchange._applied_order_events, ("ex", str(index), "", ""))
+
+        self.assertEqual(CONSTANTS.MAX_APPLIED_ORDER_EVENTS, len(self.exchange._applied_order_events))
+        self.assertNotIn(("ex", "0", "", ""), self.exchange._applied_order_events)
+        self.assertIn(("ex", str(CONSTANTS.MAX_APPLIED_ORDER_EVENTS + 4), "", ""),
+                      self.exchange._applied_order_events)
 
     def test_pending_buffer_is_bounded(self):
         self._bootstrap()

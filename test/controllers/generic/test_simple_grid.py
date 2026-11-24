@@ -5,13 +5,7 @@ from unittest.mock import MagicMock, PropertyMock
 
 from controllers.generic.simple_grid import SimpleGrid, SimpleGridConfig
 from hummingbot.connector.derivative.position import Position
-from hummingbot.core.data_type.common import (
-    OrderType,
-    PositionAction,
-    PositionSide,
-    PriceType,
-    TradeType,
-)
+from hummingbot.core.data_type.common import OrderType, PositionAction, PositionSide, PriceType, TradeType
 from hummingbot.data_feed.market_data_provider import MarketDataProvider
 from hummingbot.strategy_v2.executors.simple_grid_executor.data_types import (
     SimpleGridBarriers,
@@ -560,6 +554,48 @@ class TestSimpleGrid(IsolatedAsyncioWrapperTestCase):
 
         self.assertFalse(controller.is_halted)
         self.assertIsNone(controller._orphan_since)
+
+    def test_a_leg_still_closing_keeps_its_claim(self):
+        """
+        A leg retrying its close (backoff, a collateral wait) is SHUTTING_DOWN, not active, but
+        it still owns the position. Calling that an orphan halted the run and sent a flatten
+        racing the leg's own close.
+        """
+        controller = self.controller()
+        self.set_venue(amount=None)
+        controller.determine_executor_actions()
+        self.set_venue(amount="0.008")
+        closing = self.live_leg_holding("0.008")
+        closing.status = RunnableStatus.SHUTTING_DOWN
+        closing.is_active = False
+        controller.executors_info = [closing]
+
+        actions = self.past_the_grace(controller, seconds=60)
+
+        self.assertFalse(controller.is_halted)
+        self.assertIsNone(controller._orphan_since)
+        self.assertEqual(actions, [])
+
+    def test_a_held_position_is_claimed_and_stops_new_legs(self):
+        """
+        A leg stopped with keep_position hands its position on on purpose. Reconciliation
+        must not flatten it, and the grid — flat between legs by design — must not open the
+        next leg on top of it.
+        """
+        controller = self.controller()
+        self.set_venue(amount=None)
+        controller.determine_executor_actions()
+        self.set_venue(amount="1")
+        held = self.closed_leg("leg-1", CloseType.POSITION_HOLD, net_pnl_quote="0")
+        held.custom_info = dict(held.custom_info, held_amount=Decimal("1"))
+        controller.executors_info = [held]
+
+        actions = self.past_the_grace(controller, seconds=60)
+
+        self.assertTrue(controller.is_halted)
+        self.assertIn("keeping its position", controller._halt_reason)
+        self.assertIsNone(controller._orphan_since)
+        self.assertEqual(actions, [], "nothing may be flattened, and no new leg opened")
 
     def test_an_unclaimed_position_is_given_a_grace_period_first(self):
         """A leg that has just filled takes a moment to say so; acting at once would be worse."""

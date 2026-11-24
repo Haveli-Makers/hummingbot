@@ -13,20 +13,13 @@ from hummingbot.core.data_type.common import (
 )
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy_v2.controllers import ControllerBase, ControllerConfigBase
-from hummingbot.strategy_v2.executors.order_executor.data_types import (
-    ExecutionStrategy,
-    OrderExecutorConfig,
-)
+from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy, OrderExecutorConfig
 from hummingbot.strategy_v2.executors.simple_grid_executor.data_types import (
     SimpleGridBarriers,
     SimpleGridEntryMode,
     SimpleGridExecutorConfig,
 )
-from hummingbot.strategy_v2.models.executor_actions import (
-    CreateExecutorAction,
-    ExecutorAction,
-    StopExecutorAction,
-)
+from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction, StopExecutorAction
 from hummingbot.strategy_v2.models.executors import CloseType
 from hummingbot.strategy_v2.models.executors_info import ExecutorInfo
 
@@ -342,6 +335,15 @@ class SimpleGrid(ControllerBase):
                     f"quote — its position may still be open. Check the account and close it by "
                     f"hand before restarting")
                 self.logger().error(f"SimpleGrid halted: {self._halt_reason}")
+            held = Decimal(str(executor.custom_info.get("held_amount") or "0"))
+            if executor.close_type == CloseType.POSITION_HOLD and held > Decimal("0") \
+                    and self._halt_reason is None:
+                # The grid is flat between legs by design. Opening the next leg on top of a
+                # position someone asked us to keep would stack exposure the bracket never sized.
+                self._halt_reason = (
+                    f"leg {executor.id} was stopped keeping its position ({held} "
+                    f"{self.config.trading_pair} left open on purpose); no new legs over it")
+                self.logger().warning(f"SimpleGrid halted: {self._halt_reason}")
 
             self._last_close_timestamp = executor.close_timestamp or self.market_data_provider.time()
             self._cooldown_seconds = self._cooldown_for(executor.close_type)
@@ -366,12 +368,23 @@ class SimpleGrid(ControllerBase):
         return None
 
     def _claimed_amount(self) -> Decimal:
-        """How much of a position the live legs believe they are holding."""
+        """
+        How much of a position our legs account for.
+
+        Every leg that has not terminated, not just the active ones: a leg working its way out
+        — a close being retried, a collateral wait — still owns its position, and calling that
+        an orphan would halt the run and send a flatten racing the leg's own close. Same reason
+        as unfinished_executors(). A leg that ended in POSITION_HOLD handed its position on on
+        purpose, so what it left open is claimed too.
+        """
         total = Decimal("0")
         for executor in self.executors_info:
-            if not executor.is_active:
+            if not executor.is_done:
+                filled = executor.custom_info.get("filled_amount") or Decimal("0")
+            elif executor.close_type == CloseType.POSITION_HOLD:
+                filled = executor.custom_info.get("held_amount") or Decimal("0")
+            else:
                 continue
-            filled = executor.custom_info.get("filled_amount") or Decimal("0")
             total += abs(Decimal(str(filled)))
         return total
 

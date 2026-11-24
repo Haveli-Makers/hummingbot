@@ -246,8 +246,14 @@ notional so a partial fill still clears it.
 
 ## When it stops
 
-New legs stop on any halt condition above; an open leg is left to finish on its own barriers.
-`stop` cancels resting orders and flattens any open position in the same call.
+Any halt condition above stops new legs **and closes the open one**: the account is only flat
+between legs, so a leg left running would have nothing to hand over to. `stop` cancels resting
+orders and flattens any open position in the same call.
+
+The one exception is a leg stopped with `keep_position=True` from outside the controller. It
+cancels its resting orders and hands the position on without closing it. The controller counts
+that position as accounted for, so reconciliation does not flatten it, and halts the run
+rather than open new legs on top of it.
 
 The stop loss exists **only inside the running process**. A position that outlives the bot has
 nothing watching it — always confirm the account is flat after stopping.

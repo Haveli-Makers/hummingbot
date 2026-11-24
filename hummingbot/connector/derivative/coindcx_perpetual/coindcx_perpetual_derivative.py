@@ -1,5 +1,6 @@
 import asyncio
 import time
+from collections import OrderedDict
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -102,12 +103,15 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
         # held as (exchange_order_id, payload, buffered_at) in arrival order.
         self._pending_order_events: List[Tuple[str, Dict[str, Any], float]] = []
         # Signatures of order frames already applied, so repeats are dropped. See
-        # _already_applied.
-        self._applied_order_events: List[Tuple[str, str, str, str]] = []
+        # _order_event_signature. Ordered so the oldest can be evicted in O(1).
+        self._applied_order_events: "OrderedDict[Tuple[str, str, str, str], None]" = OrderedDict()
         self._pending_order_events_task: Optional[asyncio.Task] = None
         self._balance_refresh_task: Optional[asyncio.Task] = None
+        # A wallet read asked for while another was already under way, as the wait it wants.
+        # See _refresh_balances_soon.
+        self._balance_refresh_again_after: Optional[float] = None
         # Orders whose creation has already been announced. See trigger_event.
-        self._announced_creations: List[str] = []
+        self._announced_creations: "OrderedDict[str, None]" = OrderedDict()
         # Last set of unready status keys reported, so status_dict logs only on change.
         self._last_reported_block: List[str] = []
 
@@ -276,6 +280,7 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
             except (asyncio.CancelledError, Exception):
                 pass
             self._balance_refresh_task = None
+        self._balance_refresh_again_after = None
         self._pending_order_events.clear()
 
         # A proxied factory owns a dedicated aiohttp session; the default factory
@@ -1080,26 +1085,43 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
                     self.logger().debug(
                         f"Suppressing a repeat {event_tag.name} for {order_id}.")
                     return
-                self._announced_creations.append(order_id)
-                if len(self._announced_creations) > CONSTANTS.MAX_APPLIED_ORDER_EVENTS:
-                    del self._announced_creations[:-CONSTANTS.MAX_APPLIED_ORDER_EVENTS]
+                self._remember(self._announced_creations, order_id)
         super().trigger_event(event_tag, message)
+
+    @staticmethod
+    def _remember(seen: "OrderedDict", key) -> None:
+        """Add to a bounded record of recent keys, evicting the oldest."""
+        seen[key] = None
+        if len(seen) > CONSTANTS.MAX_APPLIED_ORDER_EVENTS:
+            seen.popitem(last=False)
 
     def _process_order_event(self, order: Dict[str, Any]):
         exchange_order_id = str(order.get("id", ""))
         if not exchange_order_id:
             return
-        if self._already_applied(order, exchange_order_id):
+        signature = self._order_event_signature(order, exchange_order_id)
+        if self._is_repeat(signature, exchange_order_id):
             return
         tracked_order = self._tracked_order_for(exchange_order_id)
         if tracked_order is None:
+            # Not recorded as applied: if this copy expires unmatched in the buffer, a later
+            # resend of the same frame must still get through.
             self._defer_order_event(exchange_order_id, order)
             return
+        self._remember(self._applied_order_events, signature)
         self._apply_order_event(order, tracked_order)
 
-    def _already_applied(self, order: Dict[str, Any], exchange_order_id: str) -> bool:
+    def _is_repeat(self, signature: Tuple[str, str, str, str], exchange_order_id: str) -> bool:
+        if signature in self._applied_order_events:
+            self.logger().debug(f"Ignoring repeated order frame for {exchange_order_id} "
+                                f"(status={signature[1]}).")
+            return True
+        return False
+
+    @staticmethod
+    def _order_event_signature(order: Dict[str, Any], exchange_order_id: str) -> Tuple[str, str, str, str]:
         """
-        Drop an order frame we have already handled.
+        The fields that define an order-frame transition, used to drop frames already handled.
 
         CoinDCX repeats frames — its Socket.IO payloads are double-wrapped, and a deferred
         event can also be replayed — so the same state transition can be applied twice. The
@@ -1111,19 +1133,14 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
         That exception escapes into the event listener, so any work queued behind it on the
         same frame is skipped. Keying on the fields that define a transition lets genuine
         updates through while repeats are ignored.
+
+        A signature is recorded only when its frame is actually applied, live or replayed —
+        never for a frame that was merely deferred.
         """
-        signature = (exchange_order_id,
-                     str(order.get("status", "")).lower(),
-                     str(order.get("updated_at") or order.get("created_at") or ""),
-                     str(order.get("filled_quantity") or ""))
-        if signature in self._applied_order_events:
-            self.logger().debug(f"Ignoring repeated order frame for {exchange_order_id} "
-                                f"(status={signature[1]}).")
-            return True
-        self._applied_order_events.append(signature)
-        if len(self._applied_order_events) > CONSTANTS.MAX_APPLIED_ORDER_EVENTS:
-            del self._applied_order_events[:-CONSTANTS.MAX_APPLIED_ORDER_EVENTS]
-        return False
+        return (exchange_order_id,
+                str(order.get("status", "")).lower(),
+                str(order.get("updated_at") or order.get("created_at") or ""),
+                str(order.get("filled_quantity") or ""))
 
     def _tracked_order_for(self, exchange_order_id: str) -> Optional[InFlightOrder]:
         return next(
@@ -1179,22 +1196,33 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
 
         ``delay`` waits before reading, for the callers where the venue frees the collateral
         slightly after it reports the order gone.
+
+        A request that arrives while a read is already under way is not dropped: that read
+        may come too early for it. The commonest case is an OCO entry: the fill starts an
+        immediate read, then cancelling the other side asks for one 1.5s later, after the
+        venue has let go of that order's margin. One more read follows the current one,
+        after the wait the later request asked for.
         """
         if not self._trading_required:
             return
         if self._balance_refresh_task is not None and not self._balance_refresh_task.done():
+            self._balance_refresh_again_after = max(self._balance_refresh_again_after or 0.0, delay)
             return
         self._balance_refresh_task = safe_ensure_future(self._refresh_balances(delay))
 
     async def _refresh_balances(self, delay: float = 0.0):
-        try:
-            if delay > 0:
-                await self._sleep(delay)
-            await self._update_balances()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exception:
-            self.logger().debug(f"Post-settlement balance refresh failed: {exception}")
+        while True:
+            try:
+                if delay > 0:
+                    await self._sleep(delay)
+                await self._update_balances()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exception:
+                self.logger().debug(f"Post-settlement balance refresh failed: {exception}")
+            if self._balance_refresh_again_after is None:
+                return
+            delay, self._balance_refresh_again_after = self._balance_refresh_again_after, None
 
     async def _sleep(self, delay: float):
         """Seam for tests, which must not wait out a real delay."""
@@ -1271,6 +1299,12 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
                 for exchange_order_id, order, buffered_at in self._pending_order_events:
                     tracked_order = self._tracked_order_for(exchange_order_id)
                     if tracked_order is not None:
+                        # Deferred frames are not recorded when buffered, so two copies of one
+                        # frame can both be waiting here. Apply it once.
+                        signature = self._order_event_signature(order, exchange_order_id)
+                        if self._is_repeat(signature, exchange_order_id):
+                            continue
+                        self._remember(self._applied_order_events, signature)
                         self.logger().debug(
                             f"Replaying deferred {CONSTANTS.ORDER_UPDATE_EVENT_TYPE} for "
                             f"{exchange_order_id} against {tracked_order.client_order_id}.")

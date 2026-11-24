@@ -30,6 +30,8 @@ TRADE_HISTORY_ACCOUNT_PATH_URL = "/exchange/v1/orders/trade_history"
 ORDER_EDIT_PATH_URL = "/exchange/v1/orders/edit"
 
 WS_HEARTBEAT_TIME_INTERVAL = 30
+# Levels per side on the "{pair}@orderbook@{depth}" channel. CoinDCX offers 10, 20 and 50; 50 matches the REST book.
+ORDER_BOOK_DEPTH = 50
 
 SIDE_BUY = "buy"
 SIDE_SELL = "sell"

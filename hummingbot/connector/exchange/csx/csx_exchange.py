@@ -697,6 +697,63 @@ class CsxExchange(ExchangePyBase):
             self.logger().error(f"Error fetching account-wide order history: {exc}")
             return []
 
+    supports_all_open_orders_without_pair = True
+
+    async def get_all_open_orders(self, trading_pairs: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """
+        Fetches every open order on the exchange for this account, including orders placed
+        outside Hummingbot (e.g. on the CSX website).
+
+        When ``trading_pairs`` is empty, all open orders are returned; otherwise the result is
+        narrowed to the requested pairs.
+        """
+        wanted: Dict[str, str] = {}
+        for trading_pair in trading_pairs or []:
+            try:
+                instrument = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+            except KeyError:
+                instrument = trading_pair.replace("-", "/")
+            wanted[str(instrument).upper()] = trading_pair
+
+        open_orders: List[Dict[str, Any]] = []
+        try:
+            response = await self._api_get(
+                path_url=CONSTANTS.ME_ORDERS_PATH_URL,
+                params={"onlyOpen": "true", "type": CONSTANTS.ORDER_TYPE_LIMIT},
+                is_auth_required=True,
+            )
+            orders = unwrap_data(response) if isinstance(response, dict) else response
+            if isinstance(orders, dict):
+                orders = orders.get("items", orders.get("orders", []))
+            for order in orders if isinstance(orders, list) else []:
+                if not isinstance(order, dict):
+                    continue
+                instrument = str(order.get("instrument") or order.get("symbol") or "").upper()
+                if wanted and instrument not in wanted:
+                    continue
+                trading_pair = wanted.get(instrument)
+                if trading_pair is None:
+                    try:
+                        trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol=instrument)
+                    except KeyError:
+                        trading_pair = instrument.replace("/", "-")
+                open_orders.append({
+                    "exchange_order_id": str(order.get("orderId") or order.get("order_id") or ""),
+                    "client_order_id": order.get("clientOrderId") or order.get("client_order_id") or None,
+                    "trading_pair": trading_pair,
+                    "trade_type": str(order.get("side", "")).upper(),
+                    "order_type": str(order.get("type", "LIMIT")).upper(),
+                    "price": float(order.get("limitPrice") or order.get("price") or 0),
+                    "amount": float(order.get("quantity") or 0),
+                    "filled_amount": float(order.get("filledQuantity") or 0),
+                    "status": str(order.get("status", "OPEN")).upper(),
+                    "created_at": order.get("createdAt") or order.get("created_at"),
+                })
+        except Exception as exc:
+            self.logger().error(f"Error fetching open orders: {exc}")
+
+        return open_orders
+
     # ── Balance ────────────────────────────────────────────────────────────────
 
     async def _update_balances(self) -> None:

@@ -30,6 +30,7 @@ def build_api_factory(
         domain: str = CONSTANTS.DEFAULT_DOMAIN,
         time_provider: Optional[Callable] = None,
         auth: Optional[AuthBase] = None,
+        proxy_url: Optional[str] = None,
 ) -> WebAssistantsFactory:
     """
     Build a WebAssistantsFactory with required components for CoinDCX API.
@@ -41,10 +42,23 @@ def build_api_factory(
     api_factory = WebAssistantsFactory(
         throttler=throttler,
         auth=auth,
+        connections_factory=_build_connections_factory(proxy_url),
         rest_pre_processors=[
             TimeSynchronizerRESTPreProcessor(synchronizer=time_synchronizer, time_provider=time_provider),
         ])
     return api_factory
+
+
+def _build_connections_factory(proxy_url: Optional[str]):
+    """
+    Build a connections factory with optional proxy support.
+    """
+    if proxy_url:
+        from hummingbot.core.web_assistant.connections.proxy_connections_factory import ProxyConnectionsFactory
+        return ProxyConnectionsFactory(proxy_url=proxy_url)
+
+    from hummingbot.core.web_assistant.connections.connections_factory import ConnectionsFactory
+    return ConnectionsFactory()
 
 
 def build_api_factory_without_time_synchronizer_pre_processor(throttler: AsyncThrottler) -> WebAssistantsFactory:

@@ -38,6 +38,7 @@ class CoindcxExchange(ExchangePyBase):
     def __init__(self,
                  coindcx_api_key: str,
                  coindcx_api_secret: str,
+                 coindcx_proxy_url: str = "",
                  balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
                  rate_limits_share_pct: Decimal = Decimal("100"),
                  trading_pairs: Optional[List[str]] = None,
@@ -46,6 +47,7 @@ class CoindcxExchange(ExchangePyBase):
                  ):
         self.api_key = coindcx_api_key
         self.secret_key = coindcx_api_secret
+        self._proxy_url = coindcx_proxy_url or ""
         self._domain = domain
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
@@ -249,7 +251,8 @@ class CoindcxExchange(ExchangePyBase):
             throttler=self._throttler,
             time_synchronizer=self._time_synchronizer,
             domain=self._domain,
-            auth=self._auth)
+            auth=self._auth,
+            proxy_url=self._proxy_url or None)
 
     def _create_order_book_data_source(self) -> OrderBookTrackerDataSource:
         """
@@ -803,6 +806,42 @@ class CoindcxExchange(ExchangePyBase):
         except Exception as e:
             self.logger().error(f"Error fetching account-wide trade history: {e}")
             return []
+
+    async def get_all_open_orders(self, trading_pairs: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """
+        Fetches every open order on the exchange for this account, including orders placed
+        outside Hummingbot (e.g. on the CoinDCX website).
+        """
+        open_orders: List[Dict[str, Any]] = []
+        for trading_pair in trading_pairs or []:
+            try:
+                symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+                response = await self._api_post(
+                    path_url=CONSTANTS.ACTIVE_ORDERS_PATH_URL,
+                    data={"market": symbol},
+                    is_auth_required=True,
+                )
+                orders = response.get("orders", []) if isinstance(response, dict) else response
+                for order in orders or []:
+                    if not isinstance(order, dict):
+                        continue
+                    total = float(order.get("total_quantity") or 0)
+                    remaining = float(order.get("remaining_quantity", total) or 0)
+                    open_orders.append({
+                        "exchange_order_id": str(order.get("id", "")),
+                        "client_order_id": order.get("client_order_id") or None,
+                        "trading_pair": trading_pair,
+                        "trade_type": str(order.get("side", "")).upper(),
+                        "order_type": str(order.get("order_type", "")).replace("_order", "").upper(),
+                        "price": float(order.get("price_per_unit") or 0),
+                        "amount": total,
+                        "filled_amount": max(total - remaining, 0.0),
+                        "status": str(order.get("status", "open")).upper(),
+                        "created_at": order.get("created_at"),
+                    })
+            except Exception as e:
+                self.logger().error(f"Error fetching open orders for {trading_pair}: {e}")
+        return open_orders
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
         """

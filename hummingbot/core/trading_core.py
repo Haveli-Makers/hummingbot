@@ -30,6 +30,7 @@ from hummingbot.logger import HummingbotLogger
 from hummingbot.model.sql_connection_manager import SQLConnectionManager
 from hummingbot.model.trade_fill import TradeFill
 from hummingbot.notifier.notifier_base import NotifierBase
+from hummingbot.remote_iface.influxdb import InfluxDBConfig, InfluxDBSink
 from hummingbot.strategy.directional_strategy_base import DirectionalStrategyBase
 from hummingbot.strategy.market_trading_pair_tuple import MarketTradingPairTuple
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
@@ -110,6 +111,9 @@ class TradingCore:
 
         # Metrics collectors mapping (connector_name -> MetricsCollector)
         self._metrics_collectors: Dict[str, MetricsCollector] = {}
+
+        # Bot monitoring: writes to InfluxDB while a strategy runs, when INFLUXDB_URL and INFLUXDB_TOKEN are set
+        self._influxdb_sink: Optional[InfluxDBSink] = None
 
         # Runtime state
         self.init_time: float = time.time()
@@ -546,6 +550,7 @@ class TradingCore:
             # Add strategy to clock
             if self.strategy and self.clock:
                 self.clock.add_iterator(self.strategy)
+                self._start_influxdb_sink()
 
                 # Restore market states if markets recorder exists
                 if self.markets_recorder:
@@ -568,6 +573,33 @@ class TradingCore:
         except Exception as e:
             self.logger().error(f"Error starting strategy execution: {e}", exc_info=True)
             raise
+
+    def _start_influxdb_sink(self):
+        """Bot monitoring: write heartbeats, prices, orders and PnL to InfluxDB, if it is configured."""
+        config = InfluxDBConfig.from_env()
+        if config is None or self.clock is None:
+            return
+        try:
+            sink = InfluxDBSink(config, bot_name=self.client_config_map.instance_id, strategy=self.strategy,
+                                connectors=self.markets)
+            sink.start_sink()
+            self.clock.add_iterator(sink)
+            self._influxdb_sink = sink
+            self.logger().info(f"Bot monitoring: writing to InfluxDB at {config.url} (database {config.database})")
+        except Exception:
+            self.logger().error("Bot monitoring could not start; the strategy runs without it.", exc_info=True)
+
+    async def _stop_influxdb_sink(self):
+        """A clean stop: the sink writes "stopped", so the api-server counts the bot as stopped, not down."""
+        sink, self._influxdb_sink = self._influxdb_sink, None
+        if sink is None:
+            return
+        try:
+            if self.clock is not None:
+                self.clock.remove_iterator(sink)
+            await sink.stop_sink()
+        except Exception:
+            self.logger().error("Bot monitoring did not stop cleanly.", exc_info=True)
 
     async def _run_clock(self):
         """Run the clock system."""
@@ -595,6 +627,7 @@ class TradingCore:
             # Remove strategy from clock FIRST to prevent further ticks
             if self.clock is not None and self.strategy is not None:
                 self.clock.remove_iterator(self.strategy)
+            await self._stop_influxdb_sink()
 
             # Remove kill switch from clock
             if self.clock is not None and self.kill_switch is not None:

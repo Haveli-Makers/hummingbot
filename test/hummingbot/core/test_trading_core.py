@@ -1,4 +1,5 @@
 import asyncio
+import os
 import time
 from decimal import Decimal
 from pathlib import Path
@@ -832,3 +833,66 @@ class TradingCoreTest(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(len(self.trading_core._metrics_collectors), 0)
         # Verify both collectors were attempted to be removed
         self.assertEqual(self.trading_core.clock.remove_iterator.call_count, 2)
+
+    def _prepare_strategy_execution(self):
+        self.trading_core.strategy = Mock(spec=StrategyBase)
+        self.trading_core.clock = Mock(spec=Clock)
+        self.trading_core.markets_recorder = Mock()
+        self.trading_core.connector_manager.connectors["binance"] = self.mock_connector
+        self.trading_core._metrics_collectors["binance"] = Mock(spec=MetricsCollector)
+
+    @patch.dict(os.environ, {"INFLUXDB_URL": "http://localhost:8181", "INFLUXDB_TOKEN": "apiv3_test"})
+    @patch("hummingbot.core.trading_core.InfluxDBSink")
+    async def test_start_strategy_execution_starts_bot_monitoring_when_configured(self, mock_sink_class):
+        self._prepare_strategy_execution()
+
+        await self.trading_core._start_strategy_execution()
+
+        sink = mock_sink_class.return_value
+        config = mock_sink_class.call_args[0][0]
+        self.assertEqual("http://localhost:8181", config.url)
+        self.assertEqual("hbot", config.database)
+        self.assertEqual(self.client_config.instance_id, mock_sink_class.call_args.kwargs["bot_name"])
+        self.assertIs(self.trading_core.strategy, mock_sink_class.call_args.kwargs["strategy"])
+        self.assertIn("binance", mock_sink_class.call_args.kwargs["connectors"])
+        sink.start_sink.assert_called_once()
+        added = [call.args[0] for call in self.trading_core.clock.add_iterator.call_args_list]
+        self.assertEqual([self.trading_core.strategy, sink], added, "the sink ticks right after the strategy")
+        self.assertIs(sink, self.trading_core._influxdb_sink)
+
+    @patch("hummingbot.core.trading_core.InfluxDBSink")
+    async def test_start_strategy_execution_without_bot_monitoring_settings(self, mock_sink_class):
+        self._prepare_strategy_execution()
+
+        with patch.dict(os.environ, {}, clear=True):
+            await self.trading_core._start_strategy_execution()
+
+        mock_sink_class.assert_not_called()
+        self.assertIsNone(self.trading_core._influxdb_sink)
+
+    @patch.dict(os.environ, {"INFLUXDB_URL": "http://localhost:8181", "INFLUXDB_TOKEN": "apiv3_test"})
+    @patch("hummingbot.core.trading_core.InfluxDBSink")
+    async def test_bot_monitoring_failure_does_not_stop_the_strategy(self, mock_sink_class):
+        self._prepare_strategy_execution()
+        mock_sink_class.return_value.start_sink.side_effect = RuntimeError("boom")
+
+        await self.trading_core._start_strategy_execution()
+
+        self.trading_core.clock.add_iterator.assert_called_once_with(self.trading_core.strategy)
+        self.assertIsNone(self.trading_core._influxdb_sink)
+
+    async def test_stop_strategy_stops_bot_monitoring(self):
+        self.trading_core._strategy_running = True
+        self.trading_core.strategy = Mock(spec=StrategyBase)
+        self.trading_core.clock = Mock(spec=Clock)
+        sink = Mock()
+        sink.stop_sink = AsyncMock()
+        self.trading_core._influxdb_sink = sink
+
+        with patch("hummingbot.core.trading_core.RateOracle"):
+            result = await self.trading_core.stop_strategy()
+
+        self.assertTrue(result)
+        self.trading_core.clock.remove_iterator.assert_any_call(sink)
+        sink.stop_sink.assert_awaited_once()
+        self.assertIsNone(self.trading_core._influxdb_sink)

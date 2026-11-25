@@ -3,7 +3,7 @@ from __future__ import annotations
 import bisect
 import logging
 import math
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 from decimal import Decimal
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Type
@@ -21,10 +21,6 @@ from hummingbot.strategy_v2.models.executors_info import ExecutorInfo
 
 _LOG = logging.getLogger(__name__)
 
-_DUST = 1e-12
-
-_RECENT_TERMINATED = 500
-
 
 class CandlesUnavailableError(NotImplementedError):
     """A controller needs OHLCV bars that could not be obtained from the venue."""
@@ -32,12 +28,6 @@ class CandlesUnavailableError(NotImplementedError):
 
 class UnsupportedExecutorError(NotImplementedError):
     """A controller created an executor type this engine cannot simulate."""
-
-
-
-
-
-
 
 
 class _Market:
@@ -79,38 +69,10 @@ class _Market:
             return self.mid
         return None
 
-    def touch(self, side: TradeType) -> Optional[float]:
-        """Passive price for a side: the best bid to buy, the best ask to sell."""
-        return self.best_bid if side == TradeType.BUY else self.best_ask
-
-    def no_cross_bound(self, side: TradeType) -> Optional[float]:
-        opposite = self.best_ask if side == TradeType.BUY else self.best_bid
-        if opposite is None or self.tick <= 0:
-            return None
-        return opposite - self.tick if side == TradeType.BUY else opposite + self.tick
-
     def quantize(self, price: float) -> float:
         if self.tick <= 0 or price <= 0:
             return price
         return math.floor(price / self.tick + 1e-9) * self.tick
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 class _OrderbookDataProvider(BacktestingDataProvider):
@@ -120,18 +82,9 @@ class _OrderbookDataProvider(BacktestingDataProvider):
         self._key: Optional[str] = None
         self.connectors = {}
         self._closes: Dict[str, List[float]] = {}
-        self.read_live_state = False
-        self.bars_read: Dict[str, int] = {}
 
     def initialize_rate_sources(self, connector_pairs) -> None:
         """Nothing to do, and the base class would start a task polling live venues for rates."""
-
-    def begin_update(self) -> None:
-        self.read_live_state = False
-        self.bars_read = {}
-
-    def bars_changed(self) -> bool:
-        return any(self._closed_count(key) != count for key, count in self.bars_read.items())
 
     def bind(self, market: _Market, connector_name: str, trading_pair: str) -> None:
         self._market = market
@@ -149,7 +102,6 @@ class _OrderbookDataProvider(BacktestingDataProvider):
         self.trading_rules.setdefault(connector_name, {})[trading_pair] = rule
 
     def get_price_by_type(self, connector_name: str, trading_pair: str, price_type: PriceType):
-        self.read_live_state = True
         key = f"{connector_name}_{trading_pair}"
         if self._market is None or key != self._key:
             return self.prices.get(key)
@@ -197,7 +149,6 @@ class _OrderbookDataProvider(BacktestingDataProvider):
                 f"no {interval} candle for {connector_name} {trading_pair} had closed by "
                 f"t={self._market.now}: the venue's bars start at {frame['timestamp'].iloc[0]}. "
                 f"The indicators have no history to start from.")
-        self.bars_read[key] = count
         return frame.iloc[max(0, count - max_records):count].copy()
 
     def candles_summary(self) -> List[Dict]:
@@ -211,7 +162,6 @@ class _OrderbookDataProvider(BacktestingDataProvider):
         return summary
 
     def time(self):
-        self.read_live_state = True
         return self._market.now if self._market is not None else self._time
 
 
@@ -257,8 +207,6 @@ class OrderbookBacktestingEngine:
 
     def __init__(self):
         self.backtesting_data_provider = _OrderbookDataProvider()
-        self._controller_class_cache = {}
-        self._post_only_entries = False
 
     @staticmethod
     def _get_controller_class(config: ControllerConfigBase) -> Type[ControllerBase]:
@@ -330,7 +278,6 @@ class OrderbookBacktestingEngine:
         fill_at_touch: bool = False,
         update_interval: float = 1.0,
         tick_size: Optional[float] = None,
-        post_only_entries: bool = False,
         strict_errors: bool = True,
         base_dir: Optional[str] = None,
         start_ts: Optional[float] = None,
@@ -365,7 +312,6 @@ class OrderbookBacktestingEngine:
         resolved_tick = tick_size if tick_size and tick_size > 0 else _infer_tick_size(
             connector, pair, start, end, base_dir=base_dir)
         market = _Market(resolved_tick)
-        self._post_only_entries = post_only_entries
 
         data_provider = self.backtesting_data_provider
         data_provider.bind(market, controller_config.connector_name, controller_config.trading_pair)
@@ -375,7 +321,6 @@ class OrderbookBacktestingEngine:
             actions_queue=None,
         )
 
-        # Run the controller's REAL executors against the replay (no per-executor simulators).
         from hummingbot.strategy_v2.backtesting.orderbook_executor_runtime import (
             run_real_executor_backtest,
         )
@@ -405,12 +350,6 @@ class OrderbookBacktestingEngine:
             view["errors"].append(f"processed_data could not be serialised: {exc}")
             _LOG.exception("controller.processed_data could not be serialised")
         return view
-
-    # ------------------------------------------------------------------ per-event work
-
-
-
-
 
     # ------------------------------------------------------------------ summary
 
@@ -484,35 +423,11 @@ class OrderbookBacktestingEngine:
             "loss_signals": int(len(losses)),
         }
 
-
-# ---------------------------------------------------------------------------- plans
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 # ---------------------------------------------------------------------------- helpers
 
 
 def _jsonable(value, _depth: int = 0):
-    """
-    Reduce a controller's ``processed_data`` to something JSON can carry.
-
-    Controllers put Decimals, enums, timestamps and whole DataFrames in there. A frame is
-    described rather than serialised: a week of features runs to megabytes, and the caller
-    asked for a result, not the dataset behind it.
-    """
+    """Convert a value to something JSON-serializable, or a string if it cannot be represented."""
     if _depth > 4:
         return str(value)
     if value is None or isinstance(value, (bool, int, str)):
@@ -536,12 +451,6 @@ def _jsonable(value, _depth: int = 0):
     if isinstance(value, (list, tuple, set)):
         return [_jsonable(item, _depth + 1) for item in value]
     return str(value)
-
-
-def _fmt_ts(ts: Optional[float]) -> str:
-    if ts is None:
-        return "open"
-    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _recording_span(connector: str, pair: str, start: str, end: Optional[str],

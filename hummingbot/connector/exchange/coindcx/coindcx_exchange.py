@@ -38,6 +38,7 @@ class CoindcxExchange(ExchangePyBase):
     def __init__(self,
                  coindcx_api_key: str,
                  coindcx_api_secret: str,
+                 coindcx_proxy_url: str = "",
                  balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
                  rate_limits_share_pct: Decimal = Decimal("100"),
                  trading_pairs: Optional[List[str]] = None,
@@ -46,6 +47,7 @@ class CoindcxExchange(ExchangePyBase):
                  ):
         self.api_key = coindcx_api_key
         self.secret_key = coindcx_api_secret
+        self._proxy_url = coindcx_proxy_url or ""
         self._domain = domain
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
@@ -249,7 +251,8 @@ class CoindcxExchange(ExchangePyBase):
             throttler=self._throttler,
             time_synchronizer=self._time_synchronizer,
             domain=self._domain,
-            auth=self._auth)
+            auth=self._auth,
+            proxy_url=self._proxy_url or None)
 
     def _create_order_book_data_source(self) -> OrderBookTrackerDataSource:
         """

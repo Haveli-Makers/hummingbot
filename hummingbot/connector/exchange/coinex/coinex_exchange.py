@@ -451,17 +451,24 @@ class CoinexExchange(ExchangePyBase):
             self.logger().error(f"Error fetching account-wide trade history: {exc}")
             return []
 
+    supports_all_open_orders_without_pair = True
+
     async def get_all_open_orders(self, trading_pairs: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """
         Fetches every open order on the exchange for this account, including orders placed
         outside Hummingbot (e.g. on the CoinEx website).
+
+        When ``trading_pairs`` is empty, a single request without a ``market`` returns open orders
+        across every spot market.
         """
-        requests: List[Tuple[str, str]] = []
+        requests: List[Tuple[Optional[str], Optional[str]]] = []
         for trading_pair in trading_pairs or []:
             try:
                 requests.append((await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair), trading_pair))
             except KeyError:
                 self.logger().warning(f"Unknown CoinEx market for {trading_pair}; skipping its open orders.")
+        if not requests:
+            requests.append((None, None))
 
         open_orders: List[Dict[str, Any]] = []
         for symbol, trading_pair in requests:

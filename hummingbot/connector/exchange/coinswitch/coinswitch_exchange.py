@@ -712,13 +712,16 @@ class CoinswitchExchange(ExchangePyBase):
 
         return trades
 
+    supports_all_open_orders_without_pair = True
+
     async def get_all_open_orders(self, trading_pairs: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """
         Fetches every open order on the exchange for this account, including orders placed
         outside Hummingbot (e.g. on the CoinSwitch website).
+
+        When ``trading_pairs`` is empty, all open orders are returned; otherwise the result is
+        narrowed to the requested pairs via the ``symbols`` filter.
         """
-        if not trading_pairs:
-            return []
         params: Dict[str, Any] = {"open": "true", "exchanges": self._exchange, "count": 500}
         wanted_symbols = {}
         for trading_pair in trading_pairs or []:

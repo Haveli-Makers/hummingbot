@@ -691,37 +691,72 @@ class AjaibExchange(ExchangePyBase):
 
         return trade_updates
 
+    supports_all_open_orders_without_pair = True
+
+    OPEN_ORDER_STATUSES = frozenset({"NEW", "OPEN", "PARTIALLY_FILLED"})
+
     async def get_all_open_orders(self, trading_pairs: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """
         Fetches every open order on the exchange for this account, including orders placed
         outside Hummingbot (e.g. in the Ajaib app).
+
+        When ``trading_pairs`` is given, the per-symbol open-orders endpoint is used. When it is
+        empty, ``/v1/order/all`` is queried without a symbol and filtered to open statuses, so all
+        open orders are returned without needing a trading pair.
         """
         open_orders: List[Dict[str, Any]] = []
-        for trading_pair in trading_pairs or []:
+
+        def _append(order, trading_pair):
+            open_orders.append({
+                "exchange_order_id": str(order.get("orderId", "")),
+                "client_order_id": order.get("clientOrderId") or None,
+                "trading_pair": trading_pair,
+                "trade_type": str(order.get("side", "")).upper(),
+                "order_type": str(order.get("type", "")).upper(),
+                "price": float(order.get("price") or 0),
+                "amount": float(order.get("origQty") or 0),
+                "filled_amount": float(order.get("executedQty") or 0),
+                "status": str(order.get("status", "NEW")).upper(),
+                "created_at": order.get("time") or order.get("workingTime"),
+            })
+
+        if trading_pairs:
+            for trading_pair in trading_pairs:
+                try:
+                    symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+                    response = await self._api_get(
+                        path_url=CONSTANTS.OPEN_ORDERS_PATH_URL,
+                        params={"symbol": symbol},
+                        is_auth_required=True,
+                    )
+                    for order in response if isinstance(response, list) else []:
+                        if isinstance(order, dict):
+                            _append(order, trading_pair)
+                except Exception as e:
+                    self.logger().error(f"Error fetching open orders for {trading_pair}: {e}")
+            return open_orders
+
+        try:
+            response = await self._api_get(
+                path_url=CONSTANTS.ALL_ORDERS_PATH_URL,
+                params={"limit": 1000},
+                is_auth_required=True,
+            )
+        except Exception as e:
+            self.logger().error(f"Error fetching all open orders: {e}")
+            return open_orders
+
+        for order in response if isinstance(response, list) else []:
+            if not isinstance(order, dict):
+                continue
+            if str(order.get("status", "")).upper() not in self.OPEN_ORDER_STATUSES:
+                continue
+            raw_symbol = str(order.get("symbol", ""))
             try:
-                symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-                response = await self._api_get(
-                    path_url=CONSTANTS.OPEN_ORDERS_PATH_URL,
-                    params={"symbol": symbol},
-                    is_auth_required=True,
-                )
-                for order in response if isinstance(response, list) else []:
-                    if not isinstance(order, dict):
-                        continue
-                    open_orders.append({
-                        "exchange_order_id": str(order.get("orderId", "")),
-                        "client_order_id": order.get("clientOrderId") or None,
-                        "trading_pair": trading_pair,
-                        "trade_type": str(order.get("side", "")).upper(),
-                        "order_type": str(order.get("type", "")).upper(),
-                        "price": float(order.get("price") or 0),
-                        "amount": float(order.get("origQty") or 0),
-                        "filled_amount": float(order.get("executedQty") or 0),
-                        "status": str(order.get("status", "NEW")).upper(),
-                        "created_at": order.get("time") or order.get("workingTime"),
-                    })
-            except Exception as e:
-                self.logger().error(f"Error fetching open orders for {trading_pair}: {e}")
+                trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol=raw_symbol)
+            except KeyError:
+                trading_pair = raw_symbol
+            _append(order, trading_pair)
         return open_orders
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:

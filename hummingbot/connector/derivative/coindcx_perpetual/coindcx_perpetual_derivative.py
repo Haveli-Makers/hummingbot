@@ -1157,12 +1157,12 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
         # moment it settles, so anything arriving afterwards is lost.
         self._apply_fills(order.get("trades"), tracked_order)
 
-        # A terminal status with no fills attached is the case that costs money: the order
-        # settles with executed_amount_base at zero and every size derived from it collapses.
-        # CoinDCX does not always attach them, so fetch them over REST before letting the
-        # order settle rather than leaving it to the periodic poll seconds later.
-        if self._is_terminal_fill_payload(order) and not tracked_order.is_done \
-                and tracked_order.executed_amount_base <= s_decimal_0:
+        # A FILLED status whose fills we have not all seen is the case that costs money: the
+        # order settles short of its real size and every size derived from it comes out short.
+        # CoinDCX does not always attach them — and an order that already reported part of its
+        # fills can arrive FILLED with none — so fetch them over REST before letting the order
+        # settle, rather than leaving it to the periodic poll seconds later.
+        if self._fills_missing_from_filled_payload(order, tracked_order):
             safe_ensure_future(self._settle_with_fetched_fills(order, tracked_order, replayed))
             return
 
@@ -1235,9 +1235,18 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
                 self._order_tracker.process_trade_update(self._trade_update_from_fill(fill, tracked_order))
 
     @staticmethod
-    def _is_terminal_fill_payload(order: Dict[str, Any]) -> bool:
+    def _fills_missing_from_filled_payload(order: Dict[str, Any], tracked_order: InFlightOrder) -> bool:
+        """
+        A FILLED frame for an order whose recorded fills still fall short of its size.
+
+        Checked after the frame's own fills are applied, so a frame carrying all of them costs
+        no REST call. Comparing against zero instead missed an order that had already reported
+        part of its fills: it settled at the part.
+        """
         status = str(order.get("status", "")).lower()
-        return CONSTANTS.ORDER_STATE.get(status) == OrderState.FILLED and not order.get("trades")
+        if CONSTANTS.ORDER_STATE.get(status) != OrderState.FILLED or tracked_order.is_done:
+            return False
+        return tracked_order.executed_amount_base < tracked_order.amount
 
     async def _settle_with_fetched_fills(self, order: Dict[str, Any], tracked_order: InFlightOrder,
                                          replayed: bool):

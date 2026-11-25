@@ -23,6 +23,14 @@ from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction,
 from hummingbot.strategy_v2.models.executors import CloseType
 from hummingbot.strategy_v2.models.executors_info import ExecutorInfo
 
+# How many closes the reconciler sends for one unclaimed position before it stops and leaves
+# it to a person. Each is a crossing limit sent as a CLOSE (reduce-only on CoinDCX), and only
+# once the venue has had orphan_grace_seconds to report how the previous one ended.
+ORPHAN_CLOSE_ATTEMPTS = 3
+# How long a close the reconciler sent may take to appear among the executors before it is
+# treated as lost. The orchestrator creates it after the tick that asked for it.
+ORPHAN_CLOSE_REPORT_TIMEOUT = 30.0
+
 
 class SimpleGridConfig(ControllerConfigBase):
     """
@@ -94,8 +102,8 @@ class SimpleGridConfig(ControllerConfigBase):
     cooldown_after_take_profit: int = Field(default=0, json_schema_extra={"is_updatable": True})
     cooldown_after_stop_loss: int = Field(default=0, json_schema_extra={"is_updatable": True})
 
-    # Risk. Any one of these stops new legs being opened. Nothing is force-closed; an open leg
-    # is left to finish on its own barriers.
+    # Risk. Any one of these halts the run: no new legs, and the open one is closed. The account
+    # is only flat between legs, so a leg left running would have nothing to hand over to.
 
     # 1. Losses reach the threshold — absolute, a fraction of total_amount_quote, or both,
     #    whichever is tighter.
@@ -177,7 +185,14 @@ class SimpleGrid(ControllerBase):
         # Reconciliation against what the venue actually holds.
         self._seen_flat_since_start: bool = False
         self._orphan_since: Optional[float] = None
-        self._orphan_flatten_sent: bool = False
+        # The close sent for an unclaimed position: its executor id, when it was sent, and how
+        # many have been sent for this position. Cleared once the venue reports flat again.
+        self._orphan_close_id: Optional[str] = None
+        self._orphan_close_sent_at: float = 0.0
+        self._orphan_close_attempts: int = 0
+        # Set once the reconciler has given up on a position — it predates the run, it is too
+        # small for any order, or the closes ran out — so the reason is logged once, not per tick.
+        self._orphan_left_for_human: bool = False
 
         self._legs_closed: int = 0
         self._wins: int = 0
@@ -225,6 +240,18 @@ class SimpleGrid(ControllerBase):
     def active_executors(self) -> List[ExecutorInfo]:
         return self.filter_executors(self.executors_info, lambda e: e.is_active)
 
+    @staticmethod
+    def _is_grid_leg(executor: ExecutorInfo) -> bool:
+        """
+        A leg of the grid, as opposed to the close the reconciler sends for an unclaimed
+        position. That close is not a grid trade: it must never be stopped by a halt (the halt
+        is what sent it), nor counted as a leg in the tally and the PnL.
+        """
+        return executor.type == "simple_grid_executor"
+
+    def active_legs(self) -> List[ExecutorInfo]:
+        return [executor for executor in self.active_executors() if self._is_grid_leg(executor)]
+
     def unfinished_executors(self) -> List[ExecutorInfo]:
         """
         Every leg that has not reached TERMINATED — including the ones still closing.
@@ -258,10 +285,11 @@ class SimpleGrid(ControllerBase):
         if self.is_halted or self.config.manual_kill_switch:
             # The account is only flat between legs, so a halt that leaves an open leg
             # running leaves a position with nothing watching it — and under this design its
-            # exit would simply open the next one. Close it instead.
+            # exit would simply open the next one. Close it instead. Grid legs only: the close
+            # the reconciler sent for an unclaimed position must be left to finish.
             return [StopExecutorAction(controller_id=self.config.id, executor_id=executor.id,
                                        keep_position=False)
-                    for executor in self.active_executors()]
+                    for executor in self.active_legs()]
         # Not active_executors: a leg that is still closing has not given the margin back yet,
         # and the next leg cannot be funded until it has.
         if len(self.unfinished_executors()) > 0:
@@ -283,6 +311,13 @@ class SimpleGrid(ControllerBase):
             if not executor.is_done or executor.id in self._processed_executor_ids:
                 continue
             self._processed_executor_ids.add(executor.id)
+            if not self._is_grid_leg(executor):
+                # The reconciler's close of an unclaimed position: reported, never tallied.
+                close_type = executor.close_type.name if executor.close_type else "unknown"
+                self.logger().info(
+                    f"SimpleGrid: the close of the unclaimed position finished ({close_type}, "
+                    f"{executor.filled_amount_quote:.4f} quote filled)")
+                continue
 
             close_price = executor.custom_info.get("close_price")
             side = executor.custom_info.get("side")
@@ -379,6 +414,8 @@ class SimpleGrid(ControllerBase):
         """
         total = Decimal("0")
         for executor in self.executors_info:
+            if not self._is_grid_leg(executor):
+                continue
             if not executor.is_done:
                 filled = executor.custom_info.get("filled_amount") or Decimal("0")
             elif executor.close_type == CloseType.POSITION_HOLD:
@@ -403,6 +440,10 @@ class SimpleGrid(ControllerBase):
         if position is None:
             self._seen_flat_since_start = True
             self._orphan_since = None
+            # Gone. Should another unclaimed position appear later, it gets fresh attempts.
+            self._orphan_close_id = None
+            self._orphan_close_attempts = 0
+            self._orphan_left_for_human = False
             return []
         if self._claimed_amount() > Decimal("0"):
             self._orphan_since = None
@@ -422,24 +463,74 @@ class SimpleGrid(ControllerBase):
                 f"in this process")
             self.logger().error(f"SimpleGrid halted: {self._halt_reason}")
 
-        if self._orphan_flatten_sent or not self.config.flatten_orphan_positions:
+        if not self.config.flatten_orphan_positions or self._orphan_left_for_human:
             return []
         if not self._seen_flat_since_start:
             # It was already there when we started, so it is not ours to close.
             self.logger().error(
                 "SimpleGrid will NOT close this position: the account was never seen flat "
                 "since start, so it predates this run. Close it by hand if it is yours.")
-            self._orphan_flatten_sent = True
+            self._orphan_left_for_human = True
+            return []
+        if self._orphan_close_in_progress(now):
+            return []
+        if self._orphan_close_attempts >= ORPHAN_CLOSE_ATTEMPTS:
+            self.logger().error(
+                f"SimpleGrid could not close the unclaimed {position.amount} "
+                f"{self.config.trading_pair} in {self._orphan_close_attempts} attempts. Close it "
+                f"by hand.")
+            self._orphan_left_for_human = True
             return []
 
         config = self._build_flatten_config(position)
         if config is None:
             return []
-        self._orphan_flatten_sent = True
+        if not self._venue_accepts_order(config.amount, config.price):
+            # The venue refuses any order under its minimum, so a close could never be sent.
+            self.logger().error(
+                f"SimpleGrid cannot close the unclaimed {position.amount} "
+                f"{self.config.trading_pair}: it is under the venue's minimum order, so no order "
+                f"can close it. Close it by hand.")
+            self._orphan_left_for_human = True
+            return []
+        self._orphan_close_id = config.id
+        self._orphan_close_sent_at = now
+        self._orphan_close_attempts += 1
         self.logger().warning(
-            f"SimpleGrid is closing the unclaimed {position.amount} "
-            f"{self.config.trading_pair} at {config.price}")
+            f"SimpleGrid is closing the unclaimed {position.amount} {self.config.trading_pair} "
+            f"at {config.price} (attempt {self._orphan_close_attempts} of {ORPHAN_CLOSE_ATTEMPTS})")
         return [CreateExecutorAction(controller_id=self.config.id, executor_config=config)]
+
+    def _orphan_close_in_progress(self, now: float) -> bool:
+        """
+        Whether the close already sent for the unclaimed position should be left to work.
+
+        One that finished without flattening the position — refused, cancelled, partly filled
+        — is followed by another, but not straight away: the venue's position feed is given
+        orphan_grace_seconds to report the result first, or a close that did fill would be
+        chased by a second one.
+        """
+        if self._orphan_close_id is None:
+            return False
+        close = next((executor for executor in self.executors_info
+                      if executor.id == self._orphan_close_id), None)
+        if close is None:
+            return now - self._orphan_close_sent_at < ORPHAN_CLOSE_REPORT_TIMEOUT
+        if not close.is_done:
+            return True
+        finished_at = close.close_timestamp or self._orphan_close_sent_at
+        return now - finished_at < self.config.orphan_grace_seconds
+
+    def _venue_accepts_order(self, amount: Decimal, price: Decimal) -> bool:
+        """Whether an order this size clears the venue's minimum size and notional."""
+        try:
+            connector = self.market_data_provider.connectors.get(self.config.connector_name)
+            rule = connector.trading_rules[self.config.trading_pair]
+        except Exception:
+            return True
+        min_size = rule.min_order_size if isinstance(rule.min_order_size, Decimal) else Decimal("0")
+        min_notional = rule.min_notional_size if isinstance(rule.min_notional_size, Decimal) else Decimal("0")
+        return amount >= min_size and amount * price >= min_notional
 
     def _build_flatten_config(self, position) -> Optional[OrderExecutorConfig]:
         """A crossing limit, for the same reason the executor's own urgent exit is one."""
@@ -514,6 +605,7 @@ class SimpleGrid(ControllerBase):
         if limit is not None and self._realized_pnl_quote <= -limit:
             self._halt_reason = (f"loss {self._realized_pnl_quote:.4f} reached the threshold "
                                  f"-{limit:.4f} after {self._legs_closed} legs")
+            self.logger().error(f"SimpleGrid halted: {self._halt_reason}")
         elif (self.config.stop_when_losses_outnumber_wins
                 and self._legs_closed >= self.config.min_legs_before_count_check
                 and self._losses >= self._wins and self._realized_pnl_quote < Decimal("0")):
@@ -592,7 +684,7 @@ class SimpleGrid(ControllerBase):
         limit = self.loss_limit_quote
         actual = self.actual_win_rate
 
-        active = [info for info in self.executors_info if info.is_active]
+        active = self.active_legs()
         info = active[0].custom_info if active else {}
 
         base = self._reference_price if self._reference_price is not None else mid_price

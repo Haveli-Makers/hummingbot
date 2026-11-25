@@ -30,9 +30,10 @@ from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
 # that settles cancels synchronously — still produces a growing wait after a refusal.
 MIN_EXIT_RETRY_DELAY = 0.1
 
-# How long a trigger waits on an unconfirmed cancel of its resting order before asking again.
+# How long to wait on an unconfirmed cancel of an entry before asking again: the resting order
+# a trigger replaces, the losing side of both_oco, or the rest of an entry too small to trade.
 # A cancel that fails in transit produces no event at all, and without a second request the
-# trigger would sit behind a live order until entry_timeout.
+# order would stay in the book.
 ENTRY_CANCEL_RESEND_SECONDS = 5.0
 
 
@@ -146,6 +147,14 @@ class SimpleGridExecutor(ExecutorBase):
         # to appear there, and skipping the exit because of that lag would be far worse than
         # the storm this guards against.
         self._exit_has_been_refused = False
+        # Take profits the venue refused, in a row. Kept apart from _current_retries: running
+        # out of those FAILS the leg and abandons the position, while a take profit that cannot
+        # be placed should give way to a close instead. See process_order_failed_event.
+        self._take_profit_refusals = 0
+
+        # When each entry cancel was last sent, so one that never lands is asked again — but
+        # not on every tick. See _request_cancel.
+        self._cancel_sent_at: Dict[str, float] = {}
 
         # Orders already warned about in _order_filled_base, so the warning is logged once
         # each rather than on every tick.
@@ -197,28 +206,26 @@ class SimpleGridExecutor(ExecutorBase):
         themselves never arrived.
 
         executed_amount_base is populated only by trade updates, so a venue whose trade feed
-        lags can report an order FILLED with zero executed amount. Every size derived from it
-        then collapses to zero and no exit is armed while a real position sits on the venue.
-        The completion event cannot help — it is built from the same field. A terminal FILLED
-        state means the venue considers the order fully filled, so fall back to the requested
-        amount and log the assumption.
+        lags can report an order FILLED with none, or only some, of its fills recorded. Every
+        size derived from it then comes out short, and the exits leave part of a real position
+        uncovered. The completion event cannot help — it is built from the same field. A
+        terminal FILLED state means the venue considers the order fully filled, so fall back to
+        the requested amount and log the assumption.
         """
         if order is None:
             return Decimal("0")
         live = order.executed_amount_base or Decimal("0")
-        if live > Decimal("0"):
-            return live
         in_flight = order.order
         if in_flight is not None and in_flight.current_state == OrderState.FILLED \
-                and in_flight.amount > Decimal("0"):
+                and in_flight.amount > live:
             if order.order_id not in self._assumed_full_fills:
                 self._assumed_full_fills.append(order.order_id)
                 self.logger().warning(
-                    f"Executor ID: {self.config.id} - order {order.order_id} is FILLED but no "
-                    f"fills arrived; assuming the full {in_flight.amount} at {in_flight.price}. "
-                    f"Sizes and PnL for this leg are approximate.")
+                    f"Executor ID: {self.config.id} - order {order.order_id} is FILLED but fills "
+                    f"for only {live} of it arrived; assuming the full {in_flight.amount}. Sizes "
+                    f"and PnL for this leg are approximate.")
             return in_flight.amount
-        return Decimal("0")
+        return live
 
     def _order_avg_price(self, order: Optional[TrackedOrder]) -> Optional[Decimal]:
         """Average fill price, falling back to the order's own price when fills are missing."""
@@ -715,12 +722,30 @@ class SimpleGridExecutor(ExecutorBase):
         self._cancel_losing_entries()
 
     def _cancel_losing_entries(self):
-        """Cancel every entry order that is not the winning side."""
+        """
+        Cancel every entry order that is not the winning side, until it is really gone.
+
+        Runs on every tick once a side has won, not only at the fill. An order the venue has
+        not acknowledged yet cannot be cancelled — the venue has no id for it — so it is left
+        to process_order_created_event, which cancels it the moment it is acknowledged. A
+        cancel that never lands is asked again (see _request_cancel). Left alone, the losing
+        order can fill later and shrink the position under exits sized for all of it.
+        """
         for side, order in self._entry_orders.items():
-            if side == self._filled_side:
+            if side == self._filled_side or order is None or order.is_done:
                 continue
-            if order and order.order and order.order.is_open:
-                self._cancel_order(order)
+            if order.order is None:
+                continue
+            self._request_cancel(order)
+
+    def _request_cancel(self, order: TrackedOrder, force: bool = False):
+        """Cancel an entry, re-sending at most every ENTRY_CANCEL_RESEND_SECONDS until it lands."""
+        now = self._strategy.current_timestamp
+        sent_at = self._cancel_sent_at.get(order.order_id)
+        if not force and sent_at is not None and now - sent_at < ENTRY_CANCEL_RESEND_SECONDS:
+            return
+        self._cancel_sent_at[order.order_id] = now
+        self._cancel_order(order)
 
     def control_entry_orders(self):
         """
@@ -734,8 +759,7 @@ class SimpleGridExecutor(ExecutorBase):
         The first leg of a run has no previous exit to measure from, so it rests at the touch
         and has no trigger.
         """
-        if self.config.entry_timeout is not None and \
-                self._strategy.current_timestamp - self.config.timestamp >= self.config.entry_timeout:
+        if self._entry_timed_out():
             self.logger().info(f"Executor ID: {self.config.id} - entry timed out unfilled")
             self._give_up_on_entry()
             return
@@ -766,6 +790,10 @@ class SimpleGridExecutor(ExecutorBase):
                 continue
             self._warned_no_touch = False
             self.place_entry_order(side, price)
+
+    def _entry_timed_out(self) -> bool:
+        return self.config.entry_timeout is not None and \
+            self._strategy.current_timestamp - self.config.timestamp >= self.config.entry_timeout
 
     def _entry_trigger_reached(self, side: TradeType) -> bool:
         """Has the market gone the wrong way by a full step since the last leg ended?"""
@@ -902,17 +930,79 @@ class SimpleGridExecutor(ExecutorBase):
     # ------------------------------------------------------------------ barriers
 
     def control_barriers(self):
+        self._cancel_losing_entries()
+        if not self._position_is_tradable():
+            self._control_untradable_position()
+            return
         self._cancel_entry_remainder()
         self.control_time_limit()
         if self._status != RunnableStatus.RUNNING:
             return
-        if self.open_filled_amount >= self.trading_rules.min_order_size and \
-                self.open_filled_amount_quote >= self.trading_rules.min_notional_size:
-            self.control_stop_loss()
-            if self._status != RunnableStatus.RUNNING:
-                return
-            if not self._stop_loss_triggered:
-                self.control_take_profit()
+        self.control_stop_loss()
+        if self._status != RunnableStatus.RUNNING:
+            return
+        if not self._stop_loss_triggered:
+            self.control_take_profit()
+
+    def _position_is_tradable(self) -> bool:
+        """Whether the venue would accept an order the size of the position, to close it."""
+        return self.open_filled_amount >= self.trading_rules.min_order_size and \
+            self.open_filled_amount_quote >= self.trading_rules.min_notional_size
+
+    def _control_untradable_position(self):
+        """
+        Hold a position too small for the venue to accept any order for.
+
+        Below the minimum order size or notional no take profit, stop loss or close can be
+        placed, so none is armed. Cancelling the rest of the entry as well used to leave the
+        leg with no way to grow, no way to close and — with no time limit set — no way to end,
+        and the controller opens no new leg while one is still running.
+
+        So the rest of the entry keeps working until the entry timeout: a position that grows
+        into a tradable one carries on as a normal leg. One that does not ends the leg once its
+        orders are confirmed gone, as FAILED — nothing the bot can send would close it, so a
+        person has to, and FAILED is what makes the controller halt and say so.
+        """
+        remainder = self._entry_orders.get(self._filled_side)
+        still_growing = remainder is not None and not remainder.is_done
+        if still_growing and not (self._entry_timed_out() or self.is_expired):
+            return
+        unfinished = self._unfinished_orders()
+        if unfinished:
+            # Wait for the venue to confirm. A fill racing the cancel may yet make the
+            # position big enough to trade, and then the leg simply carries on.
+            for order in unfinished:
+                self._request_cancel(order)
+            return
+        self._end_untradable_leg()
+
+    def _unfinished_orders(self) -> List[TrackedOrder]:
+        """Every order of ours the venue has not finished with, acknowledged or not."""
+        candidates = list(self._entry_orders.values()) + \
+            [self._take_profit_order, self._sl_chase_order, self._close_order]
+        unfinished = [order for order in candidates if order is not None and not order.is_done]
+        unfinished += [order for order in self._adopted_entry_orders()
+                       if order.order is not None and order.order.is_open]
+        return unfinished
+
+    def _end_untradable_leg(self):
+        self.close_timestamp = self._strategy.current_timestamp
+        if self.open_filled_amount <= Decimal("0"):
+            # Both sides of an OCO entry filled and cancelled each other out.
+            self.close_type = CloseType.EARLY_STOP
+            self.logger().info(
+                f"Executor ID: {self.config.id} - the entry fills net to nothing; no position "
+                f"is held, so the leg ends here.")
+        else:
+            self.close_type = CloseType.FAILED
+            self.logger().error(
+                f"Executor ID: {self.config.id} - the entry filled only {self.open_filled_amount} "
+                f"{self.config.trading_pair} ({self.open_filled_amount_quote:.4f} quote), under "
+                f"the venue's minimum order (size {self.trading_rules.min_order_size}, notional "
+                f"{self.trading_rules.min_notional_size}). No take profit, stop loss or close can "
+                f"be placed for a position that small, so the leg is ending as FAILED. Close it "
+                f"by hand.")
+        self.stop()
 
     def _cancel_entry_remainder(self):
         """
@@ -1074,14 +1164,27 @@ class SimpleGridExecutor(ExecutorBase):
         if self.take_profit_price is None:
             return
         if self._take_profit_order is None:
+            # A refused take profit waits out the same backoff as any other refused exit,
+            # rather than going straight back out on the next tick.
+            if self._exit_placement_blocked():
+                return
             self.place_take_profit_order()
         elif self._take_profit_order.order and self._take_profit_order.order.is_open:
-            # A partial fill that lands after the take profit is placed leaves the resting
-            # amount short of the position; re-issue it at the right size.
-            if self._take_profit_order.order.amount != self.amount_to_close and \
-                    self.amount_to_close >= self.trading_rules.min_order_size and \
-                    self._take_profit_order.order_id not in self._cancel_requested:
+            if self._take_profit_order.order_id in self._cancel_requested:
+                return
+            # Re-issue it only when the position really changed size underneath it — an entry
+            # fill that landed after it was placed. Compare what is still RESTING with what is
+            # left to close: the order's original amount is short by its own fills, so
+            # comparing that made every partial fill of the take profit look like a mismatch,
+            # and it was cancelled and re-posted at the back of the queue each time.
+            resting = self._take_profit_order.order.amount - self._order_filled_base(self._take_profit_order)
+            wanted = self._quantize_amount(self.amount_to_close)
+            if wanted >= self.trading_rules.min_order_size and resting != wanted:
                 self.renew_take_profit_order()
+
+    def _quantize_amount(self, amount: Decimal) -> Decimal:
+        return self.connectors[self.config.connector_name].quantize_order_amount(
+            trading_pair=self.config.trading_pair, amount=amount)
 
     def place_take_profit_order(self):
         if self.amount_to_close < self.trading_rules.min_order_size:
@@ -1612,6 +1715,15 @@ class SimpleGridExecutor(ExecutorBase):
 
     def process_order_created_event(self, _, market, event: Union[BuyOrderCreatedEvent, SellOrderCreatedEvent]):
         self.update_tracked_orders_with_order_id(event.order_id)
+        side = self._entry_side_for_order_id(event.order_id)
+        if side is not None and self._filled_side is not None and side != self._filled_side:
+            # The losing side of both_oco, acknowledged only after the other side filled. The
+            # venue has an id for it at last, so it can be cancelled now — and must be.
+            self._request_cancel(self._entry_orders[side], force=True)
+            return
+        if self._take_profit_order and self._take_profit_order.order_id == event.order_id:
+            self._take_profit_refusals = 0
+            self._reset_exit_backoff()
         # The venue accepted it, so whatever was holding the collateral has let go.
         if (self._sl_chase_order and self._sl_chase_order.order_id == event.order_id) or \
                 (self._close_order and self._close_order.order_id == event.order_id):
@@ -1724,7 +1836,23 @@ class SimpleGridExecutor(ExecutorBase):
         if self._take_profit_order and self._take_profit_order.order_id == event.order_id:
             self._failed_orders.append(self._take_profit_order)
             self._take_profit_order = None
-            self.logger().error(f"Take profit order failed {event.order_id}.")
+            self._take_profit_refusals += 1
+            if self._status != RunnableStatus.RUNNING:
+                return          # already closing; the close decides how the leg ends
+            if self._take_profit_refusals >= self._max_retries:
+                # Not FAILED: that stops the leg and abandons the position with nothing watching
+                # it. Close it instead — the close has its own retries and its own handling of
+                # a venue that says there is nothing left to close.
+                self.logger().error(
+                    f"Executor ID: {self.config.id} - the venue refused the take profit "
+                    f"{self._take_profit_refusals} times in a row (last: {event.error_message}). "
+                    f"Closing the position instead of leaving it without one.")
+                self.place_close_order_and_cancel_open_orders(close_type=CloseType.EARLY_STOP)
+                return
+            if not self._reschedule_after_exit_refusal(event):
+                self.logger().error(
+                    f"Take profit order failed {event.order_id}. Retrying in "
+                    f"{self._exit_retry_delay:.2f}s ({self._take_profit_refusals}/{self._max_retries})")
         elif self._sl_chase_order and self._sl_chase_order.order_id == event.order_id:
             self._failed_orders.append(self._sl_chase_order)
             self._sl_chase_order = None

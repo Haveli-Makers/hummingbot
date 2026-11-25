@@ -789,3 +789,122 @@ class TestSimpleGrid(IsolatedAsyncioWrapperTestCase):
 
         self.assertIsNone(controller._bias_side)
         self.assertEqual(config.entry_mode, SimpleGridEntryMode.BOTH_OCO)
+
+    # ------------------------------------------------------------------ closing an unclaimed position
+
+    def send_orphan_close(self, controller, at=11):
+        """Run the reconciler up to the close it sends for an unclaimed 0.008 long."""
+        self.set_venue(amount=None)
+        controller.determine_executor_actions()
+        self.set_venue(amount="0.008")
+        controller.determine_executor_actions()
+        actions = self.past_the_grace(controller, seconds=at)
+        self.assertEqual(len(actions), 1)
+        return actions[0].executor_config
+
+    @staticmethod
+    def orphan_close_info(config, status=RunnableStatus.RUNNING, close_type=None,
+                          close_timestamp=None, filled_quote="0", net_pnl_quote="0") -> ExecutorInfo:
+        """The orchestrator's view of the close the reconciler sent."""
+        return ExecutorInfo(
+            id=config.id, timestamp=START_TS, type="order_executor", status=status, config=config,
+            net_pnl_pct=Decimal("0"), net_pnl_quote=Decimal(net_pnl_quote),
+            cum_fees_quote=Decimal("0"), filled_amount_quote=Decimal(filled_quote),
+            is_active=status in (RunnableStatus.RUNNING, RunnableStatus.NOT_STARTED),
+            is_trading=False, custom_info={"held_position_orders": []},
+            close_timestamp=close_timestamp, close_type=close_type, controller_id="grid-1",
+        )
+
+    def test_the_halt_does_not_cancel_the_close_of_an_unclaimed_position(self):
+        """
+        The reconciler halts and sends the close in the same tick. On the next tick the halt
+        stopped every active executor — that close included — and none was ever sent again.
+        A grid leg that is still open is stopped as before.
+        """
+        controller = self.controller()
+        config = self.send_orphan_close(controller)
+        controller.executors_info = [self.orphan_close_info(config), self.active_leg("live-1")]
+
+        actions = self.past_the_grace(controller, seconds=12)
+
+        self.assertTrue(controller.is_halted)
+        self.assertEqual([action.executor_id for action in actions], ["live-1"])
+
+    def test_a_close_that_left_the_position_open_is_sent_again(self):
+        controller = self.controller()
+        config = self.send_orphan_close(controller)
+        controller.executors_info = [self.orphan_close_info(
+            config, status=RunnableStatus.TERMINATED, close_type=CloseType.FAILED,
+            close_timestamp=START_TS + 13)]
+
+        # The venue gets orphan_grace_seconds to report the position gone first.
+        self.assertEqual(self.past_the_grace(controller, seconds=20), [])
+        actions = self.past_the_grace(controller, seconds=24)
+
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].executor_config.amount, Decimal("0.008"))
+        self.assertNotEqual(actions[0].executor_config.id, config.id)
+
+    def test_closing_an_unclaimed_position_gives_up_after_three_tries_and_says_so(self):
+        controller = self.controller()
+        controller.logger = MagicMock()
+        closes = []
+        at = 11
+        for _ in range(3):
+            config = (self.send_orphan_close(controller, at=at) if not closes
+                      else self.past_the_grace(controller, seconds=at)[0].executor_config)
+            closes.append(self.orphan_close_info(
+                config, status=RunnableStatus.TERMINATED, close_type=CloseType.FAILED,
+                close_timestamp=START_TS + at + 1))
+            controller.executors_info = list(closes)
+            at += 12
+
+        self.assertEqual(self.past_the_grace(controller, seconds=at), [])
+        errors = [str(call.args[0]) for call in controller.logger.return_value.error.call_args_list]
+        self.assertTrue(any("by hand" in line for line in errors), errors)
+
+    def test_the_close_of_an_unclaimed_position_is_not_a_grid_leg(self):
+        """It is not a grid trade, so it must not move the leg count, the win rate or the PnL."""
+        controller = self.controller()
+        config = self.send_orphan_close(controller)
+        controller.executors_info = [self.orphan_close_info(
+            config, status=RunnableStatus.TERMINATED, close_type=CloseType.COMPLETED,
+            close_timestamp=START_TS + 12, filled_quote="0.8", net_pnl_quote="-0.05")]
+        self.set_venue(amount=None)
+
+        self.past_the_grace(controller, seconds=13)
+
+        self.assertEqual(controller._legs_closed, 0)
+        self.assertEqual(controller._realized_pnl_quote, Decimal("0"))
+        self.assertIsNone(controller._reference_price)
+
+    def test_a_position_too_small_to_close_is_left_for_a_human(self):
+        """The venue refuses any order below its minimum, so a close cannot be sent at all."""
+        controller = self.controller()
+        controller.logger = MagicMock()
+        self.set_venue(amount=None)
+        controller.determine_executor_actions()
+        connector = self.set_venue(amount="0.008")
+        connector.trading_rules["BTC-USDT"].min_order_size = Decimal("0.01")
+        connector.trading_rules["BTC-USDT"].min_notional_size = Decimal("0")
+        controller.determine_executor_actions()
+
+        actions = self.past_the_grace(controller)
+
+        self.assertEqual(actions, [])
+        self.assertTrue(controller.is_halted)
+        errors = [str(call.args[0]) for call in controller.logger.return_value.error.call_args_list]
+        self.assertTrue(any("by hand" in line for line in errors), errors)
+
+    # ------------------------------------------------------------------ the loss limit
+
+    def test_reaching_the_loss_limit_is_logged(self):
+        controller = self.controller(max_loss_quote=Decimal("5"))
+        controller.logger = MagicMock()
+        controller.executors_info = [self.closed_leg("leg-1", CloseType.STOP_LOSS, net_pnl_quote="-6")]
+
+        controller.determine_executor_actions()
+
+        self.assertTrue(controller.is_halted)
+        errors = [str(call.args[0]) for call in controller.logger.return_value.error.call_args_list]
+        self.assertTrue(any("SimpleGrid halted" in line and "loss" in line for line in errors), errors)

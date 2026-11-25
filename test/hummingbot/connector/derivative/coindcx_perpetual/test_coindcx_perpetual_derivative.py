@@ -1198,6 +1198,50 @@ class CoindcxPerpetualDerivativeTests(IsolatedAsyncioWrapperTestCase):
         fetch.assert_awaited_once()
         self.assertEqual(Decimal("0.01"), order.executed_amount_base)
 
+    async def test_a_partly_filled_order_reported_filled_without_its_trades_fetches_the_rest(self):
+        """
+        Fills were only fetched when none had been recorded yet. An order that had already
+        reported part of its fills and then arrived FILLED with no trades settled at the part,
+        so a strategy sizing its exits from it covered less than the real position.
+        """
+        self._bootstrap()
+        order = self._track(exchange_order_id="ex-1")
+        partial = self._fill_event(status="partially_filled")
+        partial["trades"][0]["quantity"] = "0.004"
+        self.exchange._process_order_event(partial)
+        self.assertEqual(Decimal("0.004"), order.executed_amount_base)
+
+        filled = self._fill_event()
+        filled["updated_at"] = 1700000002000
+        filled["trades"] = []
+        both_fills = [
+            self.exchange._trade_update_from_fill(
+                {"fill_id": "f-1", "id": "ex-1", "pair": "B-BTC_USDT", "price": "60000",
+                 "quantity": "0.004", "fee_amount": "0.14", "timestamp": 1700000001000}, order),
+            self.exchange._trade_update_from_fill(
+                {"fill_id": "f-2", "id": "ex-1", "pair": "B-BTC_USDT", "price": "60000",
+                 "quantity": "0.006", "fee_amount": "0.21", "timestamp": 1700000002000}, order),
+        ]
+        with patch.object(self.exchange, "_all_trade_updates_for_order",
+                          new=AsyncMock(return_value=both_fills)) as fetch:
+            self.exchange._process_order_event(filled)
+            for _ in range(4):
+                await asyncio.sleep(0)
+
+        fetch.assert_awaited_once()
+        self.assertEqual(Decimal("0.01"), order.executed_amount_base)
+
+    async def test_a_filled_frame_carrying_all_its_fills_does_not_fetch_them(self):
+        self._bootstrap()
+        order = self._track(exchange_order_id="ex-1")
+
+        with patch.object(self.exchange, "_all_trade_updates_for_order", new=AsyncMock()) as fetch:
+            self.exchange._process_order_event(self._fill_event())
+            await asyncio.sleep(0)
+
+        fetch.assert_not_awaited()
+        self.assertEqual(Decimal("0.01"), order.executed_amount_base)
+
     async def test_repeated_order_frames_are_applied_once(self):
         """
         CoinDCX repeats frames. Applying one twice re-fires the created event, and

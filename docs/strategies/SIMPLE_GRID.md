@@ -158,7 +158,7 @@ than with it. Set them all to `0` on a venue that settles a cancel synchronously
 | `insufficient_balance_grace_seconds` | `180.0` | how long our own budget check may keep refusing |
 | `reconcile_positions` | `True` | halt on a position no leg claims |
 | `orphan_grace_seconds` | `10.0` | how long the venue and our books must disagree first |
-| `flatten_orphan_positions` | `True` | close an unclaimed position the run itself opened |
+| `flatten_orphan_positions` | `True` | close an unclaimed position the run itself opened (up to 3 attempts) |
 | `stop_when_losses_outnumber_wins` | `False` | off by default; `max_loss_quote` is the agreed stop |
 | `min_legs_before_count_check` | `10` | minimum sample before that check can fire |
 | `cooldown_after_take_profit`, `cooldown_after_stop_loss` | `0` | a pause is time spent flat, so both default to none |
@@ -234,13 +234,15 @@ round-trip fee. Those four are what a misconfigured run gets wrong.
 
 The side latches on the **first** fill, however small, and the unfilled remainder of the entry
 is cancelled — leaving it open would keep moving the average entry price, and the bracket hangs
-off that price. The take profit is re-sized if the position changes underneath it, and a stop
-that fills across several chased orders is accounted at their weighted average.
+off that price. The take profit is re-sized only if the position changes underneath it (a
+partial fill of the take profit itself leaves it in place), and a stop that fills across several
+chased orders is accounted at their weighted average.
 
-**The one gap:** a partial fill below the venue's minimum notional leaves a position that
-cannot be closed. No take profit or stop loss is armed for it, the leg exhausts its retries,
-and the run halts telling you to close it by hand. Size legs comfortably above the minimum
-notional so a partial fill still clears it.
+**Below the venue minimum:** a first fill smaller than the venue's minimum order size or
+notional cannot be closed by any order, so no take profit or stop loss is armed for it. The rest
+of the entry is then kept working until `entry_timeout`. If it fills enough, the leg carries on
+as normal. If not, the leg ends as FAILED and the run halts, telling you to close the position
+by hand. Size legs comfortably above the minimum so a partial fill still clears it.
 
 ---
 

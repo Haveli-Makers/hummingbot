@@ -1,5 +1,6 @@
 import asyncio
 import time
+from collections import OrderedDict
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -22,11 +23,12 @@ from hummingbot.connector.derivative.position import Position
 from hummingbot.connector.perpetual_derivative_py_base import PerpetualDerivativePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
-from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PositionSide, TradeType
+from hummingbot.core.data_type.common import OpenOrder, OrderType, PositionAction, PositionMode, PositionSide, TradeType
 from hummingbot.core.data_type.funding_info import FundingInfo
-from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate, TradeUpdate
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.trade_fee import TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
+from hummingbot.core.event.events import MarketEvent
 from hummingbot.core.utils.async_utils import safe_ensure_future, safe_gather
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
@@ -100,7 +102,18 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
         # Order events that arrived before _place_order recorded the exchange id,
         # held as (exchange_order_id, payload, buffered_at) in arrival order.
         self._pending_order_events: List[Tuple[str, Dict[str, Any], float]] = []
+        # Signatures of order frames already applied, so repeats are dropped. See
+        # _order_event_signature. Ordered so the oldest can be evicted in O(1).
+        self._applied_order_events: "OrderedDict[Tuple[str, str, str, str], None]" = OrderedDict()
         self._pending_order_events_task: Optional[asyncio.Task] = None
+        self._balance_refresh_task: Optional[asyncio.Task] = None
+        # A wallet read asked for while another was already under way, as the wait it wants.
+        # See _refresh_balances_soon.
+        self._balance_refresh_again_after: Optional[float] = None
+        # Orders whose creation has already been announced. See trigger_event.
+        self._announced_creations: "OrderedDict[str, None]" = OrderedDict()
+        # Last set of unready status keys reported, so status_dict logs only on change.
+        self._last_reported_block: List[str] = []
 
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
@@ -161,6 +174,29 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
     @property
     def funding_fee_poll_interval(self) -> int:
         return CONSTANTS.FUNDING_FEE_POLL_INTERVAL
+
+    @property
+    def tracking_states(self) -> Dict[str, Any]:
+        """
+        Persist only the orders CoinDCX actually acknowledged.
+
+        An order the venue rejected at creation never receives an exchange order id, and
+        CoinDCX has no client-order-id to look it up by instead — so there is nothing at the
+        exchange with that identity to reconcile against, now or ever. The base class keeps
+        it anyway (failed orders are held as "lost" and lost orders are saved), so the next
+        run restores it, polls it until the not-found counter trips, logs it as lost, and
+        warns that it cannot be cancelled. That noise then outlives the incident by however
+        many restarts it takes for someone to clear the database by hand.
+
+        Orders that failed WITH an exchange id are kept, because those can still be checked,
+        and so are orders still awaiting one — dropping those could hide a position the venue
+        accepted while we missed the reply.
+        """
+        return {
+            client_order_id: order.to_json()
+            for client_order_id, order in self._order_tracker.all_updatable_orders.items()
+            if order.exchange_order_id is not None or not order.is_failure
+        }
 
     def supported_order_types(self) -> List[OrderType]:
         # CoinDCX futures instruments report allow_post_only == false, so
@@ -237,6 +273,14 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
             except (asyncio.CancelledError, Exception):
                 pass
             self._pending_order_events_task = None
+        if self._balance_refresh_task is not None:
+            self._balance_refresh_task.cancel()
+            try:
+                await self._balance_refresh_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._balance_refresh_task = None
+        self._balance_refresh_again_after = None
         self._pending_order_events.clear()
 
         # A proxied factory owns a dedicated aiohttp session; the default factory
@@ -494,6 +538,11 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
             "notification": CONSTANTS.NO_NOTIFICATION,
             "margin_currency_short_name": self._margin_currency,
         }
+        if position_action is PositionAction.CLOSE:
+            # Without this the venue treats a close as a fresh opposite position and demands
+            # margin for it, so closing fails with "Insufficient funds" exactly when the
+            # position is large relative to the wallet — the moment you most need to get out.
+            order[CONSTANTS.REDUCE_ONLY_FIELD] = True
         if order_type is not OrderType.MARKET:
             order["price"] = float(price)
             # CoinDCX rejects time_in_force on market orders.
@@ -532,6 +581,13 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
         if isinstance(response, dict):
             code = response.get("code", response.get("status"))
             if str(response.get("message", "")).lower() == "success" or code in (200, "200"):
+                # The only place a cancel WE initiated can ask for the released margin to be
+                # re-read. On success the framework marks the order CANCELED itself, bypassing
+                # _push_order_update where settling orders normally trigger a refresh, and a
+                # repeat frame from the venue returns on that method's dedupe check. So without
+                # this the freed collateral stays invisible until the next scheduled poll —
+                # LONG_POLL_INTERVAL, 120s, whenever the websocket is alive.
+                self._refresh_balances_soon(delay=CONSTANTS.BALANCE_REFRESH_AFTER_CANCEL_DELAY)
                 return True
         raise IOError(f"Unexpected response cancelling order {exchange_order_id}: {response}")
 
@@ -576,6 +632,62 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
             client_order_id=tracked_order.client_order_id,
             exchange_order_id=str(order.get("id", tracked_order.exchange_order_id or "")),
         )
+
+    @property
+    def status_dict(self) -> Dict[str, bool]:
+        """
+        Readiness, plus a note naming whatever is holding it up.
+
+        An unready connector makes the strategy log "is not ready" every tick without
+        saying which check is failing. Logged only when the set changes.
+        """
+        status = super().status_dict
+        blocked = sorted(key for key, ready in status.items() if not ready)
+        if blocked and blocked != self._last_reported_block:
+            self._last_reported_block = blocked
+            self.logger().info(f"Connector not ready; waiting on: {', '.join(blocked)}.")
+        elif not blocked and self._last_reported_block:
+            self._last_reported_block = []
+            self.logger().info("Connector ready.")
+        return status
+
+    async def get_open_orders(self) -> List[OpenOrder]:
+        """
+        Orders resting on the exchange right now.
+
+        Asks the exchange rather than reading ``in_flight_orders``, so manual orders and
+        orders left by an earlier session are included.
+        """
+        orders: List[OpenOrder] = []
+        payload = {"status": CONSTANTS.OPEN_ORDER_STATUSES,
+                   "margin_currency_short_name": [self._margin_currency]}
+        for side in (TradeType.BUY, TradeType.SELL):
+            side_payload = dict(payload, side=self.coindcx_side(side))
+            async for page in self._paginated_records(CONSTANTS.LIST_ORDERS_PATH_URL, side_payload):
+                for order in page:
+                    if not isinstance(order, dict):
+                        continue
+                    try:
+                        trading_pair = await self.trading_pair_associated_to_exchange_symbol(
+                            symbol=str(order.get("pair", "")))
+                    except Exception:
+                        # An order on a pair this connector was not configured for.
+                        continue
+                    amount = Decimal(str(order.get("total_quantity") or 0))
+                    orders.append(OpenOrder(
+                        client_order_id=str(order.get("client_order_id") or order.get("id", "")),
+                        trading_pair=trading_pair,
+                        price=Decimal(str(order.get("price") or 0)),
+                        amount=amount,
+                        executed_amount=Decimal(str(order.get("filled_quantity") or 0)),
+                        status=str(order.get("status", "")),
+                        order_type=OrderType.LIMIT if "limit" in str(
+                            order.get("order_type", "")).lower() else OrderType.MARKET,
+                        is_buy=str(order.get("side", "")).lower() == "buy",
+                        time=int(order.get("created_at") or 0),
+                        exchange_order_id=str(order.get("id", "")),
+                    ))
+        return orders
 
     async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
         trade_updates: List[TradeUpdate] = []
@@ -956,15 +1068,79 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
                 self.logger().exception("Unexpected error in user stream listener loop.")
                 await self._sleep(5.0)
 
+    def trigger_event(self, event_tag, message):
+        """
+        Announce an order's creation once, however many times the state machine says so.
+
+        The REST placement response and the websocket frame both drive an order out of
+        PENDING_CREATE, and landing ~400ms apart they each fire the created event.
+        MarketsRecorder writes a row per event, so the second fails on a duplicate
+        Order.id and aborts whatever was queued behind it. The two paths cannot see each
+        other, so the constraint is enforced here, where they converge.
+        """
+        if event_tag in (MarketEvent.BuyOrderCreated, MarketEvent.SellOrderCreated):
+            order_id = getattr(message, "order_id", None)
+            if order_id is not None:
+                if order_id in self._announced_creations:
+                    self.logger().debug(
+                        f"Suppressing a repeat {event_tag.name} for {order_id}.")
+                    return
+                self._remember(self._announced_creations, order_id)
+        super().trigger_event(event_tag, message)
+
+    @staticmethod
+    def _remember(seen: "OrderedDict", key) -> None:
+        """Add to a bounded record of recent keys, evicting the oldest."""
+        seen[key] = None
+        if len(seen) > CONSTANTS.MAX_APPLIED_ORDER_EVENTS:
+            seen.popitem(last=False)
+
     def _process_order_event(self, order: Dict[str, Any]):
         exchange_order_id = str(order.get("id", ""))
         if not exchange_order_id:
             return
+        signature = self._order_event_signature(order, exchange_order_id)
+        if self._is_repeat(signature, exchange_order_id):
+            return
         tracked_order = self._tracked_order_for(exchange_order_id)
         if tracked_order is None:
+            # Not recorded as applied: if this copy expires unmatched in the buffer, a later
+            # resend of the same frame must still get through.
             self._defer_order_event(exchange_order_id, order)
             return
+        self._remember(self._applied_order_events, signature)
         self._apply_order_event(order, tracked_order)
+
+    def _is_repeat(self, signature: Tuple[str, str, str, str], exchange_order_id: str) -> bool:
+        if signature in self._applied_order_events:
+            self.logger().debug(f"Ignoring repeated order frame for {exchange_order_id} "
+                                f"(status={signature[1]}).")
+            return True
+        return False
+
+    @staticmethod
+    def _order_event_signature(order: Dict[str, Any], exchange_order_id: str) -> Tuple[str, str, str, str]:
+        """
+        The fields that define an order-frame transition, used to drop frames already handled.
+
+        CoinDCX repeats frames — its Socket.IO payloads are double-wrapped, and a deferred
+        event can also be replayed — so the same state transition can be applied twice. The
+        second one re-fires BuyOrderCreated/SellOrderCreated, and MarketsRecorder then tries
+        to insert a row it already has:
+
+            sqlite3.IntegrityError: UNIQUE constraint failed: Order.id
+
+        That exception escapes into the event listener, so any work queued behind it on the
+        same frame is skipped. Keying on the fields that define a transition lets genuine
+        updates through while repeats are ignored.
+
+        A signature is recorded only when its frame is actually applied, live or replayed —
+        never for a frame that was merely deferred.
+        """
+        return (exchange_order_id,
+                str(order.get("status", "")).lower(),
+                str(order.get("updated_at") or order.get("created_at") or ""),
+                str(order.get("filled_quantity") or ""))
 
     def _tracked_order_for(self, exchange_order_id: str) -> Optional[InFlightOrder]:
         return next(
@@ -974,17 +1150,125 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
         )
 
     def _apply_order_event(self, order: Dict[str, Any], tracked_order: InFlightOrder, replayed: bool = False):
+        # ``trades`` carries the fills that belong to this order update, and they are
+        # applied *before* the order update. ``executed_amount_base`` is only ever written
+        # by trade updates, so an order that reaches a terminal state first is briefly
+        # "filled" with nothing executed — and ClientOrderTracker stops tracking it the
+        # moment it settles, so anything arriving afterwards is lost.
+        self._apply_fills(order.get("trades"), tracked_order)
+
+        # A FILLED status whose fills we have not all seen is the case that costs money: the
+        # order settles short of its real size and every size derived from it comes out short.
+        # CoinDCX does not always attach them — and an order that already reported part of its
+        # fills can arrive FILLED with none — so fetch them over REST before letting the order
+        # settle, rather than leaving it to the periodic poll seconds later.
+        if self._fills_missing_from_filled_payload(order, tracked_order):
+            safe_ensure_future(self._settle_with_fetched_fills(order, tracked_order, replayed))
+            return
+
         # A replayed event is by definition older than anything already applied.
         # ``update_with_order_update`` assigns ``current_state`` unconditionally,
         # so applying a stale "open" over a settled order would resurrect it.
-        # Fills are always safe: they dedupe on trade id.
         if not (replayed and tracked_order.is_done):
-            self._order_tracker.process_order_update(self._order_update_from_payload(order, tracked_order))
+            self._push_order_update(order, tracked_order)
 
-        # ``trades`` carries the fills that belong to this order update.
-        for fill in order.get("trades") or []:
+    def _push_order_update(self, order: Dict[str, Any], tracked_order: InFlightOrder):
+        """
+        Send an order update only when it actually changes the order's state.
+
+        The venue repeats frames for an unchanged order, and each one would otherwise
+        schedule a tracker update that assigns the same values back.
+        """
+        update = self._order_update_from_payload(order, tracked_order)
+        if update.new_state == tracked_order.current_state:
+            return
+        self._order_tracker.process_order_update(update)
+        if update.new_state in (OrderState.FILLED, OrderState.CANCELED, OrderState.FAILED):
+            self._refresh_balances_soon()
+
+    def _refresh_balances_soon(self, delay: float = 0.0):
+        """
+        Re-read balances as soon as an order settles.
+
+        Closing a position releases margin, but the connector only learns that on its next
+        scheduled poll — until then a budget check sees the pre-close figure and refuses
+        an order the wallet can afford. Orders settle rarely enough for this to be cheap.
+
+        ``delay`` waits before reading, for the callers where the venue frees the collateral
+        slightly after it reports the order gone.
+
+        A request that arrives while a read is already under way is not dropped: that read
+        may come too early for it. The commonest case is an OCO entry: the fill starts an
+        immediate read, then cancelling the other side asks for one 1.5s later, after the
+        venue has let go of that order's margin. One more read follows the current one,
+        after the wait the later request asked for.
+        """
+        if not self._trading_required:
+            return
+        if self._balance_refresh_task is not None and not self._balance_refresh_task.done():
+            self._balance_refresh_again_after = max(self._balance_refresh_again_after or 0.0, delay)
+            return
+        self._balance_refresh_task = safe_ensure_future(self._refresh_balances(delay))
+
+    async def _refresh_balances(self, delay: float = 0.0):
+        while True:
+            try:
+                if delay > 0:
+                    await self._sleep(delay)
+                await self._update_balances()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exception:
+                self.logger().debug(f"Post-settlement balance refresh failed: {exception}")
+            if self._balance_refresh_again_after is None:
+                return
+            delay, self._balance_refresh_again_after = self._balance_refresh_again_after, None
+
+    async def _sleep(self, delay: float):
+        """Seam for tests, which must not wait out a real delay."""
+        await asyncio.sleep(delay)
+
+    def _apply_fills(self, fills: Optional[List[Any]], tracked_order: InFlightOrder):
+        """Apply any fills on a payload. Safe to repeat: trade updates dedupe on trade id."""
+        for fill in fills or []:
             if isinstance(fill, dict):
                 self._order_tracker.process_trade_update(self._trade_update_from_fill(fill, tracked_order))
+
+    @staticmethod
+    def _fills_missing_from_filled_payload(order: Dict[str, Any], tracked_order: InFlightOrder) -> bool:
+        """
+        A FILLED frame for an order whose recorded fills still fall short of its size.
+
+        Checked after the frame's own fills are applied, so a frame carrying all of them costs
+        no REST call. Comparing against zero instead missed an order that had already reported
+        part of its fills: it settled at the part.
+        """
+        status = str(order.get("status", "")).lower()
+        if CONSTANTS.ORDER_STATE.get(status) != OrderState.FILLED or tracked_order.is_done:
+            return False
+        return tracked_order.executed_amount_base < tracked_order.amount
+
+    async def _settle_with_fetched_fills(self, order: Dict[str, Any], tracked_order: InFlightOrder,
+                                         replayed: bool):
+        """
+        Pull an order's fills over REST, then settle it.
+
+        The websocket says the order is done but has not told us what it traded. The trades
+        endpoint has the data, so ask for it directly instead of settling blind and waiting
+        for the periodic poll to reconcile a position we have already mis-sized.
+        """
+        try:
+            for trade_update in await self._all_trade_updates_for_order(tracked_order):
+                self._order_tracker.process_trade_update(trade_update)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exception:
+            self.logger().warning(
+                f"Could not fetch fills for {tracked_order.client_order_id} before settling it: "
+                f"{exception}. Settling on the order status alone; sizes may be incomplete "
+                f"until the next poll.")
+        if not (replayed and tracked_order.is_done):
+            self._push_order_update(order, tracked_order)
 
     def _defer_order_event(self, exchange_order_id: str, order: Dict[str, Any]):
         """
@@ -1024,6 +1308,12 @@ class CoindcxPerpetualDerivative(PerpetualDerivativePyBase):
                 for exchange_order_id, order, buffered_at in self._pending_order_events:
                     tracked_order = self._tracked_order_for(exchange_order_id)
                     if tracked_order is not None:
+                        # Deferred frames are not recorded when buffered, so two copies of one
+                        # frame can both be waiting here. Apply it once.
+                        signature = self._order_event_signature(order, exchange_order_id)
+                        if self._is_repeat(signature, exchange_order_id):
+                            continue
+                        self._remember(self._applied_order_events, signature)
                         self.logger().debug(
                             f"Replaying deferred {CONSTANTS.ORDER_UPDATE_EVENT_TYPE} for "
                             f"{exchange_order_id} against {tracked_order.client_order_id}.")

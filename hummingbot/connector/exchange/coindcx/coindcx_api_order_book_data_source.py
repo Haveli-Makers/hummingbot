@@ -2,6 +2,7 @@ import asyncio
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+import aiohttp
 import socketio
 
 from hummingbot.connector.exchange.coindcx import coindcx_constants as CONSTANTS, coindcx_web_utils as web_utils
@@ -25,13 +26,17 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                  trading_pairs: List[str],
                  connector: 'CoinDCXExchange',
                  api_factory: WebAssistantsFactory,
-                 domain: str = CONSTANTS.DEFAULT_DOMAIN):
+                 domain: str = CONSTANTS.DEFAULT_DOMAIN,
+                 proxy_url: Optional[str] = None):
         super().__init__(trading_pairs)
         self._connector = connector
         self._trade_messages_queue_key = CONSTANTS.TRADE_EVENT_TYPE
         self._diff_messages_queue_key = CONSTANTS.DIFF_EVENT_TYPE
         self._domain = domain
         self._api_factory = api_factory
+        self._proxy_url = proxy_url
+        # The proxied aiohttp session of the current connection, if there is a proxy. Closed in _disconnect.
+        self._http_session: Optional[aiohttp.ClientSession] = None
         self._client: Optional[socketio.AsyncClient] = None
 
     async def get_last_traded_prices(self,
@@ -96,9 +101,11 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         """
         Build Socket.IO client with event handlers for order book and trades.
         """
+        self._http_session = web_utils.build_proxy_session(self._proxy_url)
         client = socketio.AsyncClient(
             logger=False,
-            reconnection=False
+            reconnection=False,
+            http_session=self._http_session,
         )
 
         @client.event
@@ -133,6 +140,10 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
             except Exception:
                 self.logger().debug("CoinDCX order book stream disconnect failed", exc_info=True)
             self._client = None
+        if self._http_session is not None:
+            # engine.io never closes a session it was given.
+            await self._http_session.close()
+            self._http_session = None
 
     async def _subscribe_channels(self, client: socketio.AsyncClient):
         """

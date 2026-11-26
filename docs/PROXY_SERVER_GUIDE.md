@@ -1,9 +1,14 @@
 # Proxy Server Support for IP-Whitelisted Exchanges
 
 Some exchanges (e.g. CoinSwitch Kuber / CSX) only accept API requests from a
-pre-registered set of IP addresses. If your hummingbot instance runs on a
-machine whose IP is not whitelisted, every API call will be rejected with an
-authentication or IP-restriction error.
+pre-registered set of IP addresses, and some API keys (e.g. on CoinDCX) can be
+bound to an IP. If your hummingbot instance runs on a machine whose IP is not
+whitelisted, every API call will be rejected with an authentication or
+IP-restriction error.
+
+Connectors with proxy support today: `csx`, `ajaib` and `coindcx`, plus
+`coindcx_perpetual` for REST only (its Socket.IO streams still connect
+directly, see 3.4).
 
 **The solution:** route the connector's traffic through a proxy server that
 has a whitelisted IP.
@@ -18,6 +23,7 @@ add to any connector to enable it.
 1. [How it works — architecture overview](#1-how-it-works--architecture-overview)
 2. [The three files you must edit](#2-the-three-files-you-must-edit)
 3. [Complete code for each file](#3-complete-code-for-each-file)
+   (3.4 covers streams that open their own connections, such as Socket.IO)
 4. [Supported proxy types](#4-supported-proxy-types)
 5. [Runtime configuration](#5-runtime-configuration)
 6. [Testing your proxy integration](#6-testing-your-proxy-integration)
@@ -58,7 +64,9 @@ ConnectionsFactory()                   ProxyConnectionsFactory("socks5://...")
 - `ConnectionsFactory` (the default singleton) — untouched
 - Every other connector — untouched
 
-**What changes per connector:** three small additions totalling ~15 lines.
+**What changes per connector:** three small additions totalling ~15 lines,
+plus the stream files if a stream opens its own connections instead of using
+the factory (see [3.4](#34--streams-that-open-their-own-connections-socketio)).
 
 ### The shared building block
 
@@ -80,6 +88,11 @@ For a connector named `xyz`, add to these three files:
 | `hummingbot/connector/exchange/xyz/xyz_utils.py` | `xyz_proxy_url` field in `XyzConfigMap` |
 | `hummingbot/connector/exchange/xyz/xyz_exchange.py` | `xyz_proxy_url` param in `__init__`, passed to factory |
 | `hummingbot/connector/exchange/xyz/xyz_web_utils.py` | `proxy_url` param in `build_api_factory`, `_build_connections_factory` helper |
+| `xyz_api_order_book_data_source.py`, `xyz_api_user_stream_data_source.py` | Only if a stream uses its own client (e.g. python-socketio) instead of `get_ws_assistant()`: see 3.4 |
+
+To find out whether 3.4 applies, search the connector for `socketio`,
+`aiohttp.ClientSession(` or `websockets.connect`. Anything that opens a
+connection without the `WebAssistantsFactory` bypasses the proxy.
 
 ---
 
@@ -110,7 +123,7 @@ class XyzConfigMap(BaseConnectorConfigMap):
                 "(e.g. socks5://user:pass@host:1080), or leave blank to connect directly"
             ),
             "is_secure": True,       # stored encrypted in conf/connectors/xyz.yml
-            "is_connect_key": False, # optional — connection works without it
+            "is_connect_key": True,  # MUST be True, see below
             "prompt_on_new": True,   # user is asked when running `connect xyz`
         },
     )
@@ -121,10 +134,13 @@ class XyzConfigMap(BaseConnectorConfigMap):
 KEYS = XyzConfigMap.model_construct()
 ```
 
-> **Why `is_connect_key: False`?**
-> `is_connect_key: True` fields are checked when hummingbot validates the
-> connection. The proxy URL is optional — leaving it blank is a valid
-> configuration — so set it to `False`.
+> **Why `is_connect_key: True`?**
+> Only `is_connect_key: True` fields are passed to the connector's constructor
+> (`Security.api_keys()` → `api_keys_from_connector_config_map()`). With
+> `False`, `connect xyz` still asks for the proxy URL and saves it, but the
+> connector never receives it, so all traffic silently goes direct.
+> The field stays optional anyway: its default is `""`, and a blank value
+> means "connect directly".
 
 > **Why `SecretStr`?**
 > The proxy URL contains credentials (username, password). Storing it as
@@ -166,12 +182,27 @@ class XyzExchange(ExchangePyBase):
             auth=self._auth,
             proxy_url=self._proxy_url or None,  # ← ADD THIS LINE
         )
+
+    # ── ADD THIS METHOD ──────────────────────────────────────────────────────
+    async def stop_network(self):
+        await super().stop_network()
+        # A proxied factory owns its own aiohttp session; close it so it doesn't
+        # leak ("Unclosed client session"). The default ConnectionsFactory is a
+        # shared singleton and must be left alone.
+        if self._proxy_url:
+            try:
+                await self._web_assistants_factory.close()
+            except Exception:
+                self.logger().debug("Failed closing the proxy connections factory.", exc_info=True)
 ```
 
 > **Why `self._proxy_url or None`?**
 > An empty string is falsy. Passing `None` explicitly signals "no proxy" to
 > `_build_connections_factory`, which then uses the default singleton
 > `ConnectionsFactory`.
+>
+> **Set `self._proxy_url` before `super().__init__()`.** The base class builds
+> the web assistants factory and the data sources inside its `__init__`.
 
 ---
 
@@ -225,6 +256,59 @@ def _build_connections_factory(proxy_url):
 > The `if proxy_url:` block is only reached when the user actually configures
 > a proxy. `aiohttp_socks` (required by `ProxyConnectionsFactory`) is only
 > imported then. Connectors that never use a proxy pay zero overhead.
+
+---
+
+### 3.4  Streams that open their own connections (Socket.IO)
+
+The factory only covers what goes through it: REST requests and streams made
+with `get_ws_assistant()`. Some connectors drive a third-party stream client
+instead. CoinDCX's order book and user streams, for example, use
+`socketio.AsyncClient`, which opens its own connections. With only 3.1 to 3.3,
+REST goes through the proxy but those streams still connect from your own IP.
+
+python-socketio accepts an aiohttp session as `http_session`, and engine.io
+opens its websocket with it. So give each client a session over the proxy:
+
+```python
+# xyz_web_utils.py
+def build_proxy_session(proxy_url):
+    if not proxy_url:
+        return None
+    from aiohttp_socks import ProxyConnector
+    # The same settings as ProxyConnectionsFactory.
+    return aiohttp.ClientSession(connector=ProxyConnector.from_url(proxy_url, rdns=True))
+
+
+# xyz_api_user_stream_data_source.py (the same in the order book data source)
+def _build_client(self, output):
+    self._http_session = web_utils.build_proxy_session(self._proxy_url)  # None = direct
+    client = socketio.AsyncClient(logger=False, reconnection=False, http_session=self._http_session)
+    ...
+
+async def _disconnect(self):
+    if self._client is not None:
+        ...  # disconnect the client first
+        self._client = None
+    if self._http_session is not None:
+        await self._http_session.close()  # engine.io never closes a session it was given
+        self._http_session = None
+```
+
+The exchange passes `proxy_url=self._proxy_url or None` to both data sources.
+
+Two engine.io details make this exact shape matter:
+
+- engine.io never closes a session it was given, so the data source must close
+  it after each disconnect.
+- If the session it was given is already closed when it connects, engine.io
+  quietly makes a plain, **direct** `aiohttp.ClientSession()` and carries on.
+  So build a new session for every connection (in `_build_client`), and never
+  reuse one across reconnects.
+
+Reference: `hummingbot/connector/exchange/coindcx/` (`coindcx_web_utils.py`
+and both data sources), tested in
+`test/hummingbot/connector/exchange/coindcx/test_coindcx_proxy.py`.
 
 ---
 
@@ -364,7 +448,10 @@ python -m pytest test/hummingbot/connector/exchange/xyz/ -v
 | `401 Unauthorized` from exchange | API credentials wrong (not a proxy issue) | Check API key and secret |
 | Proxy works for REST but not WebSocket | SOCKS4 used instead of SOCKS5 | Use `socks5://` — SOCKS4 has limited WebSocket support |
 | DNS resolution fails inside proxy | `rdns=False` (default for some setups) | `ProxyConnectionsFactory` already passes `rdns=True` — no action needed |
+| Proxy URL saved but not used | The field has `is_connect_key: False`, so it never reaches the constructor | Set `is_connect_key: True` (3.1) |
 | Proxy URL saved but not used | Empty string passed as proxy_url | Ensure `self._proxy_url = xyz_proxy_url or ""` and `proxy_url=self._proxy_url or None` |
+| REST works through the proxy, but a stream connects direct (or is rejected) | The stream uses its own client (e.g. Socket.IO), which skips the factory | Give it a proxied session (3.4) |
+| `Unclosed client session` at shutdown | The proxied factory is never closed | Close it in `stop_network` (3.2) |
 
 ---
 
@@ -378,6 +465,16 @@ hummingbot/connector/exchange/csx/csx_utils.py       ← csx_proxy_url field
 hummingbot/connector/exchange/csx/csx_exchange.py     ← _proxy_url storage + forwarding
 hummingbot/connector/exchange/csx/csx_web_utils.py    ← _build_connections_factory helper
 scripts/verify_csx_connection.py                      ← real-API verification script
+```
+
+For a connector whose streams use Socket.IO (3.4), see CoinDCX spot:
+
+```
+hummingbot/connector/exchange/coindcx/coindcx_utils.py                       ← coindcx_proxy_url field
+hummingbot/connector/exchange/coindcx/coindcx_exchange.py                    ← passes the proxy to the factory and both streams
+hummingbot/connector/exchange/coindcx/coindcx_web_utils.py                   ← _build_connections_factory + build_proxy_session
+hummingbot/connector/exchange/coindcx/coindcx_api_order_book_data_source.py  ← a proxied session per Socket.IO connection
+hummingbot/connector/exchange/coindcx/coindcx_api_user_stream_data_source.py ← the same for the user stream
 ```
 
 The shared infrastructure lives at:

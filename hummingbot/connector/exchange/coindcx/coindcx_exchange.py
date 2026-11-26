@@ -1,5 +1,6 @@
 import asyncio
 import json
+from datetime import datetime
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -17,7 +18,7 @@ from hummingbot.connector.exchange.coindcx.coindcx_auth import CoinDCXAuth
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
-from hummingbot.core.data_type.common import OrderType, TradeType
+from hummingbot.core.data_type.common import OpenOrder, OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TokenAmount, TradeFeeBase
@@ -823,6 +824,51 @@ class CoindcxExchange(ExchangePyBase):
         except Exception as e:
             self.logger().error(f"Error fetching account-wide trade history: {e}")
             return []
+
+    async def get_open_orders(self) -> List[OpenOrder]:
+        """
+        Every open order on the account in this connector's trading pairs, whoever placed it: this connector, another
+        bot on the same account, or a person. Read from CoinDCX's active orders endpoint, one call per pair. Errors are
+        raised to the caller.
+        """
+        open_orders: List[OpenOrder] = []
+        for trading_pair in self._trading_pairs or []:
+            symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+            response = await self._api_post(
+                path_url=CONSTANTS.ACTIVE_ORDERS_PATH_URL,
+                data={"market": symbol},
+                is_auth_required=True)
+            orders = response.get("orders", []) if isinstance(response, dict) else (response or [])
+            for order in orders:
+                amount = Decimal(str(order.get("total_quantity") or 0))
+                remaining = Decimal(str(order.get("remaining_quantity", amount) or 0))
+                open_orders.append(OpenOrder(
+                    client_order_id=str(order.get("client_order_id") or ""),
+                    trading_pair=trading_pair,
+                    price=Decimal(str(order.get("price_per_unit") or 0)),
+                    amount=amount,
+                    executed_amount=amount - remaining,
+                    status=str(order.get("status") or ""),
+                    order_type=self.to_hb_order_type(order.get("order_type", "")),
+                    is_buy=str(order.get("side", "")).lower() == CONSTANTS.SIDE_BUY,
+                    time=self._epoch_ms(order.get("created_at")),
+                    exchange_order_id=str(order.get("id") or ""),
+                ))
+        return open_orders
+
+    @staticmethod
+    def _epoch_ms(value: Any) -> int:
+        """A CoinDCX time as epoch milliseconds: it sends either a number or an ISO 8601 string. 0 when unreadable."""
+        if value is None or value == "":
+            return 0
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            try:
+                return int(datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp() * 1000)
+            except ValueError:
+                return 0
+        return int(number if number > 1e11 else number * 1000)
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
         """

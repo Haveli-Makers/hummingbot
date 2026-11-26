@@ -118,6 +118,21 @@ class CoinDCXConfigMap(BaseConnectorConfigMap):
             "prompt_on_new": True,
         }
     )
+    coindcx_proxy_url: SecretStr = Field(
+        default=SecretStr(""),
+        json_schema_extra={
+            "prompt": lambda cm: (
+                "Enter a proxy URL to route CoinDCX traffic through a whitelisted IP "
+                "(e.g. socks5://user:pass@host:1080), or leave blank to connect directly"
+            ),
+            "is_secure": True,
+            # Must stay True: only connect-key fields reach the connector constructor
+            # (api_keys_from_connector_config_map). With False the URL is saved but ignored,
+            # and CoinDCX traffic goes direct. The default of "" keeps the field optional.
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        }
+    )
     model_config = ConfigDict(title="coindcx")
 
 

@@ -3,6 +3,7 @@ import json
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 
+import aiohttp
 import socketio
 
 from hummingbot.connector.exchange.coindcx import coindcx_constants as CONSTANTS, coindcx_web_utils as web_utils
@@ -57,7 +58,8 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                  trading_pairs: List[str],
                  connector: 'CoinDCXExchange',
                  api_factory: WebAssistantsFactory,
-                 domain: str = CONSTANTS.DEFAULT_DOMAIN):
+                 domain: str = CONSTANTS.DEFAULT_DOMAIN,
+                 proxy_url: Optional[str] = None):
         super().__init__(trading_pairs)
         self._connector = connector
         self._snapshot_messages_queue_key = CONSTANTS.DEPTH_SNAPSHOT_EVENT_TYPE
@@ -65,6 +67,9 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._diff_messages_queue_key = CONSTANTS.DIFF_EVENT_TYPE
         self._domain = domain
         self._api_factory = api_factory
+        self._proxy_url = proxy_url
+        # The proxied aiohttp session of the current connection, if there is a proxy. Closed in _disconnect.
+        self._http_session: Optional[aiohttp.ClientSession] = None
         self._client: Optional[socketio.AsyncClient] = None
         # Trades name the market by its pair code ("I-SOL_INR"); depth messages use its symbol ("SOLINR").
         self._pair_code_to_trading_pair: Dict[str, str] = {
@@ -132,9 +137,11 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         """
         Build Socket.IO client with event handlers for order book snapshots and trades.
         """
+        self._http_session = web_utils.build_proxy_session(self._proxy_url)
         client = socketio.AsyncClient(
             logger=False,
-            reconnection=False
+            reconnection=False,
+            http_session=self._http_session,
         )
 
         @client.event
@@ -176,6 +183,10 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
             except Exception:
                 self.logger().debug("CoinDCX order book stream disconnect failed", exc_info=True)
             self._client = None
+        if self._http_session is not None:
+            # engine.io never closes a session it was given.
+            await self._http_session.close()
+            self._http_session = None
 
     async def _subscribe_channels(self, client: socketio.AsyncClient):
         """

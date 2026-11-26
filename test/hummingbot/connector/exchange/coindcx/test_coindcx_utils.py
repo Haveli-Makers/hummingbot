@@ -55,3 +55,38 @@ def test_config_map_reflection_and_construct():
     cm = CoinDCXConfigMap.model_construct()
     has_field = hasattr(cm, "coindcx_api_key") or (hasattr(cm, "model_fields") and "coindcx_api_key" in cm.model_fields)
     assert has_field
+
+
+def test_proxy_url_field_is_an_optional_secret_connect_key():
+    from hummingbot.connector.exchange.coindcx.coindcx_utils import CoinDCXConfigMap
+
+    field = CoinDCXConfigMap.model_fields["coindcx_proxy_url"]
+    assert field.default.get_secret_value() == ""
+    extra = field.json_schema_extra
+    assert extra["is_secure"] is True
+    assert extra["prompt_on_new"] is True
+    # Only connect keys reach the connector constructor; with False the proxy would be saved and then ignored.
+    assert extra["is_connect_key"] is True
+
+
+def test_proxy_url_reaches_the_connector_arguments():
+    from hummingbot.client.config.config_helpers import ClientConfigAdapter, api_keys_from_connector_config_map
+    from hummingbot.connector.exchange.coindcx.coindcx_utils import CoinDCXConfigMap
+
+    config = ClientConfigAdapter(CoinDCXConfigMap(
+        coindcx_api_key="key", coindcx_api_secret="secret", coindcx_proxy_url="http://user:pass@proxy.local:3128"))
+
+    assert api_keys_from_connector_config_map(config) == {
+        "coindcx_api_key": "key",
+        "coindcx_api_secret": "secret",
+        "coindcx_proxy_url": "http://user:pass@proxy.local:3128",
+    }
+
+
+def test_proxy_url_is_blank_for_a_config_saved_without_it():
+    from hummingbot.client.config.config_helpers import ClientConfigAdapter, api_keys_from_connector_config_map
+    from hummingbot.connector.exchange.coindcx.coindcx_utils import CoinDCXConfigMap
+
+    config = ClientConfigAdapter(CoinDCXConfigMap(coindcx_api_key="key", coindcx_api_secret="secret"))
+
+    assert api_keys_from_connector_config_map(config)["coindcx_proxy_url"] == ""

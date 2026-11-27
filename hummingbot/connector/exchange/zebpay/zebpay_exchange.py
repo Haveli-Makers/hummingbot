@@ -567,6 +567,46 @@ class ZebpayExchange(ExchangePyBase):
             self.logger().error(f"Error fetching account-wide order history: {exc}")
             return []
 
+    async def get_all_open_orders(self, trading_pairs: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """
+        Fetches every open order on the exchange for this account, including orders placed
+        outside Hummingbot (e.g. on the Zebpay website).
+        """
+        open_orders: List[Dict[str, Any]] = []
+        for trading_pair in trading_pairs or []:
+            try:
+                try:
+                    symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+                except KeyError:
+                    symbol = trading_pair
+                result = await self._api_get(
+                    path_url=CONSTANTS.ORDERS_PATH_URL,
+                    params={"symbol": symbol, "status": CONSTANTS.ORDER_STATUS_ACTIVE},
+                    is_auth_required=True,
+                )
+                raise_for_status(result)
+                data = unwrap_data(result)
+                if isinstance(data, dict):
+                    data = data.get("items", data.get("orders", []))
+                for order in data if isinstance(data, list) else []:
+                    if not isinstance(order, dict):
+                        continue
+                    open_orders.append({
+                        "exchange_order_id": str(order.get("orderId") or order.get("id") or ""),
+                        "client_order_id": order.get("clientOrderId") or order.get("client_order_id") or None,
+                        "trading_pair": trading_pair,
+                        "trade_type": str(order.get("side", "")).upper(),
+                        "order_type": str(order.get("type", "limit")).upper(),
+                        "price": float(order.get("price") or 0),
+                        "amount": float(order.get("amount") or order.get("quantity") or 0),
+                        "filled_amount": float(order.get("filled") or 0),
+                        "status": str(order.get("status", "ACTIVE")).upper(),
+                        "created_at": order.get("createdAt") or order.get("timestamp"),
+                    })
+            except Exception as exc:
+                self.logger().error(f"Error fetching open orders for {trading_pair}: {exc}")
+        return open_orders
+
     # ── Balance ────────────────────────────────────────────────────────────────
 
     async def _update_balances(self) -> None:

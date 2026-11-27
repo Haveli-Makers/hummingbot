@@ -661,8 +661,8 @@ class CoinswitchExchange(ExchangePyBase):
                                      limit: int = 100,
                                      trading_pairs: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """
-        Fetches raw fills for this account from CoinSwitch's account-wide closed
-        orders endpoint.
+        Fetches this account's filled orders (including partly filled, then cancelled ones)
+        from CoinSwitch's account-wide closed-orders endpoint, one entry per order.
         """
         params: Dict[str, Any] = {"count": limit, "open": "false"}
         if start_time is not None:
@@ -677,20 +677,99 @@ class CoinswitchExchange(ExchangePyBase):
                 params=params,
                 is_auth_required=True,
             )
-            orders = (response or {}).get("data", [])
+            data = (response or {}).get("data", [])
+            orders = data.get("orders", []) if isinstance(data, dict) else data
             orders = orders if isinstance(orders, list) else []
             for order_data in orders:
                 if not isinstance(order_data, dict):
                     continue
-                for trade in order_data.get("trades", []) or []:
-                    if isinstance(trade, dict):
-                        trade.setdefault("order_id", order_data.get("order_id"))
-                        trade.setdefault("symbol", order_data.get("symbol"))
-                        trades.append(trade)
+                try:
+                    executed_qty = float(order_data.get("executed_qty") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if executed_qty <= 0:
+                    continue  # cancelled without any fill
+
+                symbol = str(order_data.get("symbol", ""))
+                try:
+                    trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol=symbol)
+                except KeyError:
+                    trading_pair = symbol.replace("/", "-")
+
+                trades.append({
+                    "order_id": order_data.get("order_id"),
+                    "trade_id": order_data.get("order_id"),
+                    "trading_pair": trading_pair,
+                    "side": str(order_data.get("side", "")).upper(),
+                    "price": order_data.get("average_price") or order_data.get("price"),
+                    "quantity": executed_qty,
+                    "status": order_data.get("status", "EXECUTED"),
+                    "timestamp": order_data.get("updated_time") or order_data.get("created_time"),
+                    "exchange": order_data.get("exchange"),
+                })
         except Exception as e:
             self.logger().error(f"Error fetching account-wide trade history: {e}")
 
         return trades
+
+    supports_all_open_orders_without_pair = True
+
+    async def get_all_open_orders(self, trading_pairs: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """
+        Fetches every open order on the exchange for this account, including orders placed
+        outside Hummingbot (e.g. on the CoinSwitch website).
+
+        When ``trading_pairs`` is empty, all open orders are returned; otherwise the result is
+        narrowed to the requested pairs via the ``symbols`` filter.
+        """
+        params: Dict[str, Any] = {"open": "true", "exchanges": self._exchange, "count": 500}
+        wanted_symbols = {}
+        for trading_pair in trading_pairs or []:
+            try:
+                symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+            except KeyError:
+                symbol = trading_pair.replace("-", "/")
+            wanted_symbols[symbol.upper()] = trading_pair
+        if wanted_symbols:
+            params["symbols"] = ",".join(wanted_symbols)
+
+        open_orders: List[Dict[str, Any]] = []
+        try:
+            response = await self._api_get(
+                path_url=CONSTANTS.OPEN_ORDERS_PATH_URL,
+                params=params,
+                is_auth_required=True,
+            )
+            data = (response or {}).get("data", [])
+            orders = data.get("orders", []) if isinstance(data, dict) else data
+            for order in orders or []:
+                if not isinstance(order, dict):
+                    continue
+                symbol = str(order.get("symbol", "")).upper()
+                if wanted_symbols and symbol not in wanted_symbols:
+                    continue
+                trading_pair = wanted_symbols.get(symbol)
+                if trading_pair is None:
+                    try:
+                        trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol=symbol)
+                    except KeyError:
+                        trading_pair = symbol.replace("/", "-")
+                open_orders.append({
+                    "exchange_order_id": str(order.get("order_id", "")),
+                    "client_order_id": order.get("client_order_id") or None,
+                    "trading_pair": trading_pair,
+                    "trade_type": str(order.get("side", "")).upper(),
+                    "order_type": str(order.get("type", "limit")).upper(),
+                    "price": float(order.get("price") or 0),
+                    "amount": float(order.get("orig_qty") or 0),
+                    "filled_amount": float(order.get("executed_qty") or 0),
+                    "status": str(order.get("status", "OPEN")).upper(),
+                    "created_at": order.get("created_time"),
+                })
+        except Exception as e:
+            self.logger().error(f"Error fetching open orders: {e}")
+
+        return open_orders
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
         """

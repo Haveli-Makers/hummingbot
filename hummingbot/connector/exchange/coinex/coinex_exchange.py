@@ -451,6 +451,63 @@ class CoinexExchange(ExchangePyBase):
             self.logger().error(f"Error fetching account-wide trade history: {exc}")
             return []
 
+    supports_all_open_orders_without_pair = True
+
+    async def get_all_open_orders(self, trading_pairs: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """
+        Fetches every open order on the exchange for this account, including orders placed
+        outside Hummingbot (e.g. on the CoinEx website).
+
+        When ``trading_pairs`` is empty, a single request without a ``market`` returns open orders
+        across every spot market.
+        """
+        requests: List[Tuple[Optional[str], Optional[str]]] = []
+        for trading_pair in trading_pairs or []:
+            try:
+                requests.append((await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair), trading_pair))
+            except KeyError:
+                self.logger().warning(f"Unknown CoinEx market for {trading_pair}; skipping its open orders.")
+        if not requests:
+            requests.append((None, None))
+
+        open_orders: List[Dict[str, Any]] = []
+        for symbol, trading_pair in requests:
+            params: Dict[str, Any] = {"market_type": CONSTANTS.MARKET_TYPE_SPOT, "limit": 100}
+            if symbol:
+                params["market"] = symbol
+            try:
+                response = await self._api_get(
+                    path_url=CONSTANTS.PENDING_ORDERS_PATH_URL,
+                    params=params,
+                    is_auth_required=True,
+                )
+                orders = _result(response)
+                for order in orders if isinstance(orders, list) else []:
+                    if not isinstance(order, dict):
+                        continue
+                    pair = trading_pair
+                    if pair is None:
+                        try:
+                            pair = await self.trading_pair_associated_to_exchange_symbol(symbol=order.get("market", ""))
+                        except KeyError:
+                            pair = str(order.get("market", ""))
+                    open_orders.append({
+                        "exchange_order_id": str(order.get("order_id", "")),
+                        "client_order_id": order.get("client_id") or None,
+                        "trading_pair": pair,
+                        "trade_type": str(order.get("side", "")).upper(),
+                        "order_type": str(order.get("type", "")).upper(),
+                        "price": float(order.get("price") or 0),
+                        "amount": float(order.get("amount") or 0),
+                        "filled_amount": float(order.get("filled_amount") or 0),
+                        "status": str(order.get("status", "open")).upper(),
+                        "created_at": order.get("created_at"),
+                    })
+            except Exception as exc:
+                self.logger().error(f"Error fetching open orders for {trading_pair or 'all markets'}: {exc}")
+
+        return open_orders
+
     # ── Balance ────────────────────────────────────────────────────────────────
 
     async def _update_balances(self) -> None:

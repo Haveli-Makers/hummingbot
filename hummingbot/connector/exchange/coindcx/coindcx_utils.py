@@ -118,18 +118,6 @@ class CoinDCXConfigMap(BaseConnectorConfigMap):
             "prompt_on_new": True,
         }
     )
-    coindcx_proxy_url: SecretStr = Field(
-        default=SecretStr(""),
-        json_schema_extra={
-            "prompt": lambda cm: (
-                "Enter a proxy URL to route CoinDCX traffic through an IP-allowlisted egress "
-                "(e.g. http://user:pass@host:3128), or leave blank to connect directly"
-            ),
-            "is_secure": True,
-            "is_connect_key": True,
-            "prompt_on_new": True,
-        }
-    )
     model_config = ConfigDict(title="coindcx")
 
 

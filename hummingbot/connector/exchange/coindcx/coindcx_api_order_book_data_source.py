@@ -9,6 +9,7 @@ import socketio
 from hummingbot.connector.exchange.coindcx import coindcx_constants as CONSTANTS, coindcx_web_utils as web_utils
 from hummingbot.connector.exchange.coindcx.coindcx_order_book import CoinDCXOrderBook
 from hummingbot.connector.exchange.coindcx.coindcx_utils import hb_pair_to_coindcx_pair
+from hummingbot.core.data_type.order_book import OrderBook
 from hummingbot.core.data_type.order_book_message import OrderBookMessage
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod
@@ -53,6 +54,11 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     # If no depth-snapshot arrives for this long, the base class refreshes the order books from REST.
     FULL_ORDER_BOOK_RESET_DELTA_SECONDS = 60
+    # OrderBookTracker reads each pair's first order book once, at start, and never again if that read fails: the
+    # connector would then never be ready. So get_new_order_book tries up to FIRST_ORDER_BOOK_ATTEMPTS times, waiting
+    # FIRST_ORDER_BOOK_RETRY_DELAY seconds after the first failure and twice as long after each next one.
+    FIRST_ORDER_BOOK_ATTEMPTS = 5
+    FIRST_ORDER_BOOK_RETRY_DELAY = 1.0
 
     def __init__(self,
                  trading_pairs: List[str],
@@ -85,6 +91,31 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         Returns the last traded price for each trading pair.
         """
         return await self._connector.get_last_traded_prices(trading_pairs=trading_pairs)
+
+    async def get_new_order_book(self, trading_pair: str) -> OrderBook:
+        """
+        The pair's order book read over REST, retried when the read fails (see FIRST_ORDER_BOOK_ATTEMPTS). On
+        2026-11-27 a proxy reset a few connections while the bot started; one of them was this read, and the connector
+        never became ready.
+        """
+        attempts = max(1, self.FIRST_ORDER_BOOK_ATTEMPTS)
+        delay = self.FIRST_ORDER_BOOK_RETRY_DELAY
+        for attempt in range(1, attempts + 1):
+            try:
+                return await super().get_new_order_book(trading_pair)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                error = str(e) or type(e).__name__
+                if attempt == attempts:
+                    self.logger().error(f"Could not get the {trading_pair} order book after {attempts} attempts: "
+                                        f"{error}. At start, this leaves the connector not ready until it restarts "
+                                        f"(stop, then start).")
+                    raise
+                self.logger().warning(f"Could not get the {trading_pair} order book (attempt {attempt} of {attempts}): "
+                                      f"{error}. Retrying in {delay:g} s.")
+                await self._sleep(delay)
+                delay *= 2
 
     async def _request_order_book_snapshot(self, trading_pair: str) -> Dict[str, Any]:
         coindcx_pair = hb_pair_to_coindcx_pair(trading_pair, ecode=CONSTANTS.ECODE_COINDCX)

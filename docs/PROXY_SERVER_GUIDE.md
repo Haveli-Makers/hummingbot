@@ -452,6 +452,7 @@ python -m pytest test/hummingbot/connector/exchange/xyz/ -v
 | Proxy URL saved but not used | Empty string passed as proxy_url | Ensure `self._proxy_url = xyz_proxy_url or ""` and `proxy_url=self._proxy_url or None` |
 | REST works through the proxy, but a stream connects direct (or is rejected) | The stream uses its own client (e.g. Socket.IO), which skips the factory | Give it a proxied session (3.4) |
 | `Unclosed client session` at shutdown | The proxied factory is never closed | Close it in `stop_network` (3.2) |
+| `<exchange> is not ready. Please wait...` every second, after `Connection reset by peer` errors at start | The proxy dropped the first order book read. `OrderBookTracker` makes that read only once, so the connector never gets ready | CoinDCX spot retries the read (5 tries over about 15 s). For other connectors, or if every try fails: `stop`, then `start` again |
 
 ---
 

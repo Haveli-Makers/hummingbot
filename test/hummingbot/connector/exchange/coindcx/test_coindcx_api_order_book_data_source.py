@@ -5,6 +5,7 @@ from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCa
 from typing import Any, Dict
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
 from aioresponses.core import aioresponses
 from bidict import bidict
 
@@ -96,6 +97,13 @@ class CoinDCXAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         return any(record.levelname == log_level and record.getMessage() == message
                    for record in self.log_records)
 
+    def _is_logged_starting_with(self, log_level: str, prefix: str) -> bool:
+        return any(record.levelname == log_level and record.getMessage().startswith(prefix)
+                   for record in self.log_records)
+
+    def _waits(self):
+        return [call.args[0] for call in self.data_source._sleep.await_args_list]
+
     def _rest_url_regex(self):
         url = web_utils.public_rest_url(path_url=CONSTANTS.ORDER_BOOK_PATH_URL, domain=self.domain)
         return re.compile(f"^{url}".replace(".", r"\.").replace("?", r"\?"))
@@ -127,9 +135,74 @@ class CoinDCXAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
 
     @aioresponses()
     async def test_get_new_order_book_raises_exception(self, mock_api):
-        mock_api.get(self._rest_url_regex(), status=400)
+        # Every attempt fails, so after the last one the error reaches the caller.
+        mock_api.get(self._rest_url_regex(), status=400, repeat=True)
+        self.data_source._sleep = AsyncMock()
+
         with self.assertRaises(IOError):
             await self.data_source.get_new_order_book(self.trading_pair)
+
+        self.assertEqual(5, sum(len(calls) for calls in mock_api.requests.values()))
+        self.assertEqual([1.0, 2.0, 4.0, 8.0], self._waits())
+        self.assertEqual(4, sum(1 for record in self.log_records if record.levelname == "WARNING"))
+        self.assertTrue(self._is_logged_starting_with("ERROR", "Could not get the SOL-INR order book after 5 attempts: "))
+
+    async def test_get_new_order_book_retries_a_failed_read(self):
+        # The errors a flaky proxy gave on 2026-11-27, then CoinDCX's answer.
+        self.data_source._request_order_book_snapshot = AsyncMock(side_effect=[
+            aiohttp.ClientOSError(104, "Connection reset by peer"),
+            asyncio.TimeoutError(),
+            json.loads(json.dumps(REST_BOOK)),
+        ])
+        self.data_source._sleep = AsyncMock()
+
+        order_book: OrderBook = await self.data_source.get_new_order_book(self.trading_pair)
+
+        self.assertEqual(REST_BOOK["timestamp"], order_book.snapshot_uid)
+        self.assertEqual(7405.1, order_book.get_price(False))
+        self.assertEqual(3, self.data_source._request_order_book_snapshot.await_count)
+        self.assertEqual([1.0, 2.0], self._waits())
+        self.assertTrue(self._is_logged(
+            "WARNING",
+            "Could not get the SOL-INR order book (attempt 1 of 5): [Errno 104] Connection reset by peer. "
+            "Retrying in 1 s."))
+        self.assertTrue(self._is_logged(
+            "WARNING", "Could not get the SOL-INR order book (attempt 2 of 5): TimeoutError. Retrying in 2 s."))
+        self.assertFalse(any(record.levelname == "ERROR" for record in self.log_records))
+
+    async def test_get_new_order_book_does_not_retry_a_cancel(self):
+        self.data_source._request_order_book_snapshot = AsyncMock(side_effect=asyncio.CancelledError)
+        self.data_source._sleep = AsyncMock()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await self.data_source.get_new_order_book(self.trading_pair)
+
+        self.assertEqual(1, self.data_source._request_order_book_snapshot.await_count)
+        self.data_source._sleep.assert_not_awaited()
+
+    async def test_order_book_tracker_gets_ready_when_the_first_read_fails(self):
+        """
+        What happened on 2026-11-27: the first read hit a reset connection. OrderBookTracker reads the first book only
+        once, so before the retry its init task died and the connector stayed not ready.
+        """
+        self.data_source._request_order_book_snapshot = AsyncMock(side_effect=[
+            aiohttp.ClientOSError(104, "Connection reset by peer"),
+            json.loads(json.dumps(REST_BOOK)),
+        ])
+        self.data_source._sleep = AsyncMock()
+        tracker = OrderBookTracker(data_source=self.data_source, trading_pairs=[self.trading_pair])
+        tracker._sleep = AsyncMock()
+
+        try:
+            await asyncio.wait_for(tracker._init_order_books(), timeout=1)
+
+            self.assertTrue(tracker.ready)
+            self.assertEqual(REST_BOOK["timestamp"], tracker.order_books[self.trading_pair].snapshot_uid)
+        finally:
+            await asyncio.sleep(0)  # lets the book's tracking task start, so that stopping it ends it cleanly
+            tracking_tasks = list(tracker._tracking_tasks.values())
+            tracker.stop()
+            await asyncio.gather(*tracking_tasks, return_exceptions=True)
 
     @patch("hummingbot.connector.exchange.coindcx.coindcx_api_order_book_data_source.socketio.AsyncClient")
     async def test_listen_for_subscriptions_subscribes_to_order_book_and_trades(self, mock_client_class):

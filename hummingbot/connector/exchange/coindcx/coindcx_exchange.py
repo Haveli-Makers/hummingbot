@@ -480,6 +480,10 @@ class CoindcxExchange(ExchangePyBase):
                 symbol = rule.get("symbol", rule.get("coindcx_name", ""))
                 try:
                     trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol=symbol)
+                except KeyError:
+                    # A second market for a pair the symbol map gives to another market (see
+                    # _initialize_trading_pair_symbols_from_exchange_info): its rules would replace the right ones.
+                    continue
                 except ValueError:
                     base = rule.get("base_currency_short_name", "")
                     target = rule.get("target_currency_short_name", "")
@@ -912,8 +916,12 @@ class CoindcxExchange(ExchangePyBase):
             "target_currency_short_name": "SNM",
             ...
         }
+
+        CoinDCX can list one pair on two routes: on 27 Nov 2026, for example, ASR-USDT was both "ASRUSDT" (ecode B)
+        and "ASR_USDT" (ecode G). A trading pair maps to one symbol only (a duplicate used to make the whole map
+        fail, so the connector never got ready), so the plain BASEQUOTE symbol wins, otherwise the first one listed.
         """
-        mapping = bidict()
+        symbol_for_pair: Dict[str, str] = {}
         markets_list = exchange_info if isinstance(exchange_info, list) else [exchange_info]
 
         for symbol_data in filter(coindcx_utils.is_exchange_information_valid, markets_list):
@@ -923,9 +931,11 @@ class CoindcxExchange(ExchangePyBase):
 
             if symbol and base and quote:
                 trading_pair = combine_to_hb_trading_pair(base=base, quote=quote)
-                mapping[symbol] = trading_pair
+                chosen = symbol_for_pair.get(trading_pair)
+                if chosen is None or (symbol == f"{base}{quote}" and chosen != f"{base}{quote}"):
+                    symbol_for_pair[trading_pair] = symbol
 
-        self._set_trading_pair_symbol_map(mapping)
+        self._set_trading_pair_symbol_map(bidict({symbol: pair for pair, symbol in symbol_for_pair.items()}))
 
     async def _get_last_traded_price(self, trading_pair: str) -> float:
         """

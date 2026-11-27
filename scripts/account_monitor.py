@@ -4,7 +4,8 @@ balances, open orders, fills and market data to InfluxDB, for the dashboard's Ac
 whole account, whatever acts on it: other bots on the same account, or people.
 
 Run it like any bot, with:
-- the account's API keys (`connect <exchange>`; for an IP-bound CoinDCX key, the proxy URL too);
+- the account's API keys (`connect <exchange>`; an IP-bound CoinDCX key also needs the CoinDCX proxy support
+  from branch vinayak/cdx-updates);
 - the bot-monitoring settings in the environment: INFLUXDB_URL and INFLUXDB_TOKEN, optionally INFLUXDB_DATABASE.
 
     start --script account_monitor.py --conf conf_account_monitor_coindcx.yml

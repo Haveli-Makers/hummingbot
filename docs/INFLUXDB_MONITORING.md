@@ -78,7 +78,8 @@ Its config, in `conf/scripts/<name>.yml`:
 | `fills_lookback_hours` | `24` | How far back it reads fills when it starts |
 
 To run it:
-1. `connect <exchange>` once. For an IP-bound CoinDCX key, also enter the proxy URL it asks for.
+1. `connect <exchange>` once. An IP-bound CoinDCX key also needs the CoinDCX proxy support from branch
+   `vinayak/cdx-updates`, which adds a proxy URL question to `connect`.
 2. Set the `INFLUXDB_*` variables as above, then `./start`.
 3. `start --script account_monitor.py --conf <name>.yml`. `status` then shows its last read and any errors.
 

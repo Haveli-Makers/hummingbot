@@ -1,10 +1,9 @@
 import asyncio
 from typing import TYPE_CHECKING, List, Optional
 
-import aiohttp
 import socketio
 
-from hummingbot.connector.exchange.coindcx import coindcx_constants as CONSTANTS, coindcx_web_utils as web_utils
+from hummingbot.connector.exchange.coindcx import coindcx_constants as CONSTANTS
 from hummingbot.connector.exchange.coindcx.coindcx_auth import CoinDCXAuth
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
 from hummingbot.logger import HummingbotLogger
@@ -25,17 +24,13 @@ class CoinDCXAPIUserStreamDataSource(UserStreamTrackerDataSource):
                  trading_pairs: List[str],
                  connector: 'CoinDCXExchange',
                  api_factory,
-                 domain: str = CONSTANTS.DEFAULT_DOMAIN,
-                 proxy_url: Optional[str] = None):
+                 domain: str = CONSTANTS.DEFAULT_DOMAIN):
         super().__init__()
         self._auth: CoinDCXAuth = auth
         self._domain = domain
         self._connector = connector
         self._api_factory = api_factory
         self._trading_pairs = trading_pairs
-        self._proxy_url = proxy_url
-        # The proxied aiohttp session of the current connection, if there is a proxy. Closed in _disconnect.
-        self._http_session: Optional[aiohttp.ClientSession] = None
         self._client: Optional[socketio.AsyncClient] = None
         self._last_recv_time = 0.0
 
@@ -78,11 +73,9 @@ class CoinDCXAPIUserStreamDataSource(UserStreamTrackerDataSource):
         """
         Build Socket.IO client with authentication and event handlers.
         """
-        self._http_session = web_utils.build_proxy_session(self._proxy_url)
         client = socketio.AsyncClient(
             logger=False,
-            reconnection=False,
-            http_session=self._http_session,
+            reconnection=False
         )
         auth_payload = self._auth.generate_ws_auth_payload()
 
@@ -149,10 +142,6 @@ class CoinDCXAPIUserStreamDataSource(UserStreamTrackerDataSource):
             except Exception:
                 self.logger().debug("CoinDCX user stream disconnect failed", exc_info=True)
             self._client = None
-        if self._http_session is not None:
-            # engine.io never closes a session it was given.
-            await self._http_session.close()
-            self._http_session = None
 
     async def stop(self):
         """

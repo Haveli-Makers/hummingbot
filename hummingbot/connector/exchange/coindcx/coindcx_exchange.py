@@ -44,13 +44,9 @@ class CoindcxExchange(ExchangePyBase):
                  trading_pairs: Optional[List[str]] = None,
                  trading_required: bool = True,
                  domain: str = CONSTANTS.DEFAULT_DOMAIN,
-                 coindcx_proxy_url: str = "",
                  ):
         self.api_key = coindcx_api_key
         self.secret_key = coindcx_api_secret
-        # Optional proxy for API keys bound to a whitelisted IP: REST and both Socket.IO streams go through it.
-        # Set before super().__init__(), which builds the web assistants factory and the data sources.
-        self._proxy_url = coindcx_proxy_url or ""
         self._domain = domain
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
@@ -254,8 +250,7 @@ class CoindcxExchange(ExchangePyBase):
             throttler=self._throttler,
             time_synchronizer=self._time_synchronizer,
             domain=self._domain,
-            auth=self._auth,
-            proxy_url=self._proxy_url or None)
+            auth=self._auth)
 
     def _create_order_book_data_source(self) -> OrderBookTrackerDataSource:
         """
@@ -265,8 +260,7 @@ class CoindcxExchange(ExchangePyBase):
             trading_pairs=self._trading_pairs,
             connector=self,
             domain=self.domain,
-            api_factory=self._web_assistants_factory,
-            proxy_url=self._proxy_url or None)
+            api_factory=self._web_assistants_factory)
 
     def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
         """
@@ -278,21 +272,7 @@ class CoindcxExchange(ExchangePyBase):
             connector=self,
             api_factory=self._web_assistants_factory,
             domain=self.domain,
-            proxy_url=self._proxy_url or None,
         )
-
-    async def stop_network(self):
-        """
-        Stop the network tasks, then close the proxy session if this connector has one.
-        """
-        await super().stop_network()
-        # A proxied factory owns its own aiohttp session. The default factory is a shared singleton and must be left
-        # alone.
-        if self._proxy_url:
-            try:
-                await self._web_assistants_factory.close()
-            except Exception:
-                self.logger().debug("Failed closing the CoinDCX proxy connections factory.", exc_info=True)
 
     def _get_fee(self,
                  base_currency: str,

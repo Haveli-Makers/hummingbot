@@ -10,9 +10,9 @@ Before, a bot's data reached the api-server over MQTT, and the api-server kept o
 heartbeat and the latest performance. Market data was sampled into Postgres every 15 minutes. Nothing could answer
 "was the bot up all night?", "when did it hang?" or "where were its orders against the price?".
 
-A proof of concept in tried InfluxDB 3 Core (free, open source, queried with SQL). Four days of three
-bots came to 2.7 million rows in 78 MB, queries took 23–65 ms, and InfluxDB used about 0.5 GB of memory. The we
-decided:
+A proof of concept in November 2026 tried InfluxDB 3 Core (free, open source, queried with SQL). Four days of three
+bots came to 2.7 million rows in 78 MB, queries took 23–65 ms, and InfluxDB used about 0.5 GB of memory. The team
+then decided:
 
 - InfluxDB 3 Core runs next to the api-server, one per environment, reachable only from that machine. Data is kept
   14 days.

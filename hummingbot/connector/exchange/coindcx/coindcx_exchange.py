@@ -22,7 +22,15 @@ from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
+from hummingbot.core.network_iterator import NetworkStatus
+from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
+
+
+def _field(data: Dict[str, Any], short_key: str, long_key: str) -> Any:
+    """A message field under its short stream key ("p") or, if that is missing, its long REST name ("price")."""
+    value = data.get(short_key)
+    return value if value is not None else data.get(long_key)
 
 
 class CoindcxExchange(ExchangePyBase):
@@ -32,6 +40,19 @@ class CoindcxExchange(ExchangePyBase):
     """
 
     UPDATE_ORDER_STATUS_MIN_INTERVAL = 10.0
+    # A fill is recorded once per trade id, so it must be recorded with its fee the first time. The stream host this
+    # connector uses (CONSTANTS.WSS_URL) sends the fee ("f") in its trade updates; the older host sent only "T", "c",
+    # "m", "o", "p", "q", "s" and "t" (both seen live on 28 Nov 2026). A fill the stream reports without a fee is read
+    # from REST right away, which has it. If REST doesn't have the trade yet, it is read again after
+    # STREAM_FILL_REST_DELAY seconds, then twice as long, up to STREAM_FILL_REST_ATTEMPTS reads; after that the
+    # stream's fill is recorded with the estimated fee.
+    STREAM_FILL_REST_ATTEMPTS = 3
+    STREAM_FILL_REST_DELAY = 0.5
+    # A failed network check (a REST call every 10 s) makes hummingbot stop and restart all of the connector's
+    # networking: both streams, the order books and every polling loop. Through a proxy a single call can fail now and
+    # then (28 Nov 2026: three restarts in three minutes), so while connected, a failure is reported only once this many
+    # checks in a row have failed.
+    NETWORK_CHECK_FAILURES_TO_REPORT = 2
 
     web_utils = web_utils
 
@@ -43,13 +64,23 @@ class CoindcxExchange(ExchangePyBase):
                  trading_pairs: Optional[List[str]] = None,
                  trading_required: bool = True,
                  domain: str = CONSTANTS.DEFAULT_DOMAIN,
+                 coindcx_proxy_url: str = "",
                  ):
         self.api_key = coindcx_api_key
         self.secret_key = coindcx_api_secret
+        # Optional proxy for API keys bound to a whitelisted IP: REST and both Socket.IO streams go through it.
+        # Set before super().__init__(), which builds the web assistants factory and the data sources.
+        self._proxy_url = coindcx_proxy_url or ""
         self._domain = domain
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
         self._last_trades_poll_coindcx_timestamp = 1.0
+        # Each market's pair code ("I-ETH_INR", "B-BTC_USDT"), read with the symbol map: see exchange_pair_code.
+        self._pair_code_for_trading_pair: Dict[str, str] = {}
+        # Stream fills waiting to be recorded from REST: client order id -> trade id -> [the stream's fill, REST reads].
+        self._stream_fills: Dict[str, Dict[str, list]] = {}
+        self._stream_fill_tasks: Dict[str, asyncio.Task] = {}
+        self._failed_network_checks = 0  # in a row: see NETWORK_CHECK_FAILURES_TO_REPORT
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     @staticmethod
@@ -249,7 +280,8 @@ class CoindcxExchange(ExchangePyBase):
             throttler=self._throttler,
             time_synchronizer=self._time_synchronizer,
             domain=self._domain,
-            auth=self._auth)
+            auth=self._auth,
+            proxy_url=self._proxy_url or None)
 
     def _create_order_book_data_source(self) -> OrderBookTrackerDataSource:
         """
@@ -259,7 +291,8 @@ class CoindcxExchange(ExchangePyBase):
             trading_pairs=self._trading_pairs,
             connector=self,
             domain=self.domain,
-            api_factory=self._web_assistants_factory)
+            api_factory=self._web_assistants_factory,
+            proxy_url=self._proxy_url or None)
 
     def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
         """
@@ -271,7 +304,43 @@ class CoindcxExchange(ExchangePyBase):
             connector=self,
             api_factory=self._web_assistants_factory,
             domain=self.domain,
+            proxy_url=self._proxy_url or None,
         )
+
+    async def stop_network(self):
+        """
+        Stop the network tasks, then close the proxy session if this connector has one.
+        """
+        await super().stop_network()
+        # A proxied factory owns its own aiohttp session. The default factory is a shared singleton and must be left
+        # alone.
+        if self._proxy_url:
+            try:
+                await self._web_assistants_factory.close()
+            except Exception:
+                self.logger().debug("Failed closing the CoinDCX proxy connections factory.", exc_info=True)
+
+    async def check_network(self) -> NetworkStatus:
+        """
+        Hummingbot's network check (a REST call), but a single failure while connected isn't reported: see
+        NETWORK_CHECK_FAILURES_TO_REPORT. The call gets a second less than hummingbot allows the whole check, so that a
+        slow call counts as a failure here instead of timing the check out.
+        """
+        try:
+            await asyncio.wait_for(self._make_network_check_request(),
+                                   timeout=max(1.0, self.check_network_timeout - 1.0))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self._failed_network_checks += 1
+            if (self.network_status is NetworkStatus.CONNECTED
+                    and self._failed_network_checks < self.NETWORK_CHECK_FAILURES_TO_REPORT):
+                self.logger().info(f"CoinDCX network check failed ({str(e) or type(e).__name__}); staying connected "
+                                   f"unless the next check fails too.")
+                return NetworkStatus.CONNECTED
+            return NetworkStatus.NOT_CONNECTED
+        self._failed_network_checks = 0
+        return NetworkStatus.CONNECTED
 
     def _get_fee(self,
                  base_currency: str,
@@ -460,6 +529,10 @@ class CoindcxExchange(ExchangePyBase):
                 symbol = rule.get("symbol", rule.get("coindcx_name", ""))
                 try:
                     trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol=symbol)
+                except KeyError:
+                    # A second market for a pair the symbol map gives to another market (see
+                    # _initialize_trading_pair_symbols_from_exchange_info): its rules would replace the right ones.
+                    continue
                 except ValueError:
                     base = rule.get("base_currency_short_name", "")
                     target = rule.get("target_currency_short_name", "")
@@ -601,13 +674,18 @@ class CoindcxExchange(ExchangePyBase):
         exchange_order_id = str(order_data.get("id", ""))
 
         tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
+        if tracked_order is None and exchange_order_id:
+            tracked_order = self._order_tracker.all_updatable_orders_by_exchange_order_id.get(exchange_order_id)
         if tracked_order is not None:
+            client_order_id = tracked_order.client_order_id
             status = order_data.get("status", "")
             new_state = CONSTANTS.ORDER_STATE.get(status, tracked_order.current_state)
+            # Milliseconds per CoinDCX's docs, which also show ISO text for the same field elsewhere.
+            update_time = coindcx_utils.timestamp_in_seconds(order_data.get("updated_at"))
 
             order_update = OrderUpdate(
                 trading_pair=tracked_order.trading_pair,
-                update_timestamp=order_data.get("updated_at", self._time_synchronizer.time() * 1000) / 1000,
+                update_timestamp=update_time or self._time_synchronizer.time(),
                 new_state=new_state,
                 client_order_id=client_order_id,
                 exchange_order_id=exchange_order_id,
@@ -616,43 +694,140 @@ class CoindcxExchange(ExchangePyBase):
 
     async def _process_trade_update(self, trade_data: Dict[str, Any]):
         """
-        Processes a trade update message from the user stream.
+        Processes a trade-update message from the user stream: a fill of an order.
+
+        CoinDCX sends it with short keys: "o" order id, "c" client order id, "t" trade id, "s" symbol, "p" price,
+        "q" quantity, "T" time in ms, "m" buyer is maker, and on the documented stream host also "f" fee, "e" exchange
+        code and "x" status. The long names of the REST trade history ("order_id", "price", ...) are read too.
+        A fill with a fee is recorded at once; one without is recorded from REST (see STREAM_FILL_REST_ATTEMPTS).
+        Fills of orders this connector doesn't track are ignored.
         """
         if not isinstance(trade_data, dict):
             return
 
-        client_order_id = trade_data.get("client_order_id", "")
-        exchange_order_id = str(trade_data.get("order_id", ""))
+        client_order_id = str(_field(trade_data, "c", "client_order_id") or "")
+        exchange_order_id = str(_field(trade_data, "o", "order_id") or "")
 
         tracked_order = self._order_tracker.all_fillable_orders.get(client_order_id)
-        if tracked_order is not None:
-            fee_amount = Decimal(str(trade_data.get("fee_amount", 0)))
+        if tracked_order is None and exchange_order_id:
+            tracked_order = self._order_tracker.all_fillable_orders_by_exchange_order_id.get(exchange_order_id)
+        if tracked_order is None:
+            return
 
-            trading_pair = tracked_order.trading_pair
-            base, quote = trading_pair.split("-")
-            fee_token = quote
+        fee_amount = _field(trade_data, "f", "fee_amount")
+        if fee_amount is not None:
+            self._order_tracker.process_trade_update(
+                self._trade_update_from_stream(tracked_order, trade_data, Decimal(str(fee_amount))))
+            return
+        trade_id = str(_field(trade_data, "t", "id") or "")
+        if trade_id in tracked_order.order_fills:
+            return
+        self._stream_fills.setdefault(tracked_order.client_order_id, {})[trade_id] = [trade_data, 0]
+        task = self._stream_fill_tasks.get(tracked_order.client_order_id)
+        if task is None or task.done():
+            self._stream_fill_tasks[tracked_order.client_order_id] = safe_ensure_future(
+                self._record_stream_fills(tracked_order))
 
-            fee = TradeFeeBase.new_spot_fee(
-                fee_schema=self.trade_fee_schema(),
-                trade_type=tracked_order.trade_type,
-                flat_fees=[TokenAmount(amount=fee_amount, token=fee_token)]
-            )
+    async def _record_stream_fills(self, order: InFlightOrder):
+        """
+        Records from REST, with their fees, the fills the stream reported for this order without one; see
+        STREAM_FILL_REST_ATTEMPTS. Fills the stream reports while this runs are taken in as well.
+        """
+        pending = self._stream_fills.setdefault(order.client_order_id, {})
+        delay = self.STREAM_FILL_REST_DELAY
+        while pending:
+            for trade_update in await self._all_trade_updates_for_order(order):
+                self._order_tracker.process_trade_update(trade_update)
+            for trade_id, entry in list(pending.items()):
+                entry[1] += 1
+                if trade_id in order.order_fills:
+                    del pending[trade_id]
+                elif entry[1] >= self.STREAM_FILL_REST_ATTEMPTS:
+                    self.logger().warning(
+                        f"Fill {trade_id} of order {order.client_order_id} isn't in CoinDCX's trade history after "
+                        f"{entry[1]} reads; recording it from the stream with an estimated fee.")
+                    self._order_tracker.process_trade_update(self._trade_update_from_stream(order, entry[0], None))
+                    del pending[trade_id]
+            if pending:
+                await self._sleep(delay)
+                delay = min(delay * 2, 4 * self.STREAM_FILL_REST_DELAY)
+        self._stream_fills.pop(order.client_order_id, None)
+        self._stream_fill_tasks.pop(order.client_order_id, None)
 
-            fill_price = Decimal(str(trade_data.get("price", 0)))
-            fill_amount = Decimal(str(trade_data.get("quantity", 0)))
+    def _quote_fee(self, order: InFlightOrder, fee_amount: Decimal) -> TradeFeeBase:
+        """A fill's fee as CoinDCX reports it: in the quote currency (live, 28 Nov 2026: 0.05% of the INR value)."""
+        return TradeFeeBase.new_spot_fee(
+            fee_schema=self.trade_fee_schema(),
+            trade_type=order.trade_type,
+            flat_fees=[TokenAmount(amount=fee_amount, token=order.quote_asset)])
 
-            trade_update = TradeUpdate(
-                trade_id=str(trade_data.get("id", "")),
-                client_order_id=client_order_id,
-                exchange_order_id=exchange_order_id,
-                trading_pair=tracked_order.trading_pair,
-                fee=fee,
-                fill_base_amount=fill_amount,
-                fill_quote_amount=fill_amount * fill_price,
-                fill_price=fill_price,
-                fill_timestamp=trade_data.get("timestamp", self._time_synchronizer.time() * 1000) / 1000,
-            )
-            self._order_tracker.process_trade_update(trade_update)
+    def _trade_update_from_stream(self, order: InFlightOrder, trade_data: Dict[str, Any],
+                                  fee_amount: Optional[Decimal]) -> TradeUpdate:
+        """A trade-update message as a fill of the order; with the estimated fee if fee_amount is None."""
+        price = Decimal(str(_field(trade_data, "p", "price") or 0))
+        amount = Decimal(str(_field(trade_data, "q", "quantity") or 0))
+        if fee_amount is None:
+            fee = self._get_fee(order.base_asset, order.quote_asset, order.order_type, order.trade_type, amount, price)
+        else:
+            fee = self._quote_fee(order, fee_amount)
+        fill_time = coindcx_utils.timestamp_in_seconds(_field(trade_data, "T", "timestamp"))
+        return TradeUpdate(
+            trade_id=str(_field(trade_data, "t", "id") or ""),
+            client_order_id=order.client_order_id,
+            exchange_order_id=str(_field(trade_data, "o", "order_id") or "") or order.exchange_order_id,
+            trading_pair=order.trading_pair,
+            fee=fee,
+            fill_base_amount=amount,
+            fill_quote_amount=amount * price,
+            fill_price=price,
+            fill_timestamp=fill_time or self._time_synchronizer.time(),
+        )
+
+    def _trade_update_from_rest(self, order: InFlightOrder, trade: Dict[str, Any]) -> TradeUpdate:
+        """A trade from the REST trade history as a fill of the order."""
+        price = Decimal(str(trade.get("price", 0)))
+        amount = Decimal(str(trade.get("quantity", 0)))
+        fill_time = coindcx_utils.timestamp_in_seconds(trade.get("timestamp"))
+        return TradeUpdate(
+            trade_id=str(trade.get("id", "")),
+            client_order_id=order.client_order_id,
+            exchange_order_id=order.exchange_order_id,
+            trading_pair=order.trading_pair,
+            fee=self._quote_fee(order, Decimal(str(trade.get("fee_amount", 0)))),
+            fill_base_amount=amount,
+            fill_quote_amount=amount * price,
+            fill_price=price,
+            fill_timestamp=fill_time or self._time_synchronizer.time(),
+        )
+
+    @staticmethod
+    def _trade_history_request(orders: List[InFlightOrder], symbol: Optional[str] = None) -> Dict[str, Any]:
+        """
+        A trade history request for these orders' fills: the newest first, from a minute before the oldest of them
+        was created. CoinDCX returns the oldest trades first unless asked otherwise, so on an account with many trades
+        a plain request never reaches the new ones.
+        """
+        request: Dict[str, Any] = {"limit": 100, "sort": "desc"}
+        created = [order.creation_timestamp for order in orders if order.creation_timestamp]
+        if created:
+            request["from_timestamp"] = int((min(created) - 60) * 1000)
+        if symbol:
+            request["symbol"] = symbol
+        return request
+
+    async def _sync_after_user_stream_gap(self):
+        """
+        Reads over REST what the user stream may have missed while it reconnected: the balances, and the status and
+        fills of the orders this connector tracks. CoinDCX doesn't resend stream messages, and while the stream is up
+        the regular REST check runs only every couple of minutes.
+        """
+        try:
+            await self._update_balances()
+            await self._update_order_status()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.logger().warning(f"Could not read the account over REST after the user stream reconnected: {e}")
 
     def _process_balance_update(self, balance_data: Dict[str, Any]):
         """
@@ -679,105 +854,46 @@ class CoindcxExchange(ExchangePyBase):
         long_interval_last_tick = self._last_poll_timestamp / self.LONG_POLL_INTERVAL
         long_interval_current_tick = self.current_timestamp / self.LONG_POLL_INTERVAL
 
-        if (long_interval_current_tick > long_interval_last_tick
-                or (self.in_flight_orders and small_interval_current_tick > small_interval_last_tick)):
+        fillable = list(self._order_tracker.all_fillable_orders.values())
+        if fillable and (long_interval_current_tick > long_interval_last_tick
+                         or (self.in_flight_orders and small_interval_current_tick > small_interval_last_tick)):
 
             self._last_trades_poll_coindcx_timestamp = self._time_synchronizer.time()
 
             try:
-                trade_history_params = {
-                    "limit": 100
-                }
-
                 trades = await self._api_post(
                     path_url=CONSTANTS.TRADE_HISTORY_ACCOUNT_PATH_URL,
-                    data=trade_history_params,
+                    data=self._trade_history_request(fillable),
                     is_auth_required=True
                 )
-
-                if trades:
-                    trades_by_order_id = {}
-                    for trade in trades:
-                        order_id = str(trade.get("order_id", ""))
-                        trades_by_order_id[order_id] = trade
-
-                    for tracked_order in self._order_tracker.all_fillable_orders.values():
-                        if tracked_order.exchange_order_id in trades_by_order_id:
-                            trade = trades_by_order_id[tracked_order.exchange_order_id]
-                            fee_amount = Decimal(str(trade.get("fee_amount", 0)))
-                            trading_pair = tracked_order.trading_pair
-                            base, quote = trading_pair.split("-")
-
-                            fee = TradeFeeBase.new_spot_fee(
-                                fee_schema=self.trade_fee_schema(),
-                                trade_type=tracked_order.trade_type,
-                                flat_fees=[TokenAmount(amount=fee_amount, token=quote)]
-                            )
-
-                            trade_update = TradeUpdate(
-                                trade_id=str(trade.get("id", "")),
-                                client_order_id=tracked_order.client_order_id,
-                                exchange_order_id=tracked_order.exchange_order_id,
-                                trading_pair=trading_pair,
-                                fee=fee,
-                                fill_base_amount=Decimal(str(trade.get("quantity", 0))),
-                                fill_quote_amount=Decimal(str(trade.get("quantity", 0))) * Decimal(str(trade.get("price", 0))),
-                                fill_price=Decimal(str(trade.get("price", 0))),
-                                fill_timestamp=trade.get("timestamp", self._time_synchronizer.time() * 1000) / 1000,
-                            )
-                            self._order_tracker.process_trade_update(trade_update)
+                trades_by_order_id: Dict[str, List[Dict[str, Any]]] = {}
+                for trade in trades if isinstance(trades, list) else []:
+                    trades_by_order_id.setdefault(str(trade.get("order_id", "")), []).append(trade)
+                for tracked_order in fillable:
+                    for trade in trades_by_order_id.get(tracked_order.exchange_order_id, []):
+                        self._order_tracker.process_trade_update(self._trade_update_from_rest(tracked_order, trade))
 
             except Exception as e:
                 self.logger().error(f"Error fetching trade history: {e}")
 
     async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
         """
-        Retrieves all trade updates for a specific order.
+        The order's fills, from the REST trade history.
         """
-        trade_updates = []
-
-        if order.exchange_order_id is not None:
-            try:
-                trade_history_params = {
-                    "symbol": await self.exchange_symbol_associated_to_pair(trading_pair=order.trading_pair),
-                    "limit": 100
-                }
-
-                all_fills_response = await self._api_post(
-                    path_url=CONSTANTS.TRADE_HISTORY_ACCOUNT_PATH_URL,
-                    data=trade_history_params,
-                    is_auth_required=True
-                )
-
-                for trade in all_fills_response:
-                    if str(trade.get("order_id", "")) == order.exchange_order_id:
-                        fee_amount = Decimal(str(trade.get("fee_amount", 0)))
-                        trading_pair = order.trading_pair
-                        base, quote = trading_pair.split("-")
-
-                        fee = TradeFeeBase.new_spot_fee(
-                            fee_schema=self.trade_fee_schema(),
-                            trade_type=order.trade_type,
-                            flat_fees=[TokenAmount(amount=fee_amount, token=quote)]
-                        )
-
-                        trade_update = TradeUpdate(
-                            trade_id=str(trade.get("id", "")),
-                            client_order_id=order.client_order_id,
-                            exchange_order_id=order.exchange_order_id,
-                            trading_pair=trading_pair,
-                            fee=fee,
-                            fill_base_amount=Decimal(str(trade.get("quantity", 0))),
-                            fill_quote_amount=Decimal(str(trade.get("quantity", 0))) * Decimal(str(trade.get("price", 0))),
-                            fill_price=Decimal(str(trade.get("price", 0))),
-                            fill_timestamp=trade.get("timestamp", self._time_synchronizer.time() * 1000) / 1000,
-                        )
-                        trade_updates.append(trade_update)
-
-            except Exception as e:
-                self.logger().error(f"Error fetching trades for order: {e}")
-
-        return trade_updates
+        if order.exchange_order_id is None:
+            return []
+        try:
+            symbol = await self.exchange_symbol_associated_to_pair(trading_pair=order.trading_pair)
+            trades = await self._api_post(
+                path_url=CONSTANTS.TRADE_HISTORY_ACCOUNT_PATH_URL,
+                data=self._trade_history_request([order], symbol),
+                is_auth_required=True
+            )
+        except Exception as e:
+            self.logger().error(f"Error fetching trades for order: {e}")
+            return []
+        return [self._trade_update_from_rest(order, trade) for trade in (trades if isinstance(trades, list) else [])
+                if str(trade.get("order_id", "")) == order.exchange_order_id]
 
     async def get_all_account_trades(self, start_time: Optional[int] = None,
                                      end_time: Optional[int] = None,
@@ -828,12 +944,13 @@ class CoindcxExchange(ExchangePyBase):
 
         status = updated_order_data.get("status", "")
         new_state = CONSTANTS.ORDER_STATE.get(status, tracked_order.current_state)
+        update_time = coindcx_utils.timestamp_in_seconds(updated_order_data.get("updated_at"))
 
         order_update = OrderUpdate(
             client_order_id=tracked_order.client_order_id,
             exchange_order_id=str(updated_order_data.get("id", "")),
             trading_pair=tracked_order.trading_pair,
-            update_timestamp=updated_order_data.get("updated_at", self._time_synchronizer.time() * 1000) / 1000,
+            update_timestamp=update_time or self._time_synchronizer.time(),
             new_state=new_state,
         )
 
@@ -892,8 +1009,15 @@ class CoindcxExchange(ExchangePyBase):
             "target_currency_short_name": "SNM",
             ...
         }
+
+        CoinDCX can list one pair on two routes: on 27 Nov 2026, for example, ASR-USDT was both "ASRUSDT" (ecode B)
+        and "ASR_USDT" (ecode G). A trading pair maps to one symbol only (a duplicate used to make the whole map
+        fail, so the connector never got ready), so the plain BASEQUOTE symbol wins, otherwise the first one listed.
+
+        Each chosen market's pair code (its "pair" field, e.g. "I-ETH_INR") is kept too: see exchange_pair_code.
         """
-        mapping = bidict()
+        symbol_for_pair: Dict[str, str] = {}
+        pair_code_for_pair: Dict[str, str] = {}
         markets_list = exchange_info if isinstance(exchange_info, list) else [exchange_info]
 
         for symbol_data in filter(coindcx_utils.is_exchange_information_valid, markets_list):
@@ -903,28 +1027,46 @@ class CoindcxExchange(ExchangePyBase):
 
             if symbol and base and quote:
                 trading_pair = combine_to_hb_trading_pair(base=base, quote=quote)
-                mapping[symbol] = trading_pair
+                chosen = symbol_for_pair.get(trading_pair)
+                if chosen is None or (symbol == f"{base}{quote}" and chosen != f"{base}{quote}"):
+                    symbol_for_pair[trading_pair] = symbol
+                    pair_code_for_pair.pop(trading_pair, None)
+                    if symbol_data.get("pair"):
+                        pair_code_for_pair[trading_pair] = symbol_data["pair"]
 
-        self._set_trading_pair_symbol_map(mapping)
+        self._pair_code_for_trading_pair = pair_code_for_pair
+        self._set_trading_pair_symbol_map(bidict({symbol: pair for pair, symbol in symbol_for_pair.items()}))
+
+    async def exchange_pair_code(self, trading_pair: str) -> str:
+        """
+        CoinDCX's code for a pair's market, e.g. "I-ETH_INR" or "B-BTC_USDT": what its order book endpoint and its
+        stream channels take. It is the market's "pair" field in markets_details, as CoinDCX's docs say to use. For a
+        market without one, the usual code is guessed (coindcx_utils.default_pair_code).
+        """
+        await self.trading_pair_symbol_map()  # reads markets_details, pair codes included, if not done yet
+        return self._pair_code_for_trading_pair.get(trading_pair) or coindcx_utils.default_pair_code(trading_pair)
+
+    async def get_last_traded_prices(self, trading_pairs: List[str]) -> Dict[str, float]:
+        """
+        Each pair's last traded price, from one read of CoinDCX's ticker. A pair the ticker has no price for is left
+        out. (The markets list, which this used to read, has no prices: it gave 0 for every pair.)
+        """
+        tickers = await self.get_all_pairs_prices()
+        last_price_for_symbol = {
+            ticker.get("market"): ticker.get("last_price")
+            for ticker in (tickers if isinstance(tickers, list) else []) if isinstance(ticker, dict)
+        }
+        prices: Dict[str, float] = {}
+        for trading_pair in trading_pairs:
+            symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+            try:
+                prices[trading_pair] = float(last_price_for_symbol[symbol])
+            except (KeyError, TypeError, ValueError):
+                continue
+        return prices
 
     async def _get_last_traded_price(self, trading_pair: str) -> float:
         """
-        Gets the last traded price for a trading pair.
+        The pair's last traded price, from CoinDCX's ticker. Raises KeyError if the ticker has none for it.
         """
-        try:
-            exchange_info = await self._api_get(
-                path_url=CONSTANTS.MARKETS_DETAILS_PATH_URL
-            )
-
-            symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-
-            if isinstance(exchange_info, list):
-                for market in exchange_info:
-                    if market.get("symbol", market.get("coindcx_name", "")) == symbol:
-                        last_price = market.get("last_price", market.get("last", 0))
-                        return float(last_price)
-
-            return 0.0
-        except Exception as e:
-            self.logger().error(f"Error getting last traded price: {e}")
-            return 0.0
+        return (await self.get_last_traded_prices([trading_pair]))[trading_pair]

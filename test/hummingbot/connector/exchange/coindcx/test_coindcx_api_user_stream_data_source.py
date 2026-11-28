@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from hummingbot.connector.exchange.coindcx import coindcx_constants as CONSTANTS
 from hummingbot.connector.exchange.coindcx.coindcx_api_user_stream_data_source import CoinDCXAPIUserStreamDataSource
 
 
@@ -30,11 +31,11 @@ async def test_handle_message_puts_message_in_queue():
     q = asyncio.Queue()
     test_message = {"id": "1", "client_order_id": "c1", "status": "open"}
 
-    await data_source._handle_message(test_message, q)
+    await data_source._handle_message(test_message, CONSTANTS.ORDER_UPDATE_EVENT_TYPE, q)
 
     assert not q.empty()
     item = q.get_nowait()
-    assert item == test_message
+    assert item == {"id": "1", "client_order_id": "c1", "status": "open", "event": CONSTANTS.ORDER_UPDATE_EVENT_TYPE}
 
 
 @pytest.mark.asyncio
@@ -52,7 +53,7 @@ async def test_handle_message_updates_last_recv_time():
     q = asyncio.Queue()
 
     await asyncio.sleep(0.01)  # Ensure time passes
-    await data_source._handle_message({"test": "data"}, q)
+    await data_source._handle_message({"test": "data"}, CONSTANTS.BALANCE_UPDATE_EVENT_TYPE, q)
 
     assert data_source.last_recv_time > initial_time
 
@@ -60,15 +61,15 @@ async def test_handle_message_updates_last_recv_time():
 @pytest.mark.asyncio
 async def test_build_client_creates_socketio_client():
     """Test that _build_client creates a Socket.IO client with proper handlers"""
-    # data_source = CoinDCXAPIUserStreamDataSource(
-    #     auth=DummyAuth(),
-    #     trading_pairs=["BTC-USDT"],
-    #     connector=DummyConnector(),
-    #     api_factory=None,
-    #     domain=""
-    # )
+    data_source = CoinDCXAPIUserStreamDataSource(
+        auth=DummyAuth(),
+        trading_pairs=["BTC-USDT"],
+        connector=DummyConnector(),
+        api_factory=None,
+        domain=""
+    )
 
-    # q = asyncio.Queue()
+    q = asyncio.Queue()
 
     import hummingbot.connector.exchange.coindcx.coindcx_api_user_stream_data_source as user_mod
     with patch.object(user_mod, "socketio") as mock_socketio:
@@ -77,12 +78,14 @@ async def test_build_client_creates_socketio_client():
         mock_client.event = MagicMock(side_effect=lambda func: func)
         mock_client.on = MagicMock(side_effect=lambda event_type: lambda func: func)
 
-        # client = data_source._build_client(q)
+        client = data_source._build_client(q)
 
+        assert client is mock_client
+        # No proxy configured: no session of ours, so engine.io connects directly.
         mock_socketio.AsyncClient.assert_called_once_with(
             logger=False,
             reconnection=False,
-            ssl_verify=False
+            http_session=None,
         )
 
         assert mock_client.event.call_count >= 2

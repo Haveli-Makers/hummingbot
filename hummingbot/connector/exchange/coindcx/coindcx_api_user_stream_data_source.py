@@ -1,11 +1,13 @@
 import asyncio
 from typing import TYPE_CHECKING, List, Optional
 
+import aiohttp
 import socketio
 
-from hummingbot.connector.exchange.coindcx import coindcx_constants as CONSTANTS
+from hummingbot.connector.exchange.coindcx import coindcx_constants as CONSTANTS, coindcx_web_utils as web_utils
 from hummingbot.connector.exchange.coindcx.coindcx_auth import CoinDCXAuth
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
+from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.logger import HummingbotLogger
 
 if TYPE_CHECKING:
@@ -24,15 +26,21 @@ class CoinDCXAPIUserStreamDataSource(UserStreamTrackerDataSource):
                  trading_pairs: List[str],
                  connector: 'CoinDCXExchange',
                  api_factory,
-                 domain: str = CONSTANTS.DEFAULT_DOMAIN):
+                 domain: str = CONSTANTS.DEFAULT_DOMAIN,
+                 proxy_url: Optional[str] = None):
         super().__init__()
         self._auth: CoinDCXAuth = auth
         self._domain = domain
         self._connector = connector
         self._api_factory = api_factory
         self._trading_pairs = trading_pairs
+        self._proxy_url = proxy_url
+        # The proxied aiohttp session of the current connection, if there is a proxy. Closed in _disconnect.
+        self._http_session: Optional[aiohttp.ClientSession] = None
         self._client: Optional[socketio.AsyncClient] = None
         self._last_recv_time = 0.0
+        # Whether the stream has joined before: a later join is a reconnect, after a gap (see _catch_up_after_gap).
+        self._joined_before = False
 
     @property
     def last_recv_time(self) -> float:
@@ -62,7 +70,9 @@ class CoinDCXAPIUserStreamDataSource(UserStreamTrackerDataSource):
             except asyncio.CancelledError:
                 await self._disconnect()
                 raise
-            except Exception:
+            except Exception as e:
+                self.logger().warning(f"CoinDCX user stream connection failed: {str(e) or type(e).__name__}. "
+                                      f"Retrying in 5 s.")
                 await self._disconnect()
                 await self._sleep(5.0)
             else:
@@ -73,9 +83,11 @@ class CoinDCXAPIUserStreamDataSource(UserStreamTrackerDataSource):
         """
         Build Socket.IO client with authentication and event handlers.
         """
+        self._http_session = web_utils.build_proxy_session(self._proxy_url)
         client = socketio.AsyncClient(
             logger=False,
-            reconnection=False
+            reconnection=False,
+            http_session=self._http_session,
         )
         auth_payload = self._auth.generate_ws_auth_payload()
 
@@ -83,6 +95,9 @@ class CoinDCXAPIUserStreamDataSource(UserStreamTrackerDataSource):
         async def connect():
             await client.emit("join", auth_payload)
             self._last_recv_time = self._time()
+            if self._joined_before:
+                self._catch_up_after_gap()
+            self._joined_before = True
 
         @client.event
         async def disconnect():
@@ -106,6 +121,16 @@ class CoinDCXAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
         return client
 
+    def _catch_up_after_gap(self):
+        """
+        After a reconnect, has the connector read over REST what the stream may have missed: CoinDCX doesn't resend
+        messages sent while a connection was down. (Seen through a proxy on 28 Nov 2026: the stream went quiet for
+        about 15 s, then dropped and reconnected.)
+        """
+        sync = getattr(self._connector, "_sync_after_user_stream_gap", None)
+        if asyncio.iscoroutinefunction(sync):
+            safe_ensure_future(sync())
+
     async def _handle_message(self, message, event_type: str, output: asyncio.Queue):
         """
         Process and enqueue a message from the user stream.s
@@ -118,6 +143,11 @@ class CoinDCXAPIUserStreamDataSource(UserStreamTrackerDataSource):
     async def _ping_task(self):
         """
         Periodically send ping messages to keep the user stream connection alive.
+
+        A ping sent on a connected stream also counts as hearing from it (last_recv_time). The connector polls REST
+        every 5 s once its user stream has been quiet for a minute, and every 2 minutes otherwise; an account with no
+        activity sends nothing, so without this its healthy stream would look dead and keep the fast REST polling on.
+        engine.io's own heartbeat drops a dead connection, which ends the pings.
         """
         try:
             while True:
@@ -125,6 +155,7 @@ class CoinDCXAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 if self._client and self._client.connected:
                     try:
                         await self._client.emit("ping", {"data": "Ping message"})
+                        self._last_recv_time = self._time()
                     except Exception as e:
                         self.logger().debug(f"Error sending ping: {e}")
         except asyncio.CancelledError:
@@ -142,6 +173,10 @@ class CoinDCXAPIUserStreamDataSource(UserStreamTrackerDataSource):
             except Exception:
                 self.logger().debug("CoinDCX user stream disconnect failed", exc_info=True)
             self._client = None
+        if self._http_session is not None:
+            # engine.io never closes a session it was given.
+            await self._http_session.close()
+            self._http_session = None
 
     async def stop(self):
         """

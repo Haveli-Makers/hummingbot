@@ -9,7 +9,16 @@ class CoinDCXOrderBook(OrderBook):
     """
     CoinDCX-specific order book implementation.
     Handles conversion of CoinDCX API responses to OrderBookMessage objects.
+
+    Update ids are CoinDCX's clock in milliseconds: "ts" on stream messages and "timestamp" on the REST order book.
+    Both carry the same value for the same version of the book, so the tracker can compare REST and stream messages.
+    The "vs" counter is not used: the REST book doesn't carry it, and it restarts.
     """
+
+    @staticmethod
+    def _update_id(msg: Dict, timestamp: float) -> int:
+        exchange_time_ms = msg.get("ts") or msg.get("timestamp")
+        return int(exchange_time_ms) if exchange_time_ms else int(timestamp * 1000)
 
     @classmethod
     def snapshot_message_from_exchange(
@@ -37,7 +46,7 @@ class CoinDCXOrderBook(OrderBook):
 
         content = {
             "trading_pair": metadata.get("trading_pair"),
-            "update_id": msg.get("vs", int(timestamp * 1000)),
+            "update_id": cls._update_id(msg, timestamp),
             "bids": bids,
             "asks": asks
         }
@@ -74,7 +83,7 @@ class CoinDCXOrderBook(OrderBook):
 
         content = {
             "trading_pair": metadata.get("trading_pair"),
-            "update_id": msg.get("vs", int(timestamp * 1000)),
+            "update_id": cls._update_id(msg, timestamp),
             "bids": bids,
             "asks": asks
         }
@@ -101,7 +110,8 @@ class CoinDCXOrderBook(OrderBook):
 
         content = {
             "trading_pair": metadata.get("trading_pair"),
-            "trade_type": float(TradeType.BUY.value) if msg.get("m", 0) else float(TradeType.SELL.value),
+            # "m" is true when the buyer was the maker, so the taker sold.
+            "trade_type": float(TradeType.SELL.value) if msg.get("m") else float(TradeType.BUY.value),
             "trade_id": msg.get("T"),
             "update_id": msg.get("T"),
             "price": float(msg.get("p", 0)),

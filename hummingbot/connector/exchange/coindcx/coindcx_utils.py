@@ -1,5 +1,6 @@
+from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from pydantic import ConfigDict, Field, SecretStr
 
@@ -95,6 +96,44 @@ def hb_pair_to_coindcx_pair(hb_pair: str, ecode: str = "B") -> str:
     return f"{ecode}-{hb_pair.replace('-', '_')}"
 
 
+def default_pair_code(hb_pair: str) -> str:
+    """
+    A guess at CoinDCX's pair code for a trading pair: "I-ETH_INR" for INR markets, "B-BTC_USDT" for the others.
+
+    Only for a market the markets list gives no code for. The connector uses each market's real code, the "pair" field
+    of markets_details, because some markets are on other routes ("KC-", "G-").
+    """
+    quote = hb_pair.split("-")[-1]
+    return hb_pair_to_coindcx_pair(hb_pair, ecode="I" if quote.upper() == "INR" else "B")
+
+
+def timestamp_in_seconds(value: Any) -> Optional[float]:
+    """
+    A CoinDCX time in seconds, or None if it can't be read.
+
+    CoinDCX sends times as milliseconds (a number or numeric text; trade times can have a fraction, e.g.
+    1545896665076.92) and, in some responses, as ISO text ("2026-07-07T10:52:29.770Z"). A number below 1e11 is
+    taken as seconds already.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            value = float(text)
+        except ValueError:
+            try:
+                moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=timezone.utc)
+            return moment.timestamp()
+    if not isinstance(value, (int, float)) or value <= 0:
+        return None
+    return value / 1000.0 if value >= 1e11 else float(value)
+
+
 class CoinDCXConfigMap(BaseConnectorConfigMap):
     """
     Configuration map for CoinDCX connector.
@@ -114,6 +153,21 @@ class CoinDCXConfigMap(BaseConnectorConfigMap):
         json_schema_extra={
             "prompt": lambda cm: "Enter your CoinDCX API secret",
             "is_secure": True,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        }
+    )
+    coindcx_proxy_url: SecretStr = Field(
+        default=SecretStr(""),
+        json_schema_extra={
+            "prompt": lambda cm: (
+                "Enter a proxy URL to route CoinDCX traffic through a whitelisted IP "
+                "(e.g. socks5://user:pass@host:1080), or leave blank to connect directly"
+            ),
+            "is_secure": True,
+            # Must stay True: only connect-key fields reach the connector constructor
+            # (api_keys_from_connector_config_map). With False the URL is saved but ignored,
+            # and CoinDCX traffic goes direct. The default of "" keeps the field optional.
             "is_connect_key": True,
             "prompt_on_new": True,
         }

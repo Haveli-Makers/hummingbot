@@ -55,3 +55,54 @@ def test_config_map_reflection_and_construct():
     cm = CoinDCXConfigMap.model_construct()
     has_field = hasattr(cm, "coindcx_api_key") or (hasattr(cm, "model_fields") and "coindcx_api_key" in cm.model_fields)
     assert has_field
+
+
+def test_proxy_url_field_is_an_optional_secret_connect_key():
+    from hummingbot.connector.exchange.coindcx.coindcx_utils import CoinDCXConfigMap
+
+    field = CoinDCXConfigMap.model_fields["coindcx_proxy_url"]
+    assert field.default.get_secret_value() == ""
+    extra = field.json_schema_extra
+    assert extra["is_secure"] is True
+    assert extra["prompt_on_new"] is True
+    # Only connect keys reach the connector constructor; with False the proxy would be saved and then ignored.
+    assert extra["is_connect_key"] is True
+
+
+def test_proxy_url_reaches_the_connector_arguments():
+    from hummingbot.client.config.config_helpers import ClientConfigAdapter, api_keys_from_connector_config_map
+    from hummingbot.connector.exchange.coindcx.coindcx_utils import CoinDCXConfigMap
+
+    config = ClientConfigAdapter(CoinDCXConfigMap(
+        coindcx_api_key="key", coindcx_api_secret="secret", coindcx_proxy_url="http://user:pass@proxy.local:3128"))
+
+    assert api_keys_from_connector_config_map(config) == {
+        "coindcx_api_key": "key",
+        "coindcx_api_secret": "secret",
+        "coindcx_proxy_url": "http://user:pass@proxy.local:3128",
+    }
+
+
+def test_proxy_url_is_blank_for_a_config_saved_without_it():
+    from hummingbot.client.config.config_helpers import ClientConfigAdapter, api_keys_from_connector_config_map
+    from hummingbot.connector.exchange.coindcx.coindcx_utils import CoinDCXConfigMap
+
+    config = ClientConfigAdapter(CoinDCXConfigMap(coindcx_api_key="key", coindcx_api_secret="secret"))
+
+    assert api_keys_from_connector_config_map(config)["coindcx_proxy_url"] == ""
+
+
+def test_default_pair_code_guesses_the_usual_route():
+    assert coindcx_utils.default_pair_code("ETH-INR") == "I-ETH_INR"
+    assert coindcx_utils.default_pair_code("BTC-USDT") == "B-BTC_USDT"
+
+
+def test_timestamp_in_seconds_reads_every_format_coindcx_uses():
+    assert coindcx_utils.timestamp_in_seconds(1795675620118) == 1795675620.118  # milliseconds
+    assert coindcx_utils.timestamp_in_seconds(1545896665076.92) == 1545896665.07692  # a trade time with a fraction
+    assert coindcx_utils.timestamp_in_seconds("1795675620118") == 1795675620.118
+    assert coindcx_utils.timestamp_in_seconds(1795675620) == 1795675620.0  # seconds already
+    assert abs(coindcx_utils.timestamp_in_seconds("2026-11-26T06:47:00.118Z") - 1795675620.118) < 1e-6
+    assert abs(coindcx_utils.timestamp_in_seconds("2026-11-26T06:47:00.118") - 1795675620.118) < 1e-6  # UTC
+    for unreadable in (None, "", "yesterday", 0, -5, True, [1]):
+        assert coindcx_utils.timestamp_in_seconds(unreadable) is None

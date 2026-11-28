@@ -25,7 +25,8 @@ class CoindcxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
 
     @property
     def latest_prices_url(self):
-        url = web_utils.public_rest_url(path_url=CONSTANTS.MARKETS_DETAILS_PATH_URL, domain=self.exchange._domain)
+        # Last prices come from the ticker: the markets list has none.
+        url = web_utils.public_rest_url(path_url=CONSTANTS.TICKER_PATH_URL, domain=self.exchange._domain)
         return url
 
     @property
@@ -85,15 +86,20 @@ class CoindcxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
 
     @property
     def latest_prices_request_mock_response(self):
+        # GET /exchange/ticker, with the fields CoinDCX's docs list.
         return [
             {
-                "coindcx_name": self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset),
-                "symbol": self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset),
-                "last_price": 10000.0,
-                "bid": 9999.0,
-                "ask": 10001.0,
-                "volume": 1000.0
-            }
+                "market": self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset),
+                "change_24_hour": "1.2",
+                "high": "10100.0",
+                "low": "9900.0",
+                "volume": "1000.0",
+                "last_price": "10000.0",
+                "bid": "9999.0",
+                "ask": "10001.0",
+                "timestamp": 1640000000000,
+            },
+            {"market": "OTHERINR", "last_price": "5.0"},
         ]
 
     @property
@@ -574,16 +580,23 @@ class CoindcxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests
         return url
 
     def trade_event_for_full_fill_websocket_update(self, order: InFlightOrder):
+        # As CoinDCX sends it (docs: Spot Sockets, Get Trade Update): short keys, and "data" is a JSON list as text.
+        exchange_order_id = str(order.exchange_order_id)
         return {
             "event": "trade-update",
-            "data": {
-                "order_id": order.exchange_order_id,
-                "client_order_id": order.client_order_id,
-                "price": float(order.price),
-                "quantity": float(order.amount),
-                "fee_amount": 0.1,
-                "timestamp": 1640000000000
-            }
+            "data": json.dumps([{
+                "o": int(exchange_order_id) if exchange_order_id.isdigit() else exchange_order_id,  # "now numeric"
+                "c": order.client_order_id,
+                "t": self.expected_fill_trade_id,
+                "s": self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset),
+                "p": str(order.price),
+                "q": str(order.amount),
+                "T": 1640000000000.25,
+                "m": True,
+                "f": "0.1",
+                "e": "I",
+                "x": "filled",
+            }]),
         }
 
     def _configure_erroneous_response(self, url: str, regex: str, response: Any, **kwargs):

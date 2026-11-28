@@ -11,7 +11,10 @@ MAX_ORDER_ID_LEN = 36
 
 REST_URL = "https://api.coindcx.com"
 PUBLIC_REST_URL = "https://public.coindcx.com"
-WSS_URL = "wss://stream.coindcx.com"
+# The spot stream host CoinDCX's docs list. Its trade-update carries the fee ("f"); the older host,
+# wss://stream.coindcx.com, sent trade updates without one (both checked live on 28 Nov 2026). The connector reads
+# either, but without a fee each fill costs a REST read.
+WSS_URL = "wss://stream-spot.coindcx.com"
 
 MARKETS_PATH_URL = "/exchange/v1/markets"
 MARKETS_DETAILS_PATH_URL = "/exchange/v1/markets_details"
@@ -50,6 +53,8 @@ ORDER_STATE = {
     "cancelled": OrderState.CANCELED,
     "partially_cancelled": OrderState.CANCELED,
     "rejected": OrderState.FAILED,
+    # A stop order waiting for its trigger price: still live on the exchange.
+    "untriggered": OrderState.OPEN,
 }
 
 DIFF_EVENT_TYPE = "depth-update"

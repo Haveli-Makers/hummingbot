@@ -9,7 +9,15 @@ HEALTH_CHECK_ENDPOINT = "/exchange/v1/markets"
 CANDLES_ENDPOINT = "/market_data/candles"
 MARKETS_DETAILS_ENDPOINT = "/exchange/v1/markets_details"
 
+# The base class's plain-websocket path isn't used: CoinDCX streams candles over Socket.IO, on the spot connector's
+# stream (coindcx_constants.WSS_URL), channel "<pair code>_<interval>", event "candlestick".
 WSS_URL = None
+CANDLESTICK_EVENT = "candlestick"
+# The intervals CoinDCX streams (its docs: 1m, 15m, 1h, 1d). Others are built from REST candles.
+SOCKET_INTERVALS = ["1m", "15m", "1h", "1d"]
+# While the stream delivers, REST is read only this often, as a check.
+SOCKET_REST_CHECK_INTERVAL = 60.0
+SOCKET_RETRY_DELAY = 5.0
 
 INTERVALS = bidict({
     "1m": "1m",

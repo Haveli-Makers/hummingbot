@@ -1,8 +1,12 @@
 import asyncio
+import json
 import logging
 import time
-from typing import List, Optional
+from typing import Any, List, Optional
 
+import socketio
+
+from hummingbot.connector.exchange.coindcx import coindcx_constants as EXCHANGE_CONSTANTS
 from hummingbot.connector.exchange.coindcx.coindcx_utils import hb_pair_to_coindcx_pair
 from hummingbot.core.network_iterator import NetworkStatus
 from hummingbot.core.utils.async_utils import safe_ensure_future
@@ -13,6 +17,12 @@ from hummingbot.logger import HummingbotLogger
 
 
 class CoinDCXSpotCandles(CandlesBase):
+    """
+    CoinDCX candles. REST seeds and backfills them. At the intervals CoinDCX streams (CONSTANTS.SOCKET_INTERVALS)
+    the current candle then follows its Socket.IO "candlestick" stream, and REST is only read every
+    CONSTANTS.SOCKET_REST_CHECK_INTERVAL seconds as a check. Other intervals, and any time the stream is down, are
+    polled from REST every CONSTANTS.POLL_INTERVAL seconds.
+    """
     _logger: Optional[HummingbotLogger] = None
 
     @classmethod
@@ -28,6 +38,10 @@ class CoinDCXSpotCandles(CandlesBase):
         self._is_running = False
         self._shutdown_event = asyncio.Event()
         self._historical_fill_in_progress = False
+        self._socket_task: Optional[asyncio.Task] = None
+        # True once the stream has delivered a candle on its current connection.
+        self._socket_live = False
+        self._last_rest_poll = 0.0
 
     @property
     def name(self) -> str:
@@ -218,8 +232,27 @@ class CoinDCXSpotCandles(CandlesBase):
         self._is_running = True
         self._shutdown_event.clear()
         self._polling_task = asyncio.create_task(self._polling_loop())
+        if self.uses_socket:
+            self._socket_task = asyncio.create_task(self._socket_loop())
+
+    @property
+    def uses_socket(self) -> bool:
+        """Whether this interval is one CoinDCX streams. Others are built from REST candles."""
+        return self.interval in CONSTANTS.SOCKET_INTERVALS
+
+    @property
+    def socket_channel(self) -> str:
+        return f"{self._ex_trading_pair}_{self.interval}"
 
     async def stop_network(self):
+        if self._socket_task and not self._socket_task.done():
+            self._socket_task.cancel()
+            try:
+                await self._socket_task
+            except asyncio.CancelledError:
+                pass
+        self._socket_task = None
+        self._socket_live = False
         if self._polling_task and not self._polling_task.done():
             self._is_running = False
             self._shutdown_event.set()
@@ -329,10 +362,120 @@ class CoinDCXSpotCandles(CandlesBase):
                 raise
 
     def ws_subscription_payload(self):
-        raise NotImplementedError("WebSocket not supported for CoinDCX candles; polling is used instead.")
+        raise NotImplementedError("CoinDCX streams candles over Socket.IO, not a plain websocket: see _socket_loop.")
 
     def _parse_websocket_message(self, data: dict):
-        raise NotImplementedError("WebSocket not supported for CoinDCX candles; polling is used instead.")
+        raise NotImplementedError("CoinDCX streams candles over Socket.IO, not a plain websocket: see _socket_loop.")
+
+    async def _socket_loop(self):
+        """
+        Follows the current candle on CoinDCX's "candlestick" stream until the feed stops, reconnecting after
+        CONSTANTS.SOCKET_RETRY_DELAY seconds when the connection fails or ends. REST polling covers the gaps.
+        """
+        while self._is_running and not self._shutdown_event.is_set():
+            client = socketio.AsyncClient(logger=False, reconnection=False)
+            client.on(CONSTANTS.CANDLESTICK_EVENT, self._on_socket_candle)
+            ping_task = None
+            try:
+                await client.connect(EXCHANGE_CONSTANTS.WSS_URL, transports=["websocket"])
+                await client.emit("join", {"channelName": self.socket_channel})
+                self.logger().info(f"CoinDCX candles stream joined {self.socket_channel}.")
+                ping_task = asyncio.create_task(self._socket_ping(client))
+                await client.wait()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.logger().warning(f"CoinDCX candles stream {self.socket_channel} failed: "
+                                      f"{str(e) or type(e).__name__}. Polling REST until it is back.")
+            finally:
+                self._socket_live = False
+                if ping_task is not None:
+                    ping_task.cancel()
+                try:
+                    await client.disconnect()
+                except Exception:
+                    self.logger().debug("CoinDCX candles stream disconnect failed.", exc_info=True)
+            try:
+                await asyncio.wait_for(self._shutdown_event.wait(), timeout=CONSTANTS.SOCKET_RETRY_DELAY)
+            except asyncio.TimeoutError:
+                pass
+
+    async def _socket_ping(self, client: socketio.AsyncClient):
+        """Pings the stream like the CoinDCX connector does, to keep the connection open."""
+        while True:
+            await asyncio.sleep(EXCHANGE_CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL)
+            if client.connected:
+                try:
+                    await client.emit("ping", {"data": "Ping message"})
+                except Exception as e:
+                    self.logger().debug(f"CoinDCX candles stream ping failed: {e}")
+
+    async def _on_socket_candle(self, message: Any):
+        for candle in self._parse_socket_candles(message):
+            self._apply_socket_candle(candle)
+
+    def _parse_socket_candles(self, message: Any) -> List[List[float]]:
+        """
+        The candles in a "candlestick" message, as candle rows. CoinDCX sends {"event": ..., "data": ...} with "data"
+        a candle (as JSON text or an object) whose fields are, per its docs: "t" start (ms), "o", "h", "l", "c",
+        "v" base volume, "q" quote volume, "n" trades, "V" taker buy base volume, "Q" taker quote volume, "i" the
+        interval, "x" whether the candle is complete, "channel". Candles of another interval or channel are skipped.
+        """
+        if isinstance(message, str):
+            try:
+                message = json.loads(message)
+            except ValueError:
+                return []
+        body = message.get("data", message) if isinstance(message, dict) else message
+        if isinstance(body, str):
+            try:
+                body = json.loads(body)
+            except ValueError:
+                return []
+        items = [body] if isinstance(body, dict) else (body if isinstance(body, list) else [])
+        candles = []
+        for item in items:
+            if not isinstance(item, dict) or item.get("i", self.interval) != self.interval:
+                continue
+            if item.get("channel", self.socket_channel) != self.socket_channel:
+                continue
+            try:
+                candles.append([
+                    self.ensure_timestamp_in_seconds(item["t"]),
+                    float(item["o"]),
+                    float(item["h"]),
+                    float(item["l"]),
+                    float(item["c"]),
+                    float(item.get("v") or 0),
+                    float(item.get("q") or 0),
+                    float(item.get("n") or 0),
+                    float(item.get("V") or 0),
+                    float(item.get("Q") or 0),
+                ])
+            except (KeyError, TypeError, ValueError) as e:
+                self.logger().warning(f"CoinDCX: ignoring a stream candle it can't read ({e}): {item}")
+        return candles
+
+    def _apply_socket_candle(self, candle: List[float]):
+        """
+        Puts a stream candle in place: the current candle is replaced, a newer one appended (after heartbeat candles
+        for any interval in between). Older candles are left alone, and so is an empty feed, which REST seeds first.
+        """
+        if not self._candles:
+            return
+        last_ts = self._candles[-1][0]
+        if candle[0] == last_ts:
+            self._candles[-1] = candle
+        elif candle[0] > last_ts:
+            self._fill_gaps_and_append(candle)
+        self._socket_live = True
+
+    def _rest_poll_due(self) -> bool:
+        """
+        Whether to read REST now: every POLL_INTERVAL while the stream isn't delivering, and every
+        SOCKET_REST_CHECK_INTERVAL while it is.
+        """
+        return not self._socket_live or self._time() - self._last_rest_poll >= CONSTANTS.SOCKET_REST_CHECK_INTERVAL
 
     async def _polling_loop(self):
         try:
@@ -340,10 +483,15 @@ class CoinDCXSpotCandles(CandlesBase):
                 f"Starting CoinDCX candles polling for {self._trading_pair} [{self.interval}]"
             )
             await self._initialize_candles()
+            self._last_rest_poll = self._time()
 
             while self._is_running and not self._shutdown_event.is_set():
                 try:
-                    await self._poll_and_update()
+                    if self._rest_poll_due():
+                        await self._poll_and_update()
+                        self._last_rest_poll = self._time()
+                    else:
+                        self._ensure_heartbeats_to_current_time()
                     try:
                         await asyncio.wait_for(
                             self._shutdown_event.wait(),

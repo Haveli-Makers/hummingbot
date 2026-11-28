@@ -8,7 +8,7 @@ import socketio
 
 from hummingbot.connector.exchange.coindcx import coindcx_constants as CONSTANTS, coindcx_web_utils as web_utils
 from hummingbot.connector.exchange.coindcx.coindcx_order_book import CoinDCXOrderBook
-from hummingbot.connector.exchange.coindcx.coindcx_utils import hb_pair_to_coindcx_pair
+from hummingbot.connector.exchange.coindcx.coindcx_utils import coindcx_pair_to_hb_pair
 from hummingbot.core.data_type.order_book import OrderBook
 from hummingbot.core.data_type.order_book_message import OrderBookMessage
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
@@ -52,8 +52,12 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
     can put back levels that are gone.
     """
 
-    # If no depth-snapshot arrives for this long, the base class refreshes the order books from REST.
-    FULL_ORDER_BOOK_RESET_DELTA_SECONDS = 60
+    # If no depth-snapshot arrives for this long, the base class refreshes the order books from REST. CoinDCX sends one
+    # about every 3 s per pair, quiet markets included.
+    FULL_ORDER_BOOK_RESET_DELTA_SECONDS = 10
+    # A connection with no message at all for this long is stuck, and is dropped so that it reconnects. Seen through a
+    # proxy on 28 Nov 2026: the stream went quiet for about 15 s before the connection dropped by itself.
+    STREAM_SILENCE_TIMEOUT = 15.0
     # OrderBookTracker reads each pair's first order book once, at start, and never again if that read fails: the
     # connector would then never be ready. So get_new_order_book tries up to FIRST_ORDER_BOOK_ATTEMPTS times, waiting
     # FIRST_ORDER_BOOK_RETRY_DELAY seconds after the first failure and twice as long after each next one.
@@ -77,12 +81,11 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         # The proxied aiohttp session of the current connection, if there is a proxy. Closed in _disconnect.
         self._http_session: Optional[aiohttp.ClientSession] = None
         self._client: Optional[socketio.AsyncClient] = None
-        # Trades name the market by its pair code ("I-SOL_INR"); depth messages use its symbol ("SOLINR").
-        self._pair_code_to_trading_pair: Dict[str, str] = {
-            hb_pair_to_coindcx_pair(trading_pair, ecode=CONSTANTS.ECODE_COINDCX): trading_pair
-            for trading_pair in trading_pairs
-        }
+        # Trades name the market by its pair code ("I-SOL_INR"); depth messages use its symbol ("SOLINR"). Filled in
+        # as the channels are joined, from the connector's pair codes.
+        self._pair_code_to_trading_pair: Dict[str, str] = {}
         self._unknown_symbols: Set[str] = set()
+        self._last_message_time = 0.0
 
     async def get_last_traded_prices(self,
                                      trading_pairs: List[str],
@@ -118,7 +121,7 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 delay *= 2
 
     async def _request_order_book_snapshot(self, trading_pair: str) -> Dict[str, Any]:
-        coindcx_pair = hb_pair_to_coindcx_pair(trading_pair, ecode=CONSTANTS.ECODE_COINDCX)
+        coindcx_pair = await self._connector.exchange_pair_code(trading_pair)
 
         params = {
             "pair": coindcx_pair
@@ -144,15 +147,19 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 await self._client.connect(CONSTANTS.WSS_URL, transports=["websocket"])
                 await self._subscribe_channels(self._client)
                 self.logger().info("Subscribed to public order book and trade channels")
-                ping_task = asyncio.create_task(self._ping_task())
+                self._last_message_time = time.time()
+                helpers = [asyncio.create_task(self._ping_task())]
+                if self._trading_pairs:
+                    helpers.append(asyncio.create_task(self._watch_for_silence(self._client)))
                 try:
                     await self._client.wait()
                 finally:
-                    ping_task.cancel()
-                    try:
-                        await ping_task
-                    except asyncio.CancelledError:
-                        pass
+                    for helper in helpers:
+                        helper.cancel()
+                        try:
+                            await helper
+                        except asyncio.CancelledError:
+                            pass
             except asyncio.CancelledError:
                 await self._disconnect()
                 raise
@@ -198,11 +205,24 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         Queue the message body for the base class's listen_for_* loop, which parses it. Queueing an already parsed
         message would get it parsed twice and dropped.
         """
+        self._last_message_time = time.time()
         body = unwrap_frame(message)
         if body is None:
             self.logger().debug(f"Ignoring CoinDCX stream message without a JSON body: {message!r}")
             return
         self._message_queue[queue_key].put_nowait(body)
+
+    async def _watch_for_silence(self, client: socketio.AsyncClient):
+        """
+        Drops the connection once it has sent nothing for STREAM_SILENCE_TIMEOUT seconds, so that it reconnects.
+        """
+        while True:
+            await self._sleep(1.0)
+            silent_for = time.time() - self._last_message_time
+            if silent_for >= self.STREAM_SILENCE_TIMEOUT:
+                self.logger().warning(f"CoinDCX order book stream sent nothing for {silent_for:.0f} s; reconnecting.")
+                await client.disconnect()
+                return
 
     async def _disconnect(self):
         """
@@ -221,10 +241,12 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     async def _subscribe_channels(self, client: socketio.AsyncClient):
         """
-        Subscribe to order book and trade channels for all trading pairs.
+        Subscribe to order book and trade channels for all trading pairs. The channels are named by the market's
+        pair code from markets_details ("I-ETH_INR", "B-BTC_USDT"), as CoinDCX's docs say.
         """
         for trading_pair in self._trading_pairs:
-            coindcx_pair = hb_pair_to_coindcx_pair(trading_pair, ecode=CONSTANTS.ECODE_COINDCX)
+            coindcx_pair = await self._connector.exchange_pair_code(trading_pair)
+            self._pair_code_to_trading_pair[coindcx_pair] = trading_pair
             orderbook_channel = f"{coindcx_pair}@orderbook@{CONSTANTS.ORDER_BOOK_DEPTH}"
             trades_channel = f"{coindcx_pair}@trades"
             await client.emit("join", {"channelName": orderbook_channel})
@@ -278,6 +300,10 @@ class CoinDCXAPIOrderBookDataSource(OrderBookTrackerDataSource):
         if not symbol:
             return None
         trading_pair = self._pair_code_to_trading_pair.get(symbol)
+        if trading_pair is None and "-" in symbol and "_" in symbol:
+            # A pair code of a channel not joined yet: "I-SOL_INR" is SOL-INR, if that is one of this source's pairs.
+            from_code = coindcx_pair_to_hb_pair(symbol)
+            trading_pair = from_code if from_code in self._trading_pairs else None
         if trading_pair is None:
             try:
                 trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol=symbol)

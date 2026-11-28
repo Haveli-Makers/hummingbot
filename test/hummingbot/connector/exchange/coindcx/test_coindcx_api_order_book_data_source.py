@@ -302,8 +302,9 @@ class CoinDCXAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
 
         self.assertEqual(REST_BOOK["timestamp"], msg.update_id)
 
-    def test_books_refresh_from_rest_after_a_minute_without_snapshots(self):
-        self.assertEqual(60, CoinDCXAPIOrderBookDataSource.FULL_ORDER_BOOK_RESET_DELTA_SECONDS)
+    def test_books_refresh_from_rest_after_ten_seconds_without_snapshots(self):
+        # CoinDCX sends a snapshot about every 3 s per pair, so 10 s without one means the stream is stuck.
+        self.assertEqual(10, CoinDCXAPIOrderBookDataSource.FULL_ORDER_BOOK_RESET_DELTA_SECONDS)
 
     async def test_listen_for_trades_parses_stream_trades(self):
         msg = await self._drain_via_base_loop(self.data_source.listen_for_trades, CONSTANTS.TRADE_EVENT_TYPE, TRADE)

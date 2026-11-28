@@ -115,8 +115,10 @@ class CoinDCXStreamProxyTests(IsolatedAsyncioWrapperTestCase):
 
     @staticmethod
     def order_book_source(proxy_url: Optional[str] = None) -> CoinDCXAPIOrderBookDataSource:
+        connector = MagicMock()
+        connector.exchange_pair_code = AsyncMock(return_value="I-ETH_INR")  # names the channels it joins
         return CoinDCXAPIOrderBookDataSource(
-            trading_pairs=["ETH-INR"], connector=MagicMock(), api_factory=MagicMock(), proxy_url=proxy_url)
+            trading_pairs=["ETH-INR"], connector=connector, api_factory=MagicMock(), proxy_url=proxy_url)
 
     @staticmethod
     def user_stream_source(proxy_url: Optional[str] = None) -> CoinDCXAPIUserStreamDataSource:

@@ -90,3 +90,19 @@ def test_proxy_url_is_blank_for_a_config_saved_without_it():
     config = ClientConfigAdapter(CoinDCXConfigMap(coindcx_api_key="key", coindcx_api_secret="secret"))
 
     assert api_keys_from_connector_config_map(config)["coindcx_proxy_url"] == ""
+
+
+def test_default_pair_code_guesses_the_usual_route():
+    assert coindcx_utils.default_pair_code("ETH-INR") == "I-ETH_INR"
+    assert coindcx_utils.default_pair_code("BTC-USDT") == "B-BTC_USDT"
+
+
+def test_timestamp_in_seconds_reads_every_format_coindcx_uses():
+    assert coindcx_utils.timestamp_in_seconds(1795675620118) == 1795675620.118  # milliseconds
+    assert coindcx_utils.timestamp_in_seconds(1545896665076.92) == 1545896665.07692  # a trade time with a fraction
+    assert coindcx_utils.timestamp_in_seconds("1795675620118") == 1795675620.118
+    assert coindcx_utils.timestamp_in_seconds(1795675620) == 1795675620.0  # seconds already
+    assert abs(coindcx_utils.timestamp_in_seconds("2026-11-26T06:47:00.118Z") - 1795675620.118) < 1e-6
+    assert abs(coindcx_utils.timestamp_in_seconds("2026-11-26T06:47:00.118") - 1795675620.118) < 1e-6  # UTC
+    for unreadable in (None, "", "yesterday", 0, -5, True, [1]):
+        assert coindcx_utils.timestamp_in_seconds(unreadable) is None

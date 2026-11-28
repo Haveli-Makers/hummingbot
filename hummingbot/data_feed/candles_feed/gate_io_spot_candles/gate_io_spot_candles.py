@@ -86,6 +86,12 @@ class GateioSpotCandles(CandlesBase):
         candles_ago = (int(time.time()) - start_time) // self.interval_in_seconds
         if candles_ago > CONSTANTS.MAX_CANDLES_AGO:
             raise ValueError("Gate.io REST API does not support fetching more than 10000 candles ago.")
+
+        if start_time is not None and end_time is not None:
+            span_points = (end_time - start_time) // self.interval_in_seconds + 1
+            if span_points > CONSTANTS.MAX_RESULTS_PER_CANDLESTICK_REST_REQUEST:
+                start_time = end_time - (CONSTANTS.MAX_RESULTS_PER_CANDLESTICK_REST_REQUEST - 1) * self.interval_in_seconds
+
         return {
             "currency_pair": self._ex_trading_pair,
             "interval": self.interval,

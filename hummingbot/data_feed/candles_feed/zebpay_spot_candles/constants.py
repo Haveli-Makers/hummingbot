@@ -4,6 +4,11 @@ from hummingbot.core.api_throttler.data_types import LinkedLimitWeightPair, Rate
 
 REST_URL = "https://sapi.zebpay.com"
 
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
 HEALTH_CHECK_ENDPOINT = "/api/v2/system/status"
 CANDLES_ENDPOINT = "/api/v2/market/klines"
 

@@ -3,11 +3,25 @@ import logging
 import time
 from typing import List, Optional
 
+from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
 from hummingbot.core.network_iterator import NetworkStatus
 from hummingbot.core.utils.async_utils import safe_ensure_future
+from hummingbot.core.web_assistant.connections.data_types import RESTRequest
+from hummingbot.core.web_assistant.rest_pre_processors import RESTPreProcessorBase
+from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 from hummingbot.data_feed.candles_feed.candles_base import CandlesBase
 from hummingbot.data_feed.candles_feed.zebpay_spot_candles import constants as CONSTANTS
 from hummingbot.logger import HummingbotLogger
+
+
+class ZebpayUserAgentRESTPreProcessor(RESTPreProcessorBase):
+    """Injects a browser-like User-Agent so Zebpay's WAF does not reject requests with HTTP 403."""
+
+    async def pre_process(self, request: RESTRequest) -> RESTRequest:
+        headers = dict(request.headers or {})
+        headers.setdefault("User-Agent", CONSTANTS.USER_AGENT)
+        request.headers = headers
+        return request
 
 
 class ZebpaySpotCandles(CandlesBase):
@@ -21,6 +35,10 @@ class ZebpaySpotCandles(CandlesBase):
 
     def __init__(self, trading_pair: str, interval: str = "1m", max_records: int = 150):
         super().__init__(trading_pair, interval, max_records)
+        self._api_factory = WebAssistantsFactory(
+            throttler=AsyncThrottler(rate_limits=self.rate_limits),
+            rest_pre_processors=[ZebpayUserAgentRESTPreProcessor()],
+        )
         self._polling_task: Optional[asyncio.Task] = None
         self._historical_fill_task: Optional[asyncio.Task] = None
         self._is_running = False
